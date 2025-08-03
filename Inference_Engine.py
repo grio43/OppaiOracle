@@ -579,3 +579,6 @@ class BatchInferenceProcessor:
     
     def process_directory(
         self,
+        directory: Union[str, Path],
+        output_file: Optional[Union[str, Path]] = None,
+    ) -> List[Dict[str, Any]]:

@@ -576,5 +576,7 @@ class TrainingMonitor:
                 true_tags = [tag_names[j] for j in true_indices]
                 
                 # Log image with caption
-                caption = f"Predicted: {', '.join(pred_tags[:5])}\n" \
-                         f"True: {', '.join(true
+                caption = (
+                    f"Predicted: {', '.join(pred_tags[:5])}\n"
+                    f"True: {', '.join(true_tags[:5])}"
+                )

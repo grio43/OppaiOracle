@@ -9,13 +9,12 @@ import json
 import yaml
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any, Type
+from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass, field, asdict, fields
 from enum import Enum
 import argparse
 from datetime import datetime
 import copy
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +54,22 @@ class BaseConfig:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'BaseConfig':
-        """Create config from dictionary"""
-        # Filter out unknown fields
-        valid_fields = {f.name for f in fields(cls)}
-        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
-        return cls(**filtered_data)
+        """Create config from dictionary, handling nesting."""
+        kwargs = {}
+        cls_fields = {f.name: f for f in fields(cls)}
+        
+        for key, value in data.items():
+            if key in cls_fields:
+                field_info = cls_fields[key]
+                field_type = field_info.type
+                
+                # Check for nested BaseConfig subclasses
+                if isinstance(field_type, type) and issubclass(field_type, BaseConfig) and isinstance(value, dict):
+                    kwargs[key] = field_type.from_dict(value)
+                else:
+                    kwargs[key] = value
+                    
+        return cls(**kwargs)
     
     def update(self, updates: Dict[str, Any]):
         """Update config values"""
@@ -472,17 +482,11 @@ class ConfigManager:
                 
                 # Parse value
                 try:
-                    # Try to parse as JSON first (for lists, dicts)
                     parsed_value = json.loads(value)
-                except:
-                    # Try to parse as number
+                except json.JSONDecodeError: # Catches only JSON errors
                     try:
-                        if '.' in value:
-                            parsed_value = float(value)
-                        else:
-                            parsed_value = int(value)
-                    except:
-                        # Keep as string
+                        parsed_value = float(value) if '.' in value else int(value)
+                    except ValueError: # Catches only number conversion errors
                         parsed_value = value
                         
                         # Convert string booleans
@@ -497,6 +501,7 @@ class ConfigManager:
         self._apply_nested_updates(self.config, updates)
         
         if updates:
+            self.config.validate()  # ensure consistency after changes
             logger.info(f"Updated config from environment: {list(updates.keys())}")
     
     def update_from_args(self, args: argparse.Namespace):
@@ -511,6 +516,7 @@ class ConfigManager:
         self._apply_nested_updates(self.config, updates)
         
         if updates:
+            self.config.validate()
             logger.info(f"Updated config from args: {list(updates.keys())}")
     
     def _apply_nested_updates(self, config: Any, updates: Dict[str, Any]):
@@ -603,25 +609,25 @@ def create_config_parser(config_type: ConfigType = ConfigType.FULL) -> argparse.
     
     if config_type in [ConfigType.FULL, ConfigType.TRAINING]:
         # Training arguments
-        parser.add_argument('--num-epochs', type=int, help='Number of training epochs')
-        parser.add_argument('--learning-rate', type=float, help='Learning rate')
-        parser.add_argument('--batch-size', type=int, help='Batch size')
-        parser.add_argument('--device', type=str, help='Device (cuda/cpu)')
-        parser.add_argument('--distributed', action='store_true', help='Use distributed training')
-        parser.add_argument('--output-dir', type=str, help='Output directory')
+        parser.add_argument('--training.num_epochs', dest='training.num_epochs', type=int, help='Number of training epochs')
+        parser.add_argument('--training.learning_rate', dest='training.learning_rate', type=float, help='Learning rate')
+        parser.add_argument('--data.batch_size', dest='data.batch_size', type=int, help='Batch size')
+        parser.add_argument('--training.device', dest='training.device', type=str, help='Device (cuda/cpu)')
+        parser.add_argument('--training.distributed', dest='training.distributed', action='store_true', help='Use distributed training')
+        parser.add_argument('--data.output_dir', dest='data.output_dir', type=str, help='Output directory')
     
     if config_type in [ConfigType.FULL, ConfigType.INFERENCE]:
         # Inference arguments
-        parser.add_argument('--model-path', type=str, help='Path to model')
-        parser.add_argument('--threshold', type=float, help='Prediction threshold')
-        parser.add_argument('--top-k', type=int, help='Top-k predictions')
-        parser.add_argument('--filter-nsfw', action='store_true', help='Filter NSFW tags')
+        parser.add_argument('--inference.model_path', dest='inference.model_path', type=str, help='Path to model')
+        parser.add_argument('--inference.prediction_threshold', dest='inference.prediction_threshold', type=float, help='Prediction threshold')
+        parser.add_argument('--inference.top_k', dest='inference.top_k', type=int, help='Top-k predictions')
+        parser.add_argument('--inference.filter_nsfw', dest='inference.filter_nsfw', action='store_true', help='Filter NSFW tags')
     
     if config_type in [ConfigType.FULL, ConfigType.EXPORT]:
         # Export arguments
-        parser.add_argument('--opset-version', type=int, help='ONNX opset version')
-        parser.add_argument('--optimize', action='store_true', help='Optimize exported model')
-        parser.add_argument('--quantize', action='store_true', help='Quantize model')
+        parser.add_argument('--export.opset_version', dest='export.opset_version', type=int, help='ONNX opset version')
+        parser.add_argument('--export.optimize', dest='export.optimize', action='store_true', help='Optimize exported model')
+        parser.add_argument('--export.quantize', dest='export.quantize', action='store_true', help='Quantize model')
     
     return parser
 
@@ -693,11 +699,15 @@ def generate_example_configs(output_dir: Path = Path("./config_examples")):
     
     # High performance inference config
     hp_inference = {
-        "use_fp16": True,
-        "use_tensorrt": True,
-        "optimize_for_speed": True,
-        "batch_size": 64,
-        "adaptive_threshold": True
+        "data": {
+            "batch_size": 64
+        },
+        "inference": {
+            "use_fp16": True,
+            "use_tensorrt": True,
+            "optimize_for_speed": True,
+            "adaptive_threshold": True
+        }
     }
     with open(output_dir / "high_performance_inference.yaml", 'w') as f:
         yaml.dump(hp_inference, f)

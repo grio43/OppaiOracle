@@ -572,10 +572,12 @@ class ONNXExporter:
         session = ort.InferenceSession(str(model_path), providers=providers)
         
         # Prepare input
-        input_data = np.random.randn(
+         input_data = np.random.randn(
             self.config.batch_size,
             3,
             self.config.image_size,
+            self.config.image_size
+            ).astype(np.float32)
 
 #!/usr/bin/env python3
 """

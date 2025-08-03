@@ -564,4 +564,4 @@ class DatasetAnalyzer:
             if tag_file.exists():
                 try:
                     with open(tag_file, 'r') as f:
-                        tags = [tag.st
+                        tags = [tag.strip() for tag in f.readlines()]
