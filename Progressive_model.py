@@ -34,8 +34,7 @@ from model_architecture import (
     TransformerBlock,
     create_model
 )
-from tag_head import HierarchicalTagHead, TagHeadConfig
-from training_utils import ModelEMA, compute_model_stats
+
 
 logger = logging.getLogger(__name__)
 

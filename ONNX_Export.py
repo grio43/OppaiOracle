@@ -29,7 +29,7 @@ import onnx.numpy_helper
 # Import our modules
 from model_architecture import create_model, VisionTransformerConfig
 from tag_vocabulary import load_vocabulary_for_training
-from inference import ImagePreprocessor, InferenceConfig
+
 
 logger = logging.getLogger(__name__)
 

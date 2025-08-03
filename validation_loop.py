@@ -26,7 +26,6 @@ from tqdm import tqdm
 # Import our modules
 from metrics import MetricComputer, MetricConfig, MetricVisualizer, evaluate_model
 from tag_vocabulary import TagVocabulary, load_vocabulary_for_training
-from model_architecture import create_model
 from hdf5_dataloader import create_dataloaders, HDF5DataConfig
 from training_utils import DistributedTrainingHelper
 
