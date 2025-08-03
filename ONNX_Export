@@ -1,0 +1,1158 @@
+#!/usr/bin/env python3
+"""
+ONNX Export for Anime Image Tagger
+Export trained model to ONNX format for deployment
+"""
+
+import os
+import json
+import logging
+import shutil
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union, Any
+from dataclasses import dataclass, asdict
+import time
+import warnings
+
+import numpy as np
+import torch
+import torch.nn as nn
+import onnx
+import onnxruntime as ort
+from onnxruntime.quantization import quantize_dynamic, QuantType
+from onnxruntime.transformers import optimizer
+from onnx import shape_inference
+import onnx.checker
+import onnx.helper
+import onnx.numpy_helper
+
+# Import our modules
+from model_architecture import create_model, VisionTransformerConfig
+from tag_vocabulary import load_vocabulary_for_training
+from inference import ImagePreprocessor, InferenceConfig
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ONNXExportConfig:
+    """Configuration for ONNX export"""
+    # Model paths
+    checkpoint_path: str
+    vocab_dir: str
+    output_path: str = "model.onnx"
+    
+    # Export settings
+    opset_version: int = 16
+    input_names: List[str] = None
+    output_names: List[str] = None
+    dynamic_axes: Dict[str, Dict[int, str]] = None
+    
+    # Model configuration
+    batch_size: int = 1
+    image_size: int = 640
+    export_params: bool = True
+    do_constant_folding: bool = True
+    
+    # Optimization settings
+    optimize: bool = True
+    optimize_for_mobile: bool = False
+    quantize: bool = False
+    quantization_type: str = "dynamic"  # dynamic, static, qat
+    
+    # Validation
+    validate_export: bool = True
+    tolerance_rtol: float = 1e-3
+    tolerance_atol: float = 1e-5
+    
+    # Export variants
+    export_variants: List[str] = None  # ["full", "mobile", "quantized"]
+    
+    # Metadata
+    add_metadata: bool = True
+    model_description: str = "Anime Image Tagger Model"
+    model_author: str = "AnimeTaggers"
+    model_version: str = "1.0"
+    
+    def __post_init__(self):
+        if self.input_names is None:
+            self.input_names = ["input_image"]
+        if self.output_names is None:
+            self.output_names = ["predictions", "scores"]
+        if self.dynamic_axes is None:
+            self.dynamic_axes = {
+                "input_image": {0: "batch_size"},
+                "predictions": {0: "batch_size"},
+                "scores": {0: "batch_size"}
+            }
+        if self.export_variants is None:
+            self.export_variants = ["full"]
+
+
+class ModelWrapper(nn.Module):
+    """Wrapper to simplify model output for ONNX export"""
+    
+    def __init__(self, model: nn.Module, config: ONNXExportConfig):
+        super().__init__()
+        self.model = model
+        self.config = config
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with simplified output
+        
+        Args:
+            x: Input tensor (batch_size, 3, H, W)
+            
+        Returns:
+            predictions: Binary predictions (batch_size, num_tags)
+            scores: Confidence scores (batch_size, num_tags)
+        """
+        # Get model output
+        outputs = self.model(x)
+        
+        if isinstance(outputs, dict):
+            logits = outputs['logits']
+        else:
+            logits = outputs
+        
+        # Handle hierarchical output - flatten it
+        if logits.dim() == 3:
+            batch_size = logits.shape[0]
+            logits = logits.view(batch_size, -1)
+        
+        # Convert to probabilities
+        scores = torch.sigmoid(logits)
+        
+        # Get binary predictions
+        predictions = (scores > 0.5).float()
+        
+        return predictions, scores
+
+
+class ONNXExporter:
+    """Main ONNX export class"""
+    
+    def __init__(self, config: ONNXExportConfig):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Create output directory
+        self.output_dir = Path(config.output_path).parent
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Load vocabulary
+        self.vocab = load_vocabulary_for_training(Path(config.vocab_dir))
+        logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
+        
+        # Load model
+        self.model = self._load_model()
+        
+    def _load_model(self) -> nn.Module:
+        """Load model from checkpoint"""
+        logger.info(f"Loading model from {self.config.checkpoint_path}")
+        
+        checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu')
+        
+        # Extract model config
+        if 'config' in checkpoint:
+            model_config = checkpoint['config']
+            if isinstance(model_config, dict) and 'model_config' in model_config:
+                model_config = model_config['model_config']
+        else:
+            model_config = VisionTransformerConfig()
+        
+        # Create model
+        model = create_model(**model_config if isinstance(model_config, dict) else asdict(model_config))
+        
+        # Load weights
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+        
+        # Handle DDP weights
+        if any(k.startswith('module.') for k in state_dict.keys()):
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
+        model.load_state_dict(state_dict)
+        model.eval()
+        
+        # Wrap model
+        wrapped_model = ModelWrapper(model, self.config)
+        wrapped_model.to(self.device)
+        
+        return wrapped_model
+    
+    def export(self):
+        """Export model to ONNX format"""
+        logger.info("Starting ONNX export...")
+        
+        # Export variants
+        for variant in self.config.export_variants:
+            logger.info(f"Exporting variant: {variant}")
+            
+            if variant == "full":
+                self._export_full_model()
+            elif variant == "mobile":
+                self._export_mobile_model()
+            elif variant == "quantized":
+                self._export_quantized_model()
+            else:
+                logger.warning(f"Unknown variant: {variant}")
+    
+    def _export_full_model(self):
+        """Export full precision model"""
+        output_path = Path(self.config.output_path)
+        
+        # Create dummy input
+        dummy_input = torch.randn(
+            self.config.batch_size,
+            3,
+            self.config.image_size,
+            self.config.image_size,
+            device=self.device
+        )
+        
+        # Export
+        logger.info(f"Exporting to {output_path}")
+        
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            
+            torch.onnx.export(
+                self.model,
+                dummy_input,
+                output_path,
+                export_params=self.config.export_params,
+                opset_version=self.config.opset_version,
+                do_constant_folding=self.config.do_constant_folding,
+                input_names=self.config.input_names,
+                output_names=self.config.output_names,
+                dynamic_axes=self.config.dynamic_axes,
+                verbose=False
+            )
+        
+        # Add metadata
+        if self.config.add_metadata:
+            self._add_metadata(output_path)
+        
+        # Optimize
+        if self.config.optimize:
+            self._optimize_model(output_path)
+        
+        # Validate
+        if self.config.validate_export:
+            self._validate_model(output_path)
+        
+        logger.info(f"Full model exported to {output_path}")
+        
+        # Print model info
+        self._print_model_info(output_path)
+    
+    def _export_mobile_model(self):
+        """Export optimized model for mobile deployment"""
+        base_path = Path(self.config.output_path)
+        mobile_path = base_path.parent / f"{base_path.stem}_mobile.onnx"
+        
+        # First export full model
+        temp_path = base_path.parent / "temp_mobile.onnx"
+        
+        # Use smaller batch size for mobile
+        original_batch_size = self.config.batch_size
+        self.config.batch_size = 1
+        
+        # Export
+        dummy_input = torch.randn(
+            1, 3, self.config.image_size, self.config.image_size,
+            device=self.device
+        )
+        
+        torch.onnx.export(
+            self.model,
+            dummy_input,
+            temp_path,
+            export_params=True,
+            opset_version=self.config.opset_version,
+            do_constant_folding=True,
+            input_names=self.config.input_names,
+            output_names=self.config.output_names,
+            dynamic_axes=None,  # Fixed batch size for mobile
+            verbose=False
+        )
+        
+        # Optimize for mobile
+        self._optimize_for_mobile(temp_path, mobile_path)
+        
+        # Clean up
+        temp_path.unlink()
+        self.config.batch_size = original_batch_size
+        
+        logger.info(f"Mobile model exported to {mobile_path}")
+    
+    def _export_quantized_model(self):
+        """Export quantized model"""
+        base_path = Path(self.config.output_path)
+        
+        # Ensure full model exists
+        if not base_path.exists():
+            self._export_full_model()
+        
+        if self.config.quantization_type == "dynamic":
+            quantized_path = base_path.parent / f"{base_path.stem}_quantized_dynamic.onnx"
+            self._quantize_dynamic(base_path, quantized_path)
+            
+        elif self.config.quantization_type == "static":
+            quantized_path = base_path.parent / f"{base_path.stem}_quantized_static.onnx"
+            self._quantize_static(base_path, quantized_path)
+            
+        else:
+            logger.warning(f"Unknown quantization type: {self.config.quantization_type}")
+            return
+        
+        logger.info(f"Quantized model exported to {quantized_path}")
+    
+    def _optimize_model(self, model_path: Path):
+        """Optimize ONNX model"""
+        logger.info("Optimizing ONNX model...")
+        
+        optimized_path = model_path.parent / f"{model_path.stem}_optimized.onnx"
+        
+        # Create optimizer
+        model_optimizer = optimizer.create_optimizer(
+            model=str(model_path),
+            num_heads=24,  # From model config
+            hidden_size=1536,  # From model config
+            sequence_length=2074,  # patches + special tokens
+            input_int32=False,
+            float16=True,
+            use_gpu=True,
+            opt_level=99,
+            optimization_options=optimizer.FusionOptions('all'),
+            provider='CUDAExecutionProvider'
+        )
+        
+        # Optimize
+        model_optimizer.optimize()
+        model_optimizer.save_model_to_file(str(optimized_path))
+        
+        # Replace original with optimized
+        shutil.move(str(optimized_path), str(model_path))
+        
+        logger.info("Model optimization complete")
+    
+    def _optimize_for_mobile(self, input_path: Path, output_path: Path):
+        """Optimize model specifically for mobile deployment"""
+        import onnx
+        from onnxruntime.transformers import optimizer
+        from onnx import optimizer as onnx_optimizer
+        
+        # Load model
+        model = onnx.load(str(input_path))
+        
+        # Run ONNX optimizer passes
+        passes = [
+            'eliminate_identity',
+            'eliminate_nop_dropout',
+            'eliminate_nop_monotone_argmax',
+            'eliminate_nop_pad',
+            'eliminate_nop_transpose',
+            'eliminate_unused_initializer',
+            'eliminate_deadend',
+            'fuse_consecutive_concats',
+            'fuse_consecutive_log_softmax',
+            'fuse_consecutive_reduce_unsqueeze',
+            'fuse_consecutive_squeezes',
+            'fuse_consecutive_transposes',
+            'fuse_matmul_add_bias_into_gemm',
+            'fuse_pad_into_conv',
+            'fuse_transpose_into_gemm',
+            'simplify_lexsort',
+            'nop'
+        ]
+        
+        optimized_model = onnx_optimizer.optimize(model, passes)
+        
+        # Additional mobile-specific optimizations
+        # Remove unnecessary casts
+        graph = optimized_model.graph
+        nodes_to_remove = []
+        
+        for node in graph.node:
+            # Remove identity operations
+            if node.op_type == 'Identity':
+                nodes_to_remove.append(node)
+            
+            # Fuse batch normalization if present
+            if node.op_type == 'BatchNormalization':
+                # Simplified - in practice, would fuse into previous conv/linear
+                pass
+        
+        for node in nodes_to_remove:
+            graph.node.remove(node)
+        
+        # Update model
+        optimized_model = shape_inference.infer_shapes(optimized_model)
+        
+        # Save
+        onnx.save(optimized_model, str(output_path))
+        
+        # Further optimize with ORT mobile optimizer if available
+        try:
+            from onnxruntime.tools.mobile_optimizer import optimize_model
+            optimize_model(str(output_path), str(output_path))
+        except ImportError:
+            logger.warning("ORT mobile optimizer not available")
+    
+    def _quantize_dynamic(self, input_path: Path, output_path: Path):
+        """Apply dynamic quantization"""
+        logger.info("Applying dynamic quantization...")
+        
+        quantize_dynamic(
+            model_input=str(input_path),
+            model_output=str(output_path),
+            weight_type=QuantType.QUInt8,
+            optimize_model=True,
+            per_channel=True,
+            reduce_range=True
+        )
+        
+        # Validate quantized model
+        if self.config.validate_export:
+            self._validate_model(output_path)
+    
+    def _quantize_static(self, input_path: Path, output_path: Path):
+        """Apply static quantization (requires calibration data)"""
+        logger.info("Static quantization requires calibration data")
+        
+        # This is a simplified version - full implementation would:
+        # 1. Create calibration dataset
+        # 2. Run calibration
+        # 3. Quantize model
+        
+        # For now, fall back to dynamic quantization
+        logger.warning("Static quantization not fully implemented, using dynamic")
+        self._quantize_dynamic(input_path, output_path)
+    
+    def _add_metadata(self, model_path: Path):
+        """Add metadata to ONNX model"""
+        model = onnx.load(str(model_path))
+        
+        # Add metadata
+        metadata = {
+            'model_description': self.config.model_description,
+            'model_author': self.config.model_author,
+            'model_version': self.config.model_version,
+            'export_date': str(time.strftime('%Y-%m-%d %H:%M:%S')),
+            'num_tags': str(len(self.vocab.tag_to_index)),
+            'image_size': str(self.config.image_size),
+            'framework': 'PyTorch',
+            'opset_version': str(self.config.opset_version)
+        }
+        
+        for key, value in metadata.items():
+            meta = model.metadata_props.add()
+            meta.key = key
+            meta.value = value
+        
+        # Add tag vocabulary info
+        vocab_meta = model.metadata_props.add()
+        vocab_meta.key = 'tag_vocabulary_size'
+        vocab_meta.value = str(len(self.vocab.tag_to_index))
+        
+        # Save model
+        onnx.save(model, str(model_path))
+    
+    def _validate_model(self, model_path: Path):
+        """Validate exported ONNX model"""
+        logger.info("Validating ONNX model...")
+        
+        # Check model
+        model = onnx.load(str(model_path))
+        onnx.checker.check_model(model)
+        
+        # Create test input
+        test_input = np.random.randn(
+            self.config.batch_size,
+            3,
+            self.config.image_size,
+            self.config.image_size
+        ).astype(np.float32)
+        
+        # Run inference with PyTorch
+        torch_input = torch.from_numpy(test_input).to(self.device)
+        self.model.eval()
+        
+        with torch.no_grad():
+            torch_predictions, torch_scores = self.model(torch_input)
+        
+        torch_predictions = torch_predictions.cpu().numpy()
+        torch_scores = torch_scores.cpu().numpy()
+        
+        # Run inference with ONNX Runtime
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        session = ort.InferenceSession(str(model_path), providers=providers)
+        
+        onnx_outputs = session.run(
+            None,
+            {self.config.input_names[0]: test_input}
+        )
+        
+        onnx_predictions = onnx_outputs[0]
+        onnx_scores = onnx_outputs[1]
+        
+        # Compare outputs
+        predictions_close = np.allclose(
+            torch_predictions,
+            onnx_predictions,
+            rtol=self.config.tolerance_rtol,
+            atol=self.config.tolerance_atol
+        )
+        
+        scores_close = np.allclose(
+            torch_scores,
+            onnx_scores,
+            rtol=self.config.tolerance_rtol,
+            atol=self.config.tolerance_atol
+        )
+        
+        if predictions_close and scores_close:
+            logger.info("✓ Model validation passed!")
+            logger.info(f"  Max prediction difference: {np.max(np.abs(torch_predictions - onnx_predictions))}")
+            logger.info(f"  Max score difference: {np.max(np.abs(torch_scores - onnx_scores))}")
+        else:
+            logger.error("✗ Model validation failed!")
+            logger.error(f"  Predictions match: {predictions_close}")
+            logger.error(f"  Scores match: {scores_close}")
+            raise ValueError("ONNX model output does not match PyTorch model")
+    
+    def _print_model_info(self, model_path: Path):
+        """Print information about exported model"""
+        model = onnx.load(str(model_path))
+        
+        # Get model size
+        model_size = model_path.stat().st_size / (1024 * 1024)  # MB
+        
+        # Count operations
+        op_types = defaultdict(int)
+        for node in model.graph.node:
+            op_types[node.op_type] += 1
+        
+        # Get input/output info
+        inputs = [(i.name, [d.dim_value if d.HasField('dim_value') else d.dim_param 
+                           for d in i.type.tensor_type.shape.dim]) 
+                 for i in model.graph.input]
+        outputs = [(o.name, [d.dim_value if d.HasField('dim_value') else d.dim_param 
+                            for d in o.type.tensor_type.shape.dim]) 
+                  for o in model.graph.output]
+        
+        logger.info("\n" + "="*60)
+        logger.info("ONNX MODEL INFORMATION")
+        logger.info("="*60)
+        logger.info(f"Model path: {model_path}")
+        logger.info(f"Model size: {model_size:.2f} MB")
+        logger.info(f"Opset version: {model.opset_import[0].version}")
+        logger.info(f"\nInputs:")
+        for name, shape in inputs:
+            logger.info(f"  {name}: {shape}")
+        logger.info(f"\nOutputs:")
+        for name, shape in outputs:
+            logger.info(f"  {name}: {shape}")
+        logger.info(f"\nOperation types ({len(op_types)}):")
+        for op_type, count in sorted(op_types.items(), key=lambda x: x[1], reverse=True)[:10]:
+            logger.info(f"  {op_type}: {count}")
+        logger.info("="*60)
+    
+    def benchmark(self, model_path: Path, num_runs: int = 100):
+        """Benchmark ONNX model performance"""
+        logger.info(f"Benchmarking model: {model_path}")
+        
+        # Create session
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        session = ort.InferenceSession(str(model_path), providers=providers)
+        
+        # Prepare input
+        input_data = np.random.randn(
+            self.config.batch_size,
+            3,
+            self.config.image_size,
+
+#!/usr/bin/env python3
+"""
+ONNX Export for Anime Image Tagger
+Export trained model to ONNX format for deployment
+"""
+
+import os
+import json
+import logging
+import shutil
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union, Any
+from dataclasses import dataclass, asdict
+import time
+import warnings
+
+import numpy as np
+import torch
+import torch.nn as nn
+import onnx
+import onnxruntime as ort
+from onnxruntime.quantization import quantize_dynamic, QuantType
+from onnxruntime.transformers import optimizer
+from onnx import shape_inference
+import onnx.checker
+import onnx.helper
+import onnx.numpy_helper
+
+# Import our modules
+from model_architecture import create_model, VisionTransformerConfig
+from tag_vocabulary import load_vocabulary_for_training
+from inference import ImagePreprocessor, InferenceConfig
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ONNXExportConfig:
+    """Configuration for ONNX export"""
+    # Model paths
+    checkpoint_path: str
+    vocab_dir: str
+    output_path: str = "model.onnx"
+    
+    # Export settings
+    opset_version: int = 16
+    input_names: List[str] = None
+    output_names: List[str] = None
+    dynamic_axes: Dict[str, Dict[int, str]] = None
+    
+    # Model configuration
+    batch_size: int = 1
+    image_size: int = 640
+    export_params: bool = True
+    do_constant_folding: bool = True
+    
+    # Optimization settings
+    optimize: bool = True
+    optimize_for_mobile: bool = False
+    quantize: bool = False
+    quantization_type: str = "dynamic"  # dynamic, static, qat
+    
+    # Validation
+    validate_export: bool = True
+    tolerance_rtol: float = 1e-3
+    tolerance_atol: float = 1e-5
+    
+    # Export variants
+    export_variants: List[str] = None  # ["full", "mobile", "quantized"]
+    
+    # Metadata
+    add_metadata: bool = True
+    model_description: str = "Anime Image Tagger Model"
+    model_author: str = "AnimeTaggers"
+    model_version: str = "1.0"
+    
+    def __post_init__(self):
+        if self.input_names is None:
+            self.input_names = ["input_image"]
+        if self.output_names is None:
+            self.output_names = ["predictions", "scores"]
+        if self.dynamic_axes is None:
+            self.dynamic_axes = {
+                "input_image": {0: "batch_size"},
+                "predictions": {0: "batch_size"},
+                "scores": {0: "batch_size"}
+            }
+        if self.export_variants is None:
+            self.export_variants = ["full"]
+
+
+class ModelWrapper(nn.Module):
+    """Wrapper to simplify model output for ONNX export"""
+    
+    def __init__(self, model: nn.Module, config: ONNXExportConfig):
+        super().__init__()
+        self.model = model
+        self.config = config
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with simplified output
+        
+        Args:
+            x: Input tensor (batch_size, 3, H, W)
+            
+        Returns:
+            predictions: Binary predictions (batch_size, num_tags)
+            scores: Confidence scores (batch_size, num_tags)
+        """
+        # Get model output
+        outputs = self.model(x)
+        
+        if isinstance(outputs, dict):
+            logits = outputs['logits']
+        else:
+            logits = outputs
+        
+        # Handle hierarchical output - flatten it
+        if logits.dim() == 3:
+            batch_size = logits.shape[0]
+            logits = logits.view(batch_size, -1)
+        
+        # Convert to probabilities
+        scores = torch.sigmoid(logits)
+        
+        # Get binary predictions
+        predictions = (scores > 0.5).float()
+        
+        return predictions, scores
+
+
+class ONNXExporter:
+    """Main ONNX export class"""
+    
+    def __init__(self, config: ONNXExportConfig):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Create output directory
+        self.output_dir = Path(config.output_path).parent
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Load vocabulary
+        self.vocab = load_vocabulary_for_training(Path(config.vocab_dir))
+        logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
+        
+        # Load model
+        self.model = self._load_model()
+        
+    def _load_model(self) -> nn.Module:
+        """Load model from checkpoint"""
+        logger.info(f"Loading model from {self.config.checkpoint_path}")
+        
+        checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu')
+        
+        # Extract model config
+        if 'config' in checkpoint:
+            model_config = checkpoint['config']
+            if isinstance(model_config, dict) and 'model_config' in model_config:
+                model_config = model_config['model_config']
+        else:
+            model_config = VisionTransformerConfig()
+        
+        # Create model
+        model = create_model(**model_config if isinstance(model_config, dict) else asdict(model_config))
+        
+        # Load weights
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+        
+        # Handle DDP weights
+        if any(k.startswith('module.') for k in state_dict.keys()):
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
+        model.load_state_dict(state_dict)
+        model.eval()
+        
+        # Wrap model
+        wrapped_model = ModelWrapper(model, self.config)
+        wrapped_model.to(self.device)
+        
+        return wrapped_model
+    
+    def export(self):
+        """Export model to ONNX format"""
+        logger.info("Starting ONNX export...")
+        
+        # Export variants
+        for variant in self.config.export_variants:
+            logger.info(f"Exporting variant: {variant}")
+            
+            if variant == "full":
+                self._export_full_model()
+            elif variant == "mobile":
+                self._export_mobile_model()
+            elif variant == "quantized":
+                self._export_quantized_model()
+            else:
+                logger.warning(f"Unknown variant: {variant}")
+    
+    def _export_full_model(self):
+        """Export full precision model"""
+        output_path = Path(self.config.output_path)
+        
+        # Create dummy input
+        dummy_input = torch.randn(
+            self.config.batch_size,
+            3,
+            self.config.image_size,
+            self.config.image_size,
+            device=self.device
+        )
+        
+        # Export
+        logger.info(f"Exporting to {output_path}")
+        
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            
+            torch.onnx.export(
+                self.model,
+                dummy_input,
+                output_path,
+                export_params=self.config.export_params,
+                opset_version=self.config.opset_version,
+                do_constant_folding=self.config.do_constant_folding,
+                input_names=self.config.input_names,
+                output_names=self.config.output_names,
+                dynamic_axes=self.config.dynamic_axes,
+                verbose=False
+            )
+        
+        # Add metadata
+        if self.config.add_metadata:
+            self._add_metadata(output_path)
+        
+        # Optimize
+        if self.config.optimize:
+            self._optimize_model(output_path)
+        
+        # Validate
+        if self.config.validate_export:
+            self._validate_model(output_path)
+        
+        logger.info(f"Full model exported to {output_path}")
+        
+        # Print model info
+        self._print_model_info(output_path)
+    
+    def _export_mobile_model(self):
+        """Export optimized model for mobile deployment"""
+        base_path = Path(self.config.output_path)
+        mobile_path = base_path.parent / f"{base_path.stem}_mobile.onnx"
+        
+        # First export full model
+        temp_path = base_path.parent / "temp_mobile.onnx"
+        
+        # Use smaller batch size for mobile
+        original_batch_size = self.config.batch_size
+        self.config.batch_size = 1
+        
+        # Export
+        dummy_input = torch.randn(
+            1, 3, self.config.image_size, self.config.image_size,
+            device=self.device
+        )
+        
+        torch.onnx.export(
+            self.model,
+            dummy_input,
+            temp_path,
+            export_params=True,
+            opset_version=self.config.opset_version,
+            do_constant_folding=True,
+            input_names=self.config.input_names,
+            output_names=self.config.output_names,
+            dynamic_axes=None,  # Fixed batch size for mobile
+            verbose=False
+        )
+        
+        # Optimize for mobile
+        self._optimize_for_mobile(temp_path, mobile_path)
+        
+        # Clean up
+        temp_path.unlink()
+        self.config.batch_size = original_batch_size
+        
+        logger.info(f"Mobile model exported to {mobile_path}")
+    
+    def _export_quantized_model(self):
+        """Export quantized model"""
+        base_path = Path(self.config.output_path)
+        
+        # Ensure full model exists
+        if not base_path.exists():
+            self._export_full_model()
+        
+        if self.config.quantization_type == "dynamic":
+            quantized_path = base_path.parent / f"{base_path.stem}_quantized_dynamic.onnx"
+            self._quantize_dynamic(base_path, quantized_path)
+            
+        elif self.config.quantization_type == "static":
+            quantized_path = base_path.parent / f"{base_path.stem}_quantized_static.onnx"
+            self._quantize_static(base_path, quantized_path)
+            
+        else:
+            logger.warning(f"Unknown quantization type: {self.config.quantization_type}")
+            return
+        
+        logger.info(f"Quantized model exported to {quantized_path}")
+    
+    def _optimize_model(self, model_path: Path):
+        """Optimize ONNX model"""
+        logger.info("Optimizing ONNX model...")
+        
+        optimized_path = model_path.parent / f"{model_path.stem}_optimized.onnx"
+        
+        # Create optimizer
+        model_optimizer = optimizer.create_optimizer(
+            model=str(model_path),
+            num_heads=24,  # From model config
+            hidden_size=1536,  # From model config
+            sequence_length=2074,  # patches + special tokens
+            input_int32=False,
+            float16=True,
+            use_gpu=True,
+            opt_level=99,
+            optimization_options=optimizer.FusionOptions('all'),
+            provider='CUDAExecutionProvider'
+        )
+        
+        # Optimize
+        model_optimizer.optimize()
+        model_optimizer.save_model_to_file(str(optimized_path))
+        
+        # Replace original with optimized
+        shutil.move(str(optimized_path), str(model_path))
+        
+        logger.info("Model optimization complete")
+    
+    def _optimize_for_mobile(self, input_path: Path, output_path: Path):
+        """Optimize model specifically for mobile deployment"""
+        import onnx
+        from onnxruntime.transformers import optimizer
+        from onnx import optimizer as onnx_optimizer
+        
+        # Load model
+        model = onnx.load(str(input_path))
+        
+        # Run ONNX optimizer passes
+        passes = [
+            'eliminate_identity',
+            'eliminate_nop_dropout',
+            'eliminate_nop_monotone_argmax',
+            'eliminate_nop_pad',
+            'eliminate_nop_transpose',
+            'eliminate_unused_initializer',
+            'eliminate_deadend',
+            'fuse_consecutive_concats',
+            'fuse_consecutive_log_softmax',
+            'fuse_consecutive_reduce_unsqueeze',
+            'fuse_consecutive_squeezes',
+            'fuse_consecutive_transposes',
+            'fuse_matmul_add_bias_into_gemm',
+            'fuse_pad_into_conv',
+            'fuse_transpose_into_gemm',
+            'simplify_lexsort',
+            'nop'
+        ]
+        
+        optimized_model = onnx_optimizer.optimize(model, passes)
+        
+        # Additional mobile-specific optimizations
+        # Remove unnecessary casts
+        graph = optimized_model.graph
+        nodes_to_remove = []
+        
+        for node in graph.node:
+            # Remove identity operations
+            if node.op_type == 'Identity':
+                nodes_to_remove.append(node)
+            
+            # Fuse batch normalization if present
+            if node.op_type == 'BatchNormalization':
+                # Simplified - in practice, would fuse into previous conv/linear
+                pass
+        
+        for node in nodes_to_remove:
+            graph.node.remove(node)
+        
+        # Update model
+        optimized_model = shape_inference.infer_shapes(optimized_model)
+        
+        # Save
+        onnx.save(optimized_model, str(output_path))
+        
+        # Further optimize with ORT mobile optimizer if available
+        try:
+            from onnxruntime.tools.mobile_optimizer import optimize_model
+            optimize_model(str(output_path), str(output_path))
+        except ImportError:
+            logger.warning("ORT mobile optimizer not available")
+    
+    def _quantize_dynamic(self, input_path: Path, output_path: Path):
+        """Apply dynamic quantization"""
+        logger.info("Applying dynamic quantization...")
+        
+        quantize_dynamic(
+            model_input=str(input_path),
+            model_output=str(output_path),
+            weight_type=QuantType.QUInt8,
+            optimize_model=True,
+            per_channel=True,
+            reduce_range=True
+        )
+        
+        # Validate quantized model
+        if self.config.validate_export:
+            self._validate_model(output_path)
+    
+    def _quantize_static(self, input_path: Path, output_path: Path):
+        """Apply static quantization (requires calibration data)"""
+        logger.info("Static quantization requires calibration data")
+        
+        # This is a simplified version - full implementation would:
+        # 1. Create calibration dataset
+        # 2. Run calibration
+        # 3. Quantize model
+        
+        # For now, fall back to dynamic quantization
+        logger.warning("Static quantization not fully implemented, using dynamic")
+        self._quantize_dynamic(input_path, output_path)
+    
+    def _add_metadata(self, model_path: Path):
+        """Add metadata to ONNX model"""
+        model = onnx.load(str(model_path))
+        
+        # Add metadata
+        metadata = {
+            'model_description': self.config.model_description,
+            'model_author': self.config.model_author,
+            'model_version': self.config.model_version,
+            'export_date': str(time.strftime('%Y-%m-%d %H:%M:%S')),
+            'num_tags': str(len(self.vocab.tag_to_index)),
+            'image_size': str(self.config.image_size),
+            'framework': 'PyTorch',
+            'opset_version': str(self.config.opset_version)
+        }
+        
+        for key, value in metadata.items():
+            meta = model.metadata_props.add()
+            meta.key = key
+            meta.value = value
+        
+        # Add tag vocabulary info
+        vocab_meta = model.metadata_props.add()
+        vocab_meta.key = 'tag_vocabulary_size'
+        vocab_meta.value = str(len(self.vocab.tag_to_index))
+        
+        # Save model
+        onnx.save(model, str(model_path))
+    
+    def _validate_model(self, model_path: Path):
+        """Validate exported ONNX model"""
+        logger.info("Validating ONNX model...")
+        
+        # Check model
+        model = onnx.load(str(model_path))
+        onnx.checker.check_model(model)
+        
+        # Create test input
+        test_input = np.random.randn(
+            self.config.batch_size,
+            3,
+            self.config.image_size,
+            self.config.image_size
+        ).astype(np.float32)
+        
+        # Run inference with PyTorch
+        torch_input = torch.from_numpy(test_input).to(self.device)
+        self.model.eval()
+        
+        with torch.no_grad():
+            torch_predictions, torch_scores = self.model(torch_input)
+        
+        torch_predictions = torch_predictions.cpu().numpy()
+        torch_scores = torch_scores.cpu().numpy()
+        
+        # Run inference with ONNX Runtime
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        session = ort.InferenceSession(str(model_path), providers=providers)
+        
+        onnx_outputs = session.run(
+            None,
+            {self.config.input_names[0]: test_input}
+        )
+        
+        onnx_predictions = onnx_outputs[0]
+        onnx_scores = onnx_outputs[1]
+        
+        # Compare outputs
+        predictions_close = np.allclose(
+            torch_predictions,
+            onnx_predictions,
+            rtol=self.config.tolerance_rtol,
+            atol=self.config.tolerance_atol
+        )
+        
+        scores_close = np.allclose(
+            torch_scores,
+            onnx_scores,
+            rtol=self.config.tolerance_rtol,
+            atol=self.config.tolerance_atol
+        )
+        
+        if predictions_close and scores_close:
+            logger.info("✓ Model validation passed!")
+            logger.info(f"  Max prediction difference: {np.max(np.abs(torch_predictions - onnx_predictions))}")
+            logger.info(f"  Max score difference: {np.max(np.abs(torch_scores - onnx_scores))}")
+        else:
+            logger.error("✗ Model validation failed!")
+            logger.error(f"  Predictions match: {predictions_close}")
+            logger.error(f"  Scores match: {scores_close}")
+            raise ValueError("ONNX model output does not match PyTorch model")
+    
+    def _print_model_info(self, model_path: Path):
+        """Print information about exported model"""
+        model = onnx.load(str(model_path))
+        
+        # Get model size
+        model_size = model_path.stat().st_size / (1024 * 1024)  # MB
+        
+        # Count operations
+        op_types = defaultdict(int)
+        for node in model.graph.node:
+            op_types[node.op_type] += 1
+        
+        # Get input/output info
+        inputs = [(i.name, [d.dim_value if d.HasField('dim_value') else d.dim_param 
+                           for d in i.type.tensor_type.shape.dim]) 
+                 for i in model.graph.input]
+        outputs = [(o.name, [d.dim_value if d.HasField('dim_value') else d.dim_param 
+                            for d in o.type.tensor_type.shape.dim]) 
+                  for o in model.graph.output]
+        
+        logger.info("\n" + "="*60)
+        logger.info("ONNX MODEL INFORMATION")
+        logger.info("="*60)
+        logger.info(f"Model path: {model_path}")
+        logger.info(f"Model size: {model_size:.2f} MB")
+        logger.info(f"Opset version: {model.opset_import[0].version}")
+        logger.info(f"\nInputs:")
+        for name, shape in inputs:
+            logger.info(f"  {name}: {shape}")
+        logger.info(f"\nOutputs:")
+        for name, shape in outputs:
+            logger.info(f"  {name}: {shape}")
+        logger.info(f"\nOperation types ({len(op_types)}):")
+        for op_type, count in sorted(op_types.items(), key=lambda x: x[1], reverse=True)[:10]:
+            logger.info(f"  {op_type}: {count}")
+        logger.info("="*60)
+    
+    def benchmark(self, model_path: Path, num_runs: int = 100):
+        """Benchmark ONNX model performance"""
+        logger.info(f"Benchmarking model: {model_path}")
+        
+        # Create session
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        session = ort.InferenceSession(str(model_path), providers=providers)
+        
+        # Prepare input
+        input_data = np.random.randn(
+            self.config.batch_size,
+            3,
+            self.config.image_size,
+
