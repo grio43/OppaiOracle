@@ -95,7 +95,9 @@ class ImagePreprocessor:
         
         # CLIP processor handles its own preprocessing
         from transformers import CLIPProcessor
-        self.clip_processor = CLIPProcessor.from_pretrained(config.clip_model_id)
+        self.clip_processor = CLIPProcessor.from_pretrained(
+            config.clip_model_id, torch_dtype=torch.float16
+        )
     
     def load_image(self, path: Union[str, Path]) -> Image.Image:
         """Load image handling WebP and other formats"""
