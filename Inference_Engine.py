@@ -25,8 +25,10 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 import torchvision.transforms as T
 from PIL import Image
-import cv2
+
+# Import our modules (fixed duplicate imports)
 from model_architecture import create_model
+from tag_vocabulary import load_vocabulary_for_training
 from training_utils import MemoryOptimizer
 
 # Optional imports for API
@@ -37,11 +39,6 @@ try:
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
-
-# Import our modules
-from model_architecture import create_model
-from tag_vocabulary import load_vocabulary_for_training
-from training_utils import MemoryOptimizer
 
 logger = logging.getLogger(__name__)
 
@@ -583,4 +580,192 @@ class BatchInferenceProcessor:
         self,
         directory: Union[str, Path],
         output_file: Optional[Union[str, Path]] = None,
-    ) -> List[Dict[str, Any]]
+        extensions: List[str] = ['.jpg', '.jpeg', '.png', '.webp'],
+        progress_callback: Optional[Callable] = None
+    ) -> List[Dict[str, Any]]:
+        """Process directory synchronously with optional progress callback"""
+        directory = Path(directory)
+        
+        # Find all images
+        image_paths = []
+        for ext in extensions:
+            image_paths.extend(directory.rglob(f'*{ext}'))
+        
+        logger.info(f"Found {len(image_paths)} images to process")
+        
+        # Process images
+        results = []
+        for i, path in enumerate(image_paths):
+            try:
+                result = self.engine.predict(path)
+                results.append(result)
+                
+                # Progress callback
+                if progress_callback:
+                    progress_callback(i + 1, len(image_paths), path)
+                    
+            except Exception as e:
+                logger.error(f"Error processing {path}: {e}")
+                results.append({
+                    "image": str(path),
+                    "error": str(e),
+                    "tags": []
+                })
+        
+        # Save results if requested
+        if output_file:
+            output_file = Path(output_file)
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(output_file, 'w') as f:
+                json.dump(results, f, indent=2)
+            
+            logger.info(f"Results saved to {output_file}")
+        
+        return results
+
+
+class InferenceAPI:
+    """FastAPI-based inference API"""
+    
+    def __init__(self, engine: InferenceEngine, config: InferenceConfig):
+        if not FASTAPI_AVAILABLE:
+            raise ImportError("FastAPI not installed. Install with: pip install fastapi uvicorn")
+        
+        self.engine = engine
+        self.config = config
+        self.app = FastAPI(title="Anime Image Tagger API")
+        
+        # Setup routes
+        self._setup_routes()
+        
+    def _setup_routes(self):
+        """Setup API routes"""
+        
+        @self.app.get("/")
+        async def root():
+            return {"message": "Anime Image Tagger API", "version": "1.0.0"}
+        
+        @self.app.post("/predict")
+        async def predict(file: UploadFile = File(...)):
+            """Predict tags for uploaded image"""
+            # Check file size
+            contents = await file.read()
+            if len(contents) > self.config.api_max_image_size:
+                raise HTTPException(400, f"File size exceeds {self.config.api_max_image_size} bytes")
+            
+            # Process image
+            try:
+                image = Image.open(io.BytesIO(contents))
+                result = self.engine.predict(image)
+                return JSONResponse(content=result)
+                
+            except Exception as e:
+                logger.error(f"Error processing image: {e}")
+                raise HTTPException(500, f"Error processing image: {str(e)}")
+        
+        @self.app.post("/predict_url")
+        async def predict_url(url: str):
+            """Predict tags from image URL"""
+            try:
+                result = self.engine.predict_from_url(url)
+                return JSONResponse(content=result)
+                
+            except Exception as e:
+                logger.error(f"Error processing URL: {e}")
+                raise HTTPException(500, f"Error processing URL: {str(e)}")
+        
+        @self.app.get("/stats")
+        async def get_stats():
+            """Get inference statistics"""
+            return self.engine.get_statistics()
+    
+    def run(self):
+        """Run the API server"""
+        uvicorn.run(
+            self.app,
+            host=self.config.api_host,
+            port=self.config.api_port
+        )
+
+
+def main():
+    """Main entry point for CLI usage"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Anime Image Tagger Inference")
+    parser.add_argument("--model", required=True, help="Path to model checkpoint")
+    parser.add_argument("--vocab", required=True, help="Path to vocabulary directory")
+    parser.add_argument("--image", help="Path to single image")
+    parser.add_argument("--directory", help="Path to directory of images")
+    parser.add_argument("--url", help="URL of image")
+    parser.add_argument("--output", help="Output file for results")
+    parser.add_argument("--device", default="cuda", help="Device to use")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Prediction threshold")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--api", action="store_true", help="Start API server")
+    parser.add_argument("--api-port", type=int, default=8000, help="API port")
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Create config
+    config = InferenceConfig(
+        model_path=args.model,
+        vocab_dir=args.vocab,
+        device=args.device,
+        prediction_threshold=args.threshold,
+        batch_size=args.batch_size,
+        enable_api=args.api,
+        api_port=args.api_port
+    )
+    
+    # Create engine
+    engine = InferenceEngine(config)
+    
+    # Handle different modes
+    if args.api:
+        # Start API server
+        api = InferenceAPI(engine, config)
+        api.run()
+        
+    elif args.image:
+        # Process single image
+        result = engine.predict(args.image)
+        print(json.dumps(result, indent=2))
+        
+    elif args.url:
+        # Process URL
+        result = engine.predict_from_url(args.url)
+        print(json.dumps(result, indent=2))
+        
+    elif args.directory:
+        # Process directory
+        processor = BatchInferenceProcessor(engine)
+        
+        def progress_callback(current, total, path):
+            print(f"Processing {current}/{total}: {path.name}")
+        
+        results = processor.process_directory(
+            args.directory,
+            args.output,
+            progress_callback=progress_callback
+        )
+        
+        print(f"\nProcessed {len(results)} images")
+        stats = engine.get_statistics()
+        print(f"Average inference time: {stats.get('avg_inference_time_ms', 0):.2f}ms")
+        print(f"Images per second: {stats.get('images_per_second', 0):.2f}")
+        
+    else:
+        print("Please specify --image, --url, --directory, or --api")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
