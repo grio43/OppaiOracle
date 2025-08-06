@@ -15,7 +15,10 @@ import pickle
 import re
 from enum import Enum
 import yaml
+import sys
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -81,7 +84,7 @@ class TagVocabulary:
         
         # Tag statistics
         self.tag_counts: Counter = Counter()
-        self.tag_cooccurrence: defaultdict = defaultdict(Counter)
+        self.tag_cooccurrence: Dict[str, Counter] = defaultdict(Counter)  # Fixed type annotation
         
         # Hierarchical grouping
         self.groups: List[Set[str]] = [set() for _ in range(num_groups)]
@@ -117,6 +120,9 @@ class TagVocabulary:
         """Load vocabulary from file"""
         vocab_file = Path(vocab_file)
         
+        if not vocab_file.exists():
+            raise FileNotFoundError(f"Vocabulary file not found: {vocab_file}")
+        
         if vocab_file.suffix == '.json':
             self._load_json_vocabulary(vocab_file)
         elif vocab_file.suffix == '.txt':
@@ -130,50 +136,83 @@ class TagVocabulary:
     
     def _load_json_vocabulary(self, vocab_file: Path):
         """Load vocabulary from JSON format"""
-        with open(vocab_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        try:
+            with open(vocab_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in vocabulary file: {e}")
         
         if isinstance(data, list):
             # Simple list of tags
             self._initialize_empty_vocabulary()
             for idx, tag in enumerate(data, start=2):  # Start after special tokens
-                self.add_tag(tag, index=idx)
+                if isinstance(tag, str):  # Validate tag is string
+                    self.add_tag(tag, index=idx)
         else:
             # Full vocabulary dump
             self.tag_to_index = data.get('tag_to_index', {})
             self.index_to_tag = {int(k): v for k, v in data.get('index_to_tag', {}).items()}
             
-            # Reconstruct tag info
+            # Reconstruct tag info with proper error handling
             for tag, idx in self.tag_to_index.items():
+                tag_type_value = data.get('tag_types', {}).get(tag, 0)
+                try:
+                    tag_type = TagType(tag_type_value)
+                except ValueError:
+                    tag_type = TagType.GENERAL
+                    
                 self.tag_info[tag] = TagInfo(
                     tag=tag,
                     index=idx,
                     count=data.get('tag_counts', {}).get(tag, 0),
-                    type=TagType(data.get('tag_types', {}).get(tag, 0))
+                    type=tag_type
                 )
+            
+            # Load group assignments if present
+            if 'group_assignments' in data:
+                self.group_assignments = data['group_assignments']
+                # Reconstruct groups
+                for tag, group_id in self.group_assignments.items():
+                    if 0 <= group_id < self.num_groups:
+                        self.groups[group_id].add(tag)
     
     def _load_text_vocabulary(self, vocab_file: Path):
         """Load vocabulary from text file (one tag per line)"""
         self._initialize_empty_vocabulary()
         
-        with open(vocab_file, 'r', encoding='utf-8') as f:
-            for idx, line in enumerate(f, start=2):  # Start after special tokens
-                tag = line.strip()
-                if tag:
-                    # Parse count if present (format: "tag\tcount")
-                    if '\t' in tag:
-                        tag, count = tag.split('\t', 1)
-                        count = int(count)
-                    else:
-                        count = 0
-                    
-                    self.add_tag(tag, index=idx, count=count)
+        try:
+            with open(vocab_file, 'r', encoding='utf-8') as f:
+                for idx, line in enumerate(f, start=2):  # Start after special tokens
+                    tag = line.strip()
+                    if tag:
+                        # Parse count if present (format: "tag\tcount")
+                        if '\t' in tag:
+                            parts = tag.split('\t', 1)
+                            if len(parts) == 2:
+                                tag = parts[0]
+                                try:
+                                    count = int(parts[1])
+                                except ValueError:
+                                    count = 0
+                        else:
+                            count = 0
+                        
+                        self.add_tag(tag, index=idx, count=count)
+        except IOError as e:
+            raise IOError(f"Error reading vocabulary file: {e}")
     
     def _load_pickle_vocabulary(self, vocab_file: Path):
         """Load vocabulary from pickle file"""
-        with open(vocab_file, 'rb') as f:
-            data = pickle.load(f)
-            self.__dict__.update(data)
+        try:
+            with open(vocab_file, 'rb') as f:
+                data = pickle.load(f)
+                # Validate data structure before updating
+                if isinstance(data, dict):
+                    self.__dict__.update(data)
+                else:
+                    raise ValueError("Invalid pickle data structure")
+        except (pickle.PickleError, EOFError) as e:
+            raise ValueError(f"Error loading pickle file: {e}")
     
     def save_vocabulary(self, output_path: Path, format: str = 'json'):
         """Save vocabulary to file"""
@@ -206,28 +245,40 @@ class TagVocabulary:
             'special_tags': self.special_tags
         }
         
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except IOError as e:
+            raise IOError(f"Error saving vocabulary: {e}")
     
     def _save_text_vocabulary(self, output_path: Path):
         """Save vocabulary as text file with counts"""
-        with open(output_path, 'w', encoding='utf-8') as f:
-            # Sort by frequency
-            sorted_tags = sorted(self.tag_info.values(), 
-                               key=lambda x: x.count, 
-                               reverse=True)
-            
-            for tag_info in sorted_tags:
-                if tag_info.tag not in [self.pad_token, self.unk_token]:
-                    f.write(f"{tag_info.tag}\t{tag_info.count}\n")
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                # Sort by frequency
+                sorted_tags = sorted(self.tag_info.values(), 
+                                   key=lambda x: x.count, 
+                                   reverse=True)
+                
+                for tag_info in sorted_tags:
+                    if tag_info.tag not in [self.pad_token, self.unk_token]:
+                        f.write(f"{tag_info.tag}\t{tag_info.count}\n")
+        except IOError as e:
+            raise IOError(f"Error saving text vocabulary: {e}")
     
     def _save_pickle_vocabulary(self, output_path: Path):
         """Save vocabulary as pickle"""
-        with open(output_path, 'wb') as f:
-            pickle.dump(self.__dict__, f)
+        try:
+            with open(output_path, 'wb') as f:
+                pickle.dump(self.__dict__, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except IOError as e:
+            raise IOError(f"Error saving pickle vocabulary: {e}")
     
     def add_tag(self, tag: str, index: Optional[int] = None, count: int = 0) -> int:
         """Add a tag to vocabulary"""
+        if not isinstance(tag, str) or not tag:
+            raise ValueError(f"Invalid tag: {tag}")
+            
         if tag in self.tag_to_index:
             # Update count if tag exists
             self.tag_info[tag].count += count
@@ -237,6 +288,11 @@ class TagVocabulary:
         # Assign index
         if index is None:
             index = len(self.tag_to_index)
+        
+        # Check if we've reached the maximum number of tags
+        if len(self.tag_to_index) >= self.total_tags:
+            logger.warning(f"Maximum number of tags ({self.total_tags}) reached")
+            return self.unk_index
         
         # Add to mappings
         self.tag_to_index[tag] = index
@@ -261,6 +317,9 @@ class TagVocabulary:
                           min_count: int = 10,
                           max_tags: int = 200000):
         """Build vocabulary from dataset tag files"""
+        if not tag_files:
+            raise ValueError("No tag files provided")
+            
         logger.info(f"Building vocabulary from {len(tag_files)} files")
         
         # Count all tags
@@ -269,10 +328,17 @@ class TagVocabulary:
         
         for tag_file in tag_files:
             try:
+                tag_file = Path(tag_file)
+                if not tag_file.exists():
+                    logger.warning(f"Tag file not found: {tag_file}")
+                    continue
+                    
                 with open(tag_file, 'r', encoding='utf-8') as f:
                     tags = json.load(f)
                     
                 if isinstance(tags, list):
+                    # Filter out empty strings and validate
+                    tags = [t for t in tags if isinstance(t, str) and t.strip()]
                     all_tags.update(tags)
                     
                     # Track co-occurrence
@@ -281,12 +347,19 @@ class TagVocabulary:
                             tag_cooccurrence[tag1][tag2] += 1
                             tag_cooccurrence[tag2][tag1] += 1
                             
-            except Exception as e:
+            except (json.JSONDecodeError, IOError) as e:
                 logger.error(f"Error reading {tag_file}: {e}")
+        
+        if not all_tags:
+            raise ValueError("No valid tags found in provided files")
         
         # Filter by minimum count
         filtered_tags = [(tag, count) for tag, count in all_tags.items() 
                         if count >= min_count]
+        
+        if not filtered_tags:
+            logger.warning(f"No tags meet minimum count threshold of {min_count}")
+            filtered_tags = list(all_tags.items())[:max_tags]
         
         # Sort by frequency
         filtered_tags.sort(key=lambda x: x[1], reverse=True)
@@ -303,7 +376,7 @@ class TagVocabulary:
             self.add_tag(tag, count=count)
         
         # Store co-occurrence data
-        self.tag_cooccurrence = tag_cooccurrence
+        self.tag_cooccurrence = dict(tag_cooccurrence)  # Convert from defaultdict
         
         logger.info(f"Built vocabulary with {len(self.tag_to_index)} tags")
         
@@ -312,7 +385,7 @@ class TagVocabulary:
     
     def assign_hierarchical_groups(self, strategy: str = 'frequency_balanced'):
         """Assign tags to hierarchical groups for the model head"""
-        logger.info(f"Assigning tags to {self.num_groups} groups")
+        logger.info(f"Assigning tags to {self.num_groups} groups using {strategy} strategy")
         
         # Clear existing assignments
         self.groups = [set() for _ in range(self.num_groups)]
@@ -321,6 +394,10 @@ class TagVocabulary:
         # Get all tags except special tokens
         all_tags = [tag for tag in self.tag_to_index 
                    if tag not in [self.pad_token, self.unk_token]]
+        
+        if not all_tags:
+            logger.warning("No tags to assign to groups")
+            return
         
         if strategy == 'frequency_balanced':
             self._assign_frequency_balanced_groups(all_tags)
@@ -334,8 +411,9 @@ class TagVocabulary:
         # Update tag info with group assignments
         for group_id, group_tags in enumerate(self.groups):
             for group_idx, tag in enumerate(sorted(group_tags)):
-                self.tag_info[tag].group_id = group_id
-                self.tag_info[tag].group_index = group_idx
+                if tag in self.tag_info:
+                    self.tag_info[tag].group_id = group_id
+                    self.tag_info[tag].group_index = group_idx
         
         logger.info("Group assignment complete")
         self._log_group_statistics()
@@ -343,41 +421,48 @@ class TagVocabulary:
     def _assign_frequency_balanced_groups(self, tags: List[str]):
         """Assign tags to groups balancing frequency across groups"""
         # Sort by frequency
-        sorted_tags = sorted(tags, key=lambda t: self.tag_counts[t], reverse=True)
+        sorted_tags = sorted(tags, key=lambda t: self.tag_counts.get(t, 0), reverse=True)
+        
+        # Track group sizes to prevent overflow
+        group_sizes = [0] * self.num_groups
         
         # Round-robin assignment to balance frequencies
         for idx, tag in enumerate(sorted_tags):
-            group_id = idx % self.num_groups
+            # Find the group with least tags that isn't full
+            min_group = min(range(self.num_groups), 
+                          key=lambda g: (group_sizes[g], g))
             
-            # Check group isn't full
-            if len(self.groups[group_id]) < self.tags_per_group:
-                self.groups[group_id].add(tag)
-                self.group_assignments[tag] = group_id
+            if group_sizes[min_group] < self.tags_per_group:
+                self.groups[min_group].add(tag)
+                self.group_assignments[tag] = min_group
+                group_sizes[min_group] += 1
             else:
-                # Find next available group
-                for gid in range(self.num_groups):
-                    if len(self.groups[gid]) < self.tags_per_group:
-                        self.groups[gid].add(tag)
-                        self.group_assignments[tag] = gid
-                        break
+                # All groups are full, log warning
+                logger.warning(f"All groups full, cannot assign tag: {tag}")
+                break
     
     def _assign_type_based_groups(self, tags: List[str]):
         """Assign tags to groups based on tag type"""
         # Separate by type
         tags_by_type = defaultdict(list)
         for tag in tags:
-            tag_type = self.tag_info[tag].type
-            tags_by_type[tag_type].append(tag)
+            if tag in self.tag_info:
+                tag_type = self.tag_info[tag].type
+                tags_by_type[tag_type].append(tag)
         
         # Reserve groups for special types
         group_id = 0
         
         # Artist tags get their own groups
         if TagType.ARTIST in tags_by_type:
-            artist_tags = tags_by_type[TagType.ARTIST]
+            artist_tags = sorted(tags_by_type[TagType.ARTIST], 
+                               key=lambda t: self.tag_counts.get(t, 0), reverse=True)
             artist_groups = min(3, self.num_groups // 4)  # Up to 3 groups for artists
             
             for i in range(artist_groups):
+                if group_id >= self.num_groups:
+                    break
+                    
                 start_idx = i * len(artist_tags) // artist_groups
                 end_idx = (i + 1) * len(artist_tags) // artist_groups
                 
@@ -390,10 +475,14 @@ class TagVocabulary:
         
         # Character tags
         if TagType.CHARACTER in tags_by_type:
-            char_tags = tags_by_type[TagType.CHARACTER]
+            char_tags = sorted(tags_by_type[TagType.CHARACTER],
+                             key=lambda t: self.tag_counts.get(t, 0), reverse=True)
             char_groups = min(3, self.num_groups // 4)
             
             for i in range(char_groups):
+                if group_id >= self.num_groups:
+                    break
+                    
                 start_idx = i * len(char_tags) // char_groups
                 end_idx = (i + 1) * len(char_tags) // char_groups
                 
@@ -405,8 +494,8 @@ class TagVocabulary:
                 group_id += 1
         
         # Remaining groups for general tags
-        general_tags = tags_by_type[TagType.GENERAL]
-        general_tags.sort(key=lambda t: self.tag_counts[t], reverse=True)
+        general_tags = sorted(tags_by_type[TagType.GENERAL],
+                            key=lambda t: self.tag_counts.get(t, 0), reverse=True)
         
         for tag in general_tags:
             # Find group with space
@@ -428,14 +517,11 @@ class TagVocabulary:
     
     def _assign_cooccurrence_groups(self, tags: List[str]):
         """Assign tags to groups based on co-occurrence patterns"""
-        # This is more complex - simplified version
-        # Group tags that frequently appear together
-        
         assigned = set()
         group_id = 0
         
         # Start with most frequent tags as seeds
-        sorted_tags = sorted(tags, key=lambda t: self.tag_counts[t], reverse=True)
+        sorted_tags = sorted(tags, key=lambda t: self.tag_counts.get(t, 0), reverse=True)
         
         for seed_tag in sorted_tags:
             if seed_tag in assigned:
@@ -469,17 +555,20 @@ class TagVocabulary:
                     if len(self.groups[gid]) < self.tags_per_group:
                         self.groups[gid].add(tag)
                         self.group_assignments[tag] = gid
+                        assigned.add(tag)
                         break
     
     def _log_group_statistics(self):
         """Log statistics about group assignments"""
         for i, group in enumerate(self.groups):
             if group:
-                total_count = sum(self.tag_counts[tag] for tag in group)
+                total_count = sum(self.tag_counts.get(tag, 0) for tag in group)
                 avg_count = total_count / len(group) if group else 0
                 
                 # Find most common tags in group
-                top_tags = sorted(group, key=lambda t: self.tag_counts[t], reverse=True)[:5]
+                top_tags = sorted(group, 
+                                key=lambda t: self.tag_counts.get(t, 0), 
+                                reverse=True)[:5]
                 
                 logger.info(f"Group {i}: {len(group)} tags, "
                           f"avg count: {avg_count:.1f}, "
@@ -510,36 +599,57 @@ class TagVocabulary:
     
     def encode_tags_hierarchical(self, tags: List[str]) -> Dict[int, List[int]]:
         """Encode tags into hierarchical group format"""
-        group_tags = defaultdict(list)
+        group_tags: Dict[int, List[int]] = defaultdict(list)
         
         for tag in tags:
             group_id, group_idx = self.get_group_indices(tag)
-            if group_id >= 0:
+            if group_id >= 0 and group_idx >= 0:
                 group_tags[group_id].append(group_idx)
         
         return dict(group_tags)
     
     def add_tag_implications(self, implications_file: Path):
         """Load tag implications (e.g., cat_ears -> animal_ears)"""
-        with open(implications_file, 'r') as f:
-            implications = json.load(f)
-        
-        for tag, implied_tags in implications.items():
-            if tag in self.tag_info:
-                self.tag_info[tag].implications.update(implied_tags)
+        implications_file = Path(implications_file)
+        if not implications_file.exists():
+            logger.warning(f"Implications file not found: {implications_file}")
+            return
+            
+        try:
+            with open(implications_file, 'r', encoding='utf-8') as f:
+                implications = json.load(f)
+            
+            for tag, implied_tags in implications.items():
+                if tag in self.tag_info and isinstance(implied_tags, list):
+                    self.tag_info[tag].implications.update(implied_tags)
+                    
+            logger.info(f"Loaded implications from {implications_file}")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"Error loading implications: {e}")
     
     def add_tag_aliases(self, aliases_file: Path):
         """Load tag aliases"""
-        with open(aliases_file, 'r') as f:
-            aliases = json.load(f)
-        
-        for main_tag, alias_list in aliases.items():
-            if main_tag in self.tag_info:
-                self.tag_info[main_tag].aliases.update(alias_list)
-                
-                # Map aliases to main tag
-                for alias in alias_list:
-                    self.tag_to_index[alias] = self.tag_to_index[main_tag]
+        aliases_file = Path(aliases_file)
+        if not aliases_file.exists():
+            logger.warning(f"Aliases file not found: {aliases_file}")
+            return
+            
+        try:
+            with open(aliases_file, 'r', encoding='utf-8') as f:
+                aliases = json.load(f)
+            
+            for main_tag, alias_list in aliases.items():
+                if main_tag in self.tag_info and isinstance(alias_list, list):
+                    self.tag_info[main_tag].aliases.update(alias_list)
+                    
+                    # Map aliases to main tag
+                    for alias in alias_list:
+                        if isinstance(alias, str) and alias:
+                            self.tag_to_index[alias] = self.tag_to_index[main_tag]
+                            
+            logger.info(f"Loaded aliases from {aliases_file}")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"Error loading aliases: {e}")
     
     def get_special_tag_indices(self, category: str) -> List[int]:
         """Get indices for special tag categories"""
@@ -568,14 +678,21 @@ class TagVocabulary:
         for tag, count in self.tag_counts.items():
             for min_c, max_c in buckets:
                 if min_c <= count < max_c:
-                    stats['tags_by_frequency'][f'{min_c}-{max_c}'] += 1
+                    bucket_name = f'{min_c}-{max_c}' if max_c != float('inf') else f'{min_c}+'
+                    stats['tags_by_frequency'][bucket_name] += 1
                     break
         
         # Group statistics
         for group in self.groups:
             if group:
-                total = sum(self.tag_counts[tag] for tag in group)
+                total = sum(self.tag_counts.get(tag, 0) for tag in group)
                 stats['group_total_counts'].append(total)
+            else:
+                stats['group_total_counts'].append(0)
+        
+        # Convert defaultdicts to regular dicts for JSON serialization
+        stats['tags_by_type'] = dict(stats['tags_by_type'])
+        stats['tags_by_frequency'] = dict(stats['tags_by_frequency'])
         
         return stats
     
@@ -595,18 +712,26 @@ class TagVocabulary:
         }
         
         for group_id, group_tags in enumerate(self.groups):
-            group_data['group_assignments'][group_id] = {
-                tag: self.tag_info[tag].group_index 
-                for tag in sorted(group_tags)
-            }
+            if group_tags:  # Only save non-empty groups
+                group_data['group_assignments'][str(group_id)] = {
+                    tag: self.tag_info[tag].group_index 
+                    for tag in sorted(group_tags)
+                    if tag in self.tag_info
+                }
         
-        with open(output_dir / 'group_mappings.json', 'w') as f:
-            json.dump(group_data, f, indent=2)
+        try:
+            with open(output_dir / 'group_mappings.json', 'w', encoding='utf-8') as f:
+                json.dump(group_data, f, indent=2)
+        except IOError as e:
+            logger.error(f"Error saving group mappings: {e}")
         
         # Save statistics
         stats = self.compute_tag_statistics()
-        with open(output_dir / 'vocabulary_stats.json', 'w') as f:
-            json.dump(stats, f, indent=2)
+        try:
+            with open(output_dir / 'vocabulary_stats.json', 'w', encoding='utf-8') as f:
+                json.dump(stats, f, indent=2)
+        except IOError as e:
+            logger.error(f"Error saving statistics: {e}")
         
         logger.info(f"Exported vocabulary to {output_dir}")
 
@@ -637,7 +762,8 @@ def create_vocabulary_from_danbooru(
 
 def load_vocabulary_for_training(vocab_dir: Path) -> TagVocabulary:
     """Load vocabulary for model training"""
-    vocab_file = Path(vocab_dir) / 'vocabulary.json'
+    vocab_dir = Path(vocab_dir)
+    vocab_file = vocab_dir / 'vocabulary.json'
     
     if not vocab_file.exists():
         raise FileNotFoundError(f"Vocabulary file not found: {vocab_file}")
@@ -645,54 +771,94 @@ def load_vocabulary_for_training(vocab_dir: Path) -> TagVocabulary:
     vocab = TagVocabulary(vocab_file=vocab_file)
     
     # Load group mappings if available
-    group_file = Path(vocab_dir) / 'group_mappings.json'
+    group_file = vocab_dir / 'group_mappings.json'
     if group_file.exists():
-        with open(group_file, 'r') as f:
-            group_data = json.load(f)
-            
-        # Reconstruct group assignments
-        for group_id, assignments in group_data['group_assignments'].items():
-            for tag, group_idx in assignments.items():
-                if tag in vocab.tag_info:
-                    vocab.tag_info[tag].group_id = int(group_id)
-                    vocab.tag_info[tag].group_index = group_idx
+        try:
+            with open(group_file, 'r', encoding='utf-8') as f:
+                group_data = json.load(f)
+                
+            # Reconstruct group assignments
+            for group_id, assignments in group_data.get('group_assignments', {}).items():
+                for tag, group_idx in assignments.items():
+                    if tag in vocab.tag_info:
+                        vocab.tag_info[tag].group_id = int(group_id)
+                        vocab.tag_info[tag].group_index = group_idx
+                        
+            logger.info(f"Loaded group mappings from {group_file}")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"Error loading group mappings: {e}")
     
     return vocab
 
 
-if __name__ == "__main__":
-    # Example usage
+def main():
+    """Main execution function"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Build tag vocabulary")
+    parser = argparse.ArgumentParser(description="Build tag vocabulary for anime image tagger")
     parser.add_argument('--tag_files', type=str, nargs='+', 
                        help='Paths to tag JSON files')
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Output directory for vocabulary')
     parser.add_argument('--min_count', type=int, default=10,
-                       help='Minimum tag frequency')
+                       help='Minimum tag frequency (default: 10)')
     parser.add_argument('--max_tags', type=int, default=200000,
-                       help='Maximum number of tags')
+                       help='Maximum number of tags (default: 200000)')
+    parser.add_argument('--grouping_strategy', type=str, default='frequency_balanced',
+                       choices=['frequency_balanced', 'type_based', 'cooccurrence'],
+                       help='Strategy for hierarchical grouping (default: frequency_balanced)')
     
     args = parser.parse_args()
     
-    if args.tag_files:
-        tag_files = [Path(f) for f in args.tag_files]
-        vocab = create_vocabulary_from_danbooru(
-            tag_files=tag_files,
-            output_dir=Path(args.output_dir),
-            min_count=args.min_count,
-            max_tags=args.max_tags
-        )
-        
-        # Print statistics
-        stats = vocab.compute_tag_statistics()
-        print(f"\nVocabulary Statistics:")
-        print(f"Total tags: {stats['total_tags']:,}")
-        print(f"Total occurrences: {stats['total_occurrences']:,}")
-        print(f"\nTags by type:")
-        for tag_type, count in stats['tags_by_type'].items():
-            print(f"  {tag_type}: {count:,}")
-        print(f"\nTags by frequency:")
-        for bucket, count in sorted(stats['tags_by_frequency'].items()):
-            print(f"  {bucket}: {count:,}")
+    try:
+        if args.tag_files:
+            tag_files = [Path(f) for f in args.tag_files]
+            
+            # Validate that files exist
+            missing_files = [f for f in tag_files if not f.exists()]
+            if missing_files:
+                logger.error(f"Missing tag files: {missing_files}")
+                sys.exit(1)
+            
+            vocab = create_vocabulary_from_danbooru(
+                tag_files=tag_files,
+                output_dir=Path(args.output_dir),
+                min_count=args.min_count,
+                max_tags=args.max_tags
+            )
+            
+            # Apply specified grouping strategy
+            vocab.assign_hierarchical_groups(strategy=args.grouping_strategy)
+            
+            # Re-export with new grouping
+            vocab.export_for_training(Path(args.output_dir))
+            
+            # Print statistics
+            stats = vocab.compute_tag_statistics()
+            print(f"\nVocabulary Statistics:")
+            print(f"Total tags: {stats['total_tags']:,}")
+            print(f"Total occurrences: {stats['total_occurrences']:,}")
+            print(f"\nTags by type:")
+            for tag_type, count in sorted(stats['tags_by_type'].items()):
+                print(f"  {tag_type}: {count:,}")
+            print(f"\nTags by frequency:")
+            for bucket, count in sorted(stats['tags_by_frequency'].items()):
+                print(f"  {bucket}: {count:,}")
+            print(f"\nGroup sizes:")
+            for i, size in enumerate(stats['group_sizes']):
+                if size > 0:
+                    print(f"  Group {i}: {size:,} tags")
+        else:
+            logger.error("No tag files specified. Use --tag_files option.")
+            parser.print_help()
+            sys.exit(1)
+            
+    except Exception as e:
+        logger.error(f"Error in main execution: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
