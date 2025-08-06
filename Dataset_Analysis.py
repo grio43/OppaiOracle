@@ -553,10 +553,6 @@ class DatasetAnalyzer:
             stats = self.image_analyzer.analyze_image(path)
             results.append(stats)
         return results
-    
-    def _analyze_tags(self, image_paths: List[Path]):
-        """Analyze tag distributions"""
-        logger.info("Analyzing tags...")
         
 def _analyze_tags(self, image_paths: List[Path]):
     """Analyze tag distributions"""

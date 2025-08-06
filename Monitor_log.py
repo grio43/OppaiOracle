@@ -545,15 +545,8 @@ class TrainingMonitor:
                 'epoch': epoch
             })
     
-   def log_images(
-    self,
-    step: int,
-    images: torch.Tensor,
-    predictions: torch.Tensor,
-    targets: torch.Tensor,
-    tag_names: List[str],
-    num_images: int = 4
-):
+
+        
     """Log example images with predictions"""
     if self.writer:
         # Select random images

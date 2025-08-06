@@ -9,11 +9,13 @@ import os
 import sys
 import json
 import logging
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass, field
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing as mp
+import gc
 
 import numpy as np
 import torch
@@ -21,11 +23,19 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from PIL import Image
 import h5py
-import webp
 from tqdm import tqdm
 import transformers
 from safetensors import safe_open
 from safetensors.torch import load_file
+
+# Configure PIL to handle large images and WebP
+Image.MAX_IMAGE_PIXELS = None
+try:
+    from PIL import WebPImagePlugin
+    WEBP_AVAILABLE = True
+except ImportError:
+    WEBP_AVAILABLE = False
+    print("Warning: WebP support not available. Install pillow-webp-plugin for WebP support.")
 
 # Configure logging
 logging.basicConfig(
@@ -48,8 +58,7 @@ class PreprocessConfig:
     # CLIP size handled by processor (224)
     
     # Processing settings
-    anime_batch_size: int = 256
-    clip_batch_size: int = 128  
+    batch_size: int = 32  # Unified batch size
     num_workers: int = 8
     
     # Output settings
@@ -63,7 +72,7 @@ class PreprocessConfig:
     # Gray padding color
     pad_color: Tuple[int, int, int] = (114, 114, 114)
     
-    # Storage locations in priority order (as instance variable with proper type)
+    # Storage locations in priority order
     storage_locations: List[Dict[str, Union[str, int]]] = field(default_factory=lambda: [
         {"path": "/home/user/datasets/anime_curated", "priority": 0, "type": "local"},
         {"path": "/mnt/das/anime_archive", "priority": 1, "type": "das"},
@@ -92,27 +101,27 @@ class ImagePreprocessor:
         )
         
         # CLIP processor handles its own preprocessing
-        from transformers import CLIPProcessor
-        self.clip_processor = CLIPProcessor.from_pretrained(
-            config.clip_model_id, torch_dtype=torch.float16
-        )
+        try:
+            from transformers import CLIPProcessor
+            self.clip_processor = CLIPProcessor.from_pretrained(config.clip_model_id)
+        except Exception as e:
+            logger.error(f"Failed to load CLIP processor: {e}")
+            raise
     
     def load_image(self, path: Union[str, Path]) -> Image.Image:
         """Load image handling WebP and other formats"""
         path = Path(path)
         
-        if path.suffix.lower() == '.webp':
-            # Use webp library for better handling
-            try:
-                with open(path, 'rb') as f:
-                    webp_data = webp.WebPData.from_buffer(f.read())
-                    arr = webp_data.decode()
-                    return Image.fromarray(arr)
-            except Exception as e:
-                logger.warning(f"WebP decode failed for {path}, falling back to PIL: {e}")
-                return Image.open(path)
-        else:
-            return Image.open(path)
+        try:
+            # PIL should handle WebP if plugin is installed
+            img = Image.open(path)
+            # Convert to RGB if needed (handles various modes)
+            if img.mode not in ('RGB', 'RGBA', 'L', 'LA', 'P'):
+                img = img.convert('RGB')
+            return img
+        except Exception as e:
+            logger.error(f"Failed to load image {path}: {e}")
+            raise
     
     def handle_transparency(self, img: Image.Image) -> Image.Image:
         """Handle transparency with gray background composite"""
@@ -121,16 +130,22 @@ class ImagePreprocessor:
             background = Image.new('RGB', img.size, self.pad_color)
             # Composite with alpha channel
             if img.mode == 'RGBA':
-                background.paste(img, mask=img.getchannel('A'))
+                background.paste(img, mask=img.split()[3])  # Use alpha channel
             else:  # LA mode
-                background.paste(img, mask=img.getchannel('L'))
+                background.paste(img, mask=img.split()[1])  # Use alpha channel
             return background
-        elif img.mode == 'P' and 'transparency' in img.info:
-            # Handle palette images with transparency
-            img = img.convert('RGBA')
-            return self.handle_transparency(img)
-        else:
+        elif img.mode == 'P':
+            # Convert palette images to RGBA first if they have transparency
+            if 'transparency' in img.info:
+                img = img.convert('RGBA')
+                return self.handle_transparency(img)
+            else:
+                return img.convert('RGB')
+        elif img.mode == 'L':
+            # Convert grayscale to RGB
             return img.convert('RGB')
+        else:
+            return img.convert('RGB') if img.mode != 'RGB' else img
     
     def letterbox_image(self, img: Image.Image, target_size: int) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
         """Letterbox image to target size, returns image and padding info"""
@@ -140,6 +155,11 @@ class ImagePreprocessor:
         # Resize maintaining aspect ratio
         new_w = int(w * scale)
         new_h = int(h * scale)
+        
+        # Ensure dimensions are at least 1
+        new_w = max(1, new_w)
+        new_h = max(1, new_h)
+        
         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
         
         # Create canvas with padding color
@@ -165,7 +185,7 @@ class ImagePreprocessor:
         img_letterboxed, pad_info = self.letterbox_image(img, self.student_size)
         
         # Convert to numpy array (uint8, no normalization yet)
-        img_array = np.array(img_letterboxed)
+        img_array = np.array(img_letterboxed, dtype=np.uint8)
         
         # Transpose to CHW format
         img_array = img_array.transpose(2, 0, 1)
@@ -228,7 +248,7 @@ class ImagePreprocessor:
                 'student_image': np.zeros((3, self.student_size, self.student_size), dtype=np.uint8),
                 'anime_teacher_image': torch.zeros(3, self.anime_teacher_size, self.anime_teacher_size),
                 'clip_image': torch.zeros(3, 224, 224),
-                'metadata': {'error': str(e), 'path': str(path)},
+                'metadata': {'error': str(e), 'path': str(path), 'original_size': (0, 0), 'pad_info': (0, 0, 0, 0)},
                 'path': str(path),
                 'success': False
             }
@@ -239,7 +259,7 @@ class AnimeTeacherModel:
     
     def __init__(self, model_path: str, device: int = 0):
         self.device = torch.device(f'cuda:{device}')
-        self.model_path = model_path
+        self.model_path = Path(model_path)
         
         # Load model 
         logger.info(f"Loading anime teacher from {model_path}")
@@ -252,55 +272,73 @@ class AnimeTeacherModel:
         
     def _load_model(self):
         """Load the anime teacher model"""
-        model_file = Path(self.model_path) / "model.safetensors"
-        config_file = Path(self.model_path) / "config.json"
+        model_file = self.model_path / "model.safetensors"
+        config_file = self.model_path / "config.json"
         
         # Try safetensors format first
         if model_file.exists() and config_file.exists():
-            # Load config
-            with open(config_file, 'r') as f:
-                config = json.load(f)
-            
-            # Dynamically import model class based on config
-            model_type = config.get('model_type', 'VisionTransformer')
-            
-            if model_type == 'VisionTransformer':
-                from transformers import ViTForImageClassification, ViTConfig
-                model_config = ViTConfig(**config)
-                model = ViTForImageClassification(model_config)
-            else:
-                # Fallback to a standard architecture
-                import timm
-                model = timm.create_model(
-                    config.get('architecture', 'vit_large_patch14_224'),
-                    pretrained=False,
-                    num_classes=config.get('num_classes', 70000)
-                )
-            
-            # Load weights
-            state_dict = load_file(model_file)
-            model.load_state_dict(state_dict)
-            logger.info(f"Loaded model from {model_file}")
-            
-        # Try PyTorch format
-        elif (Path(self.model_path) / "pytorch_model.bin").exists():
-            checkpoint_path = Path(self.model_path) / "pytorch_model.bin"
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            
-            # Assume it's a Vision Transformer
-            import timm
-            model = timm.create_model(
-                'vit_large_patch14_224',
-                pretrained=False,
-                num_classes=70000
-            )
-            model.load_state_dict(checkpoint)
-            logger.info(f"Loaded PyTorch model from {checkpoint_path}")
-            
-        else:
-            raise FileNotFoundError(f"No valid model file found in {self.model_path}")
+            try:
+                # Load config
+                with open(config_file, 'r') as f:
+                    config = json.load(f)
+                
+                # Try to load using transformers
+                model_type = config.get('model_type', 'vit')
+                
+                if 'vit' in model_type.lower():
+                    from transformers import ViTForImageClassification, ViTConfig
+                    model_config = ViTConfig(**config)
+                    model = ViTForImageClassification(model_config)
+                else:
+                    # Fallback to timm
+                    import timm
+                    model = timm.create_model(
+                        config.get('architecture', 'vit_large_patch14_clip_224'),
+                        pretrained=False,
+                        num_classes=config.get('num_classes', 70000)
+                    )
+                
+                # Load weights
+                state_dict = load_file(model_file)
+                model.load_state_dict(state_dict, strict=False)
+                logger.info(f"Loaded model from {model_file}")
+                return model
+                
+            except Exception as e:
+                logger.warning(f"Failed to load from safetensors: {e}, trying PyTorch format")
         
-        return model
+        # Try PyTorch format
+        pytorch_file = self.model_path / "pytorch_model.bin"
+        if pytorch_file.exists():
+            try:
+                # Use timm as fallback
+                import timm
+                
+                # Load checkpoint
+                checkpoint = torch.load(pytorch_file, map_location='cpu')
+                
+                # Try to infer model architecture
+                if 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                else:
+                    state_dict = checkpoint
+                
+                # Create model (assuming ViT)
+                model = timm.create_model(
+                    'vit_large_patch14_clip_224',
+                    pretrained=False,
+                    num_classes=70000  # Adjust based on your needs
+                )
+                
+                model.load_state_dict(state_dict, strict=False)
+                logger.info(f"Loaded PyTorch model from {pytorch_file}")
+                return model
+                
+            except Exception as e:
+                logger.error(f"Failed to load PyTorch model: {e}")
+                raise
+        
+        raise FileNotFoundError(f"No valid model file found in {self.model_path}")
     
     @torch.no_grad()
     def extract_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -319,19 +357,18 @@ class AnimeTeacherModel:
             
             # Extract different feature types
             features = {
-                'tag_logits': logits,  # Raw logits
-                'tag_probs': torch.sigmoid(logits),  # Probabilities
+                'tag_logits': logits.cpu().half(),  # Raw logits
+                'tag_probs': torch.sigmoid(logits).cpu().half(),  # Probabilities
             }
             
             # Get top-k predictions
             k = min(100, logits.shape[-1])
-            top_k_probs, top_k_indices = torch.topk(features['tag_probs'], k=k, dim=-1)
+            top_k_probs, top_k_indices = torch.topk(torch.sigmoid(logits), k=k, dim=-1)
             
-            features['top_k_indices'] = top_k_indices
-            features['top_k_probs'] = top_k_probs
+            features['top_k_indices'] = top_k_indices.cpu()
+            features['top_k_probs'] = top_k_probs.cpu().half()
         
-        # Move to CPU for storage
-        return {k: v.cpu().half() for k, v in features.items()}
+        return features
 
 
 class CLIPTeacherModel:
@@ -343,12 +380,17 @@ class CLIPTeacherModel:
         
         logger.info(f"Loading CLIP model {model_id}")
         
-        # Load CLIP model
-        from transformers import CLIPModel
-        self.model = CLIPModel.from_pretrained(model_id, torch_dtype=torch.float16)
-        
-        self.model.eval()
-        self.model.to(self.device)
+        try:
+            from transformers import CLIPModel
+            self.model = CLIPModel.from_pretrained(
+                model_id, 
+                torch_dtype=torch.float16,
+                device_map={'': device}
+            )
+            self.model.eval()
+        except Exception as e:
+            logger.error(f"Failed to load CLIP model: {e}")
+            raise
         
     @torch.no_grad()
     def extract_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -361,27 +403,31 @@ class CLIPTeacherModel:
             
             # Extract different representations
             features = {
-                'cls_token': vision_outputs.last_hidden_state[:, 0, :],  # CLS token
-                'patch_tokens': vision_outputs.last_hidden_state[:, 1:, :],  # All patches
-                'pooled': vision_outputs.pooler_output if hasattr(vision_outputs, 'pooler_output') else None
+                'cls_token': vision_outputs.last_hidden_state[:, 0, :].cpu().half(),  # CLS token
+                'patch_tokens': vision_outputs.last_hidden_state[:, 1:, :].cpu().half(),  # All patches
             }
             
+            # Get pooled output if available
+            if hasattr(vision_outputs, 'pooler_output') and vision_outputs.pooler_output is not None:
+                features['pooled'] = vision_outputs.pooler_output.cpu().half()
+            else:
+                features['pooled'] = None
+            
             # Average pool patch tokens
-            if features['patch_tokens'] is not None:
-                features['patch_tokens_avg'] = features['patch_tokens'].mean(dim=1)
-                
-                # Get top-k patches by L2 norm
-                patch_norms = features['patch_tokens'].norm(dim=-1)
-                top_k_values, top_k_indices = torch.topk(patch_norms, k=min(16, patch_norms.shape[1]), dim=1)
-                
-                # Gather top patches
-                batch_size = features['patch_tokens'].shape[0]
-                batch_indices = torch.arange(batch_size).unsqueeze(1).expand_as(top_k_indices)
-                features['top_patches'] = features['patch_tokens'][batch_indices, top_k_indices]
-                features['top_patches_indices'] = top_k_indices
+            features['patch_tokens_avg'] = features['patch_tokens'].mean(dim=1)
+            
+            # Get top-k patches by L2 norm
+            patch_norms = features['patch_tokens'].norm(dim=-1)
+            k = min(16, patch_norms.shape[1])
+            top_k_values, top_k_indices = torch.topk(patch_norms, k=k, dim=1)
+            
+            # Gather top patches
+            batch_size = features['patch_tokens'].shape[0]
+            batch_indices = torch.arange(batch_size).unsqueeze(1).expand(-1, k)
+            features['top_patches'] = features['patch_tokens'][batch_indices, top_k_indices]
+            features['top_patches_indices'] = top_k_indices
         
-        # Move to CPU and convert to fp16
-        return {k: v.cpu().half() if v is not None else None for k, v in features.items()}
+        return features
 
 
 class FeatureExtractionDataset(Dataset):
@@ -415,6 +461,7 @@ class HDF5FeatureWriter:
         self.current_h5 = None
         self.current_idx = 0
         self.file_counter = 0
+        self.global_idx = 0  # Track global index across files
         
     def _create_new_file(self):
         """Create a new HDF5 file"""
@@ -435,44 +482,56 @@ class HDF5FeatureWriter:
         self.current_h5.create_group('clip_teacher')
         self.current_h5.create_group('metadata')
         
-    def write_batch(self, batch_data: List[Dict]):
+    def write_batch(self, batch_data: List[Dict], anime_features: Dict = None, clip_features: Dict = None):
         """Write a batch of features"""
         
         if self.current_h5 is None or self.current_idx >= self.chunk_size:
             self._create_new_file()
             
         batch_size = len(batch_data)
-        start_idx = self.current_idx
-        end_idx = start_idx + batch_size
         
         # Initialize datasets if needed
         if self.current_idx == 0:
-            self._initialize_datasets(batch_data)
+            self._initialize_datasets(batch_data, anime_features, clip_features)
         
-        # Write batch data
+        # Process successful items
+        success_idx = 0
         for i, data in enumerate(batch_data):
-            idx = start_idx + i
+            idx = self.current_idx + i
             
             # Write student image
             self.current_h5['images/student_640'][idx] = data['student_image']
             
             # Write metadata
-            if data['success']:
-                pad_info = data['metadata']['pad_info']
-                self.current_h5['images/padding_info'][idx] = pad_info
-                self.current_h5['images/original_sizes'][idx] = data['metadata']['original_size']
+            self.current_h5['images/padding_info'][idx] = data['metadata']['pad_info']
+            self.current_h5['images/original_sizes'][idx] = data['metadata']['original_size']
             
             self.current_h5['metadata/indices'][idx] = data['index']
             self.current_h5['metadata/paths'][idx] = data['path']
             self.current_h5['metadata/success'][idx] = data['success']
+            
+            # Write teacher features for successful items
+            if data['success'] and anime_features is not None and clip_features is not None:
+                # Write anime features
+                for key, value in anime_features.items():
+                    if value is not None and f'anime_teacher/{key}' in self.current_h5:
+                        self.current_h5[f'anime_teacher/{key}'][idx] = value[success_idx].numpy()
+                
+                # Write CLIP features
+                for key, value in clip_features.items():
+                    if value is not None and f'clip_teacher/{key}' in self.current_h5:
+                        self.current_h5[f'clip_teacher/{key}'][idx] = value[success_idx].numpy()
+                
+                success_idx += 1
         
-        self.current_idx = end_idx
+        self.current_idx += batch_size
+        self.global_idx += batch_size
         
         # Flush periodically
         if self.current_idx % 1000 == 0:
             self.current_h5.flush()
     
-    def _initialize_datasets(self, batch_data: List[Dict]):
+    def _initialize_datasets(self, batch_data: List[Dict], anime_features: Dict = None, clip_features: Dict = None):
         """Initialize HDF5 datasets based on first batch"""
         # Student images (640x640, uint8)
         self.current_h5.create_dataset(
@@ -517,53 +576,29 @@ class HDF5FeatureWriter:
             shape=(self.chunk_size,),
             dtype=bool
         )
-    
-    def write_teacher_features(self, indices: List[int], anime_features: Dict, clip_features: Dict):
-        """Write teacher features for specific indices"""
-        if self.current_h5 is None:
-            return
         
-        # Create datasets on first write
-        if 'anime_teacher/tag_logits' not in self.current_h5:
-            self._create_teacher_datasets(anime_features, clip_features)
-        
-        # Map indices to positions in current file
-        for i, idx in enumerate(indices):
-            file_idx = idx % self.chunk_size
-            
-            # Write anime features
+        # Create teacher datasets if features provided
+        if anime_features is not None:
             for key, value in anime_features.items():
-                if value is not None and f'anime_teacher/{key}' in self.current_h5:
-                    self.current_h5[f'anime_teacher/{key}'][file_idx] = value[i].numpy()
-            
-            # Write CLIP features
-            for key, value in clip_features.items():
-                if value is not None and f'clip_teacher/{key}' in self.current_h5:
-                    self.current_h5[f'clip_teacher/{key}'][file_idx] = value[i].numpy()
-    
-    def _create_teacher_datasets(self, anime_features: Dict, clip_features: Dict):
-        """Create teacher feature datasets based on first batch"""
-        # Create anime teacher datasets
-        for key, value in anime_features.items():
-            if value is not None:
-                shape = (self.chunk_size,) + value.shape[1:]
-                self.current_h5.create_dataset(
-                    f'anime_teacher/{key}',
-                    shape=shape,
-                    dtype=np.float16,
-                    compression='lzf'
-                )
+                if value is not None:
+                    shape = (self.chunk_size,) + value.shape[1:]
+                    self.current_h5.create_dataset(
+                        f'anime_teacher/{key}',
+                        shape=shape,
+                        dtype=np.float16,
+                        compression='lzf'
+                    )
         
-        # Create CLIP datasets
-        for key, value in clip_features.items():
-            if value is not None:
-                shape = (self.chunk_size,) + value.shape[1:]
-                self.current_h5.create_dataset(
-                    f'clip_teacher/{key}',
-                    shape=shape,
-                    dtype=np.float16,
-                    compression='lzf'
-                )
+        if clip_features is not None:
+            for key, value in clip_features.items():
+                if value is not None:
+                    shape = (self.chunk_size,) + value.shape[1:]
+                    self.current_h5.create_dataset(
+                        f'clip_teacher/{key}',
+                        shape=shape,
+                        dtype=np.float16,
+                        compression='lzf'
+                    )
     
     def close(self):
         """Close current file"""
@@ -588,8 +623,7 @@ def collate_batch(batch: List[Dict]) -> Dict:
         return {
             'batch_data': batch,
             'anime_teacher_images': None,
-            'clip_images': None,
-            'indices': [item['index'] for item in batch]
+            'clip_images': None
         }
     
     # Stack teacher inputs
@@ -599,8 +633,7 @@ def collate_batch(batch: List[Dict]) -> Dict:
     return {
         'batch_data': batch,
         'anime_teacher_images': anime_teacher_images,
-        'clip_images': clip_images,
-        'indices': [item['index'] for item in successful]
+        'clip_images': clip_images
     }
 
 
@@ -609,75 +642,84 @@ def discover_images(storage_locations: List[Dict]) -> List[Path]:
     logger.info("Discovering images across storage locations...")
     
     all_files = []
-    supported_extensions = {'.webp', '.jpg', '.jpeg', '.png'}
+    supported_extensions = {'.webp', '.jpg', '.jpeg', '.png', '.gif', '.bmp'}
     
-    def scan_directory(path: Path) -> List[Path]:
-        """Recursively scan directory for images"""
-        images = []
-        for ext in supported_extensions:
-            images.extend(path.rglob(f'*{ext}'))
-        return images
-    
-    # Scan each location in parallel
-    with ProcessPoolExecutor(max_workers=len(storage_locations)) as executor:
-        futures = []
-        for location in storage_locations:
-            path = Path(location['path'])
-            if path.exists():
-                logger.info(f"Scanning {path} (priority {location['priority']})...")
-                future = executor.submit(scan_directory, path)
-                futures.append((future, location))
-            else:
-                logger.warning(f"Path does not exist: {path}")
-        
-        # Collect results
-        for future, location in futures:
-            try:
-                files = future.result()
-                logger.info(f"Found {len(files)} images in {location['path']}")
+    for location in storage_locations:
+        path = Path(location['path'])
+        if path.exists():
+            logger.info(f"Scanning {path} (priority {location['priority']})...")
+            
+            # Scan for each extension
+            for ext in supported_extensions:
+                files = list(path.rglob(f'*{ext}'))
+                files.extend(list(path.rglob(f'*{ext.upper()}')))
                 all_files.extend(files)
-            except Exception as e:
-                logger.error(f"Error scanning {location['path']}: {e}")
+            
+            logger.info(f"Found {len(all_files)} images so far")
+        else:
+            logger.warning(f"Path does not exist: {path}")
+    
+    # Remove duplicates
+    all_files = list(set(all_files))
     
     # Sort by priority (lower number = higher priority)
-    location_map = {loc['path']: loc['priority'] for loc in storage_locations}
-    all_files.sort(key=lambda f: location_map.get(str(f.parent), 999))
+    location_map = {Path(loc['path']): loc['priority'] for loc in storage_locations}
     
-    logger.info(f"Total images discovered: {len(all_files)}")
+    def get_priority(file_path):
+        for loc_path, priority in location_map.items():
+            if loc_path in file_path.parents or loc_path == file_path.parent:
+                return priority
+        return 999
+    
+    all_files.sort(key=get_priority)
+    
+    logger.info(f"Total unique images discovered: {len(all_files)}")
     return all_files
 
 
 def deduplicate_files(file_list: List[Path]) -> List[Path]:
-    """Basic file-level deduplication using hash"""
+    """Basic file-level deduplication using file size and hash"""
     logger.info("Deduplicating files...")
     
     seen_hashes = set()
     unique_files = []
     
-    def get_file_hash(path: Path) -> str:
-        """Get xxhash of file"""
-        import xxhash
-        h = xxhash.xxh64()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
-                h.update(chunk)
-        return h.hexdigest()
+    def get_file_hash(path: Path) -> Optional[str]:
+        """Get hash of file"""
+        try:
+            # Use size + first/last bytes for quick hash
+            stat = path.stat()
+            size = stat.st_size
+            
+            # For small files, hash entire content
+            if size < 1024 * 1024:  # 1MB
+                with open(path, 'rb') as f:
+                    return hashlib.md5(f.read()).hexdigest()
+            
+            # For larger files, hash size + samples
+            hasher = hashlib.md5()
+            hasher.update(str(size).encode())
+            
+            with open(path, 'rb') as f:
+                # Hash first 64KB
+                hasher.update(f.read(65536))
+                # Hash last 64KB
+                f.seek(-65536, 2)
+                hasher.update(f.read(65536))
+            
+            return hasher.hexdigest()
+            
+        except Exception as e:
+            logger.error(f"Error hashing {path}: {e}")
+            return None
     
-    # Process in parallel
-    with ThreadPoolExecutor(max_workers=32) as executor:
-        # Submit all hash jobs
-        future_to_path = {executor.submit(get_file_hash, path): path for path in file_list}
+    # Process files
+    for path in tqdm(file_list, desc="Computing file hashes"):
+        file_hash = get_file_hash(path)
         
-        for future in tqdm(future_to_path, desc="Computing file hashes"):
-            try:
-                path = future_to_path[future]
-                file_hash = future.result()
-                
-                if file_hash not in seen_hashes:
-                    seen_hashes.add(file_hash)
-                    unique_files.append(path)
-            except Exception as e:
-                logger.error(f"Error hashing file: {e}")
+        if file_hash and file_hash not in seen_hashes:
+            seen_hashes.add(file_hash)
+            unique_files.append(path)
     
     logger.info(f"Deduplication complete: {len(unique_files)}/{len(file_list)} unique files")
     return unique_files
@@ -703,13 +745,13 @@ def main():
         device=config.clip_teacher_gpu
     )
     
-    # Make teachers globally accessible for writer
-    globals()['anime_teacher'] = anime_teacher
-    globals()['clip_teacher'] = clip_teacher
-    
     # Discover and deduplicate images
     all_files = discover_images(config.storage_locations)
     unique_files = deduplicate_files(all_files)
+    
+    if not unique_files:
+        logger.error("No images found!")
+        return
     
     # Create dataset
     dataset = FeatureExtractionDataset(unique_files, preprocessor)
@@ -717,11 +759,11 @@ def main():
     # Single dataloader that prepares images for all models
     dataloader = DataLoader(
         dataset,
-        batch_size=32,  # Smaller batch since we process for all models
+        batch_size=config.batch_size,
         num_workers=config.num_workers,
         pin_memory=True,
         prefetch_factor=2,
-        persistent_workers=True,
+        persistent_workers=True if config.num_workers > 0 else False,
         collate_fn=collate_batch,
         drop_last=False
     )
@@ -737,24 +779,30 @@ def main():
     
     try:
         for batch in tqdm(dataloader, desc="Extracting features"):
-            # Write student images and metadata
-            writer.write_batch(batch['batch_data'])
+            # Extract teacher features if we have valid images
+            anime_features = None
+            clip_features = None
             
-            # Extract and write teacher features if we have valid images
             if batch['anime_teacher_images'] is not None:
                 # Extract anime teacher features
                 anime_features = anime_teacher.extract_features(batch['anime_teacher_images'])
                 
                 # Extract CLIP features  
                 clip_features = clip_teacher.extract_features(batch['clip_images'])
+            
+            # Write batch with features
+            writer.write_batch(batch['batch_data'], anime_features, clip_features)
+            
+            # Clear GPU cache periodically
+            if writer.global_idx % 1000 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
                 
-                # Write teacher features
-                writer.write_teacher_features(
-                    batch['indices'],
-                    anime_features,
-                    clip_features
-                )
-                
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Error during processing: {e}")
+        raise
     finally:
         writer.close()
         logger.info("Feature extraction complete!")
@@ -765,12 +813,15 @@ def main():
         'total_images': len(unique_files),
         'chunk_size': config.chunk_size,
         'num_files': writer.file_counter,
-        'file_paths': [str(f) for f in unique_files[:1000]],  # Just store first 1000 as sample
+        'total_processed': writer.global_idx,
+        'file_paths': [str(f) for f in unique_files[:1000]],  # Sample of paths
         'config': {
             'student_image_size': config.student_image_size,
             'anime_teacher_size': config.anime_teacher_size,
             'anime_teacher_path': config.anime_teacher_path,
-            'clip_model_id': config.clip_model_id
+            'clip_model_id': config.clip_model_id,
+            'batch_size': config.batch_size,
+            'num_workers': config.num_workers
         }
     }
     
@@ -778,6 +829,7 @@ def main():
         json.dump(index_data, f, indent=2)
     
     logger.info(f"Index file written to {index_file}")
+    logger.info(f"Processed {writer.global_idx} images into {writer.file_counter} files")
 
 
 if __name__ == "__main__":
