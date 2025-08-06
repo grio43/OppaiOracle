@@ -583,4 +583,4 @@ class BatchInferenceProcessor:
         self,
         directory: Union[str, Path],
         output_file: Optional[Union[str, Path]] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Dict[str, Any]]
