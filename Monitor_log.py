@@ -545,38 +545,58 @@ class TrainingMonitor:
                 'epoch': epoch
             })
     
-    def log_images(
-        self,
-        step: int,
-        images: torch.Tensor,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-        tag_names: List[str],
-        num_images: int = 4
-    ):
-        """Log example images with predictions"""
-        if self.writer:
-            # Select random images
-            indices = torch.randperm(len(images))[:num_images]
+   def log_images(
+    self,
+    step: int,
+    images: torch.Tensor,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    tag_names: List[str],
+    num_images: int = 4
+):
+    """Log example images with predictions"""
+    if self.writer:
+        # Select random images
+        indices = torch.randperm(len(images))[:num_images]
+        
+        for i, idx in enumerate(indices):
+            img = images[idx]
+            pred = predictions[idx]
+            target = targets[idx]
             
-            for i, idx in enumerate(indices):
-                img = images[idx]
-                pred = predictions[idx]
-                target = targets[idx]
+            # Get top predictions
+            top_k = 10
+            pred_scores, pred_indices = torch.topk(pred, top_k)
+            
+            # Create text overlay
+            pred_tags = [f"{tag_names[j]}: {pred_scores[k]:.2f}" 
+                        for k, j in enumerate(pred_indices)]
+            
+            true_indices = torch.where(target > 0)[0][:top_k]
+            true_tags = [tag_names[j] for j in true_indices]
+            
+            # Log image with caption
+            caption = (
+                f"Predicted: {', '.join(pred_tags[:5])}\n"
+                f"True: {', '.join(true_tags[:5])}"
+            )
+            
+            # Add to tensorboard
+            self.writer.add_image(f'val/image_{i}', img, step)
+            self.writer.add_text(f'val/caption_{i}', caption, step)
+        
+        # Log to wandb if enabled
+        if self.wandb_run:
+            import wandb
+            wandb_images = []
+            for i, idx in enumerate(indices[:min(4, len(indices))]):
+                img = images[idx].cpu().numpy().transpose(1, 2, 0)
+                pred_tags = [tag_names[j] for j in torch.topk(predictions[idx], 5)[1]]
+                true_tags = [tag_names[j] for j in torch.where(targets[idx] > 0)[0][:5]]
                 
-                # Get top predictions
-                top_k = 10
-                pred_scores, pred_indices = torch.topk(pred, top_k)
-                
-                # Create text overlay
-                pred_tags = [f"{tag_names[j]}: {pred_scores[k]:.2f}" 
-                           for k, j in enumerate(pred_indices)]
-                
-                true_indices = torch.where(target > 0)[0][:top_k]
-                true_tags = [tag_names[j] for j in true_indices]
-                
-                # Log image with caption
-                caption = (
-                    f"Predicted: {', '.join(pred_tags[:5])}\n"
-                    f"True: {', '.join(true_tags[:5])}"
-                )
+                wandb_images.append(wandb.Image(
+                    img,
+                    caption=f"Pred: {', '.join(pred_tags)} | True: {', '.join(true_tags)}"
+                ))
+            
+            wandb.log({"val/images": wandb_images, "step": step})

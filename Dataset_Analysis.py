@@ -558,10 +558,35 @@ class DatasetAnalyzer:
         """Analyze tag distributions"""
         logger.info("Analyzing tags...")
         
-        # Look for tag files
-        for image_path in tqdm(image_paths, desc="Loading tags"):
-            tag_file = image_path.with_suffix('.txt')
-            if tag_file.exists():
-                try:
-                    with open(tag_file, 'r') as f:
-                        tags = [tag.strip() for tag in f.readlines()]
+def _analyze_tags(self, image_paths: List[Path]):
+    """Analyze tag distributions"""
+    logger.info("Analyzing tags...")
+    
+    for image_path in tqdm(image_paths, desc="Loading tags"):
+        tag_file = image_path.with_suffix('.txt')
+        if tag_file.exists():
+            try:
+                with open(tag_file, 'r') as f:
+                    tags = [tag.strip() for tag in f.readlines() if tag.strip()]
+                
+                # Add tags to analyzer
+                self.tag_analyzer.add_image_tags(str(image_path), tags)
+                
+            except Exception as e:
+                logger.error(f"Error loading tags from {tag_file}: {e}")
+    
+    # Get tag statistics after processing all files
+    tag_stats = self.tag_analyzer.get_tag_statistics()
+    
+    # Find tag hierarchies
+    if self.config.analyze_tag_hierarchy:
+        hierarchies = self.tag_analyzer.analyze_tag_hierarchy()
+        tag_stats['hierarchies'] = hierarchies
+    
+    # Find tag clusters
+    if self.config.analyze_cooccurrence:
+        clusters = self.tag_analyzer.find_tag_clusters()
+        tag_stats['clusters'] = [list(cluster) for cluster in clusters]
+    
+    logger.info(f"Analyzed {tag_stats['total_unique_tags']} unique tags")
+    return tag_stats

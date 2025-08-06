@@ -252,50 +252,60 @@ class AnimeTeacherModel:
         # Use automatic mixed precision
         self.use_amp = True
         
-    def _load_model(self):
-        """Load the anime teacher model - adjust based on actual format"""
-        # This is a placeholder - adjust based on your actual model format
-        # Could be .pth, .safetensors, etc.
+def _load_model(self):
+    """Load the anime teacher model"""
+    model_file = Path(self.model_path) / "model.safetensors"
+    config_file = Path(self.model_path) / "config.json"
+    
+    # Try safetensors format first
+    if model_file.exists() and config_file.exists():
+        from safetensors.torch import load_file
+        import importlib
         
-        # Example for safetensors format:
-        model_file = Path(self.model_path) / "model.safetensors"
-        config_file = Path(self.model_path) / "config.json"
+        # Load config
+        with open(config_file, 'r') as f:
+            config = json.load(f)
         
-        if model_file.exists() and config_file.exists():
-            # Load config
-            with open(config_file, 'r') as f:
-                config = json.load(f)
-            
-            # Initialize model based on config
-            # model = YourModelClass(config)
-            
-            # Load weights
-            # state_dict = {}
-            # with safe_open(model_file, framework="pt") as f:
-            #     for key in f.keys():
-            #         state_dict[key] = f.get_tensor(key)
-            # model.load_state_dict(state_dict)
-            pass
+        # Dynamically import model class based on config
+        model_type = config.get('model_type', 'VisionTransformer')
         
-        # Placeholder - replace with actual loading
-        logger.warning("Using placeholder model - implement actual loading!")
-        import torch.nn as nn
+        if model_type == 'VisionTransformer':
+            from transformers import ViTForImageClassification, ViTConfig
+            model_config = ViTConfig(**config)
+            model = ViTForImageClassification(model_config)
+        else:
+            # Fallback to a standard architecture
+            import timm
+            model = timm.create_model(
+                config.get('architecture', 'vit_large_patch14_224'),
+                pretrained=False,
+                num_classes=config.get('num_classes', 70000)
+            )
         
-        class DummyAnimeModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.features = nn.Sequential(
-                    nn.Conv2d(3, 64, 3, padding=1),
-                    nn.ReLU(),
-                    nn.AdaptiveAvgPool2d(1),
-                    nn.Flatten(),
-                    nn.Linear(64, 70000)
-                )
-            
-            def forward(self, x):
-                return self.features(x)
+        # Load weights
+        state_dict = load_file(model_file)
+        model.load_state_dict(state_dict)
+        logger.info(f"Loaded model from {model_file}")
         
-        return DummyAnimeModel()
+    # Try PyTorch format
+    elif (Path(self.model_path) / "pytorch_model.bin").exists():
+        checkpoint_path = Path(self.model_path) / "pytorch_model.bin"
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Assume it's a Vision Transformer
+        import timm
+        model = timm.create_model(
+            'vit_large_patch14_224',
+            pretrained=False,
+            num_classes=70000
+        )
+        model.load_state_dict(checkpoint)
+        logger.info(f"Loaded PyTorch model from {checkpoint_path}")
+        
+    else:
+        raise FileNotFoundError(f"No valid model file found in {self.model_path}")
+    
+    return model
     
     @torch.no_grad()
     def extract_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
