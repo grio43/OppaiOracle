@@ -484,14 +484,11 @@ class ConfigManager:
                 # Parse value
                 try:
                     parsed_value = json.loads(value)
-                except json.JSONDecodeError: # Catches only JSON errors
+                except json.JSONDecodeError:
                     try:
-                        parsed_value = json.loads(value)
-                    except json.JSONDecodeError: # Catches only number conversion errors
-                        try:
-                            parsed_value = float(value) if '.' in value else int(value)
-                            except ValueError:
-                         parsed_value = value
+                        parsed_value = float(value) if '.' in value else int(value)
+                    except ValueError:
+                        parsed_value = value
                         
                         # Convert string booleans
                         if value.lower() == 'true':
