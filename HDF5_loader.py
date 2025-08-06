@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import random
 from collections import defaultdict
 
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
@@ -22,6 +23,7 @@ import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
 from tag_vocabulary import TagVocabulary, load_vocabulary_for_training
+from model_architecture import create_model
 
 logger = logging.getLogger(__name__)
 

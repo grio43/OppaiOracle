@@ -15,6 +15,7 @@ from enum import Enum
 import argparse
 from datetime import datetime
 import copy
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -485,9 +486,12 @@ class ConfigManager:
                     parsed_value = json.loads(value)
                 except json.JSONDecodeError: # Catches only JSON errors
                     try:
-                        parsed_value = float(value) if '.' in value else int(value)
-                    except ValueError: # Catches only number conversion errors
-                        parsed_value = value
+                        parsed_value = json.loads(value)
+                    except json.JSONDecodeError: # Catches only number conversion errors
+                        try:
+                            parsed_value = float(value) if '.' in value else int(value)
+                            except ValueError:
+                         parsed_value = value
                         
                         # Convert string booleans
                         if value.lower() == 'true':
