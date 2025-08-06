@@ -8,18 +8,15 @@ Correctly handles different preprocessing requirements for each model
 import os
 import sys
 import json
-import hashlib
 import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing as mp
-from collections import defaultdict
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from PIL import Image
@@ -28,6 +25,7 @@ import webp
 from tqdm import tqdm
 import transformers
 from safetensors import safe_open
+from safetensors.torch import load_file
 
 # Configure logging
 logging.basicConfig(
@@ -40,14 +38,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PreprocessConfig:
     """Configuration for preprocessing pipeline"""
-    # Storage locations in priority order
-    storage_locations = [
-        {"path": "/home/user/datasets/anime_curated", "priority": 0, "type": "local"},
-        {"path": "/mnt/das/anime_archive", "priority": 1, "type": "das"},
-        {"path": "/mnt/nas/anime_dataset/primary", "priority": 2, "type": "nas"},
-        {"path": "/mnt/nas/anime_dataset/video_frames", "priority": 3, "type": "nas"}
-    ]
-    
     # Model paths
     anime_teacher_path: str = "/models/anime_tag_model_70k"
     clip_model_id: str = "zer0int/CLIP-SAE-ViT-L-14"
@@ -72,6 +62,14 @@ class PreprocessConfig:
     
     # Gray padding color
     pad_color: Tuple[int, int, int] = (114, 114, 114)
+    
+    # Storage locations in priority order (as instance variable with proper type)
+    storage_locations: List[Dict[str, Union[str, int]]] = field(default_factory=lambda: [
+        {"path": "/home/user/datasets/anime_curated", "priority": 0, "type": "local"},
+        {"path": "/mnt/das/anime_archive", "priority": 1, "type": "das"},
+        {"path": "/mnt/nas/anime_dataset/primary", "priority": 2, "type": "nas"},
+        {"path": "/mnt/nas/anime_dataset/video_frames", "priority": 3, "type": "nas"}
+    ])
 
 
 class ImagePreprocessor:
@@ -252,60 +250,57 @@ class AnimeTeacherModel:
         # Use automatic mixed precision
         self.use_amp = True
         
-def _load_model(self):
-    """Load the anime teacher model"""
-    model_file = Path(self.model_path) / "model.safetensors"
-    config_file = Path(self.model_path) / "config.json"
-    
-    # Try safetensors format first
-    if model_file.exists() and config_file.exists():
-        from safetensors.torch import load_file
-        import importlib
+    def _load_model(self):
+        """Load the anime teacher model"""
+        model_file = Path(self.model_path) / "model.safetensors"
+        config_file = Path(self.model_path) / "config.json"
         
-        # Load config
-        with open(config_file, 'r') as f:
-            config = json.load(f)
-        
-        # Dynamically import model class based on config
-        model_type = config.get('model_type', 'VisionTransformer')
-        
-        if model_type == 'VisionTransformer':
-            from transformers import ViTForImageClassification, ViTConfig
-            model_config = ViTConfig(**config)
-            model = ViTForImageClassification(model_config)
-        else:
-            # Fallback to a standard architecture
+        # Try safetensors format first
+        if model_file.exists() and config_file.exists():
+            # Load config
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+            
+            # Dynamically import model class based on config
+            model_type = config.get('model_type', 'VisionTransformer')
+            
+            if model_type == 'VisionTransformer':
+                from transformers import ViTForImageClassification, ViTConfig
+                model_config = ViTConfig(**config)
+                model = ViTForImageClassification(model_config)
+            else:
+                # Fallback to a standard architecture
+                import timm
+                model = timm.create_model(
+                    config.get('architecture', 'vit_large_patch14_224'),
+                    pretrained=False,
+                    num_classes=config.get('num_classes', 70000)
+                )
+            
+            # Load weights
+            state_dict = load_file(model_file)
+            model.load_state_dict(state_dict)
+            logger.info(f"Loaded model from {model_file}")
+            
+        # Try PyTorch format
+        elif (Path(self.model_path) / "pytorch_model.bin").exists():
+            checkpoint_path = Path(self.model_path) / "pytorch_model.bin"
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            
+            # Assume it's a Vision Transformer
             import timm
             model = timm.create_model(
-                config.get('architecture', 'vit_large_patch14_224'),
+                'vit_large_patch14_224',
                 pretrained=False,
-                num_classes=config.get('num_classes', 70000)
+                num_classes=70000
             )
+            model.load_state_dict(checkpoint)
+            logger.info(f"Loaded PyTorch model from {checkpoint_path}")
+            
+        else:
+            raise FileNotFoundError(f"No valid model file found in {self.model_path}")
         
-        # Load weights
-        state_dict = load_file(model_file)
-        model.load_state_dict(state_dict)
-        logger.info(f"Loaded model from {model_file}")
-        
-    # Try PyTorch format
-    elif (Path(self.model_path) / "pytorch_model.bin").exists():
-        checkpoint_path = Path(self.model_path) / "pytorch_model.bin"
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        
-        # Assume it's a Vision Transformer
-        import timm
-        model = timm.create_model(
-            'vit_large_patch14_224',
-            pretrained=False,
-            num_classes=70000
-        )
-        model.load_state_dict(checkpoint)
-        logger.info(f"Loaded PyTorch model from {checkpoint_path}")
-        
-    else:
-        raise FileNotFoundError(f"No valid model file found in {self.model_path}")
-    
-    return model
+        return model
     
     @torch.no_grad()
     def extract_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -316,14 +311,20 @@ def _load_model(self):
             # Get model outputs
             outputs = self.model(images)
             
+            # Handle different output types
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            else:
+                logits = outputs
+            
             # Extract different feature types
             features = {
-                'tag_logits': outputs,  # Raw logits
-                'tag_probs': torch.sigmoid(outputs),  # Probabilities
+                'tag_logits': logits,  # Raw logits
+                'tag_probs': torch.sigmoid(logits),  # Probabilities
             }
             
             # Get top-k predictions
-            k = min(100, outputs.shape[-1])
+            k = min(100, logits.shape[-1])
             top_k_probs, top_k_indices = torch.topk(features['tag_probs'], k=k, dim=-1)
             
             features['top_k_indices'] = top_k_indices
@@ -344,11 +345,10 @@ class CLIPTeacherModel:
         
         # Load CLIP model
         from transformers import CLIPModel
-        self.model = CLIPModel.from_pretrained(model_id)
+        self.model = CLIPModel.from_pretrained(model_id, torch_dtype=torch.float16)
         
         self.model.eval()
         self.model.to(self.device)
-        self.model.half()  # Use fp16
         
     @torch.no_grad()
     def extract_features(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -447,98 +447,7 @@ class HDF5FeatureWriter:
         
         # Initialize datasets if needed
         if self.current_idx == 0:
-            # Student images (640x640, uint8)
-            self.current_h5.create_dataset(
-                'images/student_640',
-                shape=(self.chunk_size, 3, 640, 640),
-                dtype=np.uint8,
-                compression='lzf',
-                chunks=(1, 3, 640, 640)  # Chunk by single images
-            )
-            
-            # Padding info
-            self.current_h5.create_dataset(
-                'images/padding_info',
-                shape=(self.chunk_size, 4),
-                dtype=np.int16
-            )
-            
-            # Original sizes
-            self.current_h5.create_dataset(
-                'images/original_sizes',
-                shape=(self.chunk_size, 2),
-                dtype=np.int32
-            )
-            
-            # Get shapes from first batch for feature initialization
-            first_anime_features = None
-            first_clip_features = None
-            
-            # Process first valid batch item to get shapes
-            for item in batch_data:
-                if item['success']:
-                    # Extract features for shape inference
-                    anime_imgs = torch.stack([torch.from_numpy(d['anime_teacher_image']) 
-                                            for d in batch_data if d['success']])
-                    clip_imgs = torch.stack([torch.from_numpy(d['clip_image']) 
-                                           for d in batch_data if d['success']])
-                    
-                    if len(anime_imgs) > 0:
-                        with torch.no_grad():
-                            # Dummy extraction to get shapes
-                            anime_teacher = globals().get('anime_teacher')
-                            clip_teacher = globals().get('clip_teacher')
-                            
-                            if anime_teacher:
-                                first_anime_features = anime_teacher.extract_features(anime_imgs[:1])
-                            if clip_teacher:
-                                first_clip_features = clip_teacher.extract_features(clip_imgs[:1])
-                    break
-            
-            # Create anime teacher datasets
-            if first_anime_features:
-                for key, value in first_anime_features.items():
-                    if value is not None:
-                        shape = (self.chunk_size,) + value.shape[1:]
-                        self.current_h5.create_dataset(
-                            f'anime_teacher/{key}',
-                            shape=shape,
-                            dtype=np.float16,
-                            compression='lzf'
-                        )
-            
-            # Create CLIP datasets
-            if first_clip_features:
-                for key, value in first_clip_features.items():
-                    if value is not None:
-                        shape = (self.chunk_size,) + value.shape[1:]
-                        self.current_h5.create_dataset(
-                            f'clip_teacher/{key}',
-                            shape=shape,
-                            dtype=np.float16,
-                            compression='lzf'
-                        )
-            
-            # Metadata
-            self.current_h5.create_dataset(
-                'metadata/indices',
-                shape=(self.chunk_size,),
-                dtype=np.int64
-            )
-            
-            # Store paths as variable-length strings
-            dt = h5py.special_dtype(vlen=str)
-            self.current_h5.create_dataset(
-                'metadata/paths',
-                shape=(self.chunk_size,),
-                dtype=dt
-            )
-            
-            self.current_h5.create_dataset(
-                'metadata/success',
-                shape=(self.chunk_size,),
-                dtype=bool
-            )
+            self._initialize_datasets(batch_data)
         
         # Write batch data
         for i, data in enumerate(batch_data):
@@ -563,11 +472,61 @@ class HDF5FeatureWriter:
         if self.current_idx % 1000 == 0:
             self.current_h5.flush()
     
+    def _initialize_datasets(self, batch_data: List[Dict]):
+        """Initialize HDF5 datasets based on first batch"""
+        # Student images (640x640, uint8)
+        self.current_h5.create_dataset(
+            'images/student_640',
+            shape=(self.chunk_size, 3, 640, 640),
+            dtype=np.uint8,
+            compression='lzf',
+            chunks=(1, 3, 640, 640)
+        )
+        
+        # Padding info
+        self.current_h5.create_dataset(
+            'images/padding_info',
+            shape=(self.chunk_size, 4),
+            dtype=np.int16
+        )
+        
+        # Original sizes
+        self.current_h5.create_dataset(
+            'images/original_sizes',
+            shape=(self.chunk_size, 2),
+            dtype=np.int32
+        )
+        
+        # Metadata
+        self.current_h5.create_dataset(
+            'metadata/indices',
+            shape=(self.chunk_size,),
+            dtype=np.int64
+        )
+        
+        # Store paths as variable-length strings
+        dt = h5py.special_dtype(vlen=str)
+        self.current_h5.create_dataset(
+            'metadata/paths',
+            shape=(self.chunk_size,),
+            dtype=dt
+        )
+        
+        self.current_h5.create_dataset(
+            'metadata/success',
+            shape=(self.chunk_size,),
+            dtype=bool
+        )
+    
     def write_teacher_features(self, indices: List[int], anime_features: Dict, clip_features: Dict):
         """Write teacher features for specific indices"""
         if self.current_h5 is None:
             return
-            
+        
+        # Create datasets on first write
+        if 'anime_teacher/tag_logits' not in self.current_h5:
+            self._create_teacher_datasets(anime_features, clip_features)
+        
         # Map indices to positions in current file
         for i, idx in enumerate(indices):
             file_idx = idx % self.chunk_size
@@ -581,6 +540,30 @@ class HDF5FeatureWriter:
             for key, value in clip_features.items():
                 if value is not None and f'clip_teacher/{key}' in self.current_h5:
                     self.current_h5[f'clip_teacher/{key}'][file_idx] = value[i].numpy()
+    
+    def _create_teacher_datasets(self, anime_features: Dict, clip_features: Dict):
+        """Create teacher feature datasets based on first batch"""
+        # Create anime teacher datasets
+        for key, value in anime_features.items():
+            if value is not None:
+                shape = (self.chunk_size,) + value.shape[1:]
+                self.current_h5.create_dataset(
+                    f'anime_teacher/{key}',
+                    shape=shape,
+                    dtype=np.float16,
+                    compression='lzf'
+                )
+        
+        # Create CLIP datasets
+        for key, value in clip_features.items():
+            if value is not None:
+                shape = (self.chunk_size,) + value.shape[1:]
+                self.current_h5.create_dataset(
+                    f'clip_teacher/{key}',
+                    shape=shape,
+                    dtype=np.float16,
+                    compression='lzf'
+                )
     
     def close(self):
         """Close current file"""
