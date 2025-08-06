@@ -17,6 +17,7 @@ from datetime import datetime
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import warnings
+import random
 
 import numpy as np
 import pandas as pd
@@ -31,19 +32,23 @@ from sklearn.manifold import TSNE
 from sklearn.cluster import DBSCAN
 import h5py
 
-# Optional imports
+# Optional imports with fallback
 try:
     import imagehash
     IMAGEHASH_AVAILABLE = True
 except ImportError:
     IMAGEHASH_AVAILABLE = False
+    warnings.warn("imagehash not available. Install with: pip install imagehash")
     
 try:
     from wordcloud import WordCloud
     WORDCLOUD_AVAILABLE = True
 except ImportError:
     WORDCLOUD_AVAILABLE = False
+    warnings.warn("wordcloud not available. Install with: pip install wordcloud")
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -87,7 +92,7 @@ class AnalysisConfig:
     max_aspect_ratio: float = 2.0
     
     # Performance
-    num_workers: int = 8
+    num_workers: int = min(8, mp.cpu_count())
     batch_size: int = 100
     
     # Visualization
@@ -104,11 +109,11 @@ class AnalysisConfig:
 class ImageStats:
     """Statistics for a single image"""
     path: str
-    width: int
-    height: int
-    channels: int
-    format: str
-    file_size_kb: float
+    width: int = 0
+    height: int = 0
+    channels: int = 0
+    format: str = "unknown"
+    file_size_kb: float = 0
     
     # Optional stats
     mean_color: Optional[Tuple[float, float, float]] = None
@@ -154,6 +159,11 @@ class DatasetStats:
     
     # Timing
     analysis_duration_seconds: float = 0
+    
+    # Additional stats
+    tag_statistics: Dict[str, Any] = field(default_factory=dict)
+    duplicate_groups: Dict[str, List[str]] = field(default_factory=dict)
+    near_duplicates: List[Tuple[str, str, float]] = field(default_factory=list)
 
 
 class ImageAnalyzer:
@@ -171,39 +181,47 @@ class ImageAnalyzer:
                 file_size_kb=image_path.stat().st_size / 1024
             )
             
-            # Open image
-            with Image.open(image_path) as img:
-                stats.width = img.width
-                stats.height = img.height
-                stats.format = img.format or 'unknown'
-                stats.channels = len(img.getbands())
-                
-                # Check for corruption
-                if self.config.check_corrupted:
-                    try:
-                        img.load()
-                        img.verify()
-                    except:
-                        stats.is_corrupted = True
-                        stats.quality_issues.append("corrupted")
-                        return stats
-                
-                # Color statistics
-                if self.config.extract_color_stats and not stats.is_corrupted:
-                    img_array = np.array(img.convert('RGB'))
-                    stats.mean_color = tuple(img_array.mean(axis=(0, 1)))
-                    stats.std_color = tuple(img_array.std(axis=(0, 1)))
+            # Open and analyze image
+            try:
+                with Image.open(image_path) as img:
+                    # First verify the image can be loaded
+                    img.verify()
                     
-                    # Brightness (average of grayscale)
-                    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-                    stats.brightness = gray.mean()
+                # Re-open for actual processing (verify closes the file)
+                with Image.open(image_path) as img:
+                    stats.width = img.width
+                    stats.height = img.height
+                    stats.format = img.format or 'unknown'
+                    stats.channels = len(img.getbands())
                     
-                    # Contrast (standard deviation of grayscale)
-                    stats.contrast = gray.std()
-                    
-                    # Sharpness (variance of Laplacian)
-                    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-                    stats.sharpness = laplacian.var()
+                    # Convert to RGB for analysis
+                    if self.config.extract_color_stats:
+                        try:
+                            img_rgb = img.convert('RGB')
+                            img_array = np.array(img_rgb)
+                            
+                            # Color statistics
+                            stats.mean_color = tuple(float(x) for x in img_array.mean(axis=(0, 1)))
+                            stats.std_color = tuple(float(x) for x in img_array.std(axis=(0, 1)))
+                            
+                            # Brightness (average of grayscale)
+                            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+                            stats.brightness = float(gray.mean())
+                            
+                            # Contrast (standard deviation of grayscale)
+                            stats.contrast = float(gray.std())
+                            
+                            # Sharpness (variance of Laplacian)
+                            laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+                            stats.sharpness = float(laplacian.var())
+                        except Exception as e:
+                            logger.debug(f"Could not extract color stats for {image_path}: {e}")
+                            
+            except Exception as e:
+                logger.debug(f"Image corrupted or unreadable: {image_path}: {e}")
+                stats.is_corrupted = True
+                stats.quality_issues.append("corrupted")
+                return stats
             
             # File hash
             stats.file_hash = self._compute_file_hash(image_path)
@@ -223,11 +241,15 @@ class ImageAnalyzer:
     
     def _compute_file_hash(self, path: Path) -> str:
         """Compute file hash"""
-        hasher = hashlib.md5()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
-                hasher.update(chunk)
-        return hasher.hexdigest()
+        try:
+            hasher = hashlib.md5()
+            with open(path, 'rb') as f:
+                for chunk in iter(lambda: f.read(65536), b''):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except Exception as e:
+            logger.debug(f"Could not compute file hash for {path}: {e}")
+            return ""
     
     def _compute_perceptual_hash(self, path: Path) -> str:
         """Compute perceptual hash"""
@@ -235,16 +257,17 @@ class ImageAnalyzer:
             return ""
         
         try:
-            img = Image.open(path)
-            hash_val = imagehash.dhash(img, hash_size=self.config.perceptual_hash_size)
+            with Image.open(path) as img:
+                hash_val = imagehash.dhash(img, hash_size=self.config.perceptual_hash_size)
             return str(hash_val)
-        except:
+        except Exception as e:
+            logger.debug(f"Could not compute perceptual hash for {path}: {e}")
             return ""
     
     def _check_quality(self, stats: ImageStats):
         """Check image quality"""
         # Resolution checks
-        if self.config.check_resolution:
+        if self.config.check_resolution and stats.width > 0 and stats.height > 0:
             if stats.width < self.config.min_resolution[0] or stats.height < self.config.min_resolution[1]:
                 stats.quality_issues.append("low_resolution")
                 stats.is_low_quality = True
@@ -252,7 +275,7 @@ class ImageAnalyzer:
                 stats.quality_issues.append("excessive_resolution")
         
         # Aspect ratio checks
-        if self.config.check_aspect_ratio:
+        if self.config.check_aspect_ratio and stats.height > 0:
             aspect_ratio = stats.width / stats.height
             if aspect_ratio < self.config.min_aspect_ratio:
                 stats.quality_issues.append("too_tall")
@@ -267,7 +290,7 @@ class ImageAnalyzer:
             elif stats.brightness > 200:  # Too bright
                 stats.quality_issues.append("too_bright")
             
-            if stats.contrast < 20:  # Low contrast
+            if stats.contrast is not None and stats.contrast < 20:  # Low contrast
                 stats.quality_issues.append("low_contrast")
                 stats.is_low_quality = True
         
@@ -309,6 +332,7 @@ class TagAnalyzer:
             'total_unique_tags': len(self.tag_counts),
             'total_tag_occurrences': sum(self.tag_counts.values()),
             'avg_tags_per_image': np.mean([len(tags) for tags in self.tags_per_image.values()]) if self.tags_per_image else 0,
+            'median_tags_per_image': np.median([len(tags) for tags in self.tags_per_image.values()]) if self.tags_per_image else 0,
             'tag_frequency_distribution': self._get_frequency_distribution(),
             'most_common_tags': self.tag_counts.most_common(100),
             'rare_tags': [(tag, count) for tag, count in self.tag_counts.items() if count < self.config.min_tag_frequency],
@@ -339,18 +363,21 @@ class TagAnalyzer:
         """Analyze tag hierarchies and relationships"""
         hierarchies = defaultdict(list)
         
-        # Common patterns
+        # Common patterns for anime/manga tags
         patterns = {
-            'hair_color': r'.*_hair$',
-            'eye_color': r'.*_eyes$',
-            'clothing': r'.*(shirt|dress|pants|skirt|uniform|clothes|wear).*',
-            'emotion': r'.*(smile|laugh|cry|angry|sad|happy).*',
-            'pose': r'.*(sitting|standing|lying|running|walking).*'
+            'hair_color': r'.*_(hair|haired)$',
+            'eye_color': r'.*_(eyes|eyed)$',
+            'clothing': r'.*(shirt|dress|pants|skirt|uniform|clothes|wear|outfit|costume|suit|kimono|bikini|underwear|pajamas|hoodie|jacket|coat).*',
+            'emotion': r'.*(smile|laugh|cry|angry|sad|happy|blush|embarrassed|surprised|scared|nervous|confused).*',
+            'pose': r'.*(sitting|standing|lying|running|walking|kneeling|squatting|jumping|flying|sleeping).*',
+            'character_count': r'^(solo|1girl|2girls|3girls|1boy|2boys|multiple_girls|multiple_boys)$',
+            'view_angle': r'.*(from_above|from_below|from_side|from_behind|front_view|portrait|close-up|cowboy_shot|full_body).*',
+            'background': r'.*(outdoors|indoors|sky|clouds|city|forest|beach|school|bedroom|kitchen|bathroom).*'
         }
         
         import re
         for category, pattern in patterns.items():
-            regex = re.compile(pattern)
+            regex = re.compile(pattern, re.IGNORECASE)
             for tag in self.tag_counts:
                 if regex.match(tag):
                     hierarchies[category].append(tag)
@@ -365,6 +392,10 @@ class TagAnalyzer:
         # Build similarity matrix
         tags = list(self.tag_counts.keys())[:self.config.max_tags_to_analyze]
         n_tags = len(tags)
+        
+        if n_tags < 2:
+            return []
+            
         similarity_matrix = np.zeros((n_tags, n_tags))
         
         for i, tag1 in enumerate(tags):
@@ -374,21 +405,26 @@ class TagAnalyzer:
                     total1 = self.tag_counts[tag1]
                     total2 = self.tag_counts[tag2]
                     # Jaccard similarity
-                    similarity = cooc / (total1 + total2 - cooc) if (total1 + total2 - cooc) > 0 else 0
+                    denominator = total1 + total2 - cooc
+                    similarity = cooc / denominator if denominator > 0 else 0
                     similarity_matrix[i, j] = similarity
         
         # Cluster using DBSCAN
-        clustering = DBSCAN(eps=1-min_similarity, min_samples=2, metric='precomputed')
-        distance_matrix = 1 - similarity_matrix
-        clusters = clustering.fit_predict(distance_matrix)
-        
-        # Group tags by cluster
-        tag_clusters = defaultdict(set)
-        for tag, cluster_id in zip(tags, clusters):
-            if cluster_id >= 0:  # -1 means noise
-                tag_clusters[cluster_id].add(tag)
-        
-        return list(tag_clusters.values())
+        try:
+            clustering = DBSCAN(eps=1-min_similarity, min_samples=2, metric='precomputed')
+            distance_matrix = 1 - similarity_matrix
+            clusters = clustering.fit_predict(distance_matrix)
+            
+            # Group tags by cluster
+            tag_clusters = defaultdict(set)
+            for tag, cluster_id in zip(tags, clusters):
+                if cluster_id >= 0:  # -1 means noise
+                    tag_clusters[cluster_id].add(tag)
+            
+            return list(tag_clusters.values())
+        except Exception as e:
+            logger.warning(f"Could not perform clustering: {e}")
+            return []
 
 
 class DuplicateDetector:
@@ -424,20 +460,32 @@ class DuplicateDetector:
         near_duplicates = []
         hashes = list(self.perceptual_hashes.keys())
         
-        for i in range(len(hashes)):
-            for j in range(i + 1, len(hashes)):
-                hash1 = imagehash.hex_to_hash(hashes[i])
-                hash2 = imagehash.hex_to_hash(hashes[j])
-                
-                similarity = 1 - (hash1 - hash2) / len(hash1.hash) ** 2
-                
-                if similarity >= self.config.duplicate_threshold:
-                    paths1 = self.perceptual_hashes[hashes[i]]
-                    paths2 = self.perceptual_hashes[hashes[j]]
+        if len(hashes) < 2:
+            return []
+        
+        try:
+            import imagehash
+            
+            for i in range(len(hashes)):
+                for j in range(i + 1, len(hashes)):
+                    hash1 = imagehash.hex_to_hash(hashes[i])
+                    hash2 = imagehash.hex_to_hash(hashes[j])
                     
-                    for p1 in paths1:
-                        for p2 in paths2:
-                            near_duplicates.append((p1, p2, similarity))
+                    # Calculate hamming distance
+                    distance = hash1 - hash2
+                    max_distance = len(hash1.hash) ** 2
+                    similarity = 1 - (distance / max_distance) if max_distance > 0 else 0
+                    
+                    if similarity >= self.config.duplicate_threshold:
+                        paths1 = self.perceptual_hashes[hashes[i]]
+                        paths2 = self.perceptual_hashes[hashes[j]]
+                        
+                        for p1 in paths1:
+                            for p2 in paths2:
+                                if p1 != p2:  # Don't compare with itself
+                                    near_duplicates.append((p1, p2, similarity))
+        except Exception as e:
+            logger.warning(f"Error in near-duplicate detection: {e}")
         
         return near_duplicates
 
@@ -476,13 +524,18 @@ class DatasetAnalyzer:
         image_paths = self._discover_images()
         logger.info(f"Found {len(image_paths)} images")
         
+        if not image_paths:
+            logger.warning("No images found to analyze")
+            return self.dataset_stats
+        
         # Analyze images
         if self.config.analyze_images:
             self._analyze_images(image_paths)
         
         # Analyze tags
         if self.config.analyze_tags:
-            self._analyze_tags(image_paths)
+            tag_stats = self._analyze_tags(image_paths)
+            self.dataset_stats.tag_statistics = tag_stats
         
         # Detect duplicates
         if self.config.analyze_duplicates:
@@ -507,7 +560,7 @@ class DatasetAnalyzer:
     
     def _discover_images(self) -> List[Path]:
         """Discover all images in dataset paths"""
-        image_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'}
+        image_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.tif'}
         image_paths = []
         
         for dataset_path in self.config.dataset_paths:
@@ -518,6 +571,7 @@ class DatasetAnalyzer:
             elif path.is_dir():
                 for ext in image_extensions:
                     image_paths.extend(path.rglob(f'*{ext}'))
+                    image_paths.extend(path.rglob(f'*{ext.upper()}'))
         
         return sorted(set(image_paths))
     
@@ -527,62 +581,538 @@ class DatasetAnalyzer:
         
         # Sample if needed
         if self.config.sample_size_for_stats and len(image_paths) > self.config.sample_size_for_stats:
-            import random
             image_paths = random.sample(image_paths, self.config.sample_size_for_stats)
+            logger.info(f"Sampling {len(image_paths)} images for analysis")
         
-        # Parallel processing
-        with ProcessPoolExecutor(max_workers=self.config.num_workers) as executor:
-            futures = []
-            for i in range(0, len(image_paths), self.config.batch_size):
-                batch = image_paths[i:i + self.config.batch_size]
-                future = executor.submit(self._analyze_image_batch, batch)
-                futures.append(future)
-            
-            # Collect results
-            for future in tqdm(futures, desc="Analyzing images"):
-                batch_stats = future.result()
-                for stats in batch_stats:
-                    if stats:
-                        self.image_stats.append(stats)
-                        self.duplicate_detector.add_image(stats)
-    
-    def _analyze_image_batch(self, image_paths: List[Path]) -> List[ImageStats]:
-        """Analyze a batch of images"""
-        results = []
-        for path in image_paths:
+        # Sequential processing (more stable for image operations)
+        for path in tqdm(image_paths, desc="Analyzing images"):
             stats = self.image_analyzer.analyze_image(path)
-            results.append(stats)
-        return results
+            if stats:
+                self.image_stats.append(stats)
+                self.duplicate_detector.add_image(stats)
+    
+    def _analyze_tags(self, image_paths: List[Path]) -> Dict[str, Any]:
+        """Analyze tag distributions"""
+        logger.info("Analyzing tags...")
         
-def _analyze_tags(self, image_paths: List[Path]):
-    """Analyze tag distributions"""
-    logger.info("Analyzing tags...")
+        for image_path in tqdm(image_paths, desc="Loading tags"):
+            # Try different tag file formats
+            tag_files = [
+                image_path.with_suffix('.txt'),
+                image_path.with_suffix('.tags'),
+                image_path.parent / f"{image_path.stem}_tags.txt"
+            ]
+            
+            for tag_file in tag_files:
+                if tag_file.exists():
+                    try:
+                        with open(tag_file, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            # Handle different tag formats
+                            if ',' in content:
+                                tags = [tag.strip() for tag in content.split(',') if tag.strip()]
+                            else:
+                                tags = [tag.strip() for tag in content.split('\n') if tag.strip()]
+                        
+                        # Add tags to analyzer
+                        self.tag_analyzer.add_image_tags(str(image_path), tags)
+                        break
+                        
+                    except Exception as e:
+                        logger.error(f"Error loading tags from {tag_file}: {e}")
+        
+        # Get tag statistics
+        tag_stats = self.tag_analyzer.get_tag_statistics()
+        
+        # Find tag hierarchies
+        if self.config.analyze_tag_hierarchy:
+            hierarchies = self.tag_analyzer.analyze_tag_hierarchy()
+            tag_stats['hierarchies'] = hierarchies
+        
+        # Find tag clusters
+        if self.config.analyze_cooccurrence:
+            clusters = self.tag_analyzer.find_tag_clusters()
+            tag_stats['clusters'] = [list(cluster) for cluster in clusters]
+        
+        logger.info(f"Analyzed {tag_stats['total_unique_tags']} unique tags")
+        return tag_stats
     
-    for image_path in tqdm(image_paths, desc="Loading tags"):
-        tag_file = image_path.with_suffix('.txt')
-        if tag_file.exists():
+    def _detect_duplicates(self):
+        """Detect duplicate images"""
+        logger.info("Detecting duplicates...")
+        
+        # Find exact duplicates
+        exact_duplicates = self.duplicate_detector.find_exact_duplicates()
+        self.dataset_stats.duplicate_groups = exact_duplicates
+        self.dataset_stats.duplicate_images = sum(len(paths) - 1 for paths in exact_duplicates.values())
+        
+        # Find near duplicates
+        near_duplicates = self.duplicate_detector.find_near_duplicates()
+        self.dataset_stats.near_duplicates = near_duplicates
+        
+        logger.info(f"Found {self.dataset_stats.duplicate_images} exact duplicates")
+        logger.info(f"Found {len(near_duplicates)} near-duplicate pairs")
+    
+    def _compute_dataset_stats(self):
+        """Compute overall dataset statistics"""
+        logger.info("Computing dataset statistics...")
+        
+        if self.image_stats:
+            # Basic counts
+            self.dataset_stats.total_images = len(self.image_stats)
+            
+            # Image statistics
+            widths = [s.width for s in self.image_stats if s.width > 0]
+            heights = [s.height for s in self.image_stats if s.height > 0]
+            file_sizes = [s.file_size_kb for s in self.image_stats]
+            
+            if widths:
+                self.dataset_stats.avg_width = np.mean(widths)
+            if heights:
+                self.dataset_stats.avg_height = np.mean(heights)
+            if file_sizes:
+                self.dataset_stats.avg_file_size_kb = np.mean(file_sizes)
+            
+            # Format distribution
+            format_counter = Counter(s.format for s in self.image_stats)
+            self.dataset_stats.format_distribution = dict(format_counter)
+            
+            # Resolution distribution
+            resolution_buckets = defaultdict(int)
+            for s in self.image_stats:
+                if s.width > 0 and s.height > 0:
+                    if s.width < 512 or s.height < 512:
+                        bucket = "low (<512)"
+                    elif s.width < 1024 or s.height < 1024:
+                        bucket = "medium (512-1024)"
+                    elif s.width < 2048 or s.height < 2048:
+                        bucket = "high (1024-2048)"
+                    else:
+                        bucket = "very high (>2048)"
+                    resolution_buckets[bucket] += 1
+            self.dataset_stats.resolution_distribution = dict(resolution_buckets)
+            
+            # Quality metrics
+            self.dataset_stats.corrupted_images = sum(1 for s in self.image_stats if s.is_corrupted)
+            self.dataset_stats.low_quality_images = sum(1 for s in self.image_stats if s.is_low_quality)
+        
+        # Tag statistics
+        if self.dataset_stats.tag_statistics:
+            self.dataset_stats.total_tags = self.dataset_stats.tag_statistics.get('total_tag_occurrences', 0)
+            self.dataset_stats.unique_tags = self.dataset_stats.tag_statistics.get('total_unique_tags', 0)
+            self.dataset_stats.avg_tags_per_image = self.dataset_stats.tag_statistics.get('avg_tags_per_image', 0)
+    
+    def _create_visualizations(self):
+        """Create visualization plots"""
+        logger.info("Creating visualizations...")
+        
+        try:
+            # Set style
+            plt.style.use('seaborn-v0_8-darkgrid')
+            sns.set_palette("husl")
+            
+            # Create figure with subplots
+            fig = plt.figure(figsize=(20, 12))
+            
+            # 1. Resolution distribution
+            ax1 = plt.subplot(2, 3, 1)
+            if self.dataset_stats.resolution_distribution:
+                labels = list(self.dataset_stats.resolution_distribution.keys())
+                sizes = list(self.dataset_stats.resolution_distribution.values())
+                ax1.pie(sizes, labels=labels, autopct='%1.1f%%')
+                ax1.set_title('Resolution Distribution')
+            
+            # 2. Format distribution
+            ax2 = plt.subplot(2, 3, 2)
+            if self.dataset_stats.format_distribution:
+                formats = list(self.dataset_stats.format_distribution.keys())
+                counts = list(self.dataset_stats.format_distribution.values())
+                ax2.bar(formats, counts)
+                ax2.set_title('Image Format Distribution')
+                ax2.set_xlabel('Format')
+                ax2.set_ylabel('Count')
+                plt.xticks(rotation=45)
+            
+            # 3. Tag frequency distribution
+            ax3 = plt.subplot(2, 3, 3)
+            if self.dataset_stats.tag_statistics and 'most_common_tags' in self.dataset_stats.tag_statistics:
+                top_tags = self.dataset_stats.tag_statistics['most_common_tags'][:self.config.max_tags_in_plots]
+                if top_tags:
+                    tags, counts = zip(*top_tags)
+                    ax3.barh(range(len(tags)), counts)
+                    ax3.set_yticks(range(len(tags)))
+                    ax3.set_yticklabels(tags)
+                    ax3.set_title(f'Top {len(tags)} Most Common Tags')
+                    ax3.set_xlabel('Frequency')
+                    ax3.invert_yaxis()
+            
+            # 4. Image dimensions scatter plot
+            ax4 = plt.subplot(2, 3, 4)
+            if self.image_stats:
+                widths = [s.width for s in self.image_stats if s.width > 0 and s.height > 0][:1000]
+                heights = [s.height for s in self.image_stats if s.width > 0 and s.height > 0][:1000]
+                if widths and heights:
+                    ax4.scatter(widths, heights, alpha=0.5, s=10)
+                    ax4.set_title('Image Dimensions Distribution')
+                    ax4.set_xlabel('Width (pixels)')
+                    ax4.set_ylabel('Height (pixels)')
+                    ax4.grid(True, alpha=0.3)
+            
+            # 5. File size distribution
+            ax5 = plt.subplot(2, 3, 5)
+            if self.image_stats:
+                file_sizes = [s.file_size_kb for s in self.image_stats if s.file_size_kb > 0]
+                if file_sizes:
+                    ax5.hist(file_sizes, bins=50, edgecolor='black')
+                    ax5.set_title('File Size Distribution')
+                    ax5.set_xlabel('File Size (KB)')
+                    ax5.set_ylabel('Count')
+                    ax5.set_xlim(0, np.percentile(file_sizes, 95))  # Limit to 95th percentile
+            
+            # 6. Quality issues
+            ax6 = plt.subplot(2, 3, 6)
+            quality_issues = defaultdict(int)
+            for s in self.image_stats:
+                for issue in s.quality_issues:
+                    quality_issues[issue] += 1
+            
+            if quality_issues:
+                issues = list(quality_issues.keys())
+                counts = list(quality_issues.values())
+                ax6.bar(issues, counts)
+                ax6.set_title('Quality Issues Distribution')
+                ax6.set_xlabel('Issue Type')
+                ax6.set_ylabel('Count')
+                plt.xticks(rotation=45, ha='right')
+            
+            plt.tight_layout()
+            
+            # Save figure
+            output_path = self.output_dir / 'dataset_analysis_visualization.png'
+            plt.savefig(output_path, dpi=self.config.figure_dpi, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"Saved visualization to {output_path}")
+            
+            # Create word cloud if available
+            if WORDCLOUD_AVAILABLE and self.tag_analyzer.tag_counts:
+                self._create_tag_wordcloud()
+                
+        except Exception as e:
+            logger.error(f"Error creating visualizations: {e}")
+    
+    def _create_tag_wordcloud(self):
+        """Create a word cloud of tags"""
+        try:
+            # Prepare tag frequencies
+            tag_freq = dict(self.tag_analyzer.tag_counts.most_common(200))
+            
+            if tag_freq:
+                # Create word cloud
+                wordcloud = WordCloud(
+                    width=1600, 
+                    height=800, 
+                    background_color='white',
+                    relative_scaling=0.5,
+                    min_font_size=10
+                ).generate_from_frequencies(tag_freq)
+                
+                # Create figure
+                plt.figure(figsize=(20, 10))
+                plt.imshow(wordcloud, interpolation='bilinear')
+                plt.axis('off')
+                plt.title('Tag Word Cloud', fontsize=20)
+                
+                # Save
+                output_path = self.output_dir / 'tag_wordcloud.png'
+                plt.savefig(output_path, dpi=self.config.figure_dpi, bbox_inches='tight')
+                plt.close()
+                
+                logger.info(f"Saved tag word cloud to {output_path}")
+        except Exception as e:
+            logger.error(f"Error creating word cloud: {e}")
+    
+    def _generate_report(self):
+        """Generate analysis report"""
+        logger.info("Generating report...")
+        
+        try:
+            if self.config.report_format == 'json':
+                self._generate_json_report()
+            elif self.config.report_format == 'markdown':
+                self._generate_markdown_report()
+            else:  # html
+                self._generate_html_report()
+        except Exception as e:
+            logger.error(f"Error generating report: {e}")
+    
+    def _generate_json_report(self):
+        """Generate JSON report"""
+        report_data = {
+            'analysis_date': datetime.now().isoformat(),
+            'config': asdict(self.config),
+            'dataset_stats': asdict(self.dataset_stats),
+            'image_quality_summary': self._get_quality_summary(),
+            'tag_analysis': self.dataset_stats.tag_statistics
+        }
+        
+        output_path = self.output_dir / 'analysis_report.json'
+        with open(output_path, 'w') as f:
+            json.dump(report_data, f, indent=2, default=str)
+        
+        logger.info(f"Saved JSON report to {output_path}")
+    
+    def _generate_markdown_report(self):
+        """Generate Markdown report"""
+        report = []
+        report.append("# Dataset Analysis Report\n")
+        report.append(f"**Analysis Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        report.append(f"**Analysis Duration:** {self.dataset_stats.analysis_duration_seconds:.2f} seconds\n")
+        
+        # Dataset Overview
+        report.append("\n## Dataset Overview\n")
+        report.append(f"- **Total Images:** {self.dataset_stats.total_images:,}\n")
+        report.append(f"- **Total Tags:** {self.dataset_stats.total_tags:,}\n")
+        report.append(f"- **Unique Tags:** {self.dataset_stats.unique_tags:,}\n")
+        report.append(f"- **Average Tags per Image:** {self.dataset_stats.avg_tags_per_image:.2f}\n")
+        
+        # Image Statistics
+        report.append("\n## Image Statistics\n")
+        report.append(f"- **Average Width:** {self.dataset_stats.avg_width:.0f} pixels\n")
+        report.append(f"- **Average Height:** {self.dataset_stats.avg_height:.0f} pixels\n")
+        report.append(f"- **Average File Size:** {self.dataset_stats.avg_file_size_kb:.2f} KB\n")
+        
+        # Quality Metrics
+        report.append("\n## Quality Metrics\n")
+        report.append(f"- **Corrupted Images:** {self.dataset_stats.corrupted_images}\n")
+        report.append(f"- **Low Quality Images:** {self.dataset_stats.low_quality_images}\n")
+        report.append(f"- **Duplicate Images:** {self.dataset_stats.duplicate_images}\n")
+        
+        # Format Distribution
+        if self.dataset_stats.format_distribution:
+            report.append("\n## Format Distribution\n")
+            for fmt, count in self.dataset_stats.format_distribution.items():
+                report.append(f"- **{fmt}:** {count:,}\n")
+        
+        # Top Tags
+        if self.dataset_stats.tag_statistics and 'most_common_tags' in self.dataset_stats.tag_statistics:
+            report.append("\n## Top 20 Tags\n")
+            for tag, count in self.dataset_stats.tag_statistics['most_common_tags'][:20]:
+                report.append(f"1. **{tag}:** {count:,}\n")
+        
+        # Save report
+        output_path = self.output_dir / 'analysis_report.md'
+        with open(output_path, 'w') as f:
+            f.write(''.join(report))
+        
+        logger.info(f"Saved Markdown report to {output_path}")
+    
+    def _generate_html_report(self):
+        """Generate HTML report"""
+        html = []
+        html.append("""<!DOCTYPE html>
+<html>
+<head>
+    <title>Dataset Analysis Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }
+        h1 { color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }
+        h2 { color: #555; margin-top: 30px; }
+        .metric { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .metric-value { font-size: 24px; font-weight: bold; color: #4CAF50; }
+        .metric-label { color: #777; margin-top: 5px; }
+        table { width: 100%; border-collapse: collapse; background: white; margin: 20px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #4CAF50; color: white; }
+        tr:hover { background-color: #f5f5f5; }
+        .warning { color: #ff9800; }
+        .error { color: #f44336; }
+        .success { color: #4CAF50; }
+    </style>
+</head>
+<body>
+""")
+        
+        html.append(f"<h1>Dataset Analysis Report</h1>")
+        html.append(f"<p><strong>Analysis Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
+        html.append(f"<p><strong>Analysis Duration:</strong> {self.dataset_stats.analysis_duration_seconds:.2f} seconds</p>")
+        
+        # Overview metrics
+        html.append("<h2>Dataset Overview</h2>")
+        html.append('<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px;">')
+        
+        metrics = [
+            ("Total Images", f"{self.dataset_stats.total_images:,}"),
+            ("Unique Tags", f"{self.dataset_stats.unique_tags:,}"),
+            ("Avg Tags/Image", f"{self.dataset_stats.avg_tags_per_image:.2f}"),
+            ("Avg Width", f"{self.dataset_stats.avg_width:.0f}px"),
+            ("Avg Height", f"{self.dataset_stats.avg_height:.0f}px"),
+            ("Avg File Size", f"{self.dataset_stats.avg_file_size_kb:.2f}KB"),
+        ]
+        
+        for label, value in metrics:
+            html.append(f'<div class="metric"><div class="metric-value">{value}</div><div class="metric-label">{label}</div></div>')
+        
+        html.append("</div>")
+        
+        # Quality Issues
+        html.append("<h2>Quality Metrics</h2>")
+        html.append("<table>")
+        html.append("<tr><th>Metric</th><th>Count</th><th>Status</th></tr>")
+        
+        quality_metrics = [
+            ("Corrupted Images", self.dataset_stats.corrupted_images, "error" if self.dataset_stats.corrupted_images > 0 else "success"),
+            ("Low Quality Images", self.dataset_stats.low_quality_images, "warning" if self.dataset_stats.low_quality_images > 0 else "success"),
+            ("Duplicate Images", self.dataset_stats.duplicate_images, "warning" if self.dataset_stats.duplicate_images > 0 else "success"),
+        ]
+        
+        for metric, count, status in quality_metrics:
+            html.append(f'<tr><td>{metric}</td><td>{count}</td><td class="{status}">{"⚠️" if status != "success" else "✅"}</td></tr>')
+        
+        html.append("</table>")
+        
+        # Top Tags
+        if self.dataset_stats.tag_statistics and 'most_common_tags' in self.dataset_stats.tag_statistics:
+            html.append("<h2>Top 30 Tags</h2>")
+            html.append("<table>")
+            html.append("<tr><th>Rank</th><th>Tag</th><th>Count</th><th>Percentage</th></tr>")
+            
+            total_tags = self.dataset_stats.total_tags or 1
+            for i, (tag, count) in enumerate(self.dataset_stats.tag_statistics['most_common_tags'][:30], 1):
+                percentage = (count / total_tags) * 100
+                html.append(f"<tr><td>{i}</td><td>{tag}</td><td>{count:,}</td><td>{percentage:.2f}%</td></tr>")
+            
+            html.append("</table>")
+        
+        # Visualizations
+        if (self.output_dir / 'dataset_analysis_visualization.png').exists():
+            html.append("<h2>Visualizations</h2>")
+            html.append('<img src="dataset_analysis_visualization.png" style="max-width: 100%; height: auto;">')
+        
+        if (self.output_dir / 'tag_wordcloud.png').exists():
+            html.append('<img src="tag_wordcloud.png" style="max-width: 100%; height: auto; margin-top: 20px;">')
+        
+        html.append("</body></html>")
+        
+        # Save report
+        output_path = self.output_dir / 'analysis_report.html'
+        with open(output_path, 'w') as f:
+            f.write('\n'.join(html))
+        
+        logger.info(f"Saved HTML report to {output_path}")
+    
+    def _get_quality_summary(self) -> Dict[str, Any]:
+        """Get quality summary"""
+        quality_issues = defaultdict(int)
+        for s in self.image_stats:
+            for issue in s.quality_issues:
+                quality_issues[issue] += 1
+        
+        return {
+            'total_issues': sum(quality_issues.values()),
+            'issue_distribution': dict(quality_issues),
+            'corrupted_count': self.dataset_stats.corrupted_images,
+            'low_quality_count': self.dataset_stats.low_quality_images
+        }
+    
+    def save_cache(self):
+        """Save analysis cache for faster re-analysis"""
+        cache_file = self.cache_dir / 'analysis_cache.pkl'
+        cache_data = {
+            'image_stats': self.image_stats,
+            'dataset_stats': self.dataset_stats,
+            'tag_counts': dict(self.tag_analyzer.tag_counts),
+            'timestamp': datetime.now()
+        }
+        
+        with open(cache_file, 'wb') as f:
+            pickle.dump(cache_data, f)
+        
+        logger.info(f"Saved cache to {cache_file}")
+    
+    def load_cache(self) -> bool:
+        """Load analysis cache if available"""
+        cache_file = self.cache_dir / 'analysis_cache.pkl'
+        
+        if cache_file.exists():
             try:
-                with open(tag_file, 'r') as f:
-                    tags = [tag.strip() for tag in f.readlines() if tag.strip()]
+                with open(cache_file, 'rb') as f:
+                    cache_data = pickle.load(f)
                 
-                # Add tags to analyzer
-                self.tag_analyzer.add_image_tags(str(image_path), tags)
+                self.image_stats = cache_data['image_stats']
+                self.dataset_stats = cache_data['dataset_stats']
+                self.tag_analyzer.tag_counts = Counter(cache_data['tag_counts'])
                 
+                logger.info(f"Loaded cache from {cache_data['timestamp']}")
+                return True
             except Exception as e:
-                logger.error(f"Error loading tags from {tag_file}: {e}")
+                logger.warning(f"Could not load cache: {e}")
+        
+        return False
+
+
+def main():
+    """Main function for command-line usage"""
+    import argparse
     
-    # Get tag statistics after processing all files
-    tag_stats = self.tag_analyzer.get_tag_statistics()
+    parser = argparse.ArgumentParser(description='Analyze anime image dataset')
+    parser.add_argument('dataset_paths', nargs='+', help='Paths to dataset directories or images')
+    parser.add_argument('--output-dir', default='./dataset_analysis', help='Output directory for results')
+    parser.add_argument('--cache-dir', default='./analysis_cache', help='Cache directory')
+    parser.add_argument('--sample-size', type=int, help='Sample size for image analysis')
+    parser.add_argument('--num-workers', type=int, default=8, help='Number of parallel workers')
+    parser.add_argument('--no-images', action='store_true', help='Skip image analysis')
+    parser.add_argument('--no-tags', action='store_true', help='Skip tag analysis')
+    parser.add_argument('--no-duplicates', action='store_true', help='Skip duplicate detection')
+    parser.add_argument('--no-visualizations', action='store_true', help='Skip creating visualizations')
+    parser.add_argument('--report-format', choices=['html', 'markdown', 'json'], default='html', help='Report format')
+    parser.add_argument('--use-cache', action='store_true', help='Use cached results if available')
     
-    # Find tag hierarchies
-    if self.config.analyze_tag_hierarchy:
-        hierarchies = self.tag_analyzer.analyze_tag_hierarchy()
-        tag_stats['hierarchies'] = hierarchies
+    args = parser.parse_args()
     
-    # Find tag clusters
-    if self.config.analyze_cooccurrence:
-        clusters = self.tag_analyzer.find_tag_clusters()
-        tag_stats['clusters'] = [list(cluster) for cluster in clusters]
+    # Create configuration
+    config = AnalysisConfig(
+        dataset_paths=args.dataset_paths,
+        output_dir=args.output_dir,
+        cache_dir=args.cache_dir,
+        sample_size_for_stats=args.sample_size,
+        num_workers=args.num_workers,
+        analyze_images=not args.no_images,
+        analyze_tags=not args.no_tags,
+        analyze_duplicates=not args.no_duplicates,
+        create_visualizations=not args.no_visualizations,
+        report_format=args.report_format
+    )
     
-    logger.info(f"Analyzed {tag_stats['total_unique_tags']} unique tags")
-    return tag_stats
+    # Create analyzer
+    analyzer = DatasetAnalyzer(config)
+    
+    # Load cache if requested
+    if args.use_cache and analyzer.load_cache():
+        logger.info("Using cached results")
+        # Still generate visualizations and report
+        if config.create_visualizations:
+            analyzer._create_visualizations()
+        if config.generate_report:
+            analyzer._generate_report()
+    else:
+        # Run analysis
+        stats = analyzer.analyze_dataset()
+        
+        # Save cache
+        analyzer.save_cache()
+    
+    # Print summary
+    print("\n" + "="*50)
+    print("ANALYSIS COMPLETE")
+    print("="*50)
+    print(f"Total Images: {analyzer.dataset_stats.total_images:,}")
+    print(f"Unique Tags: {analyzer.dataset_stats.unique_tags:,}")
+    print(f"Corrupted Images: {analyzer.dataset_stats.corrupted_images}")
+    print(f"Duplicate Images: {analyzer.dataset_stats.duplicate_images}")
+    print(f"Analysis Duration: {analyzer.dataset_stats.analysis_duration_seconds:.2f}s")
+    print(f"\nResults saved to: {analyzer.output_dir}")
+
+
+if __name__ == "__main__":
+    main()

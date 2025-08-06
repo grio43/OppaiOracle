@@ -2,6 +2,7 @@
 """
 Evaluation Metrics for Anime Image Tagger
 Comprehensive metrics for multi-label classification with 200k tags
+Improved version with bug fixes and optimizations
 """
 
 import logging
@@ -56,16 +57,21 @@ class MetricConfig:
     
     # Sampling for large-scale metrics
     sample_size_for_expensive: Optional[int] = 10000
+    max_tags_for_detailed: int = 1000  # Maximum tags for detailed analysis
     
     # Visualization
     save_plots: bool = True
     plot_dir: str = "./metric_plots"
+    
+    # Memory management
+    batch_size_for_computation: int = 1000  # Process in batches for memory efficiency
 
 
 class MetricTracker:
     """Track metrics over time during training"""
     
-    def __init__(self):
+    def __init__(self, device: str = 'cpu'):
+        self.device = device
         self.reset()
     
     def reset(self):
@@ -83,17 +89,25 @@ class MetricTracker:
         metadata: Optional[Dict] = None
     ):
         """Update with batch results"""
-        self.predictions.append(predictions.cpu())
-        self.targets.append(targets.cpu())
+        # Validate inputs
+        if predictions.shape != targets.shape:
+            raise ValueError(f"Shape mismatch: predictions {predictions.shape} vs targets {targets.shape}")
+        
+        # Ensure CPU tensors for memory efficiency
+        self.predictions.append(predictions.detach().cpu())
+        self.targets.append(targets.detach().cpu())
         
         if loss is not None:
-            self.losses.append(loss)
+            self.losses.append(float(loss))
             
         if metadata is not None:
             self.metadata.append(metadata)
     
     def compute_metrics(self, config: MetricConfig) -> Dict[str, Any]:
         """Compute all metrics"""
+        if not self.predictions:
+            raise ValueError("No predictions to compute metrics from")
+        
         # Concatenate all batches
         all_predictions = torch.cat(self.predictions, dim=0)
         all_targets = torch.cat(self.targets, dim=0)
@@ -101,7 +115,14 @@ class MetricTracker:
         # Create metric computer
         computer = MetricComputer(config)
         
-        return computer.compute_all_metrics(all_predictions, all_targets)
+        metrics = computer.compute_all_metrics(all_predictions, all_targets)
+        
+        # Add loss statistics if available
+        if self.losses:
+            metrics['avg_loss'] = np.mean(self.losses)
+            metrics['std_loss'] = np.std(self.losses)
+        
+        return metrics
 
 
 class MetricComputer:
@@ -129,49 +150,80 @@ class MetricComputer:
         Returns:
             Dictionary of all computed metrics
         """
+        # Validate inputs
+        self._validate_inputs(predictions, targets)
+        
         metrics = {}
         
-        # Convert to numpy for sklearn
-        pred_np = predictions.numpy()
-        target_np = targets.numpy()
+        # Convert to numpy for sklearn (with memory management)
+        logger.info("Converting to numpy arrays...")
+        pred_np = self._safe_to_numpy(predictions)
+        target_np = self._safe_to_numpy(targets)
         
-        # Basic metrics
-        logger.info("Computing basic metrics...")
-        metrics.update(self._compute_basic_metrics(pred_np, target_np))
-        
-        # Top-k metrics
-        logger.info("Computing top-k metrics...")
-        metrics.update(self._compute_topk_metrics(predictions, targets))
-        
-        # Threshold analysis
-        logger.info("Computing threshold metrics...")
-        metrics.update(self._compute_threshold_metrics(pred_np, target_np))
-        
-        # Hierarchical metrics (for grouped tags)
-        if predictions.shape[1] == self.config.num_groups * self.config.tags_per_group:
-            logger.info("Computing hierarchical metrics...")
-            metrics.update(self._compute_hierarchical_metrics(predictions, targets))
-        
-        # Per-tag metrics
-        if self.config.compute_per_tag_metrics:
-            logger.info("Computing per-tag metrics...")
-            metrics.update(self._compute_per_tag_metrics(pred_np, target_np, tag_names))
-        
-        # Frequency-based metrics
-        if tag_frequencies is not None:
-            logger.info("Computing frequency-based metrics...")
-            metrics.update(self._compute_frequency_metrics(pred_np, target_np, tag_frequencies))
-        
-        # Coverage and diversity
-        logger.info("Computing coverage metrics...")
-        metrics.update(self._compute_coverage_metrics(pred_np, target_np))
-        
-        # Mean Average Precision
-        if self.config.compute_auc:
-            logger.info("Computing mAP...")
-            metrics['mAP'] = self._compute_map(pred_np, target_np)
+        try:
+            # Basic metrics
+            logger.info("Computing basic metrics...")
+            metrics.update(self._compute_basic_metrics(pred_np, target_np))
+            
+            # Top-k metrics
+            logger.info("Computing top-k metrics...")
+            metrics.update(self._compute_topk_metrics(predictions, targets))
+            
+            # Threshold analysis
+            logger.info("Computing threshold metrics...")
+            metrics.update(self._compute_threshold_metrics(pred_np, target_np))
+            
+            # Hierarchical metrics (for grouped tags)
+            if self._is_hierarchical(predictions):
+                logger.info("Computing hierarchical metrics...")
+                metrics.update(self._compute_hierarchical_metrics(predictions, targets))
+            
+            # Per-tag metrics
+            if self.config.compute_per_tag_metrics:
+                logger.info("Computing per-tag metrics...")
+                metrics.update(self._compute_per_tag_metrics(pred_np, target_np, tag_names))
+            
+            # Frequency-based metrics
+            if tag_frequencies is not None:
+                logger.info("Computing frequency-based metrics...")
+                metrics.update(self._compute_frequency_metrics(pred_np, target_np, tag_frequencies))
+            
+            # Coverage and diversity
+            logger.info("Computing coverage metrics...")
+            metrics.update(self._compute_coverage_metrics(pred_np, target_np))
+            
+            # Mean Average Precision
+            if self.config.compute_auc:
+                logger.info("Computing mAP...")
+                metrics['mAP'] = self._compute_map(pred_np, target_np)
+                
+        except Exception as e:
+            logger.error(f"Error computing metrics: {str(e)}")
+            metrics['error'] = str(e)
         
         return metrics
+    
+    def _validate_inputs(self, predictions: torch.Tensor, targets: torch.Tensor):
+        """Validate input tensors"""
+        if predictions.shape != targets.shape:
+            raise ValueError(f"Shape mismatch: {predictions.shape} vs {targets.shape}")
+        
+        if not (0 <= predictions.min() and predictions.max() <= 1):
+            logger.warning("Predictions not in [0,1] range, applying sigmoid")
+            predictions = torch.sigmoid(predictions)
+        
+        if not torch.all((targets == 0) | (targets == 1)):
+            raise ValueError("Targets must be binary (0 or 1)")
+    
+    def _safe_to_numpy(self, tensor: torch.Tensor) -> np.ndarray:
+        """Safely convert tensor to numpy array"""
+        if tensor.is_cuda:
+            tensor = tensor.cpu()
+        return tensor.detach().numpy()
+    
+    def _is_hierarchical(self, predictions: torch.Tensor) -> bool:
+        """Check if predictions follow hierarchical structure"""
+        return predictions.shape[1] == self.config.num_groups * self.config.tags_per_group
     
     def _compute_basic_metrics(
         self,
@@ -183,9 +235,8 @@ class MetricComputer:
         if self.config.adaptive_threshold:
             pred_binary = self._adaptive_threshold(predictions)
         else:
-            pred_binary = predictions > self.config.prediction_threshold
+            pred_binary = (predictions > self.config.prediction_threshold).astype(np.int32)
         
-        # Compute metrics
         metrics = {}
         
         # Exact match ratio
@@ -194,40 +245,78 @@ class MetricComputer:
         # Hamming loss
         metrics['hamming_loss'] = (pred_binary != targets).mean()
         
-        # Micro metrics (aggregate)
-        tp_micro = ((pred_binary == 1) & (targets == 1)).sum()
-        fp_micro = ((pred_binary == 1) & (targets == 0)).sum()
-        fn_micro = ((pred_binary == 0) & (targets == 1)).sum()
-        tn_micro = ((pred_binary == 0) & (targets == 0)).sum()
+        # Vectorized computation for efficiency
+        tp = ((pred_binary == 1) & (targets == 1)).sum()
+        fp = ((pred_binary == 1) & (targets == 0)).sum()
+        fn = ((pred_binary == 0) & (targets == 1)).sum()
+        tn = ((pred_binary == 0) & (targets == 0)).sum()
         
-        metrics['precision_micro'] = tp_micro / (tp_micro + fp_micro + 1e-8)
-        metrics['recall_micro'] = tp_micro / (tp_micro + fn_micro + 1e-8)
+        # Micro metrics
+        metrics['precision_micro'] = tp / max(tp + fp, 1)
+        metrics['recall_micro'] = tp / max(tp + fn, 1)
         metrics['f1_micro'] = 2 * metrics['precision_micro'] * metrics['recall_micro'] / \
-                             (metrics['precision_micro'] + metrics['recall_micro'] + 1e-8)
+                             max(metrics['precision_micro'] + metrics['recall_micro'], 1e-8)
         
-        # Macro metrics (average per tag)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
-                targets, pred_binary, average='macro', zero_division=0
-            )
+        # Macro metrics - handle large number of tags
+        if targets.shape[1] <= self.config.max_tags_for_detailed:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+                    targets.ravel(), pred_binary.ravel(), 
+                    average='macro', zero_division=0
+                )
+        else:
+            # Sample tags for macro computation
+            sample_indices = np.random.choice(targets.shape[1], 
+                                            self.config.max_tags_for_detailed, 
+                                            replace=False)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+                    targets[:, sample_indices].ravel(), 
+                    pred_binary[:, sample_indices].ravel(),
+                    average='macro', zero_division=0
+                )
         
-        metrics['precision_macro'] = precision_macro
-        metrics['recall_macro'] = recall_macro
-        metrics['f1_macro'] = f1_macro
+        metrics['precision_macro'] = float(precision_macro)
+        metrics['recall_macro'] = float(recall_macro)
+        metrics['f1_macro'] = float(f1_macro)
         
-        # Sample metrics (average per sample)
-        precision_sample, recall_sample, f1_sample, _ = precision_recall_fscore_support(
-            targets, pred_binary, average='samples', zero_division=0
-        )
+        # Sample metrics
+        sample_precisions = []
+        sample_recalls = []
+        sample_f1s = []
         
-        metrics['precision_samples'] = precision_sample
-        metrics['recall_samples'] = recall_sample
-        metrics['f1_samples'] = f1_sample
+        # Process in batches for memory efficiency
+        batch_size = self.config.batch_size_for_computation
+        for i in range(0, len(pred_binary), batch_size):
+            batch_pred = pred_binary[i:i+batch_size]
+            batch_target = targets[i:i+batch_size]
+            
+            for j in range(len(batch_pred)):
+                pred_sum = batch_pred[j].sum()
+                target_sum = batch_target[j].sum()
+                
+                if pred_sum > 0 or target_sum > 0:
+                    tp_sample = ((batch_pred[j] == 1) & (batch_target[j] == 1)).sum()
+                    fp_sample = ((batch_pred[j] == 1) & (batch_target[j] == 0)).sum()
+                    fn_sample = ((batch_pred[j] == 0) & (batch_target[j] == 1)).sum()
+                    
+                    prec = tp_sample / max(tp_sample + fp_sample, 1)
+                    rec = tp_sample / max(tp_sample + fn_sample, 1)
+                    f1 = 2 * prec * rec / max(prec + rec, 1e-8)
+                    
+                    sample_precisions.append(prec)
+                    sample_recalls.append(rec)
+                    sample_f1s.append(f1)
         
-        # Average number of predictions per sample
-        metrics['avg_predictions_per_sample'] = pred_binary.sum(axis=1).mean()
-        metrics['avg_targets_per_sample'] = targets.sum(axis=1).mean()
+        metrics['precision_samples'] = float(np.mean(sample_precisions)) if sample_precisions else 0.0
+        metrics['recall_samples'] = float(np.mean(sample_recalls)) if sample_recalls else 0.0
+        metrics['f1_samples'] = float(np.mean(sample_f1s)) if sample_f1s else 0.0
+        
+        # Average predictions
+        metrics['avg_predictions_per_sample'] = float(pred_binary.sum(axis=1).mean())
+        metrics['avg_targets_per_sample'] = float(targets.sum(axis=1).mean())
         
         return metrics
     
@@ -240,8 +329,11 @@ class MetricComputer:
         metrics = {}
         
         for k in self.config.top_k_values:
+            if k > predictions.shape[1]:
+                continue
+                
             # Get top-k predictions
-            _, top_k_indices = torch.topk(predictions, k=min(k, predictions.shape[1]), dim=1)
+            _, top_k_indices = torch.topk(predictions, k=k, dim=1)
             
             # Create binary matrix for top-k predictions
             top_k_preds = torch.zeros_like(predictions)
@@ -252,17 +344,17 @@ class MetricComputer:
             fp = (top_k_preds * (1 - targets)).sum()
             fn = ((1 - top_k_preds) * targets).sum()
             
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
-            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+            precision = tp / max(tp + fp, 1)
+            recall = tp / max(tp + fn, 1)
+            f1 = 2 * precision * recall / max(precision + recall, 1e-8)
             
-            metrics[f'precision_at_{k}'] = precision.item()
-            metrics[f'recall_at_{k}'] = recall.item()
-            metrics[f'f1_at_{k}'] = f1.item()
+            metrics[f'precision_at_{k}'] = float(precision.item())
+            metrics[f'recall_at_{k}'] = float(recall.item())
+            metrics[f'f1_at_{k}'] = float(f1.item())
             
-            # Top-k accuracy (at least one correct in top-k)
+            # Top-k accuracy
             correct_in_topk = (top_k_preds * targets).sum(dim=1) > 0
-            metrics[f'accuracy_at_{k}'] = correct_in_topk.float().mean().item()
+            metrics[f'accuracy_at_{k}'] = float(correct_in_topk.float().mean().item())
         
         return metrics
     
@@ -275,51 +367,57 @@ class MetricComputer:
         thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
         metrics = {}
         
-        for thresh in thresholds:
-            pred_binary = predictions > thresh
-            
-            # F1 score at this threshold
-            f1_scores = []
-            for i in range(targets.shape[0]):
-                if targets[i].sum() > 0:  # Skip samples with no tags
-                    tp = ((pred_binary[i] == 1) & (targets[i] == 1)).sum()
-                    fp = ((pred_binary[i] == 1) & (targets[i] == 0)).sum()
-                    fn = ((pred_binary[i] == 0) & (targets[i] == 1)).sum()
-                    
-                    prec = tp / (tp + fp + 1e-8)
-                    rec = tp / (tp + fn + 1e-8)
-                    f1 = 2 * prec * rec / (prec + rec + 1e-8)
-                    f1_scores.append(f1)
-            
-            metrics[f'f1_at_threshold_{thresh}'] = np.mean(f1_scores)
-            metrics[f'avg_predictions_at_threshold_{thresh}'] = pred_binary.sum(axis=1).mean()
+        # Sample for efficiency if dataset is large
+        sample_size = min(1000, predictions.shape[0])
+        if predictions.shape[0] > sample_size:
+            indices = np.random.choice(predictions.shape[0], sample_size, replace=False)
+            pred_sample = predictions[indices]
+            target_sample = targets[indices]
+        else:
+            pred_sample = predictions
+            target_sample = targets
         
-        # Find optimal threshold
+        for thresh in thresholds:
+            pred_binary = (pred_sample > thresh).astype(np.int32)
+            
+            # Vectorized F1 computation
+            tp = ((pred_binary == 1) & (target_sample == 1)).sum(axis=1)
+            fp = ((pred_binary == 1) & (target_sample == 0)).sum(axis=1)
+            fn = ((pred_binary == 0) & (target_sample == 1)).sum(axis=1)
+            
+            # Avoid division by zero
+            precision = np.divide(tp, tp + fp, out=np.zeros_like(tp, dtype=float), 
+                                where=(tp + fp) != 0)
+            recall = np.divide(tp, tp + fn, out=np.zeros_like(tp, dtype=float), 
+                             where=(tp + fn) != 0)
+            f1 = np.divide(2 * precision * recall, precision + recall, 
+                          out=np.zeros_like(precision), 
+                          where=(precision + recall) != 0)
+            
+            metrics[f'f1_at_threshold_{thresh}'] = float(f1.mean())
+            metrics[f'avg_predictions_at_threshold_{thresh}'] = float(pred_binary.sum(axis=1).mean())
+        
+        # Find optimal threshold using grid search
         best_f1 = 0
         best_threshold = 0.5
         
         for thresh in np.arange(0.1, 0.9, 0.05):
-            pred_binary = predictions > thresh
-            f1_sample = []
+            pred_binary = (pred_sample > thresh).astype(np.int32)
             
-            for i in range(min(1000, targets.shape[0])):  # Sample for speed
-                if targets[i].sum() > 0:
-                    tp = ((pred_binary[i] == 1) & (targets[i] == 1)).sum()
-                    fp = ((pred_binary[i] == 1) & (targets[i] == 0)).sum()
-                    fn = ((pred_binary[i] == 0) & (targets[i] == 1)).sum()
-                    
-                    prec = tp / (tp + fp + 1e-8)
-                    rec = tp / (tp + fn + 1e-8)
-                    f1 = 2 * prec * rec / (prec + rec + 1e-8)
-                    f1_sample.append(f1)
+            tp = ((pred_binary == 1) & (target_sample == 1)).sum()
+            fp = ((pred_binary == 1) & (target_sample == 0)).sum()
+            fn = ((pred_binary == 0) & (target_sample == 1)).sum()
             
-            avg_f1 = np.mean(f1_sample)
-            if avg_f1 > best_f1:
-                best_f1 = avg_f1
+            prec = tp / max(tp + fp, 1)
+            rec = tp / max(tp + fn, 1)
+            f1 = 2 * prec * rec / max(prec + rec, 1e-8)
+            
+            if f1 > best_f1:
+                best_f1 = f1
                 best_threshold = thresh
         
-        metrics['optimal_threshold'] = best_threshold
-        metrics['optimal_threshold_f1'] = best_f1
+        metrics['optimal_threshold'] = float(best_threshold)
+        metrics['optimal_threshold_f1'] = float(best_f1)
         
         return metrics
     
@@ -346,39 +444,42 @@ class MetricComputer:
             group_preds = pred_hier[:, g, :]
             group_targets = target_hier[:, g, :]
             
+            # Convert to numpy for processing
+            group_preds_np = group_preds.cpu().numpy()
+            group_targets_np = group_targets.cpu().numpy()
+            
             # Apply threshold
             if self.config.adaptive_threshold:
-                group_binary = self._adaptive_threshold(group_preds.numpy())
+                group_binary = self._adaptive_threshold(group_preds_np)
             else:
-                group_binary = group_preds > self.config.prediction_threshold
-                group_binary = group_binary.numpy()
+                group_binary = (group_preds_np > self.config.prediction_threshold).astype(np.int32)
             
             # Compute metrics for this group
-            tp = ((group_binary == 1) & (group_targets.numpy() == 1)).sum()
-            fp = ((group_binary == 1) & (group_targets.numpy() == 0)).sum()
-            fn = ((group_binary == 0) & (group_targets.numpy() == 1)).sum()
+            tp = ((group_binary == 1) & (group_targets_np == 1)).sum()
+            fp = ((group_binary == 1) & (group_targets_np == 0)).sum()
+            fn = ((group_binary == 0) & (group_targets_np == 1)).sum()
             
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
-            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+            precision = tp / max(tp + fp, 1)
+            recall = tp / max(tp + fn, 1)
+            f1 = 2 * precision * recall / max(precision + recall, 1e-8)
             
             group_f1_scores.append(f1)
             group_precisions.append(precision)
             group_recalls.append(recall)
         
         # Aggregate group metrics
-        metrics['group_f1_mean'] = np.mean(group_f1_scores)
-        metrics['group_f1_std'] = np.std(group_f1_scores)
-        metrics['group_precision_mean'] = np.mean(group_precisions)
-        metrics['group_recall_mean'] = np.mean(group_recalls)
+        metrics['group_f1_mean'] = float(np.mean(group_f1_scores))
+        metrics['group_f1_std'] = float(np.std(group_f1_scores))
+        metrics['group_precision_mean'] = float(np.mean(group_precisions))
+        metrics['group_recall_mean'] = float(np.mean(group_recalls))
         
-        # Group coverage (how many groups have predictions)
+        # Group coverage
         group_has_pred = (pred_hier > self.config.prediction_threshold).any(dim=2)
-        metrics['avg_groups_with_predictions'] = group_has_pred.float().mean().item()
+        metrics['avg_groups_with_predictions'] = float(group_has_pred.float().mean().item())
         
-        # Group balance (variance in predictions across groups)
+        # Group balance
         preds_per_group = (pred_hier > self.config.prediction_threshold).sum(dim=2).float()
-        metrics['group_prediction_variance'] = preds_per_group.var(dim=1).mean().item()
+        metrics['group_prediction_variance'] = float(preds_per_group.var(dim=1).mean().item())
         
         return metrics
     
@@ -391,9 +492,16 @@ class MetricComputer:
         """Compute metrics for individual tags"""
         num_tags = predictions.shape[1]
         
-        # Sample tags if too many
-        if num_tags > 1000 and self.config.sample_size_for_expensive:
-            sample_indices = np.random.choice(num_tags, 1000, replace=False)
+        # Determine which tags to analyze
+        if num_tags > self.config.max_tags_for_detailed:
+            # Sample tags based on frequency
+            tag_freq = targets.sum(axis=0)
+            # Get mix of frequent and infrequent tags
+            freq_sorted = np.argsort(tag_freq)
+            sample_indices = np.concatenate([
+                freq_sorted[:self.config.max_tags_for_detailed//2],  # Least frequent
+                freq_sorted[-self.config.max_tags_for_detailed//2:]  # Most frequent
+            ])
         else:
             sample_indices = np.arange(num_tags)
         
@@ -403,48 +511,49 @@ class MetricComputer:
         tag_recalls = []
         tag_support = []
         
-        for tag_idx in sample_indices:
+        for idx, tag_idx in enumerate(sample_indices):
             tag_preds = predictions[:, tag_idx]
             tag_targets = targets[:, tag_idx]
             
             # Skip if tag never appears
-            if tag_targets.sum() == 0:
+            support = tag_targets.sum()
+            if support == 0:
                 continue
             
             # Binary predictions for this tag
-            tag_binary = tag_preds > self.config.prediction_threshold
+            tag_binary = (tag_preds > self.config.prediction_threshold).astype(np.int32)
             
             tp = ((tag_binary == 1) & (tag_targets == 1)).sum()
             fp = ((tag_binary == 1) & (tag_targets == 0)).sum()
             fn = ((tag_binary == 0) & (tag_targets == 1)).sum()
             
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
-            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+            precision = tp / max(tp + fp, 1)
+            recall = tp / max(tp + fn, 1)
+            f1 = 2 * precision * recall / max(precision + recall, 1e-8)
             
             tag_f1_scores.append(f1)
             tag_precisions.append(precision)
             tag_recalls.append(recall)
-            tag_support.append(tag_targets.sum())
+            tag_support.append(support)
             
             # Store detailed metrics for specific tags
             if tag_names and tag_idx < len(tag_names):
                 tag_name = tag_names[tag_idx]
                 per_tag_metrics[tag_name] = {
-                    'precision': precision,
-                    'recall': recall,
-                    'f1': f1,
-                    'support': int(tag_targets.sum())
+                    'precision': float(precision),
+                    'recall': float(recall),
+                    'f1': float(f1),
+                    'support': int(support)
                 }
         
         # Aggregate statistics
         metrics = {
-            'per_tag_f1_mean': np.mean(tag_f1_scores),
-            'per_tag_f1_std': np.std(tag_f1_scores),
-            'per_tag_precision_mean': np.mean(tag_precisions),
-            'per_tag_recall_mean': np.mean(tag_recalls),
-            'tags_with_zero_f1': sum(1 for f1 in tag_f1_scores if f1 == 0),
-            'tags_with_perfect_f1': sum(1 for f1 in tag_f1_scores if f1 == 1.0)
+            'per_tag_f1_mean': float(np.mean(tag_f1_scores)) if tag_f1_scores else 0.0,
+            'per_tag_f1_std': float(np.std(tag_f1_scores)) if tag_f1_scores else 0.0,
+            'per_tag_precision_mean': float(np.mean(tag_precisions)) if tag_precisions else 0.0,
+            'per_tag_recall_mean': float(np.mean(tag_recalls)) if tag_recalls else 0.0,
+            'tags_with_zero_f1': int(sum(1 for f1 in tag_f1_scores if f1 == 0)),
+            'tags_with_perfect_f1': int(sum(1 for f1 in tag_f1_scores if f1 >= 0.99))
         }
         
         # Find worst and best performing tags
@@ -453,22 +562,26 @@ class MetricComputer:
             
             # Worst 10 tags
             worst_tags = []
-            for idx in sorted_indices[:10]:
-                if sample_indices[idx] < len(tag_names):
+            for i in range(min(10, len(sorted_indices))):
+                idx = sorted_indices[i]
+                tag_idx = sample_indices[idx]
+                if tag_idx < len(tag_names):
                     worst_tags.append({
-                        'tag': tag_names[sample_indices[idx]],
-                        'f1': tag_f1_scores[idx],
+                        'tag': tag_names[tag_idx],
+                        'f1': float(tag_f1_scores[idx]),
                         'support': int(tag_support[idx])
                     })
             metrics['worst_performing_tags'] = worst_tags
             
             # Best 10 tags
             best_tags = []
-            for idx in sorted_indices[-10:]:
-                if sample_indices[idx] < len(tag_names):
+            for i in range(max(0, len(sorted_indices)-10), len(sorted_indices)):
+                idx = sorted_indices[i]
+                tag_idx = sample_indices[idx]
+                if tag_idx < len(tag_names):
                     best_tags.append({
-                        'tag': tag_names[sample_indices[idx]],
-                        'f1': tag_f1_scores[idx],
+                        'tag': tag_names[tag_idx],
+                        'f1': float(tag_f1_scores[idx]),
                         'support': int(tag_support[idx])
                     })
             metrics['best_performing_tags'] = best_tags
@@ -482,7 +595,7 @@ class MetricComputer:
         tag_frequencies: torch.Tensor
     ) -> Dict[str, float]:
         """Compute metrics based on tag frequency bins"""
-        freq_np = tag_frequencies.numpy()
+        freq_np = self._safe_to_numpy(tag_frequencies)
         metrics = {}
         
         # Create frequency bins
@@ -501,20 +614,20 @@ class MetricComputer:
             bin_targets = targets[:, mask]
             
             # Binary predictions
-            bin_binary = bin_preds > self.config.prediction_threshold
+            bin_binary = (bin_preds > self.config.prediction_threshold).astype(np.int32)
             
             tp = ((bin_binary == 1) & (bin_targets == 1)).sum()
             fp = ((bin_binary == 1) & (bin_targets == 0)).sum()
             fn = ((bin_binary == 0) & (bin_targets == 1)).sum()
             
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
-            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+            precision = tp / max(tp + fp, 1)
+            recall = tp / max(tp + fn, 1)
+            f1 = 2 * precision * recall / max(precision + recall, 1e-8)
             
-            metrics[f'precision_freq_{bin_name}'] = precision
-            metrics[f'recall_freq_{bin_name}'] = recall
-            metrics[f'f1_freq_{bin_name}'] = f1
-            metrics[f'num_tags_freq_{bin_name}'] = mask.sum()
+            metrics[f'precision_freq_{bin_name}'] = float(precision)
+            metrics[f'recall_freq_{bin_name}'] = float(recall)
+            metrics[f'f1_freq_{bin_name}'] = float(f1)
+            metrics[f'num_tags_freq_{bin_name}'] = int(mask.sum())
         
         return metrics
     
@@ -524,43 +637,53 @@ class MetricComputer:
         targets: np.ndarray
     ) -> Dict[str, float]:
         """Compute tag coverage and diversity metrics"""
-        pred_binary = predictions > self.config.prediction_threshold
+        pred_binary = (predictions > self.config.prediction_threshold).astype(np.int32)
         
         metrics = {}
         
-        # Tag coverage (percentage of tags ever predicted)
+        # Tag coverage
         tags_predicted = pred_binary.any(axis=0)
-        metrics['tag_coverage'] = tags_predicted.mean()
+        metrics['tag_coverage'] = float(tags_predicted.mean())
         
         # Tag coverage in ground truth
         tags_in_gt = targets.any(axis=0)
-        metrics['tag_coverage_gt'] = tags_in_gt.mean()
+        metrics['tag_coverage_gt'] = float(tags_in_gt.mean())
         
         # Coverage of ground truth tags
         covered_gt_tags = tags_predicted & tags_in_gt
-        metrics['gt_tag_coverage'] = covered_gt_tags.sum() / (tags_in_gt.sum() + 1e-8)
+        metrics['gt_tag_coverage'] = float(covered_gt_tags.sum() / max(tags_in_gt.sum(), 1))
         
-        # Prediction diversity (entropy)
+        # Prediction diversity (entropy) - use safe computation
         tag_pred_probs = pred_binary.mean(axis=0)
-        tag_pred_probs = tag_pred_probs[tag_pred_probs > 0]  # Remove never-predicted
-        entropy = -np.sum(tag_pred_probs * np.log(tag_pred_probs + 1e-8))
-        metrics['prediction_entropy'] = entropy
+        tag_pred_probs = tag_pred_probs[tag_pred_probs > 0]
+        if len(tag_pred_probs) > 0:
+            # Normalize to get proper probability distribution
+            tag_pred_probs = tag_pred_probs / tag_pred_probs.sum()
+            entropy = -np.sum(tag_pred_probs * np.log(tag_pred_probs + 1e-10))
+        else:
+            entropy = 0.0
+        metrics['prediction_entropy'] = float(entropy)
         
-        # Jaccard similarity between samples
-        sample_similarities = []
-        num_samples = min(100, predictions.shape[0])  # Sample for efficiency
-        
-        for i in range(num_samples):
-            for j in range(i + 1, num_samples):
-                intersection = (pred_binary[i] & pred_binary[j]).sum()
-                union = (pred_binary[i] | pred_binary[j]).sum()
-                if union > 0:
-                    similarity = intersection / union
-                    sample_similarities.append(similarity)
-        
-        if sample_similarities:
-            metrics['avg_sample_similarity'] = np.mean(sample_similarities)
-            metrics['sample_similarity_std'] = np.std(sample_similarities)
+        # Sample similarity - compute on subset for efficiency
+        sample_size = min(100, predictions.shape[0])
+        if sample_size >= 2:
+            indices = np.random.choice(predictions.shape[0], sample_size, replace=False)
+            sample_pred = pred_binary[indices]
+            
+            similarities = []
+            for i in range(sample_size):
+                for j in range(i + 1, sample_size):
+                    intersection = (sample_pred[i] & sample_pred[j]).sum()
+                    union = (sample_pred[i] | sample_pred[j]).sum()
+                    if union > 0:
+                        similarities.append(intersection / union)
+            
+            if similarities:
+                metrics['avg_sample_similarity'] = float(np.mean(similarities))
+                metrics['sample_similarity_std'] = float(np.std(similarities))
+            else:
+                metrics['avg_sample_similarity'] = 0.0
+                metrics['sample_similarity_std'] = 0.0
         
         return metrics
     
@@ -587,37 +710,43 @@ class MetricComputer:
                 continue
             
             try:
-                ap = average_precision_score(targets[i], predictions[i])
-                ap_scores.append(ap)
-            except:
+                # Only compute for tags that appear in this sample
+                mask = targets[i] > 0
+                if mask.sum() > 0:
+                    ap = average_precision_score(targets[i][mask], predictions[i][mask])
+                    ap_scores.append(ap)
+            except Exception as e:
+                logger.debug(f"Error computing AP for sample {i}: {e}")
                 continue
         
-        return np.mean(ap_scores) if ap_scores else 0.0
+        return float(np.mean(ap_scores)) if ap_scores else 0.0
     
     def _adaptive_threshold(self, predictions: np.ndarray) -> np.ndarray:
-        """Apply adaptive thresholding to ensure reasonable number of predictions"""
-        binary_preds = np.zeros_like(predictions, dtype=bool)
+        """Apply adaptive thresholding"""
+        binary_preds = np.zeros_like(predictions, dtype=np.int32)
         
         for i in range(predictions.shape[0]):
             sample_preds = predictions[i]
             
-            # Start with base threshold
-            threshold = self.config.prediction_threshold
-            num_pred = (sample_preds > threshold).sum()
+            # Sort predictions
+            sorted_indices = np.argsort(sample_preds)[::-1]
+            sorted_preds = sample_preds[sorted_indices]
             
-            # Adjust threshold if needed
-            if num_pred < self.config.min_predictions:
-                # Lower threshold to get more predictions
-                sorted_preds = np.sort(sample_preds)[::-1]
-                if self.config.min_predictions <= len(sorted_preds):
-                    threshold = sorted_preds[self.config.min_predictions - 1] - 1e-6
+            # Determine number of predictions
+            num_pred = np.sum(sample_preds > self.config.prediction_threshold)
+            
+            if num_pred < self.config.min_predictions and len(sorted_preds) >= self.config.min_predictions:
+                # Take top min_predictions
+                threshold_idx = min(self.config.min_predictions, len(sorted_preds))
+                top_indices = sorted_indices[:threshold_idx]
+                binary_preds[i, top_indices] = 1
             elif num_pred > self.config.max_predictions:
-                # Raise threshold to get fewer predictions
-                sorted_preds = np.sort(sample_preds)[::-1]
-                if self.config.max_predictions <= len(sorted_preds):
-                    threshold = sorted_preds[self.config.max_predictions] + 1e-6
-            
-            binary_preds[i] = sample_preds > threshold
+                # Take top max_predictions
+                top_indices = sorted_indices[:self.config.max_predictions]
+                binary_preds[i, top_indices] = 1
+            else:
+                # Use standard threshold
+                binary_preds[i] = (sample_preds > self.config.prediction_threshold).astype(np.int32)
         
         return binary_preds
 
@@ -637,214 +766,348 @@ class MetricVisualizer:
         num_tags_to_plot: int = 10
     ):
         """Plot precision-recall curves"""
-        fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-        axes = axes.flatten()
-        
-        # Select tags to plot
-        tag_support = targets.sum(axis=0)
-        top_tags = np.argsort(tag_support)[-num_tags_to_plot:]
-        
-        for idx, tag_idx in enumerate(top_tags):
-            ax = axes[idx]
+        try:
+            fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+            axes = axes.flatten()
             
-            # Compute PR curve
-            precision, recall, _ = precision_recall_curve(
-                targets[:, tag_idx],
-                predictions[:, tag_idx]
-            )
+            # Select tags to plot
+            tag_support = targets.sum(axis=0)
+            valid_tags = np.where(tag_support > 0)[0]
             
-            # Plot
-            ax.plot(recall, precision)
-            ax.set_xlabel('Recall')
-            ax.set_ylabel('Precision')
-            ax.grid(True, alpha=0.3)
+            if len(valid_tags) == 0:
+                logger.warning("No tags with positive samples for PR curve")
+                return
             
-            # Title with tag name if available
-            if tag_names and tag_idx < len(tag_names):
-                ax.set_title(f'{tag_names[tag_idx]}\n(support: {int(tag_support[tag_idx])})')
-            else:
-                ax.set_title(f'Tag {tag_idx}\n(support: {int(tag_support[tag_idx])})')
-        
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'pr_curves.png', dpi=150)
-        plt.close()
+            # Select top tags by support
+            top_tags = valid_tags[np.argsort(tag_support[valid_tags])[-num_tags_to_plot:]]
+            
+            for idx, tag_idx in enumerate(top_tags[:10]):
+                ax = axes[idx]
+                
+                # Compute PR curve
+                try:
+                    precision, recall, _ = precision_recall_curve(
+                        targets[:, tag_idx],
+                        predictions[:, tag_idx]
+                    )
+                    
+                    # Plot
+                    ax.plot(recall, precision)
+                    ax.set_xlabel('Recall')
+                    ax.set_ylabel('Precision')
+                    ax.grid(True, alpha=0.3)
+                    
+                    # Title with tag name if available
+                    if tag_names and tag_idx < len(tag_names):
+                        ax.set_title(f'{tag_names[tag_idx][:20]}\n(support: {int(tag_support[tag_idx])})')
+                    else:
+                        ax.set_title(f'Tag {tag_idx}\n(support: {int(tag_support[tag_idx])})')
+                except Exception as e:
+                    logger.debug(f"Error plotting PR curve for tag {tag_idx}: {e}")
+                    ax.set_title(f"Error for tag {tag_idx}")
+            
+            plt.tight_layout()
+            plt.savefig(self.output_dir / 'pr_curves.png', dpi=150, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            logger.error(f"Error creating PR curve plot: {e}")
+            plt.close('all')
     
     def plot_threshold_analysis(self, metrics: Dict[str, Any]):
         """Plot metrics vs threshold"""
-        thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
-        f1_scores = [metrics.get(f'f1_at_threshold_{t}', 0) for t in thresholds]
-        avg_preds = [metrics.get(f'avg_predictions_at_threshold_{t}', 0) for t in thresholds]
-        
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        
-        # F1 vs threshold
-        ax1.plot(thresholds, f1_scores, 'o-')
-        ax1.axvline(metrics.get('optimal_threshold', 0.5), color='red', linestyle='--', 
-                   label=f"Optimal: {metrics.get('optimal_threshold', 0.5):.2f}")
-        ax1.set_xlabel('Threshold')
-        ax1.set_ylabel('F1 Score')
-        ax1.set_title('F1 Score vs Threshold')
-        ax1.grid(True, alpha=0.3)
-        ax1.legend()
-        
-        # Average predictions vs threshold
-        ax2.plot(thresholds, avg_preds, 'o-')
-        ax2.axhline(metrics.get('avg_targets_per_sample', 0), color='green', linestyle='--',
-                   label='Avg targets per sample')
-        ax2.set_xlabel('Threshold')
-        ax2.set_ylabel('Average Predictions')
-        ax2.set_title('Average Predictions vs Threshold')
-        ax2.grid(True, alpha=0.3)
-        ax2.legend()
-        
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'threshold_analysis.png', dpi=150)
-        plt.close()
+        try:
+            thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
+            f1_scores = [metrics.get(f'f1_at_threshold_{t}', 0) for t in thresholds]
+            avg_preds = [metrics.get(f'avg_predictions_at_threshold_{t}', 0) for t in thresholds]
+            
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            
+            # F1 vs threshold
+            ax1.plot(thresholds, f1_scores, 'o-', linewidth=2, markersize=8)
+            optimal_thresh = metrics.get('optimal_threshold', 0.5)
+            ax1.axvline(optimal_thresh, color='red', linestyle='--', 
+                       label=f"Optimal: {optimal_thresh:.2f}")
+            ax1.set_xlabel('Threshold')
+            ax1.set_ylabel('F1 Score')
+            ax1.set_title('F1 Score vs Threshold')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+            
+            # Average predictions vs threshold
+            ax2.plot(thresholds, avg_preds, 'o-', linewidth=2, markersize=8)
+            avg_targets = metrics.get('avg_targets_per_sample', 0)
+            ax2.axhline(avg_targets, color='green', linestyle='--',
+                       label=f'Avg targets: {avg_targets:.1f}')
+            ax2.set_xlabel('Threshold')
+            ax2.set_ylabel('Average Predictions')
+            ax2.set_title('Average Predictions vs Threshold')
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
+            
+            plt.tight_layout()
+            plt.savefig(self.output_dir / 'threshold_analysis.png', dpi=150, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            logger.error(f"Error creating threshold analysis plot: {e}")
+            plt.close('all')
     
     def plot_frequency_performance(self, metrics: Dict[str, Any]):
         """Plot performance vs tag frequency"""
-        freq_bins = []
-        f1_scores = []
-        
-        # Extract frequency bin metrics
-        for key, value in metrics.items():
-            if key.startswith('f1_freq_'):
-                bin_name = key.replace('f1_freq_', '')
-                freq_bins.append(bin_name)
-                f1_scores.append(value)
-        
-        if not freq_bins:
-            return
-        
-        plt.figure(figsize=(10, 6))
-        x = np.arange(len(freq_bins))
-        plt.bar(x, f1_scores)
-        plt.xticks(x, freq_bins, rotation=45)
-        plt.xlabel('Tag Frequency Range')
-        plt.ylabel('F1 Score')
-        plt.title('Performance vs Tag Frequency')
-        plt.grid(True, alpha=0.3, axis='y')
-        
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'frequency_performance.png', dpi=150)
-        plt.close()
+        try:
+            freq_bins = []
+            f1_scores = []
+            
+            # Extract frequency bin metrics
+            for key, value in metrics.items():
+                if key.startswith('f1_freq_'):
+                    bin_name = key.replace('f1_freq_', '')
+                    freq_bins.append(bin_name)
+                    f1_scores.append(value)
+            
+            if not freq_bins:
+                logger.warning("No frequency bin metrics to plot")
+                return
+            
+            plt.figure(figsize=(10, 6))
+            x = np.arange(len(freq_bins))
+            bars = plt.bar(x, f1_scores)
+            
+            # Color bars by performance
+            colors = ['red' if f1 < 0.3 else 'yellow' if f1 < 0.6 else 'green' for f1 in f1_scores]
+            for bar, color in zip(bars, colors):
+                bar.set_color(color)
+            
+            plt.xticks(x, freq_bins, rotation=45)
+            plt.xlabel('Tag Frequency Range')
+            plt.ylabel('F1 Score')
+            plt.title('Performance vs Tag Frequency')
+            plt.grid(True, alpha=0.3, axis='y')
+            
+            # Add value labels on bars
+            for i, (bar, f1) in enumerate(zip(bars, f1_scores)):
+                plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                        f'{f1:.3f}', ha='center', va='bottom')
+            
+            plt.tight_layout()
+            plt.savefig(self.output_dir / 'frequency_performance.png', dpi=150, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            logger.error(f"Error creating frequency performance plot: {e}")
+            plt.close('all')
     
-    def plot_confusion_examples(
+    def plot_tag_cooccurrence_matrix(
         self,
         predictions: np.ndarray,
         targets: np.ndarray,
         tag_names: List[str],
-        num_examples: int = 20
+        num_tags: int = 20
     ):
-        """Plot confusion matrix for top tags"""
-        # Select top tags by frequency
-        tag_freq = targets.sum(axis=0)
-        top_indices = np.argsort(tag_freq)[-num_examples:]
-        
-        # Binary predictions
-        pred_binary = predictions > 0.5
-        
-        # Compute confusion matrix
-        cm = np.zeros((num_examples, num_examples))
-        
-        for i, idx_i in enumerate(top_indices):
-            for j, idx_j in enumerate(top_indices):
-                # Co-occurrence in predictions vs targets
-                pred_cooc = (pred_binary[:, idx_i] & pred_binary[:, idx_j]).sum()
-                true_cooc = (targets[:, idx_i] & targets[:, idx_j]).sum()
-                cm[i, j] = pred_cooc / (true_cooc + 1e-8) if i != j else 1.0
-        
-        # Plot heatmap
-        plt.figure(figsize=(12, 10))
-        
-        # Get tag names for axes
-        labels = [tag_names[idx] if idx < len(tag_names) else f'Tag {idx}' 
-                 for idx in top_indices]
-        
-        sns.heatmap(cm, annot=False, cmap='YlOrRd', 
-                   xticklabels=labels, yticklabels=labels,
-                   cbar_kws={'label': 'Prediction / Ground Truth Co-occurrence'})
-        
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        plt.title('Tag Co-occurrence Confusion')
-        
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'confusion_matrix.png', dpi=150)
-        plt.close()
+        """Plot tag co-occurrence matrix (fixed version)"""
+        try:
+            # Select top tags by frequency
+            tag_freq = targets.sum(axis=0)
+            valid_tags = np.where(tag_freq > 0)[0]
+            
+            if len(valid_tags) == 0:
+                logger.warning("No valid tags for co-occurrence matrix")
+                return
+            
+            top_indices = valid_tags[np.argsort(tag_freq[valid_tags])[-num_tags:]]
+            
+            # Binary predictions
+            pred_binary = (predictions > 0.5).astype(np.int32)
+            
+            # Compute co-occurrence matrices
+            pred_cooc = np.zeros((num_tags, num_tags))
+            true_cooc = np.zeros((num_tags, num_tags))
+            
+            for i, idx_i in enumerate(top_indices):
+                for j, idx_j in enumerate(top_indices):
+                    pred_cooc[i, j] = ((pred_binary[:, idx_i] == 1) & 
+                                      (pred_binary[:, idx_j] == 1)).sum()
+                    true_cooc[i, j] = ((targets[:, idx_i] == 1) & 
+                                      (targets[:, idx_j] == 1)).sum()
+            
+            # Normalize by diagonal (self-occurrence)
+            for i in range(num_tags):
+                if true_cooc[i, i] > 0:
+                    true_cooc[i, :] /= true_cooc[i, i]
+                if pred_cooc[i, i] > 0:
+                    pred_cooc[i, :] /= pred_cooc[i, i]
+            
+            # Compute difference
+            diff_matrix = pred_cooc - true_cooc
+            
+            # Plot
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            
+            # Get tag names for axes
+            labels = [tag_names[idx][:15] if idx < len(tag_names) else f'Tag {idx}' 
+                     for idx in top_indices]
+            
+            # Ground truth co-occurrence
+            sns.heatmap(true_cooc, annot=False, cmap='Blues', 
+                       xticklabels=labels, yticklabels=labels,
+                       cbar_kws={'label': 'Co-occurrence Rate'},
+                       ax=axes[0], vmin=0, vmax=1)
+            axes[0].set_title('Ground Truth Co-occurrence')
+            
+            # Predicted co-occurrence
+            sns.heatmap(pred_cooc, annot=False, cmap='Oranges',
+                       xticklabels=labels, yticklabels=labels,
+                       cbar_kws={'label': 'Co-occurrence Rate'},
+                       ax=axes[1], vmin=0, vmax=1)
+            axes[1].set_title('Predicted Co-occurrence')
+            
+            # Difference
+            sns.heatmap(diff_matrix, annot=False, cmap='RdBu_r',
+                       xticklabels=labels, yticklabels=labels,
+                       cbar_kws={'label': 'Prediction - Truth'},
+                       ax=axes[2], vmin=-0.5, vmax=0.5, center=0)
+            axes[2].set_title('Co-occurrence Difference')
+            
+            for ax in axes:
+                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+                ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+            
+            plt.tight_layout()
+            plt.savefig(self.output_dir / 'cooccurrence_matrix.png', dpi=150, bbox_inches='tight')
+            plt.close()
+            
+        except Exception as e:
+            logger.error(f"Error creating co-occurrence matrix plot: {e}")
+            plt.close('all')
     
     def create_metric_report(self, metrics: Dict[str, Any], save_path: Optional[Path] = None):
         """Create a comprehensive metric report"""
         if save_path is None:
             save_path = self.output_dir / 'metric_report.txt'
         
-        with open(save_path, 'w') as f:
-            f.write("=" * 80 + "\n")
-            f.write("ANIME IMAGE TAGGER - EVALUATION REPORT\n")
-            f.write("=" * 80 + "\n\n")
-            
-            # Overall metrics
-            f.write("OVERALL PERFORMANCE\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"Exact Match Ratio: {metrics.get('exact_match_ratio', 0):.4f}\n")
-            f.write(f"Hamming Loss: {metrics.get('hamming_loss', 0):.4f}\n")
-            f.write(f"Mean Average Precision: {metrics.get('mAP', 0):.4f}\n\n")
-            
-            # Micro/Macro metrics
-            f.write("AGGREGATE METRICS\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"Micro Precision: {metrics.get('precision_micro', 0):.4f}\n")
-            f.write(f"Micro Recall: {metrics.get('recall_micro', 0):.4f}\n")
-            f.write(f"Micro F1: {metrics.get('f1_micro', 0):.4f}\n")
-            f.write(f"Macro Precision: {metrics.get('precision_macro', 0):.4f}\n")
-            f.write(f"Macro Recall: {metrics.get('recall_macro', 0):.4f}\n")
-            f.write(f"Macro F1: {metrics.get('f1_macro', 0):.4f}\n\n")
-            
-            # Top-k metrics
-            f.write("TOP-K PERFORMANCE\n")
-            f.write("-" * 40 + "\n")
-            for k in [1, 5, 10, 20, 50]:
-                if f'f1_at_{k}' in metrics:
-                    f.write(f"F1@{k}: {metrics[f'f1_at_{k}']:.4f} | ")
-                    f.write(f"Precision@{k}: {metrics[f'precision_at_{k}']:.4f} | ")
-                    f.write(f"Recall@{k}: {metrics[f'recall_at_{k}']:.4f}\n")
-            f.write("\n")
-            
-            # Threshold analysis
-            f.write("THRESHOLD ANALYSIS\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"Optimal Threshold: {metrics.get('optimal_threshold', 0.5):.3f}\n")
-            f.write(f"F1 at Optimal: {metrics.get('optimal_threshold_f1', 0):.4f}\n\n")
-            
-            # Coverage metrics
-            f.write("COVERAGE AND DIVERSITY\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"Tag Coverage: {metrics.get('tag_coverage', 0):.4f}\n")
-            f.write(f"GT Tag Coverage: {metrics.get('gt_tag_coverage', 0):.4f}\n")
-            f.write(f"Prediction Entropy: {metrics.get('prediction_entropy', 0):.4f}\n")
-            f.write(f"Avg Sample Similarity: {metrics.get('avg_sample_similarity', 0):.4f}\n\n")
-            
-            # Hierarchical metrics
-            if 'group_f1_mean' in metrics:
-                f.write("HIERARCHICAL GROUP METRICS\n")
+        try:
+            with open(save_path, 'w') as f:
+                f.write("=" * 80 + "\n")
+                f.write("ANIME IMAGE TAGGER - EVALUATION REPORT\n")
+                f.write("=" * 80 + "\n\n")
+                
+                # Overall metrics
+                f.write("OVERALL PERFORMANCE\n")
                 f.write("-" * 40 + "\n")
-                f.write(f"Mean Group F1: {metrics['group_f1_mean']:.4f} (±{metrics['group_f1_std']:.4f})\n")
-                f.write(f"Avg Groups with Predictions: {metrics['avg_groups_with_predictions']:.2f}\n\n")
-            
-            # Worst performing tags
-            if 'worst_performing_tags' in metrics:
-                f.write("WORST PERFORMING TAGS\n")
+                f.write(f"Exact Match Ratio: {metrics.get('exact_match_ratio', 0):.4f}\n")
+                f.write(f"Hamming Loss: {metrics.get('hamming_loss', 0):.4f}\n")
+                f.write(f"Mean Average Precision: {metrics.get('mAP', 0):.4f}\n\n")
+                
+                # Loss statistics if available
+                if 'avg_loss' in metrics:
+                    f.write(f"Average Loss: {metrics['avg_loss']:.4f} (±{metrics.get('std_loss', 0):.4f})\n\n")
+                
+                # Aggregate metrics
+                f.write("AGGREGATE METRICS\n")
                 f.write("-" * 40 + "\n")
-                for tag_info in metrics['worst_performing_tags']:
-                    f.write(f"{tag_info['tag']:30s} F1: {tag_info['f1']:.4f} (support: {tag_info['support']})\n")
+                f.write(f"Micro Precision: {metrics.get('precision_micro', 0):.4f}\n")
+                f.write(f"Micro Recall: {metrics.get('recall_micro', 0):.4f}\n")
+                f.write(f"Micro F1: {metrics.get('f1_micro', 0):.4f}\n")
+                f.write(f"Macro Precision: {metrics.get('precision_macro', 0):.4f}\n")
+                f.write(f"Macro Recall: {metrics.get('recall_macro', 0):.4f}\n")
+                f.write(f"Macro F1: {metrics.get('f1_macro', 0):.4f}\n")
+                f.write(f"Sample Precision: {metrics.get('precision_samples', 0):.4f}\n")
+                f.write(f"Sample Recall: {metrics.get('recall_samples', 0):.4f}\n")
+                f.write(f"Sample F1: {metrics.get('f1_samples', 0):.4f}\n\n")
+                
+                # Top-k metrics
+                f.write("TOP-K PERFORMANCE\n")
+                f.write("-" * 40 + "\n")
+                for k in [1, 5, 10, 20, 50]:
+                    if f'f1_at_{k}' in metrics:
+                        f.write(f"@{k:3d}: F1={metrics[f'f1_at_{k}']:.4f} | ")
+                        f.write(f"P={metrics[f'precision_at_{k}']:.4f} | ")
+                        f.write(f"R={metrics[f'recall_at_{k}']:.4f} | ")
+                        f.write(f"Acc={metrics.get(f'accuracy_at_{k}', 0):.4f}\n")
                 f.write("\n")
-            
-            # Best performing tags
-            if 'best_performing_tags' in metrics:
-                f.write("BEST PERFORMING TAGS\n")
+                
+                # Threshold analysis
+                f.write("THRESHOLD ANALYSIS\n")
                 f.write("-" * 40 + "\n")
-                for tag_info in metrics['best_performing_tags']:
-                    f.write(f"{tag_info['tag']:30s} F1: {tag_info['f1']:.4f} (support: {tag_info['support']})\n")
+                f.write(f"Optimal Threshold: {metrics.get('optimal_threshold', 0.5):.3f}\n")
+                f.write(f"F1 at Optimal: {metrics.get('optimal_threshold_f1', 0):.4f}\n")
+                f.write(f"Avg Predictions per Sample: {metrics.get('avg_predictions_per_sample', 0):.1f}\n")
+                f.write(f"Avg Targets per Sample: {metrics.get('avg_targets_per_sample', 0):.1f}\n\n")
+                
+                # Coverage metrics
+                f.write("COVERAGE AND DIVERSITY\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"Tag Coverage (% predicted): {metrics.get('tag_coverage', 0)*100:.2f}%\n")
+                f.write(f"GT Tag Coverage: {metrics.get('gt_tag_coverage', 0)*100:.2f}%\n")
+                f.write(f"Prediction Entropy: {metrics.get('prediction_entropy', 0):.4f}\n")
+                f.write(f"Avg Sample Similarity: {metrics.get('avg_sample_similarity', 0):.4f}")
+                if 'sample_similarity_std' in metrics:
+                    f.write(f" (±{metrics['sample_similarity_std']:.4f})")
+                f.write("\n\n")
+                
+                # Hierarchical metrics
+                if 'group_f1_mean' in metrics:
+                    f.write("HIERARCHICAL GROUP METRICS\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"Mean Group F1: {metrics['group_f1_mean']:.4f} (±{metrics['group_f1_std']:.4f})\n")
+                    f.write(f"Mean Group Precision: {metrics['group_precision_mean']:.4f}\n")
+                    f.write(f"Mean Group Recall: {metrics['group_recall_mean']:.4f}\n")
+                    f.write(f"Avg Groups with Predictions: {metrics['avg_groups_with_predictions']:.2f}\n")
+                    f.write(f"Group Prediction Variance: {metrics['group_prediction_variance']:.4f}\n\n")
+                
+                # Per-tag statistics
+                if 'per_tag_f1_mean' in metrics:
+                    f.write("PER-TAG STATISTICS\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"Mean Tag F1: {metrics['per_tag_f1_mean']:.4f} (±{metrics['per_tag_f1_std']:.4f})\n")
+                    f.write(f"Mean Tag Precision: {metrics['per_tag_precision_mean']:.4f}\n")
+                    f.write(f"Mean Tag Recall: {metrics['per_tag_recall_mean']:.4f}\n")
+                    f.write(f"Tags with Zero F1: {metrics['tags_with_zero_f1']}\n")
+                    f.write(f"Tags with Perfect F1: {metrics['tags_with_perfect_f1']}\n\n")
+                
+                # Worst performing tags
+                if 'worst_performing_tags' in metrics and metrics['worst_performing_tags']:
+                    f.write("WORST PERFORMING TAGS\n")
+                    f.write("-" * 40 + "\n")
+                    for tag_info in metrics['worst_performing_tags'][:10]:
+                        f.write(f"{tag_info['tag']:30s} F1: {tag_info['f1']:.4f} (support: {tag_info['support']})\n")
+                    f.write("\n")
+                
+                # Best performing tags
+                if 'best_performing_tags' in metrics and metrics['best_performing_tags']:
+                    f.write("BEST PERFORMING TAGS\n")
+                    f.write("-" * 40 + "\n")
+                    for tag_info in metrics['best_performing_tags'][:10]:
+                        f.write(f"{tag_info['tag']:30s} F1: {tag_info['f1']:.4f} (support: {tag_info['support']})\n")
+                    f.write("\n")
+                
+                # Frequency-based performance
+                f.write("FREQUENCY-BASED PERFORMANCE\n")
+                f.write("-" * 40 + "\n")
+                freq_metrics = [(k, v) for k, v in metrics.items() if k.startswith('f1_freq_')]
+                for key, value in sorted(freq_metrics):
+                    bin_name = key.replace('f1_freq_', '')
+                    f.write(f"Frequency {bin_name:15s}: F1={value:.4f}")
+                    if f'num_tags_freq_{bin_name}' in metrics:
+                        f.write(f" (tags: {metrics[f'num_tags_freq_{bin_name}']})")
+                    f.write("\n")
+                
+                # Error reporting
+                if 'error' in metrics:
+                    f.write("\n" + "=" * 40 + "\n")
+                    f.write("ERRORS ENCOUNTERED\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"{metrics['error']}\n")
+                
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("END OF REPORT\n")
+                f.write("=" * 80 + "\n")
+                
+            logger.info(f"Metric report saved to {save_path}")
+            
+        except Exception as e:
+            logger.error(f"Error creating metric report: {e}")
 
 
 def evaluate_model(
@@ -872,33 +1135,41 @@ def evaluate_model(
         Dictionary of all metrics
     """
     model.eval()
-    metric_tracker = MetricTracker()
+    metric_tracker = MetricTracker(device=str(device))
     
     # Collect predictions
+    logger.info("Collecting model predictions...")
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            images = batch['image'].to(device)
-            targets = batch['labels']['binary'].to(device)
-            
-            # Get predictions
-            outputs = model(images)
-            logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-            
-            # Handle hierarchical output
-            if logits.dim() == 3:
-                batch_size = logits.shape[0]
-                logits = logits.view(batch_size, -1)
-            
-            # Convert to probabilities
-            predictions = torch.sigmoid(logits)
-            
-            # Track
-            metric_tracker.update(predictions, targets)
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
+            try:
+                images = batch['image'].to(device)
+                targets = batch['labels']['binary'].to(device)
+                
+                # Get predictions
+                outputs = model(images)
+                logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+                
+                # Handle hierarchical output
+                if logits.dim() == 3:
+                    batch_size = logits.shape[0]
+                    logits = logits.view(batch_size, -1)
+                
+                # Convert to probabilities
+                predictions = torch.sigmoid(logits)
+                
+                # Track
+                loss = outputs.get('loss', None) if isinstance(outputs, dict) else None
+                metric_tracker.update(predictions, targets, loss=loss)
+                
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_idx}: {e}")
+                continue
     
     # Compute metrics
+    logger.info("Computing evaluation metrics...")
     metrics = metric_tracker.compute_metrics(config)
     
-    # Add tag names and frequencies if provided
+    # Add detailed metrics if requested
     if tag_names or tag_frequencies is not None:
         computer = MetricComputer(config)
         all_preds = torch.cat(metric_tracker.predictions, dim=0)
@@ -911,60 +1182,100 @@ def evaluate_model(
     
     # Create visualizations
     if save_plots and config.save_plots:
+        logger.info("Creating visualization plots...")
         visualizer = MetricVisualizer(config.plot_dir)
         
-        # Create various plots
         if len(metric_tracker.predictions) > 0:
             all_preds_np = torch.cat(metric_tracker.predictions, dim=0).numpy()
             all_targets_np = torch.cat(metric_tracker.targets, dim=0).numpy()
             
-            visualizer.plot_pr_curve(all_preds_np, all_targets_np, tag_names)
-            visualizer.plot_threshold_analysis(metrics)
-            visualizer.plot_frequency_performance(metrics)
+            # Create various plots with error handling
+            try:
+                visualizer.plot_pr_curve(all_preds_np, all_targets_np, tag_names)
+            except Exception as e:
+                logger.error(f"Failed to create PR curve: {e}")
             
-            if tag_names and all_preds_np.shape[0] < 10000:  # Only for smaller datasets
-                visualizer.plot_confusion_examples(all_preds_np, all_targets_np, tag_names)
+            try:
+                visualizer.plot_threshold_analysis(metrics)
+            except Exception as e:
+                logger.error(f"Failed to create threshold analysis: {e}")
+            
+            try:
+                visualizer.plot_frequency_performance(metrics)
+            except Exception as e:
+                logger.error(f"Failed to create frequency performance plot: {e}")
+            
+            if tag_names and all_preds_np.shape[0] < 10000:
+                try:
+                    visualizer.plot_tag_cooccurrence_matrix(all_preds_np, all_targets_np, tag_names)
+                except Exception as e:
+                    logger.error(f"Failed to create co-occurrence matrix: {e}")
         
         # Create report
         visualizer.create_metric_report(metrics)
     
+    logger.info("Evaluation complete!")
     return metrics
 
 
 if __name__ == "__main__":
-    # Test metrics computation
-    logger.info("Testing metrics computation...")
+    # Test metrics computation with improved test case
+    logging.basicConfig(level=logging.INFO)
+    logger.info("Testing improved metrics computation...")
     
-    # Create dummy data
+    # Create more realistic dummy data
     batch_size = 100
     num_tags = 1000
     
     # Simulate predictions and targets
+    torch.manual_seed(42)
     predictions = torch.rand(batch_size, num_tags)
     targets = torch.zeros(batch_size, num_tags)
     
-    # Add some positive labels
+    # Add some positive labels with realistic distribution
     for i in range(batch_size):
         num_pos = torch.randint(5, 20, (1,)).item()
         pos_indices = torch.randperm(num_tags)[:num_pos]
         targets[i, pos_indices] = 1
-        # Make predictions somewhat correlated
-        predictions[i, pos_indices] += 0.3
+        # Make predictions somewhat correlated with targets
+        predictions[i, pos_indices] += torch.rand(num_pos) * 0.5
     
+    # Apply sigmoid to get probabilities
     predictions = torch.sigmoid(predictions)
     
+    # Create tag names
+    tag_names = [f"tag_{i}" for i in range(num_tags)]
+    
+    # Create tag frequencies (power law distribution)
+    tag_frequencies = torch.tensor([1000 / (i + 1) for i in range(num_tags)])
+    
     # Test metric computation
-    config = MetricConfig()
+    config = MetricConfig(
+        compute_per_tag_metrics=True,
+        compute_auc=True,
+        save_plots=False
+    )
+    
     computer = MetricComputer(config)
     
-    metrics = computer.compute_all_metrics(predictions, targets)
-    
-    # Print results
-    print("\nComputed Metrics:")
-    for key, value in sorted(metrics.items()):
-        if isinstance(value, float):
-            print(f"  {key}: {value:.4f}")
-        elif isinstance(value, int):
-            print(f"  {key}: {value}")
-    
-    print("\nMetrics test completed!")
+    try:
+        metrics = computer.compute_all_metrics(
+            predictions, targets, tag_names, tag_frequencies
+        )
+        
+        # Print results
+        print("\nComputed Metrics:")
+        print("-" * 50)
+        for key, value in sorted(metrics.items()):
+            if isinstance(value, (int, float)):
+                if isinstance(value, float):
+                    print(f"  {key:30s}: {value:.4f}")
+                else:
+                    print(f"  {key:30s}: {value}")
+        
+        print("\nMetrics test completed successfully!")
+        
+    except Exception as e:
+        print(f"\nError during test: {e}")
+        import traceback
+        traceback.print_exc()
