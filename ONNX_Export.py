@@ -563,22 +563,54 @@ class ONNXExporter:
             logger.info(f"  {op_type}: {count}")
         logger.info("="*60)
     
-    def benchmark(self, model_path: Path, num_runs: int = 100):
-        """Benchmark ONNX model performance"""
-        logger.info(f"Benchmarking model: {model_path}")
-        
-        # Create session
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        session = ort.InferenceSession(str(model_path), providers=providers)
-        
-        # Prepare input
-         input_data = np.random.randn(
-            self.config.batch_size,
-            3,
-            self.config.image_size,
-            self.config.image_size
-            ).astype(np.float32)
-
+def benchmark(self, model_path: Path, num_runs: int = 100):
+    """Benchmark ONNX model performance"""
+    logger.info(f"Benchmarking model: {model_path}")
+    
+    # Create session
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    session = ort.InferenceSession(str(model_path), providers=providers)
+    
+    # Prepare input
+    input_data = np.random.randn(
+        self.config.batch_size,
+        3,
+        self.config.image_size,
+        self.config.image_size
+    ).astype(np.float32)
+    
+    # Warmup runs
+    for _ in range(5):
+        _ = session.run(None, {self.config.input_names[0]: input_data})
+    
+    # Benchmark runs
+    times = []
+    for _ in tqdm(range(num_runs), desc="Benchmarking"):
+        start = time.perf_counter()
+        _ = session.run(None, {self.config.input_names[0]: input_data})
+        end = time.perf_counter()
+        times.append((end - start) * 1000)  # Convert to ms
+    
+    # Compute statistics
+    times = np.array(times)
+    results = {
+        'mean_ms': np.mean(times),
+        'std_ms': np.std(times),
+        'min_ms': np.min(times),
+        'max_ms': np.max(times),
+        'median_ms': np.median(times),
+        'p95_ms': np.percentile(times, 95),
+        'p99_ms': np.percentile(times, 99),
+        'throughput_fps': 1000 / np.mean(times) * self.config.batch_size
+    }
+    
+    logger.info(f"Benchmark Results:")
+    logger.info(f"  Mean: {results['mean_ms']:.2f} ms")
+    logger.info(f"  Std: {results['std_ms']:.2f} ms")
+    logger.info(f"  P95: {results['p95_ms']:.2f} ms")
+    logger.info(f"  Throughput: {results['throughput_fps']:.1f} FPS")
+    
+    return results
 #!/usr/bin/env python3
 """
 ONNX Export for Anime Image Tagger
@@ -1144,17 +1176,51 @@ class ONNXExporter:
             logger.info(f"  {op_type}: {count}")
         logger.info("="*60)
     
-    def benchmark(self, model_path: Path, num_runs: int = 100):
-        """Benchmark ONNX model performance"""
-        logger.info(f"Benchmarking model: {model_path}")
-        
-        # Create session
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        session = ort.InferenceSession(str(model_path), providers=providers)
-        
-        # Prepare input
-        input_data = np.random.randn(
-            self.config.batch_size,
-            3,
-            self.config.image_size,
-
+def benchmark(self, model_path: Path, num_runs: int = 100):
+    """Benchmark ONNX model performance"""
+    logger.info(f"Benchmarking model: {model_path}")
+    
+    # Create session
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    session = ort.InferenceSession(str(model_path), providers=providers)
+    
+    # Prepare input
+    input_data = np.random.randn(
+        self.config.batch_size,
+        3,
+        self.config.image_size,
+        self.config.image_size
+    ).astype(np.float32)
+    
+    # Warmup runs
+    for _ in range(5):
+        _ = session.run(None, {self.config.input_names[0]: input_data})
+    
+    # Benchmark runs
+    times = []
+    for _ in tqdm(range(num_runs), desc="Benchmarking"):
+        start = time.perf_counter()
+        _ = session.run(None, {self.config.input_names[0]: input_data})
+        end = time.perf_counter()
+        times.append((end - start) * 1000)  # Convert to ms
+    
+    # Compute statistics
+    times = np.array(times)
+    results = {
+        'mean_ms': np.mean(times),
+        'std_ms': np.std(times),
+        'min_ms': np.min(times),
+        'max_ms': np.max(times),
+        'median_ms': np.median(times),
+        'p95_ms': np.percentile(times, 95),
+        'p99_ms': np.percentile(times, 99),
+        'throughput_fps': 1000 / np.mean(times) * self.config.batch_size
+    }
+    
+    logger.info(f"Benchmark Results:")
+    logger.info(f"  Mean: {results['mean_ms']:.2f} ms")
+    logger.info(f"  Std: {results['std_ms']:.2f} ms")
+    logger.info(f"  P95: {results['p95_ms']:.2f} ms")
+    logger.info(f"  Throughput: {results['throughput_fps']:.1f} FPS")
+    
+    return results
