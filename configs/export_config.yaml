@@ -1,0 +1,267 @@
+# Export Configuration for Anime Image Tagger
+# Configuration for exporting trained models to various deployment formats
+
+# Export Format Settings
+export_format: onnx  # Options: onnx, torchscript, tflite, coreml, tensorrt
+export_variants:  # Which variants to export
+  - full         # Full precision model
+  - mobile       # Optimized for mobile deployment
+  - quantized    # Quantized for size/speed
+
+# ONNX-Specific Settings
+opset_version: 16  # ONNX opset version (16 is widely supported)
+export_params: true  # Export model parameters
+do_constant_folding: true  # Optimize constants during export
+input_names:
+  - input_image
+output_names:
+  - predictions
+  - scores
+
+# Dynamic Batching Configuration
+dynamic_batch_size: true  # Allow variable batch sizes
+min_batch_size: 1
+max_batch_size: 128
+dynamic_axes:  # Define dynamic dimensions
+  input_image:
+    0: batch_size
+  predictions:
+    0: batch_size
+  scores:
+    0: batch_size
+
+# Model Architecture Settings
+batch_size: 1  # Default batch size for export
+image_size: 640  # Input image size (must match training)
+
+# Optimization Settings
+optimize: true  # Apply optimization passes
+optimize_for_mobile: false  # Additional mobile optimizations
+quantize: false  # Enable quantization
+quantization_type: dynamic  # Options: dynamic, static, qat (quantization-aware training)
+calibration_dataset_size: 100  # Number of calibration samples for static quantization
+
+# Validation Settings
+validate_export: true  # Validate exported model against original
+tolerance_rtol: 1.0e-3  # Relative tolerance for validation
+tolerance_atol: 1.0e-5  # Absolute tolerance for validation
+num_validation_samples: 10  # Number of samples for validation
+
+# Metadata Settings
+add_metadata: true  # Add metadata to exported model
+model_description: "Anime Image Tagger Model - 200k tag vocabulary with hierarchical prediction"
+model_author: "AnimeTaggers"
+model_version: "1.0.0"
+model_license: "MIT"
+
+# Output Settings
+output_path: ./exported_models/model.onnx  # Base output path
+output_dir: ./exported_models  # Directory for all exports
+
+# Export Variants Configuration
+# Each variant can have specific settings
+
+variants:
+  full:
+    # Full precision model for maximum accuracy
+    optimize: true
+    quantize: false
+    batch_size: 1
+    dynamic_batch_size: true
+    output_suffix: "_full"
+    
+  mobile:
+    # Optimized for mobile/edge deployment
+    optimize: true
+    optimize_for_mobile: true
+    quantize: true
+    quantization_type: dynamic
+    batch_size: 1
+    dynamic_batch_size: false  # Fixed batch for mobile
+    output_suffix: "_mobile"
+    min_batch_size: 1
+    max_batch_size: 1
+    
+  quantized:
+    # Quantized for size and speed
+    optimize: true
+    quantize: true
+    quantization_type: dynamic
+    batch_size: 1
+    dynamic_batch_size: true
+    output_suffix: "_quantized"
+    
+  server:
+    # Server deployment with larger batches
+    optimize: true
+    quantize: false
+    batch_size: 32
+    dynamic_batch_size: true
+    min_batch_size: 1
+    max_batch_size: 256
+    output_suffix: "_server"
+
+# TorchScript Export Settings (if export_format is torchscript)
+torchscript:
+  use_trace: false  # Use tracing instead of scripting
+  optimize_for_inference: true
+  example_input_shape: [1, 3, 640, 640]
+
+# TensorRT Export Settings (if export_format is tensorrt)
+tensorrt:
+  fp16_mode: true  # Use FP16 precision
+  int8_mode: false  # Use INT8 precision
+  max_workspace_size: 4294967296  # 4GB
+  min_batch_size: 1
+  opt_batch_size: 8
+  max_batch_size: 32
+
+# CoreML Export Settings (if export_format is coreml)
+coreml:
+  minimum_deployment_target: "15.0"  # iOS 15.0
+  compute_precision: FLOAT16  # Options: FLOAT32, FLOAT16
+  convert_to_mlpackage: true
+
+# TFLite Export Settings (if export_format is tflite)
+tflite:
+  representative_dataset_size: 100
+  optimization_default: true
+  target_spec_supported_ops:
+    - TFLITE_BUILTINS
+    - SELECT_TF_OPS
+  inference_type: FLOAT16  # Options: FLOAT32, FLOAT16, INT8
+
+# Benchmark Settings
+benchmark:
+  run_benchmark: true  # Run benchmark after export
+  num_warmup_runs: 5
+  num_benchmark_runs: 100
+  batch_sizes_to_test:
+    - 1
+    - 8
+    - 16
+    - 32
+  save_results: true
+  results_file: benchmark_results.json
+
+# Advanced Settings
+advanced:
+  # Graph optimization levels
+  graph_optimization_level: 2  # 0: none, 1: basic, 2: extended
+  
+  # Memory optimization
+  enable_memory_optimization: true
+  memory_optimization_level: 1
+  
+  # Custom operators (if any)
+  custom_ops: []
+  
+  # ONNX specific optimizations
+  onnx_optimizations:
+    - eliminate_identity
+    - eliminate_nop_dropout
+    - eliminate_nop_pad
+    - eliminate_nop_transpose
+    - eliminate_unused_initializer
+    - fuse_consecutive_concats
+    - fuse_consecutive_squeezes
+    - fuse_consecutive_transposes
+    - fuse_matmul_add_bias_into_gemm
+    - fuse_pad_into_conv
+    - simplify_lexsort
+
+# Logging and Debugging
+logging:
+  log_level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  verbose_export: false  # Verbose ONNX export
+  save_export_log: true
+  log_file: export.log
+
+# Post-Export Actions
+post_export:
+  # Verification
+  verify_outputs: true
+  compare_with_original: true
+  
+  # Compression (for deployment)
+  compress_model: false  # Zip the exported model
+  
+  # Documentation
+  generate_model_card: true  # Generate model documentation
+  include_sample_code: true  # Include usage examples
+  
+  # Testing
+  run_integration_tests: false
+  test_with_sample_images: false
+  sample_images_dir: ./sample_images
+
+# Model-Specific Settings (for hierarchical model)
+hierarchical:
+  num_groups: 20
+  tags_per_group: 10000
+  total_tags: 200000
+  flatten_output: false  # Whether to flatten hierarchical output
+  include_group_weights: true  # Include group activation weights
+
+# Deployment Target Profiles
+deployment_profiles:
+  cloud:
+    # Settings for cloud deployment
+    export_format: onnx
+    optimize: true
+    batch_size: 32
+    dynamic_batch_size: true
+    
+  edge:
+    # Settings for edge devices
+    export_format: tflite
+    optimize: true
+    quantize: true
+    batch_size: 1
+    
+  web:
+    # Settings for web deployment (ONNX.js/WebAssembly)
+    export_format: onnx
+    opset_version: 15  # Better web compatibility
+    optimize: true
+    quantize: true
+    quantization_type: dynamic
+    batch_size: 1
+    
+  mobile_ios:
+    # Settings for iOS deployment
+    export_format: coreml
+    optimize: true
+    
+  mobile_android:
+    # Settings for Android deployment
+    export_format: tflite
+    optimize: true
+    quantize: true
+
+# Paths (can be overridden by command line)
+paths:
+  checkpoint_path: null  # Path to model checkpoint (required)
+  vocab_dir: ./vocabulary  # Path to vocabulary directory
+  output_base_dir: ./exported_models  # Base directory for exports
+  cache_dir: ./export_cache  # Cache directory for intermediate files
+
+# Export Scheduling
+schedule:
+  # Export multiple formats in sequence
+  export_sequence:
+    - onnx
+    - torchscript
+    # - tflite  # Uncomment if needed
+    # - coreml  # Uncomment if needed
+  
+  # Parallel export (if supported)
+  parallel_export: false
+  max_parallel_jobs: 2
+
+# Error Handling
+error_handling:
+  continue_on_error: false  # Continue with other exports if one fails
+  retry_on_failure: true
+  max_retries: 3
+  save_failed_exports: true  # Save partially completed exports
