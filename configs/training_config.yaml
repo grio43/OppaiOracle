@@ -1,0 +1,134 @@
+# Training Configuration for Anime Image Tagger
+# This configuration is for training a 1B parameter model with dual teacher distillation
+
+# Basic Training Settings
+num_epochs: 100
+learning_rate: 1.0e-4  # Base learning rate for AdamW
+weight_decay: 0.01
+gradient_accumulation_steps: 4  # Effective batch size = batch_size * grad_accum * world_size
+
+# Optimizer Configuration
+optimizer: adamw  # Options: adam, adamw, sgd, rmsprop, adagrad
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+
+# Learning Rate Scheduler
+scheduler: cosine  # Options: linear, cosine, constant, polynomial, exponential
+warmup_steps: 10000  # Linear warmup for first 10k steps
+warmup_ratio: 0.0  # Alternative: use ratio of total steps (0.0 means use warmup_steps)
+num_cycles: 0.5  # For cosine scheduler
+lr_end: 1.0e-6  # Minimum learning rate at the end
+
+# Mixed Precision Training
+use_amp: true  # Use automatic mixed precision
+amp_opt_level: O1  # Options: O0, O1, O2, O3
+amp_dtype: float16  # Options: float16, bfloat16
+
+# Gradient Clipping
+max_grad_norm: 1.0  # Maximum gradient norm for clipping
+
+# Checkpointing Strategy
+save_steps: 5000  # Save checkpoint every N steps
+save_total_limit: 5  # Keep only the last N checkpoints
+save_best_only: false  # Save all checkpoints, not just the best
+eval_steps: 1000  # Run validation every N steps
+logging_steps: 100  # Log metrics every N steps
+
+# Loss Configuration - Asymmetric Focal Loss
+focal_gamma_pos: 0.0  # Gamma for positive samples (0 = no focal weighting)
+focal_gamma_neg: 4.0  # Gamma for negative samples (higher = focus on hard negatives)
+focal_alpha_pos: 1.0  # Weight for positive samples
+focal_alpha_neg: 1.0  # Weight for negative samples
+label_smoothing: 0.1  # Label smoothing factor
+use_class_weights: true  # Use frequency-based class weights
+
+# Knowledge Distillation from Dual Teachers
+use_distillation: true
+distillation_alpha: 0.7  # Weight for distillation loss vs ground truth
+distillation_temperature: 3.0  # Temperature for soft targets
+anime_teacher_weight: 0.7  # Weight for anime teacher (70k tags model)
+clip_teacher_weight: 0.3  # Weight for CLIP teacher
+
+# Curriculum Learning Strategy
+use_curriculum: true  # Enable curriculum learning
+start_region_training_epoch: 20  # Start region-based training after N epochs
+region_training_interval: 5  # Update region training every N epochs
+curriculum_difficulty_schedule: linear  # Options: linear, exponential, step
+
+# Hardware Configuration
+device: cuda  # Options: cuda, cpu, mps
+distributed: false  # Enable for multi-GPU training
+local_rank: -1  # Local rank for distributed training
+world_size: 1  # Number of GPUs for distributed training
+ddp_backend: nccl  # Backend for distributed training
+
+# Experiment Tracking
+use_tensorboard: true
+use_wandb: false  # Set to true if using Weights & Biases
+wandb_project: anime-tagger
+wandb_run_name: null  # Will be auto-generated if null
+wandb_entity: null  # Your W&B entity/username
+
+# Training Stability
+seed: 42  # Random seed for reproducibility
+deterministic: false  # True for exact reproducibility (slower)
+benchmark: true  # Enable cudnn benchmarking for performance
+
+# Early Stopping
+early_stopping_patience: 10  # Stop if no improvement for N epochs
+early_stopping_threshold: 0.0001  # Minimum change to qualify as improvement
+
+# Additional Settings for Production Training
+# These can be uncommented and adjusted as needed
+
+# Data Augmentation (handled in DataConfig, but can influence training)
+# augmentation_probability: 0.5
+# mixup_alpha: 0.2
+# cutmix_alpha: 0.0
+
+# Advanced Optimizer Settings
+# gradient_centralization: false
+# lookahead_k: 0
+# lookahead_alpha: 0.5
+
+# Learning Rate Schedule Fine-tuning
+# polynomial_power: 1.0
+# cycle_momentum: true
+# base_momentum: 0.85
+# max_momentum: 0.95
+
+# Memory Optimization
+# gradient_checkpointing: true  # Trade compute for memory
+# find_unused_parameters: false  # For DDP optimization
+
+# Validation Settings
+# val_check_interval: 1.0  # Check validation every epoch
+# limit_val_batches: 1.0  # Use full validation set
+# num_sanity_val_steps: 2  # Sanity check steps before training
+
+# Progressive Training (for scaling from 1B to 3B)
+# progressive_unfreezing: false
+# unfreeze_schedule: [20, 40, 60, 80]  # Epochs to unfreeze layers
+# layer_wise_lr_decay: 0.95  # Learning rate decay per layer
+
+# Loss Weights for Multi-Task Learning
+# main_task_weight: 0.8
+# auxiliary_task_weight: 0.2
+
+# Logging Verbosity
+# log_level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+# log_gradients: false
+# log_weights: false
+# log_activations: false
+
+# Performance Monitoring
+# profile_training: false
+# profile_memory: false
+# detect_anomaly: false  # Enable for debugging NaN issues
+
+# Dataset-Specific Settings (override in full config)
+# num_workers: 8
+# prefetch_factor: 2
+# persistent_workers: true
+# pin_memory: true
