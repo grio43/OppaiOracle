@@ -504,12 +504,12 @@ Critical for correct augmentation:
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| mAP | 0.82 | Mean Average Precision |
-| F1 Micro | 0.78 | Overall F1 score |
-| Precision@5 | 0.91 | Top-5 precision |
-| Recall@20 | 0.94 | Top-20 recall |
-| Inference Speed | 42ms | Per image on V100 |
-| Model Size | 1.28B params | ~5GB FP32 |
+| mAP | TBD | Mean Average Precision |
+| F1 Micro | TBD | Overall F1 score |
+| Precision@5 | TBD | Top-5 precision |
+| Recall@20 | TBD | Top-20 recall |
+| Inference Speed | TBD | Per image on V100 |
+| Model Size | TBD params | ~5GB FP32 |
 
 ### Training Performance
 
