@@ -1,0 +1,176 @@
+{
+  "_comment": "Comprehensive orientation mapping for horizontal flip augmentation in anime image tagging",
+  "_version": "1.0.0",
+  
+  "explicit_mappings": {
+    "hair_over_left_eye": "hair_over_right_eye",
+    "hair_over_right_eye": "hair_over_left_eye",
+    "left_eye_closed": "right_eye_closed",
+    "right_eye_closed": "left_eye_closed",
+    "winking_left": "winking_right",
+    "winking_right": "winking_left",
+    "hand_on_left_hip": "hand_on_right_hip",
+    "hand_on_right_hip": "hand_on_left_hip",
+    "looking_to_the_left": "looking_to_the_right",
+    "looking_to_the_right": "looking_to_the_left",
+    "facing_left": "facing_right",
+    "facing_right": "facing_left",
+    "left_hand_up": "right_hand_up",
+    "right_hand_up": "left_hand_up",
+    "left_arm_up": "right_arm_up",
+    "right_arm_up": "left_arm_up",
+    "left_leg_up": "right_leg_up",
+    "right_leg_up": "left_leg_up",
+    "leaning_left": "leaning_right",
+    "leaning_right": "leaning_left",
+    "tilted_left": "tilted_right",
+    "tilted_right": "tilted_left",
+    "left_side_up": "right_side_up",
+    "right_side_up": "left_side_up",
+    "asymmetrical_hair": "asymmetrical_hair",
+    "asymmetrical_bangs": "asymmetrical_bangs",
+    "asymmetrical_clothes": "asymmetrical_clothes",
+    "asymmetrical_legwear": "asymmetrical_legwear",
+    "asymmetrical_sleeves": "asymmetrical_sleeves",
+    "asymmetrical_gloves": "asymmetrical_gloves",
+    "asymmetrical_footwear": "asymmetrical_footwear",
+    "single_thighhigh": "single_thighhigh",
+    "single_glove": "single_glove",
+    "single_sleeve": "single_sleeve",
+    "single_sock": "single_sock",
+    "single_shoe": "single_shoe",
+    "single_earring": "single_earring",
+    "single_pauldron": "single_pauldron",
+    "single_gauntlet": "single_gauntlet",
+    "single_elbow_glove": "single_elbow_glove",
+    "single_knee_pad": "single_knee_pad",
+    "single_bare_shoulder": "single_bare_shoulder",
+    "single_detached_sleeve": "single_detached_sleeve",
+    "single_mechanical_arm": "single_mechanical_arm",
+    "single_wing": "single_wing",
+    "single_horn": "single_horn",
+    "left_eyepatch": "right_eyepatch",
+    "right_eyepatch": "left_eyepatch",
+    "left_hair_ornament": "right_hair_ornament",
+    "right_hair_ornament": "left_hair_ornament",
+    "left_shoulder_tattoo": "right_shoulder_tattoo",
+    "right_shoulder_tattoo": "left_shoulder_tattoo",
+    "left_arm_tattoo": "right_arm_tattoo",
+    "right_arm_tattoo": "left_arm_tattoo",
+    "left_breast_grab": "right_breast_grab",
+    "right_breast_grab": "left_breast_grab",
+    "left-to-right": "right-to-left",
+    "right-to-left": "left-to-right",
+    "pointing_left": "pointing_right",
+    "pointing_right": "pointing_left",
+    "head_tilt_left": "head_tilt_right",
+    "head_tilt_right": "head_tilt_left",
+    "left_hand_on_hip": "right_hand_on_hip",
+    "right_hand_on_hip": "left_hand_on_hip",
+    "covering_left_eye": "covering_right_eye",
+    "covering_right_eye": "covering_left_eye",
+    "left_arm_behind_back": "right_arm_behind_back",
+    "right_arm_behind_back": "left_arm_behind_back",
+    "left_arm_support": "right_arm_support",
+    "right_arm_support": "left_arm_support",
+    "left_knee_up": "right_knee_up",
+    "right_knee_up": "left_knee_up",
+    "injury_to_the_left_eye": "injury_to_the_right_eye",
+    "injury_to_the_right_eye": "injury_to_the_left_eye",
+    "bandage_over_left_eye": "bandage_over_right_eye",
+    "bandage_over_right_eye": "bandage_over_left_eye"
+  },
+  
+  "regex_patterns": [
+    {
+      "pattern": "(.*)_left_(.*)",
+      "replacement": "\\1_right_\\2",
+      "description": "Generic left to right with underscore"
+    },
+    {
+      "pattern": "(.*)_right_(.*)",
+      "replacement": "\\1_left_\\2",
+      "description": "Generic right to left with underscore"
+    },
+    {
+      "pattern": "^left_(.*)",
+      "replacement": "right_\\1",
+      "description": "Tags starting with left_"
+    },
+    {
+      "pattern": "^right_(.*)",
+      "replacement": "left_\\1",
+      "description": "Tags starting with right_"
+    },
+    {
+      "pattern": "(.*)_to_the_left$",
+      "replacement": "\\1_to_the_right",
+      "description": "Actions to the left"
+    },
+    {
+      "pattern": "(.*)_to_the_right$",
+      "replacement": "\\1_to_the_left",
+      "description": "Actions to the right"
+    }
+  ],
+  
+  "symmetric_tags": [
+    "symmetrical_pose",
+    "symmetrical_hand_pose",
+    "symmetrical_docking",
+    "mirrored",
+    "reflection",
+    "arms_up",
+    "arms_behind_back",
+    "arms_crossed",
+    "hands_on_hips",
+    "hands_up",
+    "standing",
+    "sitting",
+    "lying",
+    "frontal_view",
+    "looking_at_viewer",
+    "facing_viewer"
+  ],
+  
+  "skip_flip_tags": [
+    "text",
+    "english_text",
+    "japanese_text",
+    "chinese_text",
+    "korean_text",
+    "signature",
+    "watermark",
+    "artist_name",
+    "character_name",
+    "copyright_name",
+    "dated",
+    "username",
+    "web_address",
+    "patreon_username",
+    "twitter_username",
+    "pixiv_id"
+  ],
+  
+  "complex_asymmetric_tags": {
+    "heterochromia": {
+      "subtype": "eye_color",
+      "requires_special_handling": true,
+      "note": "Eye colors may need swapping if specific left/right eye colors are tagged"
+    },
+    "parted_bangs": {
+      "subtype": "hair_style",
+      "directional": true
+    },
+    "side_ponytail": {
+      "subtype": "hair_style",
+      "directional": true,
+      "variants": ["left_side_ponytail", "right_side_ponytail"]
+    },
+    "side_braid": {
+      "subtype": "hair_style", 
+      "directional": true,
+      "variants": ["left_side_braid", "right_side_braid"]
+    }
+  }
+}
