@@ -442,19 +442,11 @@ class TrainingConfig(BaseConfig):
     logging_steps: int = 100
     
     # Loss configuration
-    focal_gamma_pos: float = 0.0
-    focal_gamma_neg: float = 4.0
-    focal_alpha_pos: float = 1.0
-    focal_alpha_neg: float = 1.0
+    focal_gamma_pos: float = 1.0  # Updated from 0.0
+    focal_gamma_neg: float = 3.0  # Updated from 4.0
+    focal_alpha: float = 0.75  # Unified weight for focal loss
     label_smoothing: float = 0.1
     use_class_weights: bool = True
-    
-    # Distillation
-    use_distillation: bool = True
-    distillation_alpha: float = 0.7
-    distillation_temperature: float = 3.0
-    anime_teacher_weight: float = 0.7
-    clip_teacher_weight: float = 0.3
     
     # Curriculum learning
     use_curriculum: bool = True
@@ -513,14 +505,9 @@ class TrainingConfig(BaseConfig):
             if not 0 <= self.adam_beta2 < 1:
                 errors.append(f"adam_beta2 must be in [0, 1), got {self.adam_beta2}")
         
-        # Validate distillation parameters
-        if self.use_distillation:
-            if not 0 <= self.distillation_alpha <= 1:
-                errors.append(f"distillation_alpha must be in [0, 1], got {self.distillation_alpha}")
-            
-            total_weight = self.anime_teacher_weight + self.clip_teacher_weight
-            if abs(total_weight - 1.0) > 1e-6:
-                errors.append(f"Teacher weights must sum to 1.0, got {total_weight}")
+        # Validate focal loss parameters
+        if not 0 <= self.focal_alpha <= 1:
+            errors.append(f"focal_alpha must be in [0, 1], got {self.focal_alpha}")
         
         # Validate device
         valid_devices = ["cuda", "cpu", "mps"]
@@ -752,7 +739,7 @@ class ConfigManager:
         self.config_type = config_type
         self.config = self._create_default_config()
         self.config_history: List[Dict[str, Any]] = []
-        self._env_pattern = re.compile(r'^([A-Z_]+)__([A-Z_]+)(?:__(.+))?$')
+        self._env_pattern = re.compile(r'^([A-Z_]+)__([A-Z_]+)(?:__(.+))?)
     
     def _create_default_config(self) -> BaseConfig:
         """Create default configuration based on type"""
