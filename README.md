@@ -504,21 +504,21 @@ Critical for correct augmentation:
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| mAP | 0.82 | Mean Average Precision |
-| F1 Micro | 0.78 | Overall F1 score |
-| Precision@5 | 0.91 | Top-5 precision |
-| Recall@20 | 0.94 | Top-20 recall |
-| Inference Speed | 42ms | Per image on V100 |
-| Model Size | 1.28B params | ~5GB FP32 |
+| mAP | TBD | Mean Average Precision |
+| F1 Micro | TBD | Overall F1 score |
+| Precision@5 | TBD | Top-5 precision |
+| Recall@20 | TBD | Top-20 recall |
+| Inference Speed | TBD | Per image on V100 |
+| Model Size | TBD params | ~5GB FP32 |
 
 ### Training Performance
 
 | Configuration | Speed | Memory |
 |--------------|-------|--------|
-| Single V100 | 180 img/s | 14GB |
-| 4x V100 DDP | 680 img/s | 14GB/GPU |
-| Mixed Precision | 270 img/s | 9GB |
-| Gradient Checkpointing | 140 img/s | 8GB |
+| Single V100 | TBD img/s | 14GB |
+| 4x V100 DDP | TBD img/s | 14GB/GPU |
+| Mixed Precision | TBD img/s | 9GB |
+| Gradient Checkpointing | TBD img/s | 8GB |
 
 ## 🔧 Troubleshooting
 
@@ -597,8 +597,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Vision Transformer architecture based on [Google Research](https://github.com/google-research/vision_transformer)
 - Asymmetric Focal Loss inspired by [ASL paper](https://arxiv.org/abs/2009.14119)
 - Dataset preparation tools adapted from Danbooru tagging research
-
-
+- [DeepGHS](https://huggingface.co/deepghs) and the artists on his datasets
+  
 ---
 
 **Note**: This project is designed for research and educational purposes. Please ensure you have appropriate rights to use any datasets and respect content creators' licenses.
