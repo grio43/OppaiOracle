@@ -597,8 +597,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Vision Transformer architecture based on [Google Research](https://github.com/google-research/vision_transformer)
 - Asymmetric Focal Loss inspired by [ASL paper](https://arxiv.org/abs/2009.14119)
 - Dataset preparation tools adapted from Danbooru tagging research
-
-
+- [DeepGHS](https://huggingface.co/deepghs) and the artists on his datasets
+  
 ---
 
 **Note**: This project is designed for research and educational purposes. Please ensure you have appropriate rights to use any datasets and respect content creators' licenses.
