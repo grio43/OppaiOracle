@@ -2,6 +2,7 @@
 """
 Inference Engine for Anime Image Tagger
 Production-ready inference pipeline with multiple interfaces
+FIXED: Normalization now matches training (0.5, 0.5, 0.5)
 """
 
 import os
@@ -70,31 +71,31 @@ class SimpleViT(nn.Module):
         # Patch embedding
         self.patch_embed = nn.Conv2d(
             config.num_channels, 
-            config.embed_dim,
+            config.hidden_size,
             kernel_size=config.patch_size,
             stride=config.patch_size
         )
         
         # Position embedding
         num_patches = (config.image_size // config.patch_size) ** 2
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, config.embed_dim))
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, config.hidden_size))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
         
         # Transformer blocks
         self.blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
-                d_model=config.embed_dim,
-                nhead=config.num_heads,
-                dim_feedforward=int(config.embed_dim * config.mlp_ratio),
+                d_model=config.hidden_size,
+                nhead=config.num_attention_heads,
+                dim_feedforward=config.intermediate_size,
                 dropout=config.dropout,
                 batch_first=True
             )
-            for _ in range(config.depth)
+            for _ in range(config.num_hidden_layers)
         ])
         
         # Classification head
-        self.norm = nn.LayerNorm(config.embed_dim)
-        self.head = nn.Linear(config.embed_dim, config.num_classes)
+        self.norm = nn.LayerNorm(config.hidden_size)
+        self.head = nn.Linear(config.hidden_size, config.num_tags)
         
     def forward(self, x):
         B = x.shape[0]
@@ -191,28 +192,34 @@ class MemoryOptimizer:
     @staticmethod
     def optimize_model(model: nn.Module) -> nn.Module:
         """Optimize model for inference"""
-        # Fuse batch norm layers
-        model = torch.jit.optimize_for_inference(torch.jit.script(model))
+        # Fuse batch norm layers if available
+        if hasattr(torch.jit, 'optimize_for_inference'):
+            try:
+                model = torch.jit.optimize_for_inference(torch.jit.script(model))
+            except:
+                pass  # Skip if scripting fails
         return model
 
 
 # ============================================================================
-# Main Inference Components
+# Main Inference Components with FIXED Normalization
 # ============================================================================
 
 @dataclass
 class InferenceConfig:
-    """Configuration for inference"""
+    """Configuration for inference with FIXED normalization"""
     # Model settings
     model_path: str
     vocab_dir: str
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_fp16: bool = True
     
-    # Image preprocessing
+    # Image preprocessing - FIXED to match training
     image_size: int = 640
-    normalize_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
-    normalize_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+    # CRITICAL FIX: Use anime-optimized normalization to match training
+    # These values MUST match what was used during training (HDF5_loader.py)
+    normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)  # FIXED: was (0.485, 0.456, 0.406)
+    normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5)    # FIXED: was (0.229, 0.224, 0.225)
     pad_color: Tuple[int, int, int] = (114, 114, 114)
     
     # Prediction settings
@@ -250,6 +257,22 @@ class InferenceConfig:
     api_port: int = 8000
     api_max_image_size: int = 10 * 1024 * 1024  # 10MB
     api_rate_limit: int = 100  # requests per minute
+    
+    def validate_normalization(self):
+        """Validate normalization parameters are correct for anime models"""
+        # Check if using incorrect ImageNet normalization
+        if (abs(self.normalize_mean[0] - 0.485) < 0.01 or 
+            abs(self.normalize_std[0] - 0.229) < 0.01):
+            logger.warning(
+                "⚠️ WARNING: Config appears to use ImageNet normalization!\n"
+                "  Anime models should use mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)\n"
+                "  Auto-correcting to anime normalization..."
+            )
+            # Auto-correct to anime normalization
+            self.normalize_mean = (0.5, 0.5, 0.5)
+            self.normalize_std = (0.5, 0.5, 0.5)
+            return False
+        return True
 
 
 class ImagePreprocessor:
@@ -258,12 +281,20 @@ class ImagePreprocessor:
     def __init__(self, config: InferenceConfig):
         self.config = config
         
-        # Create transforms
+        # Validate normalization on initialization
+        config.validate_normalization()
+        
+        # Create transforms with correct normalization
         self.normalize = T.Normalize(mean=config.normalize_mean, std=config.normalize_std)
         
         # Pre-allocate tensors for efficiency
         self.device = torch.device(config.device)
         
+        # Log normalization being used
+        logger.info(f"ImagePreprocessor initialized with normalization:")
+        logger.info(f"  Mean: {config.normalize_mean}")
+        logger.info(f"  Std: {config.normalize_std}")
+    
     def preprocess_image(self, image: Union[str, Path, Image.Image, np.ndarray]) -> torch.Tensor:
         """Preprocess single image"""
         # Load image if path
@@ -490,7 +521,7 @@ class TagPostProcessor:
 
 
 class InferenceEngine:
-    """Main inference engine"""
+    """Main inference engine with normalization validation"""
     
     def __init__(self, config: InferenceConfig):
         self.config = config
@@ -500,9 +531,12 @@ class InferenceEngine:
         logger.info(f"Loading vocabulary from {config.vocab_dir}")
         self.vocab = load_vocabulary_for_training(Path(config.vocab_dir))
         
-        # Load model
+        # Load model and validate normalization
         logger.info(f"Loading model from {config.model_path}")
         self.model = self._load_model()
+        
+        # Validate normalization parameters
+        self._validate_normalization()
         
         # Initialize components
         self.preprocessor = ImagePreprocessor(config)
@@ -513,18 +547,82 @@ class InferenceEngine:
         
         # Performance tracking
         self.inference_times = []
-        
+    
+    def _validate_normalization(self):
+        """Validate that normalization parameters match training"""
+        try:
+            # Try to load normalization params from checkpoint
+            checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=False)
+            
+            if 'normalization_params' in checkpoint:
+                # If checkpoint contains normalization params, validate against config
+                saved_mean = checkpoint['normalization_params'].get('mean')
+                saved_std = checkpoint['normalization_params'].get('std')
+                
+                if saved_mean and saved_std:
+                    config_mean = self.config.normalize_mean
+                    config_std = self.config.normalize_std
+                    
+                    # Check if they match (with small tolerance for float precision)
+                    mean_match = all(abs(s - c) < 1e-6 for s, c in zip(saved_mean, config_mean))
+                    std_match = all(abs(s - c) < 1e-6 for s, c in zip(saved_std, config_std))
+                    
+                    if not (mean_match and std_match):
+                        logger.warning(
+                            f"⚠️ NORMALIZATION MISMATCH DETECTED!\n"
+                            f"  Training used: mean={saved_mean}, std={saved_std}\n"
+                            f"  Config has: mean={config_mean}, std={config_std}\n"
+                            f"  Updating config to match training values..."
+                        )
+                        # Auto-correct the mismatch
+                        self.config.normalize_mean = tuple(saved_mean)
+                        self.config.normalize_std = tuple(saved_std)
+                    else:
+                        logger.info("✓ Normalization parameters validated successfully")
+            else:
+                # No saved params in checkpoint, log expected values
+                logger.info(
+                    f"Normalization parameters not found in checkpoint.\n"
+                    f"Using config values: mean={self.config.normalize_mean}, "
+                    f"std={self.config.normalize_std}\n"
+                    f"⚠️ Please ensure these match training values!"
+                )
+                
+                # Add runtime warning if using ImageNet values
+                if (abs(self.config.normalize_mean[0] - 0.485) < 0.01 or 
+                    abs(self.config.normalize_std[0] - 0.229) < 0.01):
+                    logger.warning(
+                        "⚠️ Config appears to use ImageNet normalization!\n"
+                        "  Anime models typically use mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)\n"
+                        "  Auto-correcting to anime normalization..."
+                    )
+                    # Auto-correct to anime normalization
+                    self.config.normalize_mean = (0.5, 0.5, 0.5)
+                    self.config.normalize_std = (0.5, 0.5, 0.5)
+                    
+        except Exception as e:
+            logger.error(f"Could not validate normalization parameters: {e}")
+            # Default to anime normalization if validation fails
+            logger.info("Defaulting to anime normalization: mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)")
+            self.config.normalize_mean = (0.5, 0.5, 0.5)
+            self.config.normalize_std = (0.5, 0.5, 0.5)
+    
     def _load_model(self) -> nn.Module:
         """Load and optimize model"""
         try:
             # Load checkpoint
-            checkpoint = torch.load(self.config.model_path, map_location='cpu')
+            checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=False)
             
-            # Extract config
+            # Extract config and normalization params if available
             if 'config' in checkpoint:
                 model_config = checkpoint['config']
                 if 'model_config' in model_config:
                     model_config = model_config['model_config']
+                    
+                # Check for normalization params in config
+                if 'normalization_params' in model_config:
+                    norm_params = model_config['normalization_params']
+                    logger.info(f"Found normalization params in model config: {norm_params}")
             else:
                 model_config = VisionTransformerConfig()
             
@@ -649,6 +747,10 @@ class InferenceEngine:
             
             if isinstance(result, dict):
                 result['inference_time'] = round(inference_time * 1000, 2)  # ms
+                result['normalization'] = {
+                    'mean': self.config.normalize_mean,
+                    'std': self.config.normalize_std
+                }
             
             return result
             
@@ -741,10 +843,16 @@ class InferenceEngine:
                 "count": 0
             }
     
-    def get_statistics(self) -> Dict[str, float]:
+    def get_statistics(self) -> Dict[str, Any]:
         """Get inference statistics"""
         if not self.inference_times:
-            return {}
+            return {
+                "normalization": {
+                    "mean": self.config.normalize_mean,
+                    "std": self.config.normalize_std,
+                    "scheme": "anime" if self.config.normalize_mean == (0.5, 0.5, 0.5) else "unknown"
+                }
+            }
         
         times_ms = [t * 1000 for t in self.inference_times]
         
@@ -754,7 +862,12 @@ class InferenceEngine:
             'min_inference_time_ms': float(np.min(times_ms)),
             'max_inference_time_ms': float(np.max(times_ms)),
             'total_images': len(self.inference_times),
-            'images_per_second': 1000 / np.mean(times_ms) if times_ms else 0
+            'images_per_second': 1000 / np.mean(times_ms) if times_ms else 0,
+            'normalization': {
+                'mean': self.config.normalize_mean,
+                'std': self.config.normalize_std,
+                'scheme': 'anime' if self.config.normalize_mean == (0.5, 0.5, 0.5) else 'unknown'
+            }
         }
 
 
@@ -849,8 +962,20 @@ class BatchInferenceProcessor:
             output_file = Path(output_file)
             output_file.parent.mkdir(parents=True, exist_ok=True)
             
+            # Add metadata about normalization
+            output_data = {
+                'results': results,
+                'metadata': {
+                    'total_images': len(results),
+                    'normalization': {
+                        'mean': self.engine.config.normalize_mean,
+                        'std': self.engine.config.normalize_std
+                    }
+                }
+            }
+            
             with open(output_file, 'w') as f:
-                json.dump(results, f, indent=2)
+                json.dump(output_data, f, indent=2)
             
             logger.info(f"Results saved to {output_file}")
         
@@ -876,7 +1001,14 @@ class InferenceAPI:
         
         @self.app.get("/")
         async def root():
-            return {"message": "Anime Image Tagger API", "version": "1.0.0"}
+            return {
+                "message": "Anime Image Tagger API",
+                "version": "1.0.0",
+                "normalization": {
+                    "mean": self.config.normalize_mean,
+                    "std": self.config.normalize_std
+                }
+            }
         
         @self.app.post("/predict")
         async def predict(file: UploadFile = File(...)):
@@ -917,7 +1049,29 @@ class InferenceAPI:
         @self.app.get("/health")
         async def health_check():
             """Health check endpoint"""
-            return {"status": "healthy"}
+            return {
+                "status": "healthy",
+                "normalization": {
+                    "mean": self.config.normalize_mean,
+                    "std": self.config.normalize_std,
+                    "valid": self.config.normalize_mean == (0.5, 0.5, 0.5)
+                }
+            }
+        
+        @self.app.get("/config")
+        async def get_config():
+            """Get current configuration"""
+            return {
+                "image_size": self.config.image_size,
+                "normalization": {
+                    "mean": self.config.normalize_mean,
+                    "std": self.config.normalize_std
+                },
+                "prediction_threshold": self.config.prediction_threshold,
+                "adaptive_threshold": self.config.adaptive_threshold,
+                "min_predictions": self.config.min_predictions,
+                "max_predictions": self.config.max_predictions
+            }
     
     def run(self):
         """Run the API server"""
@@ -928,11 +1082,49 @@ class InferenceAPI:
         )
 
 
+def verify_normalization_fix():
+    """Utility function to verify normalization is fixed"""
+    print("\n" + "="*60)
+    print("NORMALIZATION VERIFICATION")
+    print("="*60)
+    
+    # Check default config
+    config = InferenceConfig(
+        model_path="dummy.pt",
+        vocab_dir="."
+    )
+    
+    print(f"Default normalization:")
+    print(f"  Mean: {config.normalize_mean}")
+    print(f"  Std: {config.normalize_std}")
+    
+    if config.normalize_mean == (0.5, 0.5, 0.5) and config.normalize_std == (0.5, 0.5, 0.5):
+        print("✅ Normalization is CORRECT (anime-optimized)")
+    else:
+        print("❌ Normalization is INCORRECT (not anime-optimized)")
+    
+    # Test auto-correction
+    bad_config = InferenceConfig(
+        model_path="dummy.pt",
+        vocab_dir=".",
+        normalize_mean=(0.485, 0.456, 0.406),
+        normalize_std=(0.229, 0.224, 0.225)
+    )
+    
+    print(f"\nTesting auto-correction for ImageNet values:")
+    if bad_config.validate_normalization():
+        print("  No correction needed")
+    else:
+        print(f"  Auto-corrected to: mean={bad_config.normalize_mean}, std={bad_config.normalize_std}")
+    
+    print("\n" + "="*60)
+
+
 def main():
     """Main entry point for CLI usage"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Anime Image Tagger Inference")
+    parser = argparse.ArgumentParser(description="Anime Image Tagger Inference (FIXED)")
     parser.add_argument("--model", required=True, help="Path to model checkpoint")
     parser.add_argument("--vocab", required=True, help="Path to vocabulary directory")
     parser.add_argument("--image", help="Path to single image")
@@ -945,6 +1137,7 @@ def main():
     parser.add_argument("--api", action="store_true", help="Start API server")
     parser.add_argument("--api-port", type=int, default=8000, help="API port")
     parser.add_argument("--format", choices=["json", "text", "csv"], default="json", help="Output format")
+    parser.add_argument("--verify-fix", action="store_true", help="Verify normalization fix")
     
     args = parser.parse_args()
     
@@ -954,7 +1147,12 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Create config
+    # Verify fix if requested
+    if args.verify_fix:
+        verify_normalization_fix()
+        return
+    
+    # Create config with FIXED normalization
     config = InferenceConfig(
         model_path=args.model,
         vocab_dir=args.vocab,
@@ -963,8 +1161,21 @@ def main():
         batch_size=args.batch_size,
         enable_api=args.api,
         api_port=args.api_port,
-        output_format=args.format
+        output_format=args.format,
+        # Ensure correct normalization
+        normalize_mean=(0.5, 0.5, 0.5),
+        normalize_std=(0.5, 0.5, 0.5)
     )
+    
+    # Log normalization being used
+    logger.info("="*60)
+    logger.info("INFERENCE ENGINE INITIALIZATION")
+    logger.info("="*60)
+    logger.info(f"Normalization Configuration:")
+    logger.info(f"  Mean: {config.normalize_mean}")
+    logger.info(f"  Std: {config.normalize_std}")
+    logger.info(f"  Scheme: {'anime' if config.normalize_mean == (0.5, 0.5, 0.5) else 'unknown'}")
+    logger.info("="*60)
     
     # Create engine
     engine = InferenceEngine(config)
@@ -1013,9 +1224,11 @@ def main():
         if stats:
             print(f"Average inference time: {stats.get('avg_inference_time_ms', 0):.2f}ms")
             print(f"Images per second: {stats.get('images_per_second', 0):.2f}")
+            print(f"Normalization scheme: {stats['normalization']['scheme']}")
         
     else:
         print("Please specify --image, --url, --directory, or --api")
+        print("Use --verify-fix to check normalization configuration")
         sys.exit(1)
 
 
