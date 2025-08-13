@@ -515,10 +515,10 @@ Critical for correct augmentation:
 
 | Configuration | Speed | Memory |
 |--------------|-------|--------|
-| Single V100 | 180 img/s | 14GB |
-| 4x V100 DDP | 680 img/s | 14GB/GPU |
-| Mixed Precision | 270 img/s | 9GB |
-| Gradient Checkpointing | 140 img/s | 8GB |
+| Single V100 | TBD img/s | 14GB |
+| 4x V100 DDP | TBD img/s | 14GB/GPU |
+| Mixed Precision | TBD img/s | 9GB |
+| Gradient Checkpointing | TBD img/s | 8GB |
 
 ## 🔧 Troubleshooting
 
