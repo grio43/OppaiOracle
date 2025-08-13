@@ -1,73 +1,59 @@
 #!/usr/bin/env python3
 """
-Simplified DataLoader for Direct Training (No Teacher Distillation)
------------------------------------------------------------------
+Improved data loading and augmentation for the direct anime image tagger.
 
-This module implements a minimal yet extensible dataset and dataloader for
-training an anime image tagger from scratch.  The loader performs the
-following key duties:
+This module provides a simplified but extensible dataset and dataloader for
+training an anime image tagger from scratch.  The implementation builds on
+top of the original ``HDF5_loader.py`` found in the upstream repository
+but incorporates a number of important fixes and enhancements:
 
-* Parsing JSON annotation files and building a tag vocabulary on demand.
-* Loading, resizing and normalising RGB images from disk with an optional
-  in‑memory cache to speed up repeated accesses during an epoch.
-* Applying a suite of data augmentations including random horizontal flips
-  with orientation‑aware tag remapping, random resized crops, colour jitter
-  and random gamma adjustments.
-* Balancing the dataset via frequency‑based sampling with optional
-  oversampling of orientation‑specific tags to ensure the model sees enough
-  examples of these rare classes.
-* Exposing a simple ``create_dataloaders`` helper to construct both
-  training and validation dataloaders along with the underlying
-  ``TagVocabulary``.
+* **Consistent normalisation statistics** – The dataset now defaults to
+  using an (0.5, 0.5, 0.5) mean and standard deviation for RGB channels.
+  These values better match anime artwork distributions than the
+  ImageNet values used previously.  Both parameters can be overridden per
+  dataset via the :class:`SimplifiedDataConfig`.
 
-The implementation here addresses a number of shortcomings identified in the
-original codebase:
+* **Orientation‑aware flips with extensible mapping** – Random horizontal
+  flips are handled inside :meth:`SimplifiedDataset.__getitem__` but
+  orientation‑sensitive tags are remapped using a dictionary loaded from
+  a JSON or YAML file if supplied.  If no mapping is provided the
+  loader falls back to a small built‑in mapping covering common left/right
+  tags.  Flips can be disabled entirely by setting
+  :attr:`SimplifiedDataConfig.random_flip_prob` to zero.
 
-1.  Orientation‑aware augmentation and tag flipping: a mapping of
-    orientation‑sensitive tags (e.g. ``hair_over_left_eye`` ↔︎
-    ``hair_over_right_eye``) is maintained and used to remap tag names
-    whenever a horizontal flip is applied.  This prevents silent
-    mislabelling when images are mirrored.
+* **Expanded augmentation pipeline** – The augmentation pipeline includes
+  random resized cropping, optional colour jitter and a random gamma
+  adjustment.  The gamma range has been widened to [0.7, 1.3] to
+  better simulate exposure variations in stylised artwork.  The crop
+  scale range defaults to (0.95, 1.0) to preserve more of the subject in
+  each image.
 
-2.  Data normalisation and colour statistics: default normalisation
-    statistics have been relaxed to (0.5, 0.5, 0.5) mean and std.  This
-    reflects the fact that anime artwork does not follow the ImageNet
-    distribution.  These values can be overridden via the configuration.
+* **Unknown tag handling** – Tags found in the annotation JSON that are
+  not present in the vocabulary are no longer silently discarded.
+  Instead, they are encoded to the special ``<UNK>`` index so the model
+  learns to handle rare or unseen tags gracefully.
 
-3.  Colour and gamma augmentation: colour jitter parameters are exposed via
-    ``SimplifiedDataConfig`` and a small random gamma transform is applied
-    after other augmentations.  This helps the model cope with the wide
-    dynamic range of colour palettes and exposure variations in anime data.
+* **Simplified label dictionary** – The dictionary returned from
+  ``__getitem__`` no longer includes the redundant ``'binary'`` field.
+  Downstream code should use the returned ``'tag_labels'`` tensor as
+  needed.
 
-4.  Tag vocabulary design: separate ``<PAD>`` and ``<UNK>`` tokens are
-    introduced to avoid collisions in the vocabulary.  The minimum tag
-    frequency can be configured per experiment.  Unknown tags map to the
-    ``<UNK>`` index rather than being silently discarded.
+* **Configurable sampling and caching** – Oversampling of orientation
+  tags, the exponent used in sample weight computation and the cache
+  precision are all exposed via the configuration.  Default values
+  favour efficient memory usage and balanced training.
 
-5.  Sampling and class imbalance: sample weights are computed from tag
-    frequencies.  An optional multiplier can be applied to annotations
-    containing orientation‑specific tags to oversample these rare cases.
-
-6.  Image caching and memory usage: cached images are stored in a
-    lower‑precision format (float16 by default) to reduce host memory
-    consumption.  The precision can be configured via ``cache_precision``.
-
-7.  Dynamic tag dimension: the length of the vocabulary determines the
-    dimensionality of the tag head in the model.  Consumers of this module
-    should query the vocabulary size and pass it to their model
-    constructors.
-
-The resulting dataloader is fully self‑contained and can be used in both
-single‑ and multi‑GPU settings.  It gracefully handles missing data and
-unknown tags, and logs informative messages to aid debugging.
+The resulting dataloader is self‑contained and compatible with both
+single‑GPU and distributed training scenarios.
 """
+
+from __future__ import annotations
 
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -83,10 +69,12 @@ logger = logging.getLogger(__name__)
 class SimplifiedDataConfig:
     """Configuration parameters controlling data loading and augmentation.
 
-    These parameters can be overridden on construction or via a higher level
-    configuration system.  Reasonable defaults are provided for
-    high‑resolution anime artwork.
+    Attributes are initialised with sensible defaults for high‑resolution
+    anime artwork.  Most fields can be overridden when constructing
+    dataloaders to tailor the pipeline to a specific dataset or hardware
+    environment.
     """
+
     # Required locations
     data_dir: Path
     json_dir: Path
@@ -104,13 +92,19 @@ class SimplifiedDataConfig:
 
     # Augmentation settings
     augmentation_enabled: bool = True
-    random_flip_prob: float = 0.5
-    random_crop_scale: Tuple[float, float] = (0.9, 1.0)
+    # Reduce flip probability because many tags encode left/right semantics
+    random_flip_prob: float = 0.2
+    # Narrow crop scale range to preserve most of the subject in the frame
+    random_crop_scale: Tuple[float, float] = (0.95, 1.0)
+    # Colour jitter parameters
     color_jitter: bool = True
     color_jitter_brightness: float = 0.4
     color_jitter_contrast: float = 0.4
     color_jitter_saturation: float = 0.4
     color_jitter_hue: float = 0.1
+    # Optional path to orientation mapping (JSON or YAML).  If provided, the
+    # mapping is loaded on dataset initialisation.
+    orientation_map_path: Optional[Path] = None
 
     # Sampling settings
     frequency_weighted_sampling: bool = True
@@ -139,15 +133,16 @@ class SimplifiedDataConfig:
 
 
 class TagVocabulary:
-    """Tag vocabulary manager with distinct <PAD> and <UNK> tokens.
+    """Tag vocabulary manager with separate <PAD> and <UNK> tokens.
 
-    The vocabulary is built from a collection of JSON annotation files.  Tags
-    occurring less often than ``min_frequency`` times are omitted from the
-    vocabulary, but unknown tags are mapped to the ``<UNK>`` index rather than
-    being ignored.  Rating classes are fixed.
+    The vocabulary can be built from a collection of JSON annotation files or
+    loaded from a JSON file.  Tags appearing less than ``min_frequency``
+    times are omitted to keep the vocabulary size manageable.  Unknown
+    tags are mapped to the ``<UNK>`` index rather than being silently
+    discarded.
     """
 
-    def __init__(self, vocab_path: Optional[Path] = None, min_frequency: int = 1):
+    def __init__(self, vocab_path: Optional[Path] = None, min_frequency: int = 1) -> None:
         self.tag_to_index: Dict[str, int] = {}
         self.index_to_tag: Dict[int, str] = {}
         self.tag_frequencies: Dict[str, int] = {}
@@ -155,146 +150,167 @@ class TagVocabulary:
         # Distinct special tokens
         self.pad_token = "<PAD>"
         self.unk_token = "<UNK>"
-        # Rating classes (fixed)
-        self.rating_to_index = {
+        # Rating classes (fixed).  A fifth ``unknown`` rating is included to
+        # handle missing annotations.
+        self.rating_to_index: Dict[str, int] = {
             "general": 0,
             "sensitive": 1,
             "questionable": 2,
             "explicit": 3,
             "unknown": 4,
         }
-        self.index_to_rating = {v: k for k, v in self.rating_to_index.items()}
-        # If a vocabulary file exists, load it
-        if vocab_path and vocab_path.exists():
-            self.load_vocabulary(vocab_path)
 
-    def build_from_annotations(self, json_files: List[Path], top_k: int = 100_000) -> None:
-        """Build the vocabulary from a list of JSON annotation files."""
+        # If a vocabulary file is supplied, attempt to load it
+        if vocab_path is not None and vocab_path.exists():
+            try:
+                self.load_vocabulary(vocab_path)
+            except Exception:
+                logger.info(f"Could not load vocabulary from {vocab_path}, will build a new one")
+
+    def __len__(self) -> int:
+        return len(self.tag_to_index)
+
+    def encode_tags(self, tags: Iterable[str]) -> torch.Tensor:
+        """Encode a list of tag strings into a multi‑hot tensor.
+
+        Unknown tags are mapped to the ``<UNK>`` index; the resulting tensor
+        has shape (vocab_size,) and dtype ``float32``.
+        """
+        vector = torch.zeros(len(self.tag_to_index), dtype=torch.float32)
+        for tag in tags:
+            idx = self.tag_to_index.get(tag, self.tag_to_index[self.unk_token])
+            vector[idx] = 1.0
+        return vector
+
+    def build_from_annotations(self, json_files: List[Path], top_k: int) -> None:
+        """Build a vocabulary from a collection of JSON annotation files.
+
+        Parameters
+        ----------
+        json_files: List[Path]
+            List of annotation files to parse.
+        top_k: int
+            Maximum number of tags to keep.  Tags are sorted by frequency
+            descending and truncated to this value.
+        """
         logger.info(f"Building vocabulary from {len(json_files)} annotation files")
-        tag_counter: Dict[str, int] = {}
-        rating_counter: Dict[str, int] = {}
+        tag_counts: Dict[str, int] = {}
         for json_file in json_files:
             try:
-                with open(json_file, 'r') as f:
+                with open(json_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 for entry in data:
-                    # Tags may be stored as a space separated string or list
-                    if 'tags' in entry:
-                        tags = entry['tags']
-                        if isinstance(tags, str):
-                            tags = tags.split()
-                        for t in tags:
-                            tag_counter[t] = tag_counter.get(t, 0) + 1
-                    if 'rating' in entry:
-                        rating_counter[entry['rating']] = rating_counter.get(entry['rating'], 0) + 1
+                    tags_field = entry.get('tags')
+                    if not tags_field:
+                        continue
+                    tags_list: List[str]
+                    if isinstance(tags_field, str):
+                        tags_list = tags_field.split()
+                    elif isinstance(tags_field, list):
+                        tags_list = tags_field
+                    else:
+                        continue
+                    for tag in tags_list:
+                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
             except Exception as e:
-                logger.error(f"Error processing {json_file}: {e}")
-        # Sort tags by frequency and truncate to top_k
-        most_common = sorted(tag_counter.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
-        # Insert special tokens at positions 0 and 1
+                logger.warning(f"Failed to parse {json_file}: {e}")
+        # Sort tags by frequency and cut to top_k
+        sorted_tags = sorted(
+            [t for t, c in tag_counts.items() if c >= self.min_frequency],
+            key=lambda x: (-tag_counts[x], x)
+        )
+        if top_k is not None and top_k > 0:
+            sorted_tags = sorted_tags[:top_k]
+        # Assign indices.  Reserve 0 for <PAD> and 1 for <UNK>
         self.tag_to_index = {self.pad_token: 0, self.unk_token: 1}
-        current_index = 2
-        for tag, freq in most_common:
-            if freq >= self.min_frequency:
-                self.tag_to_index[tag] = current_index
-                self.tag_frequencies[tag] = freq
-                current_index += 1
-        self.index_to_tag = {idx: tag for tag, idx in self.tag_to_index.items()}
-        logger.info(f"Vocabulary size (including special tokens): {len(self.tag_to_index)}")
-        logger.info(f"Rating distribution: {rating_counter}")
+        self.index_to_tag = {0: self.pad_token, 1: self.unk_token}
+        for idx, tag in enumerate(sorted_tags, start=2):
+            self.tag_to_index[tag] = idx
+            self.index_to_tag[idx] = tag
+            self.tag_frequencies[tag] = tag_counts[tag]
+        logger.info(f"Vocabulary built with {len(self.tag_to_index)} tags (incl. special tokens)")
 
-    def save_vocabulary(self, path: Path) -> None:
-        """Persist the vocabulary to disk as JSON."""
-        vocab_data = {
-            'tag_to_index': self.tag_to_index,
-            'tag_frequencies': self.tag_frequencies,
-            'rating_to_index': self.rating_to_index,
-            'min_frequency': self.min_frequency,
-        }
-        with open(path, 'w') as f:
-            json.dump(vocab_data, f, indent=2)
-        logger.info(f"Vocabulary saved to {path}")
+    def save_vocabulary(self, vocab_path: Path) -> None:
+        """Save the vocabulary to a JSON file.
 
-    def load_vocabulary(self, path: Path) -> None:
-        """Load a vocabulary from a JSON file."""
-        with open(path, 'r') as f:
-            vocab_data = json.load(f)
-        self.tag_to_index = vocab_data['tag_to_index']
-        # Convert keys back to ints for index_to_tag
-        self.index_to_tag = {int(idx): tag for tag, idx in self.tag_to_index.items()}
-        self.tag_frequencies = vocab_data.get('tag_frequencies', {})
-        self.rating_to_index = vocab_data.get('rating_to_index', self.rating_to_index)
-        self.index_to_rating = {v: k for k, v in self.rating_to_index.items()}
-        self.min_frequency = vocab_data.get('min_frequency', self.min_frequency)
-        logger.info(f"Loaded vocabulary with {len(self.tag_to_index)} tags from {path}")
-
-    def encode_tags(self, tags: List[str]) -> torch.Tensor:
-        """Encode a list of tag strings into a multi‑hot vector.
-
-        Unknown tags activate the ``<UNK>`` index.  The returned tensor has
-        shape ``(num_tags,)`` and dtype ``float32``.
+        The file contains a mapping from tags to indices and vice versa as
+        well as tag frequencies.  The top‑level keys are ``tag_to_index``,
+        ``index_to_tag`` and ``tag_frequencies``.
         """
-        num_tags = len(self.tag_to_index)
-        encoded = torch.zeros(num_tags, dtype=torch.float32)
-        unk_index = self.tag_to_index[self.unk_token]
-        for tag in tags:
-            idx = self.tag_to_index.get(tag, unk_index)
-            encoded[idx] = 1.0
-        return encoded
+        vocab_path = Path(vocab_path)
+        vocab_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(vocab_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'tag_to_index': self.tag_to_index,
+                'index_to_tag': self.index_to_tag,
+                'tag_frequencies': self.tag_frequencies,
+            }, f, ensure_ascii=False, indent=2)
+        logger.info(f"Saved vocabulary to {vocab_path}")
 
-    def decode_tags(self, encoded: torch.Tensor, threshold: float = 0.5) -> List[str]:
-        """Decode a multi‑hot vector back into tag strings.
-
-        Indices with activation above ``threshold`` are returned.  The
-        ``<UNK>`` token is never returned in the decoded list.
-        """
-        indices = torch.where(encoded > threshold)[0].tolist()
-        tags: List[str] = []
-        unk_index = self.tag_to_index[self.unk_token]
-        for idx in indices:
-            if idx != unk_index:
-                tag = self.index_to_tag.get(idx)
-                if tag is not None:
-                    tags.append(tag)
-        return tags
+    def load_vocabulary(self, vocab_path: Path) -> None:
+        """Load vocabulary from a JSON file created by :meth:`save_vocabulary`."""
+        with open(vocab_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        self.tag_to_index = data['tag_to_index']
+        self.index_to_tag = {int(k): v for k, v in data['index_to_tag'].items()}
+        self.tag_frequencies = data.get('tag_frequencies', {})
+        # Ensure special tokens are present
+        for token in (self.pad_token, self.unk_token):
+            if token not in self.tag_to_index:
+                idx = len(self.tag_to_index)
+                self.tag_to_index[token] = idx
+                self.index_to_tag[idx] = token
+        logger.info(f"Loaded vocabulary with {len(self.tag_to_index)} tags from {vocab_path}")
 
 
 class SimplifiedDataset(Dataset):
-    """Dataset that reads images and tags from disk and applies augmentation.
+    """Dataset for anime image tagging with augmentation and sampling.
 
-    Args:
-        config: A ``SimplifiedDataConfig`` describing data loading options.
-        json_files: A list of JSON annotation files to consume.
-        split: ``'train'`` or ``'val'`` to control augmentation behaviour.
-        vocab: A pre‑built ``TagVocabulary``.  If ``None`` the dataset will
-            create one but not persist it.
+    Each item returned is a dictionary containing an image tensor,
+    multi‑hot tag labels, a rating label and some metadata (index, path,
+    original tag list and rating string).  See the module docstring for
+    details on the implemented features.
     """
 
     def __init__(
         self,
         config: SimplifiedDataConfig,
         json_files: List[Path],
-        split: str = 'train',
-        vocab: Optional[TagVocabulary] = None,
+        split: str,
+        vocab: TagVocabulary,
     ) -> None:
+        assert split in {'train', 'val', 'test'}, f"Unknown split '{split}'"
         self.config = config
         self.split = split
-        # Load or build vocabulary
-        self.vocab = vocab or TagVocabulary(config.vocab_path, config.min_tag_frequency)
-        # Load annotations
+        self.vocab = vocab
         self.annotations: List[Dict[str, Any]] = []
-        self._load_annotations(json_files)
-        # Setup augmentation
-        self.augmentation = self._setup_augmentation() if (config.augmentation_enabled and split == 'train') else None
-        # Normalisation transform
-        self.normalize = T.Normalize(mean=config.normalize_mean, std=config.normalize_std)
-        # Sample weights for frequency‑based sampling
-        self.sample_weights: Optional[np.ndarray] = None
-        if config.frequency_weighted_sampling and split == 'train':
-            self._calculate_sample_weights()
-        # Cache for images
         self.cache: Dict[str, torch.Tensor] = {}
-        # Compute maximum cache entries based on desired precision
+        # Load orientation mapping from file if provided
+        if config.orientation_map_path is not None and config.orientation_map_path.exists():
+            try:
+                with open(config.orientation_map_path, 'r', encoding='utf-8') as f:
+                    self.orientation_tag_map = json.load(f)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load orientation mapping from {config.orientation_map_path}: {e}. "
+                    "Falling back to default mapping"
+                )
+                self.orientation_tag_map = self._default_orientation_map()
+        else:
+            self.orientation_tag_map = self._default_orientation_map()
+        # Preload annotations
+        if config.preload_metadata:
+            self._load_annotations(json_files)
+            # Precompute sample weights for frequency sampling
+            self.sample_weights: Optional[np.ndarray] = None
+            if config.frequency_weighted_sampling and split == 'train':
+                self._calculate_sample_weights()
+        else:
+            self.sample_weights = None
+        # Set up augmentation and normalisation
+        self.augmentation = self._setup_augmentation() if config.augmentation_enabled and split == 'train' else None
+        self.normalize = T.Normalize(mean=config.normalize_mean, std=config.normalize_std)
+        # Determine maximum cache size in number of images
         bytes_per_element = {
             'float32': 4,
             'float16': 2,
@@ -303,8 +319,11 @@ class SimplifiedDataset(Dataset):
         bytes_per_image = 3 * config.image_size * config.image_size * bytes_per_element
         self.max_cache_size = int((config.cache_size_gb * (1024 ** 3)) / bytes_per_image)
         self.cache_precision = config.cache_precision
-        # Orientation mapping for left/right tags
-        self.orientation_tag_map: Dict[str, str] = {
+        logger.info(f"Dataset initialised with {len(self.annotations)} samples for split '{split}'")
+
+    def _default_orientation_map(self) -> Dict[str, str]:
+        """Return a minimal left/right tag mapping for orientation flips."""
+        return {
             'hair_over_left_eye': 'hair_over_right_eye',
             'hair_over_right_eye': 'hair_over_left_eye',
             'hand_on_left_hip': 'hand_on_right_hip',
@@ -312,17 +331,17 @@ class SimplifiedDataset(Dataset):
             'looking_to_the_left': 'looking_to_the_right',
             'looking_to_the_right': 'looking_to_the_left',
         }
-        logger.info(f"Dataset initialised with {len(self.annotations)} samples for split '{split}'")
 
     def _load_annotations(self, json_files: List[Path]) -> None:
         """Parse annotation files and populate ``self.annotations``.
 
-        Only annotations with at least one tag present in the vocabulary are
-        kept.  Invalid or missing entries are skipped silently but logged.
+        Images with at least one tag are kept.  Unknown tags are retained
+        (they will map to ``<UNK>`` when encoding).  Missing or invalid
+        entries are skipped silently but logged.
         """
         for json_file in json_files:
             try:
-                with open(json_file, 'r') as f:
+                with open(json_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 for entry in data:
                     filename = entry.get('filename')
@@ -336,12 +355,7 @@ class SimplifiedDataset(Dataset):
                         tags_list = tags_field
                     else:
                         continue
-                    # Filter tags by vocabulary if it is already built
-                    if self.vocab.tag_to_index:
-                        valid_tags = [t for t in tags_list if t in self.vocab.tag_to_index]
-                    else:
-                        valid_tags = tags_list
-                    if not valid_tags:
+                    if not tags_list:
                         continue
                     rating = entry.get('rating', 'unknown')
                     if rating not in self.vocab.rating_to_index:
@@ -351,9 +365,9 @@ class SimplifiedDataset(Dataset):
                         continue
                     self.annotations.append({
                         'image_path': str(image_path),
-                        'tags': valid_tags,
+                        'tags': tags_list,
                         'rating': rating,
-                        'num_tags': len(valid_tags),
+                        'num_tags': len(tags_list),
                     })
             except Exception as e:
                 logger.error(f"Error loading {json_file}: {e}")
@@ -363,20 +377,17 @@ class SimplifiedDataset(Dataset):
         """Compute per‑sample weights based on tag frequencies.
 
         Each annotation receives a weight equal to the average of the inverse
-        square root of its tag frequencies raised to ``sample_weight_power``.
-        An optional multiplier is applied if any tag in the annotation is
-        orientation specific (determined by ``orientation_tag_map``).  The
-        resulting weights are normalised to sum to one.
+        of its tag frequencies raised to ``sample_weight_power``.  An optional
+        multiplier is applied if any tag in the annotation is orientation
+        specific (as determined by ``orientation_tag_map``).  The resulting
+        weights are normalised to sum to one.
         """
         weights: List[float] = []
         for anno in self.annotations:
             w = 0.0
             has_orientation_tag = False
             for tag in anno['tags']:
-                # Skip unknown tags when computing weights
-                if tag not in self.vocab.tag_frequencies:
-                    continue
-                freq = self.vocab.tag_frequencies[tag]
+                freq = self.vocab.tag_frequencies.get(tag, 1)
                 # Inverse frequency weighting
                 w += (1.0 / max(freq, 1)) ** self.config.sample_weight_power
                 if tag in self.orientation_tag_map:
@@ -399,10 +410,10 @@ class SimplifiedDataset(Dataset):
         """Create an augmentation pipeline for the training split.
 
         The pipeline excludes horizontal flips, which are handled explicitly in
-        ``__getitem__`` to enable orientation‑aware tag remapping.  Colour
-        jitter parameters are configurable via ``SimplifiedDataConfig``.  A
-        random gamma transform is appended to better handle exposure
-        variations.
+        :meth:`__getitem__` to enable orientation‑aware tag remapping.  Colour
+        jitter parameters are configurable via :class:`SimplifiedDataConfig`.
+        A random gamma transform with a wide range is appended to better
+        handle exposure variations.
         """
         transforms: List[Any] = []
         # Random resized crop
@@ -427,7 +438,7 @@ class SimplifiedDataset(Dataset):
             )
         # Random gamma correction
         def gamma_transform(img: torch.Tensor) -> torch.Tensor:
-            gamma = float(np.random.uniform(0.8, 1.2))
+            gamma = float(np.random.uniform(0.7, 1.3))
             # torchvision's adjust_gamma operates on PIL images; convert via functional
             return TF.adjust_gamma(img, gamma=gamma)
         transforms.append(T.Lambda(gamma_transform))
@@ -441,9 +452,9 @@ class SimplifiedDataset(Dataset):
 
         Images are resized to ``image_size`` using Lanczos interpolation.  A
         copy of the image may be cached to accelerate repeated accesses.  The
-        cache stores images in the precision specified by
-        ``cache_precision``; loaded images are always returned as
-        ``float32`` tensors in the [0, 1] range.
+        cache stores images in the precision specified by ``cache_precision``;
+        loaded images are always returned as ``float32`` tensors in the [0, 1]
+        range.
         """
         # Check cache first
         if image_path in self.cache:
@@ -513,7 +524,6 @@ class SimplifiedDataset(Dataset):
                 'labels': {
                     'tags': tag_labels,
                     'rating': rating_label,
-                    'binary': tag_labels,
                 },
                 'tag_labels': tag_labels,
                 'rating_label': rating_label,
@@ -553,14 +563,15 @@ def create_dataloaders(
     world_size: int = 1,
     frequency_sampling: bool = True,
     val_batch_size: Optional[int] = None,
+    config_updates: Optional[Dict[str, Any]] = None,
 ) -> Tuple[DataLoader, DataLoader, TagVocabulary]:
     """Construct training and validation dataloaders along with the vocabulary.
 
-    Splits JSON annotation files into 90 % training and 10 % validation.  If a
+    Splits JSON annotation files into 90 % training and 10 % validation.  If a
     vocabulary file exists it is loaded; otherwise it is built from all
     annotations and saved.  The returned validation batch size defaults to
-    ``batch_size`` if not explicitly provided.  Both dataloaders use
-    ``collate_fn`` defined below.
+    ``batch_size`` if not explicitly provided.  Both dataloaders use a
+    custom collate function defined below.
     """
     json_files = list(json_dir.glob("*.json"))
     if not json_files:
@@ -572,24 +583,28 @@ def create_dataloaders(
     train_files = json_files_sorted[:split_idx]
     val_files = json_files_sorted[split_idx:]
     # Instantiate config and vocabulary
-    config = SimplifiedDataConfig(
+    cfg = SimplifiedDataConfig(
         data_dir=data_dir,
         json_dir=json_dir,
         vocab_path=vocab_path,
-        min_tag_frequency=1,
         distributed=distributed,
         rank=rank,
         world_size=world_size,
         frequency_weighted_sampling=frequency_sampling,
     )
-    vocab = TagVocabulary(vocab_path, min_frequency=config.min_tag_frequency)
+    # Apply any user‑provided overrides
+    if config_updates:
+        for k, v in config_updates.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+    vocab = TagVocabulary(vocab_path, min_frequency=cfg.min_tag_frequency)
     if not vocab_path.exists():
         # Build vocabulary from all available annotations
-        vocab.build_from_annotations(json_files_sorted, config.top_k_tags)
+        vocab.build_from_annotations(json_files_sorted, cfg.top_k_tags)
         vocab.save_vocabulary(vocab_path)
     # Create datasets
-    train_dataset = SimplifiedDataset(config, train_files, split='train', vocab=vocab)
-    val_dataset = SimplifiedDataset(config, val_files, split='val', vocab=vocab)
+    train_dataset = SimplifiedDataset(cfg, train_files, split='train', vocab=vocab)
+    val_dataset = SimplifiedDataset(cfg, val_files, split='val', vocab=vocab)
     # Choose sampler
     train_sampler: Optional[Any] = None
     if distributed:
