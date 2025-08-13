@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Direct training script for the anime image tagger.
+Simplified training script for the anime image tagger.
 
 This entry point wires together the dataset, model, loss functions and
-optimiser into a simple training loop.  It demonstrates how to work with the
-orientation‑aware dataloader defined in ``HDF5_loader.py`` and how to
-instantiate the model with a dynamic tag dimension derived from the
-vocabulary.  Mixed precision training and gradient accumulation are
-supported.
+optimiser into a straightforward training loop.  It uses the improved
+``HDF5_loader`` provided in this repository and exposes a number of
+configuration knobs to adapt the model and data pipeline to different
+hardware constraints.  By default a lighter Vision Transformer (ViT)
+configuration is used (hidden size 768, 12 layers and 12 heads) to
+reduce VRAM requirements on GPUs with 32 GB or less.
 
-The configuration dictionary at the top of ``train_direct`` should be
-customised for your hardware and dataset.  In particular, update the
-``data_dir``, ``json_dir`` and ``vocab_path`` fields to point at your
-images, annotation JSONs and vocabulary file respectively.  The batch size,
-number of epochs and learning rate can be tuned based on VRAM capacity and
-convergence behaviour.
+To tailor the training run, edit the ``config`` dictionary at the top of
+the script or pass overrides via the ``config_updates`` argument when
+creating dataloaders.
 """
 
 import logging
@@ -24,13 +22,16 @@ from typing import Dict, Any
 import torch
 from torch.cuda.amp import GradScaler, autocast
 
-from HDF5_loader import create_dataloaders
+from repo.HDF5_loader import create_dataloaders
 from model_architecture import create_model
 from loss_functions import MultiTaskLoss, AsymmetricFocalLoss
 
 
 def train_direct() -> None:
     # Basic configuration.  Adjust these values for your environment.
+    # The ``model_config`` sub-dictionary controls the Vision Transformer
+    # architecture.  Reduce ``hidden_size`` or ``num_hidden_layers`` if
+    # memory usage is too high.  Increase them on GPUs with 64 GB or more.
     config: Dict[str, Any] = {
         "learning_rate": 4e-4,
         "batch_size": 32,
@@ -47,6 +48,17 @@ def train_direct() -> None:
         "amp": True,
         # Validation batch size factor.  If None, defaults to the training batch size.
         "val_batch_size": None,
+        # Data loader overrides.  For example, you can set
+        # "random_flip_prob": 0.1 or "orientation_map_path": Path("orientation_map.json").
+        "dataloader_overrides": {},
+        # Model architecture overrides
+        "model_config": {
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "patch_size": 16,
+            "gradient_checkpointing": True,
+        },
     }
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -61,20 +73,17 @@ def train_direct() -> None:
         num_workers=config["num_workers"],
         frequency_sampling=True,
         val_batch_size=config["val_batch_size"],
+        config_updates=config["dataloader_overrides"],
     )
     # Determine the number of tags and ratings from the vocabulary
     num_tags = len(vocab.tag_to_index)
     num_ratings = len(vocab.rating_to_index)
     logger.info(f"Creating model with {num_tags} tags and {num_ratings} ratings")
-    # Instantiate model.  Other architectural parameters can be overridden here.
+    # Instantiate model.  Architectural parameters come from ``model_config``.
     model = create_model(
-        hidden_size=1280,
-        num_hidden_layers=24,
-        num_attention_heads=16,
         num_tags=num_tags,
         num_ratings=num_ratings,
-        patch_size=16,
-        gradient_checkpointing=True,
+        **config["model_config"],
     )
     model.to(device)
     # Loss function
@@ -162,5 +171,4 @@ def train_direct() -> None:
 
 
 if __name__ == "__main__":
-    from typing import Any
     train_direct()
