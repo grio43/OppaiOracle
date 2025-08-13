@@ -2,6 +2,7 @@
 """
 Data Preparation Script for Direct Training Pipeline
 Prepares Danbooru dataset for simplified direct training approach
+FIXED VERSION - Handles single-string tag fields with duplicates
 """
 
 import json
@@ -15,6 +16,12 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 from tqdm import tqdm
 import pickle
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.metadata_ingestion import parse_tags_field, dedupe_preserve_order
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,10 +70,18 @@ class DanbooruDataPreprocessor:
             'explicit': 3
         }
         
+        # Statistics tracking
+        self.stats = {
+            'total_duplicates_removed': 0,
+            'files_with_duplicates': 0,
+            'files_with_all_oov': 0,
+            'total_oov_tags': 0
+        }
+        
         logger.info(f"Loaded vocabulary with {self.vocab_size} tags")
     
     def process_metadata_batch(self, json_files: List[Path]) -> Dict:
-        """Process a batch of JSON metadata files"""
+        """Process a batch of JSON metadata files - FIXED VERSION"""
         results = {
             'filenames': [],
             'tag_indices': [],
@@ -87,46 +102,93 @@ class DanbooruDataPreprocessor:
         
         for json_file in json_files:
             try:
+                # ISSUE-009 FIX: Force UTF-8 encoding
                 with open(json_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 
-                # Extract tags
-                if isinstance(data, dict):
-                    tags = data.get('tags', [])
-                    rating = data.get('rating', 'general')
-                    filename = data.get('filename', json_file.stem)
-                else:
-                    continue
+                # ISSUE-002 FIX: Handle single-object JSON files (your format)
+                entries = [data] if isinstance(data, dict) else data
                 
-                # Convert tags to indices
-                tag_indices = []
-                for tag in tags:
-                    if tag in self.tag_to_index:
-                        tag_indices.append(self.tag_to_index[tag])
-                
-                if not tag_indices:
-                    continue
-                
-                # Calculate quality score
-                quality_score = len(tag_indices) * 0.1  # Base score from tag count
-                
-                for tag in tags:
-                    if tag in quality_indicators:
-                        quality_score += 2.0
-                    elif tag in negative_indicators:
-                        quality_score -= 1.0
-                
-                quality_score = max(0.1, min(10.0, quality_score))  # Clamp between 0.1 and 10
-                
-                # Store results
-                results['filenames'].append(filename)
-                results['tag_indices'].append(tag_indices)
-                results['ratings'].append(self.rating_to_index.get(rating, 0))
-                results['tag_counts'].append(len(tag_indices))
-                results['quality_scores'].append(quality_score)
-                
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    
+                    # Extract fields from your format
+                    filename = entry.get('filename')
+                    rating = entry.get('rating', 'general')
+                    tags_field = entry.get('tags')  # Single space-delimited string
+                    
+                    if not filename:
+                        logger.debug(f"Entry in {json_file} missing filename")
+                        continue
+                    
+                    # ISSUE-001 FIX: Parse space-delimited string correctly
+                    tags_list = parse_tags_field(tags_field)
+                    
+                    if not tags_list:
+                        logger.debug(f"No tags found for {filename} in {json_file}")
+                        continue
+                    
+                    original_count = len(tags_list)
+                    
+                    # ISSUE-003 FIX: Remove duplicates while preserving order
+                    tags_list = dedupe_preserve_order(tags_list)
+                    
+                    # Track duplicate statistics
+                    dedupe_count = original_count - len(tags_list)
+                    if dedupe_count > 0:
+                        self.stats['total_duplicates_removed'] += dedupe_count
+                        self.stats['files_with_duplicates'] += 1
+                        logger.debug(f"Removed {dedupe_count} duplicate tags from {filename}")
+                    
+                    # Convert tags to indices
+                    tag_indices = []
+                    oov_count = 0
+                    
+                    for tag in tags_list:
+                        if tag in self.tag_to_index:
+                            tag_indices.append(self.tag_to_index[tag])
+                        else:
+                            # ISSUE-010 FIX: Track OOV tags
+                            oov_count += 1
+                            self.stats['total_oov_tags'] += 1
+                    
+                    # Log OOV tags for debugging
+                    if oov_count > 0:
+                        oov_tags = [t for t in tags_list if t not in self.tag_to_index]
+                        logger.debug(f"{filename}: {oov_count} OOV tags: {oov_tags[:5]}...")
+                    
+                    # ISSUE-007 FIX: Skip if no tags are in vocabulary
+                    if not tag_indices:
+                        self.stats['files_with_all_oov'] += 1
+                        logger.warning(f"Skipping {filename}: all {len(tags_list)} tags are OOV")
+                        continue
+                    
+                    # Calculate quality score
+                    quality_score = len(tag_indices) * 0.1  # Base score from tag count
+                    
+                    for tag in tags_list:
+                        if tag in quality_indicators:
+                            quality_score += 2.0
+                        elif tag in negative_indicators:
+                            quality_score -= 1.0
+                    
+                    quality_score = max(0.1, min(10.0, quality_score))  # Clamp between 0.1 and 10
+                    
+                    # Store results
+                    results['filenames'].append(filename)
+                    results['tag_indices'].append(tag_indices)
+                    results['ratings'].append(self.rating_to_index.get(rating, 0))
+                    results['tag_counts'].append(len(tag_indices))
+                    results['quality_scores'].append(quality_score)
+                    
+            except json.JSONDecodeError as e:
+                # ISSUE-008 FIX: Better error logging
+                logger.error(f"JSON decode error in {json_file}: {e}")
+                continue
             except Exception as e:
-                logger.debug(f"Error processing {json_file}: {e}")
+                # ISSUE-008 FIX: Log with file path
+                logger.error(f"Error processing {json_file}: {e}")
                 continue
         
         return results
@@ -150,6 +212,14 @@ class DanbooruDataPreprocessor:
             json_files = json_files[:max_images]
         
         logger.info(f"Processing {len(json_files)} metadata files")
+        
+        # Reset statistics
+        self.stats = {
+            'total_duplicates_removed': 0,
+            'files_with_duplicates': 0,
+            'files_with_all_oov': 0,
+            'total_oov_tags': 0
+        }
         
         # Process in parallel batches
         batch_size = 1000
@@ -182,7 +252,11 @@ class DanbooruDataPreprocessor:
                 all_results['ratings'].extend(batch_results['ratings'])
                 all_results['quality_scores'].extend(batch_results['quality_scores'])
         
+        # Log statistics
         logger.info(f"Processed {len(all_results['filenames'])} valid images")
+        logger.info(f"Removed {self.stats['total_duplicates_removed']} duplicate tags from {self.stats['files_with_duplicates']} files")
+        logger.info(f"Skipped {self.stats['files_with_all_oov']} files with only OOV tags")
+        logger.info(f"Total OOV tags encountered: {self.stats['total_oov_tags']}")
         
         # Apply stratified sampling if requested
         if stratified:
@@ -321,7 +395,8 @@ class DanbooruDataPreprocessor:
                 'min': float(np.min(results['quality_scores'])),
                 'max': float(np.max(results['quality_scores'])),
                 'median': float(np.median(results['quality_scores']))
-            }
+            },
+            'processing_stats': self.stats  # Include duplicate/OOV statistics
         }
         
         # Save metadata
