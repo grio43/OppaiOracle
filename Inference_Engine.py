@@ -47,15 +47,17 @@ logger = logging.getLogger(__name__)
 class VisionTransformerConfig:
     """Configuration for Vision Transformer model"""
     image_size: int = 640
-    patch_size: int = 16
+    patch_size: int = 14  # Changed from 16
     num_channels: int = 3
-    embed_dim: int = 768
-    depth: int = 12
-    num_heads: int = 12
-    mlp_ratio: float = 4.0
-    num_classes: int = 10000
+    hidden_size: int = 1280  # Changed from 768
+    num_hidden_layers: int = 24  # Changed from 12
+    num_attention_heads: int = 16  # Changed from 12
+    intermediate_size: int = 5120  # Changed to 4x hidden_size
+    num_tags: int = 100000  # Changed from 10000
+    num_ratings: int = 5  # Added
     dropout: float = 0.1
     attention_dropout: float = 0.1
+    layer_norm_eps: float = 1e-6
 
 
 class SimpleViT(nn.Module):

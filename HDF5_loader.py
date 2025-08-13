@@ -378,17 +378,23 @@ class SimplifiedDataset(Dataset):
             rating_label = self.vocab.rating_to_index[anno['rating']]
             
             return {
-                'image': image,
-                'tag_labels': tag_labels,
-                'rating_label': torch.tensor(rating_label, dtype=torch.long),
-                'metadata': {
-                    'index': idx,
-                    'path': anno['image_path'],
-                    'num_tags': anno['num_tags'],
-                    'tags': anno['tags'],
-                    'rating': anno['rating']
-                }
-            }
+                        'image': image,
+                        'labels': {
+                            'tags': tag_labels,       # Binary vector for tags
+                            'rating': rating_label,   # Integer for rating
+                            'binary': tag_labels      # Compatibility alias
+                        },
+                        'tag_labels': tag_labels,        # Direct access
+                        'rating_label': rating_label,    # Direct access
+                        'metadata': {
+                            'index': idx,
+                            'path': anno['image_path'],
+                            'num_tags': anno['num_tags'],
+                            'tags': anno['tags'],
+                            'rating': anno['rating']
+                        }
+                    }
+
             
         except Exception as e:
             logger.error(f"Error in __getitem__ for index {idx}: {e}")

@@ -739,7 +739,10 @@ class ConfigManager:
         self.config_type = config_type
         self.config = self._create_default_config()
         self.config_history: List[Dict[str, Any]] = []
-        self._env_pattern = re.compile(r'^([A-Z_]+)__([A-Z_]+)(?:__(.+))?)
+        self._env_pattern = re.compile(
+            r'^([A-Z0-9_]+)__([A-Z0-9_]+)(?:__(.+))?$',
+            re.IGNORECASE
+        )
     
     def _create_default_config(self) -> BaseConfig:
         """Create default configuration based on type"""
