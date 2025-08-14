@@ -42,7 +42,7 @@ except ImportError:
 
 # Import our modules
 from model_architecture import create_model, VisionTransformerConfig
-from tag_vocabulary import load_vocabulary_for_training
+from Inference_Engine import load_vocabulary_for_training
 
 
 # Configure logging
