@@ -35,11 +35,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Import our modules
-from metrics import MetricComputer, MetricConfig, MetricVisualizer, evaluate_model
-from tag_vocabulary import TagVocabulary, load_vocabulary_for_training
-from model_architecture import create_model
-from hdf5_dataloader import create_dataloaders, HDF5DataConfig
+from Evaluation_Metrics import MetricComputer, MetricConfig
+from Inference_Engine import load_vocabulary_for_training
+from HDF5_loader import create_dataloaders, SimplifiedDataConfig
 from training_utils import DistributedTrainingHelper
+
 
 logger = logging.getLogger(__name__)
 
@@ -201,13 +201,14 @@ class ValidationRunner:
     def create_dataloader(self) -> DataLoader:
         """Create validation dataloader"""
         # Data config
-        data_config = HDF5DataConfig(
-            hdf5_dir=Path(self.config.hdf5_dir),
-            vocab_dir=Path(self.config.vocab_dir),
-            normalize_mean=(0.485, 0.456, 0.406),
-            normalize_std=(0.229, 0.224, 0.225),
-            augmentation_enabled=False  # No augmentation for validation
-        )
+        data_config = SimplifiedDataConfig(
+             hdf5_dir=Path(self.config.hdf5_dir),
+             vocab_dir=Path(self.config.vocab_dir),
+             normalize_mean=(0.485, 0.456, 0.406),
+             normalize_std=(0.229, 0.224, 0.225),
+             augmentation_enabled=False  # No augmentation for validation
+         )
+
         
         # Create dataloader
         _, val_loader = create_dataloaders(
