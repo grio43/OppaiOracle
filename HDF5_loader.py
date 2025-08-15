@@ -288,7 +288,7 @@ class SimplifiedDataset(Dataset):
         self.split = split
         self.vocab = vocab
         self.annotations: List[Dict[str, Any]] = []
-        self.cache: Dict[str, torch.Tensor] = {}
+        self.cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         # Load orientation mapping from file if provided
         if config.orientation_map_path is not None and config.orientation_map_path.exists():
             try:
@@ -457,12 +457,14 @@ class SimplifiedDataset(Dataset):
         Images are resized to ``image_size`` using Lanczos interpolation.  A
         copy of the image may be cached to accelerate repeated accesses.  The
         cache stores images in the precision specified by ``cache_precision``;
-        loaded images are always returned as ``float32`` tensors in the [0, 1]
+        loaded images are always returned as ``float32`` tensors in the [0, 1]
         range.
         """
         # Check cache first
         if image_path in self.cache:
             cached = self.cache[image_path]
+            # Move to end to mark as recently used (LRU behavior)
+            self.cache.move_to_end(image_path)
             # Convert cached tensor back to float32
             if cached.dtype == torch.uint8:
                 return cached.float() / 255.0
@@ -479,14 +481,22 @@ class SimplifiedDataset(Dataset):
                 interpolation=T.InterpolationMode.LANCZOS,
             )
             tensor = TF.to_tensor(image)  # returns float32 in [0, 1]
-            # Decide whether to cache
-            if len(self.cache) < self.max_cache_size:
-                if self.cache_precision == 'uint8':
-                    self.cache[image_path] = (tensor * 255).to(torch.uint8)
-                elif self.cache_precision == 'float16':
-                    self.cache[image_path] = tensor.half()
-                else:
-                    self.cache[image_path] = tensor.clone()
+            # Add to cache with LRU eviction if needed
+            if self.cache_precision == 'uint8':
+                cached_tensor = (tensor * 255).to(torch.uint8)
+            elif self.cache_precision == 'float16':
+                cached_tensor = tensor.half()
+            else:
+                cached_tensor = tensor.clone()
+            
+            # Evict least recently used item if cache is at capacity
+            if len(self.cache) >= self.max_cache_size:
+                # Remove the least recently used item (first item in OrderedDict)
+                self.cache.popitem(last=False)
+            
+            # Add new item to cache (automatically becomes most recently used)
+            self.cache[image_path] = cached_tensor
+            
             return tensor
         except Exception as e:
             logger.error(f"Error loading image {image_path}: {e}")
