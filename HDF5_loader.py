@@ -274,6 +274,7 @@ class SimplifiedDataset(Dataset):
         bytes_per_image = 3 * config.image_size * config.image_size * bytes_per_element
         self.max_cache_size = int((config.cache_size_gb * (1024 ** 3)) / bytes_per_image)
         self.cache_precision = config.cache_precision
+        self.cache_lock = threading.Lock()  # Add thread lock for cache operations
         logger.info(f"Dataset initialised with {len(self.annotations)} samples for split '{split}'")
 
     def _default_orientation_map(self) -> Dict[str, str]:
@@ -412,17 +413,18 @@ class SimplifiedDataset(Dataset):
         range.
         """
         # Check cache first
-        if image_path in self.cache:
-            cached = self.cache[image_path]
-            # Move to end to mark as recently used (LRU behavior)
-            self.cache.move_to_end(image_path)
-            # Convert cached tensor back to float32
-            if cached.dtype == torch.uint8:
-                return cached.float() / 255.0
-            elif cached.dtype == torch.float16:
-                return cached.float()
-            else:
-                return cached.clone()
+        with self.cache_lock:
+            if image_path in self.cache:
+                cached = self.cache[image_path]
+                # Move to end to mark as recently used (LRU behavior)
+                self.cache.move_to_end(image_path)
+                # Convert cached tensor back to float32
+                if cached.dtype == torch.uint8:
+                    return cached.float() / 255.0
+                elif cached.dtype == torch.float16:
+                    return cached.float()
+                else:
+                    return cached.clone()
         # Load from disk
         try:
             image = Image.open(image_path).convert('RGB')
@@ -441,12 +443,13 @@ class SimplifiedDataset(Dataset):
                 cached_tensor = tensor.clone()
             
             # Evict least recently used item if cache is at capacity
-            if len(self.cache) >= self.max_cache_size:
-                # Remove the least recently used item (first item in OrderedDict)
-                self.cache.popitem(last=False)
-            
-            # Add new item to cache (automatically becomes most recently used)
-            self.cache[image_path] = cached_tensor
+            with self.cache_lock:
+                if len(self.cache) >= self.max_cache_size:
+                    # Remove the least recently used item (first item in OrderedDict)
+                    self.cache.popitem(last=False)
+                
+                # Add new item to cache (automatically becomes most recently used)
+                self.cache[image_path] = cached_tensor
             
             return tensor
         except Exception as e:
