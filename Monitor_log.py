@@ -700,18 +700,18 @@ class TrainingMonitor:
     
        
     def signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}, shutting down...")
-        cleanup()
-        sys.exit(0)
+            logger.info(f"Received signal {signum}, shutting down...")
+            cleanup()
+            sys.exit(0)
 
-    # Only register signals that are available on the platform
-    for sig in [signal.SIGINT, signal.SIGTERM]:
+        # Only register signals that are available on the platform
+    signal_names = {signal.SIGINT: 'SIGINT', signal.SIGTERM: 'SIGTERM'}
+    for sig, sig_name in signal_names.items():
         try:
-            if hasattr(signal, sig.name):
-                signal.signal(sig, signal_handler)
-                logger.debug(f"Registered signal handler for {sig.name}")
+            signal.signal(sig, signal_handler)
+            logger.debug(f"Registered signal handler for {sig_name}")
         except (OSError, ValueError, AttributeError) as e:
-            logger.debug(f"Could not register signal {sig}: {e}")
+            logger.debug(f"Could not register signal {sig_name}: {e}")
     
     def log_step(
         self,
