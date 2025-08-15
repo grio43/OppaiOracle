@@ -53,6 +53,7 @@ try:
     PANDAS_AVAILABLE = True
 except ImportError:
     PANDAS_AVAILABLE = False
+    pd = None 
 
 try:
     from prometheus_client import Counter, Gauge, Histogram, Summary, start_http_server
@@ -383,11 +384,16 @@ class SystemMonitor:
         self.gpu_available = False
         if config.track_gpu_metrics and GPUTIL_AVAILABLE:
             try:
-                self.gpu_available = len(GPUtil.getGPUs()) > 0
+        # Test GPUtil functionality, not just presence
+                test_gpus = GPUtil.getGPUs()
+                self.gpu_available = test_gpus is not None and len(test_gpus) > 0
                 if self.gpu_available:
-                    logger.info(f"GPU monitoring enabled")
-            except Exception as e:
+                    logger.info(f"GPU monitoring enabled for {len(test_gpus)} GPU(s)")
+                else:
+                    logger.info("No GPUs detected for monitoring")
+            except (Exception, ImportError) as e:
                 logger.warning(f"GPU monitoring not available: {e}")
+                self.gpu_available = False
     
     def start(self):
         """Start system monitoring"""
@@ -507,22 +513,30 @@ class SystemMonitor:
         try:
             # GPU metrics (with fresh query)
             if self.gpu_available and GPUTIL_AVAILABLE:
-                gpus = GPUtil.getGPUs()
-                for gpu in gpus:
-                    gpu_metrics = {
-                        'id': gpu.id,
-                        'name': gpu.name,
-                        'memory_total_gb': gpu.memoryTotal / 1024,
-                        'memory_used_gb': gpu.memoryUsed / 1024,
-                        'memory_free_gb': gpu.memoryFree / 1024,
-                        'memory_percent': (gpu.memoryUsed / gpu.memoryTotal * 100) if gpu.memoryTotal > 0 else 0,
-                        'utilization': gpu.load * 100,
-                        'temperature': gpu.temperature
-                    }
-                    metrics['gpu'].append(gpu_metrics)
+                try:
+                    # Double-check GPUtil is still available and working
+                    gpus = GPUtil.getGPUs()
+                    if gpus is not None:  # Additional safety check
+                        for gpu in gpus:
+                            if gpu is not None:  # Check each GPU object
+                                gpu_metrics = {
+                                    'id': getattr(gpu, 'id', -1),
+                                    'name': getattr(gpu, 'name', 'Unknown'),
+                                    'memory_total_gb': getattr(gpu, 'memoryTotal', 0) / 1024,
+                                    'memory_used_gb': getattr(gpu, 'memoryUsed', 0) / 1024,
+                                    'memory_free_gb': getattr(gpu, 'memoryFree', 0) / 1024,
+                                    'memory_percent': (getattr(gpu, 'memoryUsed', 0) / getattr(gpu, 'memoryTotal', 1) * 100) if getattr(gpu, 'memoryTotal', 0) > 0 else 0,
+                                    'utilization': getattr(gpu, 'load', 0) * 100,
+                                    'temperature': getattr(gpu, 'temperature', 0)
+                                }
+                                metrics['gpu'].append(gpu_metrics)
+                except (AttributeError, ImportError, RuntimeError) as e:
+                    # GPUtil might become unavailable, disable it
+                    self.gpu_available = False
+                    logger.warning(f"GPUtil became unavailable, disabling GPU monitoring: {e}")
         except Exception as e:
             logger.debug(f"Failed to collect GPU metrics: {e}")
-        
+                
         try:
             # Network metrics
             if self.config.track_network_io:
@@ -684,26 +698,20 @@ class TrainingMonitor:
             logger.error(f"Failed to setup profiler: {e}")
             self.profiler = None
     
-    def _register_cleanup(self):
-        """Register cleanup handlers for graceful shutdown"""
-        def cleanup():
-            logger.info("Running cleanup...")
-            self.close()
-        
-        # Register with atexit
-        atexit.register(cleanup)
-        
-        # Register signal handlers
-        def signal_handler(signum, frame):
-            logger.info(f"Received signal {signum}, shutting down...")
-            cleanup()
-            sys.exit(0)
-        
+       
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, shutting down...")
+        cleanup()
+        sys.exit(0)
+
+    # Only register signals that are available on the platform
+    for sig in [signal.SIGINT, signal.SIGTERM]:
         try:
-            signal.signal(signal.SIGINT, signal_handler)
-            signal.signal(signal.SIGTERM, signal_handler)
-        except:
-            pass  # May fail on Windows
+            if hasattr(signal, sig.name):
+                signal.signal(sig, signal_handler)
+                logger.debug(f"Registered signal handler for {sig.name}")
+        except (OSError, ValueError, AttributeError) as e:
+            logger.debug(f"Could not register signal {sig}: {e}")
     
     def log_step(
         self,
@@ -760,16 +768,20 @@ class TrainingMonitor:
         
         # Update profiler
         if self.profiler:
-            self.profiler.step()
-            self.profiler_step += 1
+            try:
+                self.profiler.step()
+                self.profiler_step += 1
+                
+                # Start/stop profiling at intervals
+                if self.profiler_step == self.config.profile_interval_steps:
+                    self.profiler.start()
+                elif self.profiler_step == self.config.profile_interval_steps + self.config.profile_duration_steps:
+                    self.profiler.stop()
+                    self.profiler_step = 0
+            except RuntimeError as e:
+                logger.warning(f"Profiler error (may be already stopped): {e}")
+                self.profiler = None  # Disable profiler on error
             
-            # Start/stop profiling at intervals
-            if self.profiler_step == self.config.profile_interval_steps:
-                self.profiler.start()
-            elif self.profiler_step == self.config.profile_interval_steps + self.config.profile_duration_steps:
-                self.profiler.stop()
-                self.profiler_step = 0
-    
     def log_validation(
         self,
         step: int,
@@ -1102,14 +1114,20 @@ class TrainingMonitor:
         
         return summary
     
+
     def close(self):
         """Cleanup and close all resources"""
+        # Prevent multiple cleanup calls
+        if hasattr(self, '_closed') and self._closed:
+            return
+        self._closed = True
+        
         logger.info("Closing training monitor...")
         
         # Stop system monitor
         if self.system_monitor:
             self.system_monitor.stop()
-        
+            
         # Close profiler
         if self.profiler:
             try:
