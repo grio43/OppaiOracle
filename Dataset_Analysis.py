@@ -20,7 +20,6 @@ import warnings
 import random
 
 import numpy as np
-import pandas as pd
 from PIL import Image
 import cv2
 import matplotlib.pyplot as plt
@@ -34,18 +33,18 @@ import h5py
 
 # Optional imports with fallback
 try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+    warnings.warn("pandas not available. Install with: pip install pandas")
+
+try:
     import imagehash
     IMAGEHASH_AVAILABLE = True
 except ImportError:
     IMAGEHASH_AVAILABLE = False
     warnings.warn("imagehash not available. Install with: pip install imagehash")
-    
-try:
-    from wordcloud import WordCloud
-    WORDCLOUD_AVAILABLE = True
-except ImportError:
-    WORDCLOUD_AVAILABLE = False
-    warnings.warn("wordcloud not available. Install with: pip install wordcloud")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
