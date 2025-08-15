@@ -1,53 +1,6 @@
 #!/usr/bin/env python3
-"""
-Improved data loading and augmentation for the direct anime image tagger.
 
-This module provides a simplified but extensible dataset and dataloader for
-training an anime image tagger from scratch.  The implementation builds on
-top of the original ``HDF5_loader.py`` found in the upstream repository
-but incorporates a number of important fixes and enhancements:
-
-* **Consistent normalisation statistics** – The dataset now defaults to
-  using an (0.5, 0.5, 0.5) mean and standard deviation for RGB channels.
-  These values better match anime artwork distributions than the
-  ImageNet values used previously.  Both parameters can be overridden per
-  dataset via the :class:`SimplifiedDataConfig`.
-
-* **Orientation‑aware flips with extensible mapping** – Random horizontal
-  flips are handled inside :meth:`SimplifiedDataset.__getitem__` but
-  orientation‑sensitive tags are remapped using a dictionary loaded from
-  a JSON or YAML file if supplied.  If no mapping is provided the
-  loader falls back to a small built‑in mapping covering common left/right
-  tags.  Flips can be disabled entirely by setting
-  :attr:`SimplifiedDataConfig.random_flip_prob` to zero.
-
-* **Expanded augmentation pipeline** – The augmentation pipeline includes
-  random resized cropping, optional colour jitter and a random gamma
-  adjustment.  The gamma range has been widened to [0.7, 1.3] to
-  better simulate exposure variations in stylised artwork.  The crop
-  scale range defaults to (0.95, 1.0) to preserve more of the subject in
-  each image.
-
-* **Unknown tag handling** – Tags found in the annotation JSON that are
-  not present in the vocabulary are no longer silently discarded.
-  Instead, they are encoded to the special ``<UNK>`` index so the model
-  learns to handle rare or unseen tags gracefully.
-
-* **Simplified label dictionary** – The dictionary returned from
-  ``__getitem__`` no longer includes the redundant ``'binary'`` field.
-  Downstream code should use the returned ``'tag_labels'`` tensor as
-  needed.
-
-* **Configurable sampling and caching** – Oversampling of orientation
-  tags, the exponent used in sample weight computation and the cache
-  precision are all exposed via the configuration.  Default values
-  favour efficient memory usage and balanced training.
-
-The resulting dataloader is self‑contained and compatible with both
-single‑GPU and distributed training scenarios.
-"""
-
-
+from __future__ import annotations
 
 import threading
 import json
@@ -62,9 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler
-from collections import OrderedDict
-from __future__ import annotations
-
+from collections import OrderedDic
 
 logger = logging.getLogger(__name__)
 
