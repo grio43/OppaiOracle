@@ -327,10 +327,20 @@ def compute_metrics(
     fp = (pred_binary * (1 - targets)).sum(dim=1)
     fn = ((1 - pred_binary) * targets).sum(dim=1)
     
-    # Precision, Recall, F1 (micro-averaged)
-    micro_precision = tp.sum() / (tp.sum() + fp.sum() + 1e-8)
-    micro_recall = tp.sum() / (tp.sum() + fn.sum() + 1e-8)
-    micro_f1 = 2 * micro_precision * micro_recall / (micro_precision + micro_recall + 1e-8)
+    # Precision, Recall, F1 (micro-averaged) with safer division
+    tp_sum = tp.sum()
+    fp_sum = fp.sum()
+    fn_sum = fn.sum()
+    
+    # Use torch operations with explicit checks
+    micro_precision = torch.div(tp_sum, tp_sum + fp_sum) if (tp_sum + fp_sum) > 0 else torch.tensor(0.0)
+    micro_recall = torch.div(tp_sum, tp_sum + fn_sum) if (tp_sum + fn_sum) > 0 else torch.tensor(0.0)
+    
+    # F1 with explicit check
+    if micro_precision + micro_recall > 0:
+        micro_f1 = 2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+    else:
+        micro_f1 = torch.tensor(0.0)
     
     # Per-class metrics for macro-averaging
     class_tp = (pred_binary * targets).sum(dim=0)

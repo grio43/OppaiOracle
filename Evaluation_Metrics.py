@@ -251,11 +251,20 @@ class MetricComputer:
         fn = ((pred_binary == 0) & (targets == 1)).sum()
         tn = ((pred_binary == 0) & (targets == 0)).sum()
         
-        # Micro metrics
-        metrics['precision_micro'] = tp / max(tp + fp, 1)
-        metrics['recall_micro'] = tp / max(tp + fn, 1)
-        metrics['f1_micro'] = 2 * metrics['precision_micro'] * metrics['recall_micro'] / \
-                             max(metrics['precision_micro'] + metrics['recall_micro'], 1e-8)
+        # Micro metrics - use float division with numpy for safety
+        metrics['precision_micro'] = float(np.divide(tp, tp + fp, 
+                                                     out=np.zeros(1), 
+                                                     where=(tp + fp) != 0)[0])
+        metrics['recall_micro'] = float(np.divide(tp, tp + fn,
+                                                  out=np.zeros(1),
+                                                  where=(tp + fn) != 0)[0])
+        
+        # F1 calculation with safer division
+        if metrics['precision_micro'] + metrics['recall_micro'] > 0:
+            metrics['f1_micro'] = 2 * metrics['precision_micro'] * metrics['recall_micro'] / \
+                                 (metrics['precision_micro'] + metrics['recall_micro'])
+        else:
+            metrics['f1_micro'] = 0.0
         
         # Macro metrics - handle large number of tags
         if targets.shape[1] <= self.config.max_tags_for_detailed:
@@ -344,9 +353,15 @@ class MetricComputer:
             fp = (top_k_preds * (1 - targets)).sum()
             fn = ((1 - top_k_preds) * targets).sum()
             
-            precision = tp / max(tp + fp, 1)
-            recall = tp / max(tp + fn, 1)
-            f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+            # Use safe division for tensor operations
+            precision = torch.div(tp, tp + fp) if (tp + fp) > 0 else torch.tensor(0.0)
+            recall = torch.div(tp, tp + fn) if (tp + fn) > 0 else torch.tensor(0.0)
+            
+            # F1 with explicit check
+            if precision + recall > 0:
+                f1 = 2 * precision * recall / (precision + recall)
+            else:
+                f1 = torch.tensor(0.0)
             
             metrics[f'precision_at_{k}'] = float(precision.item())
             metrics[f'recall_at_{k}'] = float(recall.item())
@@ -520,16 +535,19 @@ class MetricComputer:
             if support == 0:
                 continue
             
-            # Binary predictions for this tag
-            tag_binary = (tag_preds > self.config.prediction_threshold).astype(np.int32)
+            tp = float(((tag_binary == 1) & (tag_targets == 1)).sum())
+            fp = float(((tag_binary == 1) & (tag_targets == 0)).sum())
+            fn = float(((tag_binary == 0) & (tag_targets == 1)).sum())
             
-            tp = ((tag_binary == 1) & (tag_targets == 1)).sum()
-            fp = ((tag_binary == 1) & (tag_targets == 0)).sum()
-            fn = ((tag_binary == 0) & (tag_targets == 1)).sum()
+            # Use numpy divide for consistent safe division
+            precision = np.divide(tp, tp + fp, out=np.zeros(1), where=(tp + fp) > 0)[0]
+            recall = np.divide(tp, tp + fn, out=np.zeros(1), where=(tp + fn) > 0)[0]
             
-            precision = tp / max(tp + fp, 1)
-            recall = tp / max(tp + fn, 1)
-            f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+            # F1 with explicit check
+            if precision + recall > 0:
+                f1 = 2 * precision * recall / (precision + recall)
+            else:
+                f1 = 0.0
             
             tag_f1_scores.append(f1)
             tag_precisions.append(precision)
@@ -653,13 +671,21 @@ class MetricComputer:
         covered_gt_tags = tags_predicted & tags_in_gt
         metrics['gt_tag_coverage'] = float(covered_gt_tags.sum() / max(tags_in_gt.sum(), 1))
         
-        # Prediction diversity (entropy) - use safe computation
+# Prediction diversity (entropy) - use safe computation
         tag_pred_probs = pred_binary.mean(axis=0)
         tag_pred_probs = tag_pred_probs[tag_pred_probs > 0]
         if len(tag_pred_probs) > 0:
-            # Normalize to get proper probability distribution
-            tag_pred_probs = tag_pred_probs / tag_pred_probs.sum()
-            entropy = -np.sum(tag_pred_probs * np.log(tag_pred_probs + 1e-10))
+            # Normalize to get proper probability distribution with safety check
+            prob_sum = tag_pred_probs.sum()
+            if prob_sum > 0:
+                tag_pred_probs = tag_pred_probs / prob_sum
+                # Use np.where to safely compute log only for positive values
+                log_probs = np.where(tag_pred_probs > 0, 
+                                     np.log(tag_pred_probs), 
+                                     0)
+                entropy = -np.sum(tag_pred_probs * log_probs)
+            else:
+                entropy = 0.0
         else:
             entropy = 0.0
         metrics['prediction_entropy'] = float(entropy)
@@ -673,10 +699,12 @@ class MetricComputer:
             similarities = []
             for i in range(sample_size):
                 for j in range(i + 1, sample_size):
-                    intersection = (sample_pred[i] & sample_pred[j]).sum()
-                    union = (sample_pred[i] | sample_pred[j]).sum()
+                    intersection = float((sample_pred[i] & sample_pred[j]).sum())
+                    union = float((sample_pred[i] | sample_pred[j]).sum())
                     if union > 0:
-                        similarities.append(intersection / union)
+                        # Use explicit float division
+                        similarity = intersection / union
+                        similarities.append(similarity)
             
             if similarities:
                 metrics['avg_sample_similarity'] = float(np.mean(similarities))
