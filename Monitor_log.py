@@ -519,15 +519,27 @@ class SystemMonitor:
                     if gpus is not None:  # Additional safety check
                         for gpu in gpus:
                             if gpu is not None:  # Check each GPU object
+                                # Safely get all values with proper null handling
+                                mem_total = getattr(gpu, 'memoryTotal', 0)
+                                mem_used = getattr(gpu, 'memoryUsed', 0)
+                                mem_free = getattr(gpu, 'memoryFree', 0)
+                                gpu_load = getattr(gpu, 'load', 0)
+                                
+                                # Ensure numeric values
+                                mem_total = float(mem_total) if mem_total is not None else 0
+                                mem_used = float(mem_used) if mem_used is not None else 0
+                                mem_free = float(mem_free) if mem_free is not None else 0
+                                gpu_load = float(gpu_load) if gpu_load is not None else 0
+                                
                                 gpu_metrics = {
                                     'id': getattr(gpu, 'id', -1),
                                     'name': getattr(gpu, 'name', 'Unknown'),
-                                    'memory_total_gb': getattr(gpu, 'memoryTotal', 0) / 1024,
-                                    'memory_used_gb': getattr(gpu, 'memoryUsed', 0) / 1024,
-                                    'memory_free_gb': getattr(gpu, 'memoryFree', 0) / 1024,
-                                    'memory_percent': (getattr(gpu, 'memoryUsed', 0) / getattr(gpu, 'memoryTotal', 1) * 100) if getattr(gpu, 'memoryTotal', 0) > 0 else 0,
-                                    'utilization': getattr(gpu, 'load', 0) * 100,
-                                    'temperature': getattr(gpu, 'temperature', 0)
+                                    'memory_total_gb': mem_total / 1024 if mem_total > 0 else 0,
+                                    'memory_used_gb': mem_used / 1024 if mem_used > 0 else 0,
+                                    'memory_free_gb': mem_free / 1024 if mem_free > 0 else 0,
+                                    'memory_percent': (mem_used / mem_total * 100) if mem_total > 0 else 0,
+                                    'utilization': gpu_load * 100 if gpu_load >= 0 else 0,
+                                    'temperature': getattr(gpu, 'temperature', 0) or 0
                                 }
                                 metrics['gpu'].append(gpu_metrics)
                 except (AttributeError, ImportError, RuntimeError) as e:
