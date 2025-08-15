@@ -39,6 +39,7 @@ from Evaluation_Metrics import MetricComputer, MetricConfig
 from Inference_Engine import load_vocabulary_for_training
 from HDF5_loader import create_dataloaders, SimplifiedDataConfig
 from training_utils import DistributedTrainingHelper
+from model_architecture import create_model, VisionTransformerConfig
 
 
 logger = logging.getLogger(__name__)
@@ -162,11 +163,10 @@ class ValidationRunner:
                 if 'model_config' in model_config:
                     model_config = model_config['model_config']
             else:
-                # Default config
-                from model_architecture import VisionTransformerConfig
+               # Default config
                 model_config = VisionTransformerConfig()
-            
-            # Create model
+
+                # Create model
             model = create_model(**model_config if isinstance(model_config, dict) else asdict(model_config))
             
             # Load weights
