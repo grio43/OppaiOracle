@@ -605,21 +605,31 @@ class DatasetAnalyzer:
             
             for tag_file in tag_files:
                 if tag_file.exists():
+                    content = None
                     try:
-                        with open(tag_file, 'r', encoding='utf-8') as f:
+                        with open(tag_file, 'r', encoding='utf-8', errors='ignore') as f:
                             content = f.read()
+                    except (IOError, OSError) as e:
+                        logger.error(f"Error reading tag file {tag_file}: {e}")
+                        continue
+                    except Exception as e:
+                        logger.error(f"Unexpected error loading tags from {tag_file}: {e}")
+                        continue
+                    
+                    if content:
+                        try:
                             # Handle different tag formats
                             if ',' in content:
                                 tags = [tag.strip() for tag in content.split(',') if tag.strip()]
                             else:
                                 tags = [tag.strip() for tag in content.split('\n') if tag.strip()]
-                        
-                        # Add tags to analyzer
-                        self.tag_analyzer.add_image_tags(str(image_path), tags)
-                        break
-                        
-                    except Exception as e:
-                        logger.error(f"Error loading tags from {tag_file}: {e}")
+                            
+                            # Add tags to analyzer
+                            self.tag_analyzer.add_image_tags(str(image_path), tags)
+                            break
+                        except Exception as e:
+                            logger.error(f"Error parsing tags from {tag_file}: {e}")
+                            continue
         
         # Get tag statistics
         tag_stats = self.tag_analyzer.get_tag_statistics()
@@ -803,6 +813,7 @@ class DatasetAnalyzer:
     
     def _create_tag_wordcloud(self):
         """Create a word cloud of tags"""
+        fig = None
         try:
             # Prepare tag frequencies
             tag_freq = dict(self.tag_analyzer.tag_counts.most_common(200))
@@ -818,19 +829,27 @@ class DatasetAnalyzer:
                 ).generate_from_frequencies(tag_freq)
                 
                 # Create figure
-                plt.figure(figsize=(20, 10))
+                fig = plt.figure(figsize=(20, 10))
                 plt.imshow(wordcloud, interpolation='bilinear')
                 plt.axis('off')
                 plt.title('Tag Word Cloud', fontsize=20)
                 
-                # Save
+                # Save with proper error handling
                 output_path = self.output_dir / 'tag_wordcloud.png'
-                plt.savefig(output_path, dpi=self.config.figure_dpi, bbox_inches='tight')
-                plt.close()
-                
-                logger.info(f"Saved tag word cloud to {output_path}")
+                try:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    plt.savefig(output_path, dpi=self.config.figure_dpi, bbox_inches='tight')
+                    logger.info(f"Saved tag word cloud to {output_path}")
+                except (IOError, OSError) as e:
+                    logger.error(f"Error saving word cloud to {output_path}: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error saving word cloud: {e}")
         except Exception as e:
             logger.error(f"Error creating word cloud: {e}")
+        finally:
+            # Ensure matplotlib resources are always cleaned up
+            if fig is not None:
+                plt.close(fig)
     
     def _generate_report(self):
         """Generate analysis report"""
