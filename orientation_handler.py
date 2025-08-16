@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import warnings
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +49,14 @@ class OrientationHandler:
         self.skip_flip_tags = set()
         self.complex_tags = {}
         
-        # Track statistics
+        # Track statistics (thread-safe)
         self.stats = {
             'total_flips': 0,
             'skipped_flips': 0,
             'unmapped_tags': set(),
             'mapped_tags': set()
         }
+        self._stats_lock = threading.Lock()
         
         # Load mappings
         if mapping_file and mapping_file.exists():
@@ -167,11 +169,6 @@ class OrientationHandler:
         """
         # Check for tags that should never be flipped (text, signatures, etc.)
         if any(tag in self.skip_flip_tags for tag in tags):
-            self.stats['skipped_flips'] += 1
-            return True
-        
-        # If skip_unmapped is enabled, check for unmapped orientation tags
-        if self.skip_unmapped:
             unmapped = self._find_unmapped_orientation_tags(tags)
             if unmapped:
                 self.stats['skipped_flips'] += 1
@@ -221,12 +218,14 @@ class OrientationHandler:
         
         # Check explicit mappings first (highest priority)
         if tag in self.explicit_mappings:
-            self.stats['mapped_tags'].add(tag)
+            with self._stats_lock:
+                self.stats['mapped_tags'].add(tag)
             return self.explicit_mappings[tag]
         
         # Check reverse mappings
         if tag in self.reverse_mappings:
-            self.stats['mapped_tags'].add(tag)
+            with self._stats_lock:
+                self.stats['mapped_tags'].add(tag)
             return self.reverse_mappings[tag]
         
         # Try regex patterns
@@ -236,16 +235,16 @@ class OrientationHandler:
                 try:
                     swapped = pattern.sub(regex_data['replacement'], tag)
                     if swapped != tag:  # Only count if actually changed
-                        self.stats['mapped_tags'].add(tag)
+                        with self._stats_lock:
+                            self.stats['mapped_tags'].add(tag)
                         return swapped
                 except Exception as e:
                     logger.error(f"Regex substitution failed for tag '{tag}': {e}")
         
         # No mapping found
         if any(keyword in tag for keyword in ['left', 'right', 'asymmetric']):
-            self.stats['unmapped_tags'].add(tag)
-            if self.strict_mode:
-                logger.warning(f"No orientation mapping for tag: {tag}")
+            with self._stats_lock:
+                self.stats['unmapped_tags'].add(tag)
         
         return tag
     
@@ -265,9 +264,122 @@ class OrientationHandler:
         
         # Swap all tags
         swapped_tags = [self.swap_tag(tag) for tag in tags]
-        self.stats['total_flips'] += 1
+        with self._stats_lock:
+            self.stats['total_flips'] += 1
         
         return swapped_tags, True
+    
+    def precompute_all_mappings(self, known_vocabulary: Set[str]) -> Dict[str, str]:
+        """Pre-compute all possible tag swaps for a known vocabulary.
+        
+        Args:
+            known_vocabulary: Set of all known tags
+            
+        Returns:
+            Dictionary mapping each orientation tag to its flipped version
+        """
+        full_mapping = {}
+        
+        for tag in known_vocabulary:
+            # Skip if already computed
+            if tag in full_mapping:
+                continue
+                
+            swapped = self.swap_tag(tag)
+            if swapped != tag:
+                full_mapping[tag] = swapped
+                # Add reverse mapping too
+                full_mapping[swapped] = tag
+        
+        logger.info(f"Pre-computed {len(full_mapping)} orientation mappings from vocabulary of {len(known_vocabulary)} tags")
+        return full_mapping
+    
+    def can_swap_eye_colors(self, eye_color_tags: List[str]) -> bool:
+        """Check if eye color tags can be properly swapped for heterochromia."""
+        # This is a simplified check - expand based on your tag format
+        left_colors = [t for t in eye_color_tags if 'left' in t]
+        right_colors = [t for t in eye_color_tags if 'right' in t]
+        
+        # Can only swap if we have both left and right eye color tags
+        return len(left_colors) > 0 and len(right_colors) > 0
+    
+    def handle_complex_tags(self, tags: List[str]) -> Tuple[List[str], bool]:
+        """Handle complex asymmetric cases like heterochromia.
+        
+        Args:
+            tags: List of tags for the image
+            
+        Returns:
+            Tuple of (possibly modified tags, whether flip should proceed)
+        """
+        # Check for heterochromia with specific eye colors
+        if 'heterochromia' in tags:
+            # Look for patterns like "blue_left_eye" and "green_right_eye"
+            eye_color_tags = [t for t in tags if 'eye' in t and any(
+                color in t for color in ['blue', 'green', 'red', 'yellow', 'purple', 'amber', 'violet']
+            )]
+            
+            if eye_color_tags and not self.can_swap_eye_colors(eye_color_tags):
+                # Skip flip if we can't properly swap eye colors
+                logger.debug(f"Skipping flip due to complex heterochromia tags: {eye_color_tags}")
+                self.stats['skipped_flips'] += 1
+                return tags, False
+        
+        # Check for other complex asymmetric tags
+        for tag in tags:
+            if tag in self.complex_tags:
+                tag_info = self.complex_tags[tag]
+                if tag_info.get('requires_special_handling', False):
+                    # For now, skip these unless we have specific handlers
+                    logger.debug(f"Skipping flip due to complex tag requiring special handling: {tag}")
+                    self.stats['skipped_flips'] += 1
+                    return tags, False
+        
+        # Proceed with normal tag swapping
+        return self.swap_tags(tags)
+    
+    def validate_dataset_tags(self, all_tags: Set[str]) -> Dict[str, List[str]]:
+        """Validate that all orientation-specific tags in dataset have mappings.
+        
+        Args:
+            all_tags: Set of all unique tags in the dataset
+            
+        Returns:
+            Dictionary of validation issues found
+        """
+        issues = {
+            'unmapped_orientation_tags': [],
+            'asymmetric_mappings': [],
+            'conflicting_patterns': []
+        }
+        
+        orientation_indicators = ['left', 'right', 'asymmetric', 'single_']
+        
+        for tag in all_tags:
+            # Check if this might be an orientation tag
+            if any(indicator in tag for indicator in orientation_indicators):
+                # Skip if it's known to be symmetric
+                if tag in self.symmetric_tags:
+                    continue
+                    
+                # Check if this tag has a proper mapping
+                swapped = self.swap_tag(tag)
+                if swapped == tag:
+                    issues['unmapped_orientation_tags'].append(tag)
+                else:
+                    # Verify bidirectionality
+                    double_swapped = self.swap_tag(swapped)
+                    if double_swapped != tag:
+                        issues['asymmetric_mappings'].append(
+                            f"{tag} -> {swapped} -> {double_swapped}"
+                        )
+        
+        # Sort for consistent output
+        for key in issues:
+            issues[key] = sorted(issues[key])
+        
+        # Only return non-empty issues
+        return {k: v for k, v in issues.items() if v}
     
     def validate_mappings(self) -> Dict[str, List[str]]:
         """
@@ -321,16 +433,83 @@ class OrientationHandler:
         
         return {k: v for k, v in issues.items() if v}
     
-    def get_statistics(self) -> Dict[str, any]:
+def get_statistics(self) -> Dict[str, any]:
         """Get usage statistics."""
+        with self._stats_lock:
+            total_flips = self.stats['total_flips']
+            skipped_flips = self.stats['skipped_flips']
+            num_mapped = len(self.stats['mapped_tags'])
+            num_unmapped = len(self.stats['unmapped_tags'])
+            unmapped_sample = list(self.stats['unmapped_tags'])[:20]
+        
         return {
-            'total_flips': self.stats['total_flips'],
-            'skipped_flips': self.stats['skipped_flips'],
-            'skip_rate': self.stats['skipped_flips'] / max(1, self.stats['total_flips'] + self.stats['skipped_flips']),
-            'num_mapped_tags': len(self.stats['mapped_tags']),
-            'num_unmapped_tags': len(self.stats['unmapped_tags']),
-            'unmapped_tags_sample': list(self.stats['unmapped_tags'])[:20]  # First 20 unmapped tags
+            'total_flips': total_flips,
+            'skipped_flips': skipped_flips,
+            'skip_rate': skipped_flips / max(1, total_flips + skipped_flips),
+            'num_mapped_tags': num_mapped,
+            'num_unmapped_tags': num_unmapped,
+            'unmapped_tags_sample': unmapped_sample
         }
+
+
+class OrientationMonitor:
+    """Monitor for tracking orientation handling health during training."""
+    
+    def __init__(self, threshold_unmapped: int = 10, check_interval: int = 100):
+        """
+        Initialize the monitor.
+        
+        Args:
+            threshold_unmapped: Number of unmapped tags before warning
+            check_interval: How often to check (every N batches)
+        """
+        self.threshold_unmapped = threshold_unmapped
+        self.check_interval = check_interval
+        self.warning_issued = False
+        self.batch_count = 0
+        self.last_unmapped_count = 0
+    
+    def check_health(self, handler: OrientationHandler, force: bool = False) -> None:
+        """Check if too many unmapped tags are accumulating.
+        
+        Args:
+            handler: The orientation handler to monitor
+            force: Force check regardless of interval
+        """
+        self.batch_count += 1
+        
+        # Only check at intervals unless forced
+        if not force and self.batch_count % self.check_interval != 0:
+            return
+        
+        stats = handler.get_statistics()
+        unmapped_count = stats['num_unmapped_tags']
+        
+        # Check if unmapped tags are growing
+        if unmapped_count > self.last_unmapped_count:
+            new_unmapped = unmapped_count - self.last_unmapped_count
+            if new_unmapped > 5:  # Significant growth
+                logger.info(f"Found {new_unmapped} new unmapped orientation tags")
+        
+        # Issue warning if threshold exceeded
+        if (unmapped_count > self.threshold_unmapped and not self.warning_issued):
+            logger.warning(
+                f"Found {unmapped_count} unmapped orientation tags. "
+                f"Examples: {stats['unmapped_tags_sample'][:5]}. "
+                "Consider updating orientation_map.json"
+            )
+            self.warning_issued = True
+            
+            # Optionally save unmapped tags to file for review
+            unmapped_file = Path("unmapped_orientation_tags.txt")
+            with open(unmapped_file, 'w') as f:
+                f.write("# Unmapped orientation tags found during training\n")
+                f.write("# Add these to orientation_map.json if needed\n\n")
+                for tag in sorted(stats['unmapped_tags_sample']):
+                    f.write(f"{tag}\n")
+            logger.info(f"Saved unmapped tags to {unmapped_file}")
+        
+        self.last_unmapped_count = unmapped_count
 
 
 def test_orientation_handler():

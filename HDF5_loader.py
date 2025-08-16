@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from __future__ import annotations
-
+from orientation_handler import OrientationHandler, OrientationMonitor
 import threading
 import json
 import logging
@@ -17,7 +17,6 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler
 from collections import OrderedDict
 from vocabulary import TagVocabulary
-from orientation_handler import OrientationHandler
 
 logger = logging.getLogger(__name__)
 
@@ -119,17 +118,35 @@ class SimplifiedDataset(Dataset):
                     strict_mode=False,  # Don't fail if mapping is incomplete
                     skip_unmapped=True   # Skip flipping images with unmapped orientation tags
                 )
+                
+                # Pre-compute mappings if vocabulary is available for better performance
+                if vocab and hasattr(vocab, 'tag_to_index'):
+                    all_tags = set(vocab.tag_to_index.keys())
+                    self.precomputed_mappings = self.orientation_handler.precompute_all_mappings(all_tags)
+                    
+                    # Validate mappings and log any issues
+                    validation_issues = self.orientation_handler.validate_dataset_tags(all_tags)
+                    if validation_issues:
+                        logger.warning(f"Orientation mapping validation issues: {validation_issues}")
+                        
+                        # Save validation report for review
+                        validation_report_path = Path("orientation_validation_report.json")
+                        with open(validation_report_path, 'w') as f:
+                            json.dump(validation_issues, f, indent=2)
+                        logger.info(f"Saved validation report to {validation_report_path}")
+                        
+                        # Optionally fail if strict validation is enabled
+                        if hasattr(config, 'strict_orientation_validation') and config.strict_orientation_validation:
+                            raise ValueError(f"Critical orientation mapping issues found. Check {validation_report_path}")
+                else:
+                    self.precomputed_mappings = None
+                
+                # Initialize monitor for training
+                self.orientation_monitor = OrientationMonitor(threshold_unmapped=20)
             else:
                 self.orientation_handler = None
-            # Preload annotations
-            if config.preload_metadata:
-                self._load_annotations(json_files)
-                # Precompute sample weights for frequency sampling
-                self.sample_weights: Optional[np.ndarray] = None
-                if config.frequency_weighted_sampling and split == 'train':
-                    self._calculate_sample_weights()
-            else:
-                self.sample_weights = None
+                self.precomputed_mappings = None
+                self.orientation_monitor = None
             # Set up augmentation and normalisation
             self.augmentation = self._setup_augmentation() if config.augmentation_enabled and split == 'train' else None
             self.normalize = T.Normalize(mean=config.normalize_mean, std=config.normalize_std)
@@ -321,6 +338,7 @@ class SimplifiedDataset(Dataset):
             # Return black image to avoid crashing caller
             return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32)
 
+    
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Fetch an item for training or validation.
 
@@ -353,12 +371,13 @@ class SimplifiedDataset(Dataset):
         
         try:
             # Load image (float32 tensor)
- # Load image (float32 tensor)
+            # Load image (float32 tensor)
             image = self._load_image(image_path)
             
             # Copy tags so we can mutate without altering the original
             tags = list(anno['tags'])
             
+
             # Random horizontal flip with orientation-aware tag swapping
             # Only attempt flip if handler is available and random check passes
             if (
@@ -366,14 +385,18 @@ class SimplifiedDataset(Dataset):
                 and self.split == 'train'
                 and np.random.rand() < self.config.random_flip_prob
             ):
-                # Use orientation handler to swap tags and determine if flip should proceed
-                swapped_tags, should_flip = self.orientation_handler.swap_tags(tags)
+                # Use orientation handler to handle complex tags and determine if flip should proceed
+                swapped_tags, should_flip = self.orientation_handler.handle_complex_tags(tags)
                 
                 if should_flip:
                     # Apply the horizontal flip to the image
                     image = TF.hflip(image)
                     # Use the swapped tags
                     tags = swapped_tags
+                    
+                    # Update monitoring statistics
+                    if self.orientation_monitor:
+                        self.orientation_monitor.check_health(self.orientation_handler)
                 # If should_flip is False, the handler determined this image should not be flipped
                 # (e.g., contains text, signature, or unmapped orientation tags)
             
