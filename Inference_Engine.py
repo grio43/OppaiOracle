@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 import torchvision.transforms as T
 from PIL import Image
+from vocabulary import TagVocabulary, load_vocabulary_for_training
 
 # Optional imports for API
 try:
@@ -130,56 +131,6 @@ def create_model(**kwargs):
     config = VisionTransformerConfig(**kwargs)
     return SimpleViT(config)
 
-
-# ============================================================================
-# Vocabulary Components
-# ============================================================================
-
-class TagVocabulary:
-    """Tag vocabulary manager"""
-    
-    def __init__(self, tags: List[str] = None):
-        self.tags = tags or []
-        self.tag_to_index = {tag: idx for idx, tag in enumerate(self.tags)}
-        self.index_to_tag = {idx: tag for idx, tag in enumerate(self.tags)}
-        self.unk_index = len(self.tags)  # Unknown tag index
-        self.unk_token = "<UNK>"
-        
-    def get_tag_index(self, tag: str) -> int:
-        """Get index for a tag"""
-        return self.tag_to_index.get(tag, self.unk_index)
-    
-    def get_tag_from_index(self, index: int) -> str:
-        """Get tag from index"""
-        return self.index_to_tag.get(index, self.unk_token)
-    
-    def __len__(self):
-        return len(self.tags)
-    
-    @classmethod
-    def from_file(cls, filepath: Path):
-        """Load vocabulary from file"""
-        with open(filepath, 'r') as f:
-            tags = [line.strip() for line in f if line.strip()]
-        return cls(tags)
-    
-    def save(self, filepath: Path):
-        """Save vocabulary to file"""
-        with open(filepath, 'w') as f:
-            for tag in self.tags:
-                f.write(f"{tag}\n")
-
-
-def load_vocabulary_for_training(vocab_dir: Path) -> TagVocabulary:
-    """Load vocabulary from directory"""
-    vocab_file = vocab_dir / "tags.txt"
-    if vocab_file.exists():
-        return TagVocabulary.from_file(vocab_file)
-    else:
-        # Create dummy vocabulary for demo
-        logger.warning(f"Vocabulary file not found at {vocab_file}, using dummy vocabulary")
-        dummy_tags = [f"tag_{i}" for i in range(1000)]
-        return TagVocabulary(dummy_tags)
 
 
 # ============================================================================

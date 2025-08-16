@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler
 from collections import OrderedDic
+from vocabulary import TagVocabulary  
 
 logger = logging.getLogger(__name__)
 
@@ -85,138 +86,6 @@ class SimplifiedDataConfig:
             raise ValueError(
                 f"cache_precision must be one of 'float32', 'float16' or 'uint8', got {self.cache_precision}"
             )
-
-
-class TagVocabulary:
-    """Tag vocabulary manager with separate <PAD> and <UNK> tokens.
-
-    The vocabulary can be built from a collection of JSON annotation files or
-    loaded from a JSON file.  Tags appearing less than ``min_frequency``
-    times are omitted to keep the vocabulary size manageable.  Unknown
-    tags are mapped to the ``<UNK>`` index rather than being silently
-    discarded.
-    """
-
-    def __init__(self, vocab_path: Optional[Path] = None, min_frequency: int = 1) -> None:
-        self.tag_to_index: Dict[str, int] = {}
-        self.index_to_tag: Dict[int, str] = {}
-        self.tag_frequencies: Dict[str, int] = {}
-        self.min_frequency = min_frequency
-        # Distinct special tokens
-        self.pad_token = "<PAD>"
-        self.unk_token = "<UNK>"
-        # Rating classes (fixed).  A fifth ``unknown`` rating is included to
-        # handle missing annotations.
-        self.rating_to_index: Dict[str, int] = {
-            "general": 0,
-            "sensitive": 1,
-            "questionable": 2,
-            "explicit": 3,
-            "unknown": 4,
-        }
-
-        # If a vocabulary file is supplied, attempt to load it
-        if vocab_path is not None and vocab_path.exists():
-            try:
-                self.load_vocabulary(vocab_path)
-            except Exception:
-                logger.info(f"Could not load vocabulary from {vocab_path}, will build a new one")
-
-    def __len__(self) -> int:
-        return len(self.tag_to_index)
-
-    def encode_tags(self, tags: Iterable[str]) -> torch.Tensor:
-        """Encode a list of tag strings into a multi‑hot tensor.
-
-        Unknown tags are mapped to the ``<UNK>`` index; the resulting tensor
-        has shape (vocab_size,) and dtype ``float32``.
-        """
-        vector = torch.zeros(len(self.tag_to_index), dtype=torch.float32)
-        for tag in tags:
-            idx = self.tag_to_index.get(tag, self.tag_to_index[self.unk_token])
-            vector[idx] = 1.0
-        return vector
-
-    def build_from_annotations(self, json_files: List[Path], top_k: int) -> None:
-        """Build a vocabulary from a collection of JSON annotation files.
-
-        Parameters
-        ----------
-        json_files: List[Path]
-            List of annotation files to parse.
-        top_k: int
-            Maximum number of tags to keep.  Tags are sorted by frequency
-            descending and truncated to this value.
-        """
-        logger.info(f"Building vocabulary from {len(json_files)} annotation files")
-        tag_counts: Dict[str, int] = {}
-        for json_file in json_files:
-            try:
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                for entry in data:
-                    tags_field = entry.get('tags')
-                    if not tags_field:
-                        continue
-                    tags_list: List[str]
-                    if isinstance(tags_field, str):
-                        tags_list = tags_field.split()
-                    elif isinstance(tags_field, list):
-                        tags_list = tags_field
-                    else:
-                        continue
-                    for tag in tags_list:
-                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
-            except Exception as e:
-                logger.warning(f"Failed to parse {json_file}: {e}")
-        # Sort tags by frequency and cut to top_k
-        sorted_tags = sorted(
-            [t for t, c in tag_counts.items() if c >= self.min_frequency],
-            key=lambda x: (-tag_counts[x], x)
-        )
-        if top_k is not None and top_k > 0:
-            sorted_tags = sorted_tags[:top_k]
-        # Assign indices.  Reserve 0 for <PAD> and 1 for <UNK>
-        self.tag_to_index = {self.pad_token: 0, self.unk_token: 1}
-        self.index_to_tag = {0: self.pad_token, 1: self.unk_token}
-        for idx, tag in enumerate(sorted_tags, start=2):
-            self.tag_to_index[tag] = idx
-            self.index_to_tag[idx] = tag
-            self.tag_frequencies[tag] = tag_counts[tag]
-        logger.info(f"Vocabulary built with {len(self.tag_to_index)} tags (incl. special tokens)")
-
-    def save_vocabulary(self, vocab_path: Path) -> None:
-        """Save the vocabulary to a JSON file.
-
-        The file contains a mapping from tags to indices and vice versa as
-        well as tag frequencies.  The top‑level keys are ``tag_to_index``,
-        ``index_to_tag`` and ``tag_frequencies``.
-        """
-        vocab_path = Path(vocab_path)
-        vocab_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(vocab_path, 'w', encoding='utf-8') as f:
-            json.dump({
-                'tag_to_index': self.tag_to_index,
-                'index_to_tag': self.index_to_tag,
-                'tag_frequencies': self.tag_frequencies,
-            }, f, ensure_ascii=False, indent=2)
-        logger.info(f"Saved vocabulary to {vocab_path}")
-
-    def load_vocabulary(self, vocab_path: Path) -> None:
-        """Load vocabulary from a JSON file created by :meth:`save_vocabulary`."""
-        with open(vocab_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        self.tag_to_index = data['tag_to_index']
-        self.index_to_tag = {int(k): v for k, v in data['index_to_tag'].items()}
-        self.tag_frequencies = data.get('tag_frequencies', {})
-        # Ensure special tokens are present
-        for token in (self.pad_token, self.unk_token):
-            if token not in self.tag_to_index:
-                idx = len(self.tag_to_index)
-                self.tag_to_index[token] = idx
-                self.index_to_tag[idx] = token
-        logger.info(f"Loaded vocabulary with {len(self.tag_to_index)} tags from {vocab_path}")
-
 
 class SimplifiedDataset(Dataset):
     """Dataset for anime image tagging with augmentation and sampling.
