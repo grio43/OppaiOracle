@@ -15,8 +15,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler
-from collections import OrderedDic
-from vocabulary import TagVocabulary  
+from collections import OrderedDict
+from vocabulary import TagVocabulary
+from orientation_handler import OrientationHandler
 
 logger = logging.getLogger(__name__)
 
@@ -97,65 +98,52 @@ class SimplifiedDataset(Dataset):
     """
 
     def __init__(
-        self,
-        config: SimplifiedDataConfig,
-        json_files: List[Path],
-        split: str,
-        vocab: TagVocabulary,
-    ) -> None:
-        assert split in {'train', 'val', 'test'}, f"Unknown split '{split}'"
-        self.config = config
-        self.split = split
-        self.vocab = vocab
-        self.annotations: List[Dict[str, Any]] = []
-        self.cache: OrderedDict[str, torch.Tensor] = OrderedDict()
-        # Load orientation mapping from file if provided
-        if config.orientation_map_path is not None and config.orientation_map_path.exists():
-            try:
-                with open(config.orientation_map_path, 'r', encoding='utf-8') as f:
-                    self.orientation_tag_map = json.load(f)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to load orientation mapping from {config.orientation_map_path}: {e}. "
-                    "Falling back to default mapping"
+            self,
+            config: SimplifiedDataConfig,
+            json_files: List[Path],
+            split: str,
+            vocab: TagVocabulary,
+        ) -> None:
+            assert split in {'train', 'val', 'test'}, f"Unknown split '{split}'"
+            self.config = config
+            self.split = split
+            self.vocab = vocab
+            self.annotations: List[Dict[str, Any]] = []
+            self.cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+            # Initialize orientation handler for flip augmentation
+            # Only needed for training split when flips are enabled
+            if split == 'train' and config.random_flip_prob > 0:
+                self.orientation_handler = OrientationHandler(
+                    mapping_file=config.orientation_map_path,
+                    random_flip_prob=config.random_flip_prob,
+                    strict_mode=False,  # Don't fail if mapping is incomplete
+                    skip_unmapped=True   # Skip flipping images with unmapped orientation tags
                 )
-                self.orientation_tag_map = self._default_orientation_map()
-        else:
-            self.orientation_tag_map = self._default_orientation_map()
-        # Preload annotations
-        if config.preload_metadata:
-            self._load_annotations(json_files)
-            # Precompute sample weights for frequency sampling
-            self.sample_weights: Optional[np.ndarray] = None
-            if config.frequency_weighted_sampling and split == 'train':
-                self._calculate_sample_weights()
-        else:
-            self.sample_weights = None
-        # Set up augmentation and normalisation
-        self.augmentation = self._setup_augmentation() if config.augmentation_enabled and split == 'train' else None
-        self.normalize = T.Normalize(mean=config.normalize_mean, std=config.normalize_std)
-        # Determine maximum cache size in number of images
-        bytes_per_element = {
-            'float32': 4,
-            'float16': 2,
-            'uint8': 1,
-        }[config.cache_precision]
-        bytes_per_image = 3 * config.image_size * config.image_size * bytes_per_element
-        self.max_cache_size = int((config.cache_size_gb * (1024 ** 3)) / bytes_per_image)
-        self.cache_precision = config.cache_precision
-        self.cache_lock = threading.Lock()  # Add thread lock for cache operations
-        logger.info(f"Dataset initialised with {len(self.annotations)} samples for split '{split}'")
-
-    def _default_orientation_map(self) -> Dict[str, str]:
-        """Return a minimal left/right tag mapping for orientation flips."""
-        return {
-            'hair_over_left_eye': 'hair_over_right_eye',
-            'hair_over_right_eye': 'hair_over_left_eye',
-            'hand_on_left_hip': 'hand_on_right_hip',
-            'hand_on_right_hip': 'hand_on_left_hip',
-            'looking_to_the_left': 'looking_to_the_right',
-            'looking_to_the_right': 'looking_to_the_left',
-        }
+            else:
+                self.orientation_handler = None
+            # Preload annotations
+            if config.preload_metadata:
+                self._load_annotations(json_files)
+                # Precompute sample weights for frequency sampling
+                self.sample_weights: Optional[np.ndarray] = None
+                if config.frequency_weighted_sampling and split == 'train':
+                    self._calculate_sample_weights()
+            else:
+                self.sample_weights = None
+            # Set up augmentation and normalisation
+            self.augmentation = self._setup_augmentation() if config.augmentation_enabled and split == 'train' else None
+            self.normalize = T.Normalize(mean=config.normalize_mean, std=config.normalize_std)
+            # Determine maximum cache size in number of images
+            bytes_per_element = {
+                'float32': 4,
+                'float16': 2,
+                'uint8': 1,
+            }[config.cache_precision]
+            bytes_per_image = 3 * config.image_size * config.image_size * bytes_per_element
+            self.max_cache_size = int((config.cache_size_gb * (1024 ** 3)) / bytes_per_image)
+            self.cache_precision = config.cache_precision
+            self.cache_lock = threading.Lock()  # Add thread lock for cache operations
+            logger.info(f"Dataset initialised with {len(self.annotations)} samples for split '{split}'")
 
     def _load_annotations(self, json_files: List[Path]) -> None:
         """Parse annotation files and populate ``self.annotations``.
@@ -199,37 +187,44 @@ class SimplifiedDataset(Dataset):
         logger.info(f"Loaded {len(self.annotations)} valid annotations")
 
     def _calculate_sample_weights(self) -> None:
-        """Compute per‑sample weights based on tag frequencies.
+            """Compute per‑sample weights based on tag frequencies.
 
-        Each annotation receives a weight equal to the average of the inverse
-        of its tag frequencies raised to ``sample_weight_power``.  An optional
-        multiplier is applied if any tag in the annotation is orientation
-        specific (as determined by ``orientation_tag_map``).  The resulting
-        weights are normalised to sum to one.
-        """
-        weights: List[float] = []
-        for anno in self.annotations:
-            w = 0.0
-            has_orientation_tag = False
-            for tag in anno['tags']:
-                freq = self.vocab.tag_frequencies.get(tag, 1)
-                # Inverse frequency weighting
-                w += (1.0 / max(freq, 1)) ** self.config.sample_weight_power
-                if tag in self.orientation_tag_map:
-                    has_orientation_tag = True
-            # Average over number of tags to avoid biasing multi‑tag images
-            w = w / max(1, len(anno['tags']))
-            # Apply orientation oversample factor if needed
-            if has_orientation_tag:
-                w *= self.config.orientation_oversample_factor
-            weights.append(w)
-        weights_arr = np.array(weights, dtype=np.float64)
-        # Normalise weights to sum to one
-        weights_arr = weights_arr / weights_arr.sum() if weights_arr.sum() > 0 else weights_arr
-        self.sample_weights = weights_arr
-        logger.info(
-            f"Sample weights calculated (min={weights_arr.min():.6f}, max={weights_arr.max():.6f})"
-        )
+            Each annotation receives a weight equal to the average of the inverse
+            of its tag frequencies raised to ``sample_weight_power``.  An optional
+            multiplier is applied if any tag in the annotation is orientation
+            specific (as determined by the orientation handler).  The resulting
+            weights are normalised to sum to one.
+            """
+            weights: List[float] = []
+            # Get orientation tags from handler if available
+            orientation_tags = set()
+            if self.orientation_handler:
+                # Collect all orientation-aware tags (explicit mappings + reverse mappings)
+                orientation_tags.update(self.orientation_handler.explicit_mappings.keys())
+                orientation_tags.update(self.orientation_handler.reverse_mappings.keys())
+            
+            for anno in self.annotations:
+                w = 0.0
+                has_orientation_tag = False
+                for tag in anno['tags']:
+                    freq = self.vocab.tag_frequencies.get(tag, 1)
+                    # Inverse frequency weighting
+                    w += (1.0 / max(freq, 1)) ** self.config.sample_weight_power
+                    if tag in orientation_tags:
+                        has_orientation_tag = True
+                # Average over number of tags to avoid biasing multi‑tag images
+                w = w / max(1, len(anno['tags']))
+                # Apply orientation oversample factor if needed
+                if has_orientation_tag:
+                    w *= self.config.orientation_oversample_factor
+                weights.append(w)
+            weights_arr = np.array(weights, dtype=np.float64)
+            # Normalise weights to sum to one
+            weights_arr = weights_arr / weights_arr.sum() if weights_arr.sum() > 0 else weights_arr
+            self.sample_weights = weights_arr
+            logger.info(
+                f"Sample weights calculated (min={weights_arr.min():.6f}, max={weights_arr.max():.6f})"
+            )
 
     def _setup_augmentation(self) -> Optional[T.Compose]:
         """Create an augmentation pipeline for the training split.
@@ -358,19 +353,29 @@ class SimplifiedDataset(Dataset):
         
         try:
             # Load image (float32 tensor)
+ # Load image (float32 tensor)
             image = self._load_image(image_path)
             
             # Copy tags so we can mutate without altering the original
             tags = list(anno['tags'])
             
-            # Random horizontal flip with orientation tag swap
+            # Random horizontal flip with orientation-aware tag swapping
+            # Only attempt flip if handler is available and random check passes
             if (
-                self.config.random_flip_prob > 0
+                self.orientation_handler is not None
                 and self.split == 'train'
                 and np.random.rand() < self.config.random_flip_prob
             ):
-                image = TF.hflip(image)
-                tags = [self.orientation_tag_map.get(t, t) for t in tags]
+                # Use orientation handler to swap tags and determine if flip should proceed
+                swapped_tags, should_flip = self.orientation_handler.swap_tags(tags)
+                
+                if should_flip:
+                    # Apply the horizontal flip to the image
+                    image = TF.hflip(image)
+                    # Use the swapped tags
+                    tags = swapped_tags
+                # If should_flip is False, the handler determined this image should not be flipped
+                # (e.g., contains text, signature, or unmapped orientation tags)
             
             # Additional augmentation
             if self.augmentation is not None:
