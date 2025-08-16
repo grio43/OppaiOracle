@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field
 from collections import defaultdict
 import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import io
 import base64
@@ -498,6 +499,7 @@ class InferenceEngine:
         
         # Performance tracking
         self.inference_times = []
+        self._inference_times_lock = threading.Lock()  # Add lock for thread safety
     
     def _validate_normalization(self):
         """Validate that normalization parameters match training"""
@@ -691,7 +693,8 @@ class InferenceEngine:
             
             # Track timing
             inference_time = time.time() - start_time
-            self.inference_times.append(inference_time)
+            with self._inference_times_lock:
+                self.inference_times.append(inference_time)
             
             # Format output
             result = self.postprocessor.format_output(tags, image if isinstance(image, (str, Path)) else None)
@@ -760,7 +763,8 @@ class InferenceEngine:
                 
                 # Track timing
                 batch_time = time.time() - start_time
-                self.inference_times.extend([batch_time / len(batch_images)] * len(batch_images))
+                with self._inference_times_lock:
+                    self.inference_times.extend([batch_time / len(batch_images)] * len(batch_images))
                 
             except Exception as e:
                 logger.error(f"Error processing batch: {e}")
@@ -796,16 +800,18 @@ class InferenceEngine:
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get inference statistics"""
-        if not self.inference_times:
-            return {
-                "normalization": {
-                    "mean": self.config.normalize_mean,
-                    "std": self.config.normalize_std,
-                    "scheme": "anime" if self.config.normalize_mean == (0.5, 0.5, 0.5) else "unknown"
+        with self._inference_times_lock:
+            if not self.inference_times:
+                return {
+                    "normalization": {
+                        "mean": self.config.normalize_mean,
+                        "std": self.config.normalize_std,
+                        "scheme": "anime" if self.config.normalize_mean == (0.5, 0.5, 0.5) else "unknown"
                 }
-            }
+            
         
-        times_ms = [t * 1000 for t in self.inference_times]
+        # Make a copy to avoid holding the lock too long
+        times_ms = [t * 1000 for t in self.inference_times.copy()]
         
         return {
             'avg_inference_time_ms': float(np.mean(times_ms)),

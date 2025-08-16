@@ -376,6 +376,7 @@ class SystemMonitor:
         self.config = config
         self.running = False
         self.thread = None
+        self._lock = threading.Lock()  # Add lock for thread safety
         self.metrics_queue = queue.Queue(maxsize=100)
         self.error_count = 0
         self.max_errors = 10
@@ -397,25 +398,29 @@ class SystemMonitor:
     
     def start(self):
         """Start system monitoring"""
-        if self.running:
-            return
+        with self._lock:
+            if self.running:
+                return
+            self.running = True
+            self.thread = threading.Thread(target=self._monitor_loop, daemon=True, name="SystemMonitor")
+            self.thread.start()
+            logger.info("System monitoring started")
         
-        self.running = True
-        self.thread = threading.Thread(target=self._monitor_loop, daemon=True, name="SystemMonitor")
-        self.thread.start()
-        logger.info("System monitoring started")
     
     def stop(self):
         """Stop system monitoring gracefully"""
-        if not self.running:
-            return
+        with self._lock:
+            if not self.running:
+                return
             
-        self.running = False
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=5)
-            if self.thread.is_alive():
-                logger.warning("System monitor thread did not stop gracefully")
-        logger.info("System monitoring stopped")
+            self.running = False
+            thread_to_join = self.thread
+            
+        if thread_to_join and thread_to_join.is_alive():
+                thread_to_join.join(timeout=5)
+                if thread_to_join.is_alive():
+                    logger.warning("System monitor thread did not stop gracefully")
+                logger.info("System monitoring stopped")
     
     def _monitor_loop(self):
         """Main monitoring loop with error handling"""
