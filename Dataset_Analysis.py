@@ -172,71 +172,108 @@ class ImageAnalyzer:
         self.config = config
         
     def analyze_image(self, image_path: Path) -> Optional[ImageStats]:
-        """Analyze a single image"""
+        """Analyze a single image
+        
+        Args:
+            image_path: Path to image file
+            
+        Returns:
+            ImageStats object or None if image is corrupted
+            
+        Raises:
+            FileNotFoundError: If image file doesn't exist
+            PermissionError: If file can't be accessed
+            RuntimeError: For unexpected errors
+        """
+        # Check file exists before processing
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        
+        if not image_path.is_file():
+            raise ValueError(f"Path is not a file: {image_path}")
+        
         try:
-            # Basic stats
-            stats = ImageStats(
-                path=str(image_path),
-                file_size_kb=image_path.stat().st_size / 1024
-            )
+            # Get file stats (may raise PermissionError)
+            file_size_kb = image_path.stat().st_size / 1024
+        except PermissionError as e:
+            logger.error(f"Permission denied accessing {image_path}")
+            raise
+        except OSError as e:
+            logger.error(f"OS error accessing {image_path}: {e}")
+            raise
+        
+        stats = ImageStats(
+            path=str(image_path),
+            file_size_kb=file_size_kb
+        )
+        
+        # Try to open and analyze image
+        try:
+            with Image.open(image_path) as img:
+                # First verify the image can be loaded
+                img.verify()
             
-            # Open and analyze image
-            try:
-                with Image.open(image_path) as img:
-                    # First verify the image can be loaded
-                    img.verify()
-                    
-                # Re-open for actual processing (verify closes the file)
-                with Image.open(image_path) as img:
-                    stats.width = img.width
-                    stats.height = img.height
-                    stats.format = img.format or 'unknown'
-                    stats.channels = len(img.getbands())
-                    
-                    # Convert to RGB for analysis
-                    if self.config.extract_color_stats:
-                        try:
-                            img_rgb = img.convert('RGB')
-                            img_array = np.array(img_rgb)
-                            
-                            # Color statistics
-                            stats.mean_color = tuple(float(x) for x in img_array.mean(axis=(0, 1)))
-                            stats.std_color = tuple(float(x) for x in img_array.std(axis=(0, 1)))
-                            
-                            # Brightness (average of grayscale)
-                            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-                            stats.brightness = float(gray.mean())
-                            
-                            # Contrast (standard deviation of grayscale)
-                            stats.contrast = float(gray.std())
-                            
-                            # Sharpness (variance of Laplacian)
-                            laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-                            stats.sharpness = float(laplacian.var())
-                        except Exception as e:
-                            logger.debug(f"Could not extract color stats for {image_path}: {e}")
-                            
-            except Exception as e:
-                logger.debug(f"Image corrupted or unreadable: {image_path}: {e}")
-                stats.is_corrupted = True
-                stats.quality_issues.append("corrupted")
-                return stats
-            
-            # File hash
-            stats.file_hash = self._compute_file_hash(image_path)
-            
-            # Perceptual hash
-            if self.config.use_perceptual_hash and IMAGEHASH_AVAILABLE:
-                stats.perceptual_hash = self._compute_perceptual_hash(image_path)
-            
-            # Quality checks
-            self._check_quality(stats)
-            
-            return stats
-            
+            # Re-open for actual processing (verify closes the file)
+            with Image.open(image_path) as img:
+                stats.width = img.width
+                stats.height = img.height
+                stats.format = img.format or 'unknown'
+                stats.channels = len(img.getbands())
+                
+                # Convert to RGB for analysis
+                if self.config.extract_color_stats:
+                    try:
+                        img_rgb = img.convert('RGB')
+                        img_array = np.array(img_rgb)
+                        
+                        # Color statistics
+                        stats.mean_color = tuple(float(x) for x in img_array.mean(axis=(0, 1)))
+                        stats.std_color = tuple(float(x) for x in img_array.std(axis=(0, 1)))
+                        
+                        # Brightness (average of grayscale)
+                        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+                        stats.brightness = float(gray.mean())
+                        
+                        # Contrast (standard deviation of grayscale)
+                        stats.contrast = float(gray.std())
+                        
+                        # Sharpness (variance of Laplacian)
+                        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+                        stats.sharpness = float(laplacian.var())
+                    except Exception as e:
+                        # Color stats are optional, log but don't fail
+                        logger.debug(f"Could not extract color stats for {image_path}: {e}")
+                        
+        except (IOError, OSError) as e:
+            # Image is corrupted or unreadable - this is expected for some files
+            logger.debug(f"Image corrupted or unreadable: {image_path}: {e}")
+            stats.is_corrupted = True
+            stats.quality_issues.append("corrupted")
+            return stats  # Return partial stats for corrupted images
         except Exception as e:
-            logger.error(f"Error analyzing {image_path}: {e}")
-            return None
+            # Unexpected error - should not happen
+            logger.error(f"Unexpected error analyzing {image_path}: {e}")
+            raise RuntimeError(f"Unexpected error analyzing image {image_path}") from e
+        
+        # File hash
+        try:
+            stats.file_hash = self._compute_file_hash(image_path)
+        except Exception as e:
+            logger.debug(f"Could not compute file hash: {e}")
+            # Hash is optional, continue
+        
+        # Perceptual hash
+        if self.config.use_perceptual_hash and IMAGEHASH_AVAILABLE:
+            try:
+                stats.perceptual_hash = self._compute_perceptual_hash(image_path)
+            except Exception as e:
+                logger.debug(f"Could not compute perceptual hash: {e}")
+                # Perceptual hash is optional, continue
+        
+        # Quality checks
+        self._check_quality(stats)
+        
+        return stats
     
     def _compute_file_hash(self, path: Path) -> str:
         """Compute file hash"""
