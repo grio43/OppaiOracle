@@ -331,15 +331,38 @@ class SimplifiedDataset(Dataset):
 
         Applies a random horizontal flip with orientation‑aware tag remapping
         for the training split.  Augmentation and normalisation are then
-        applied.  Any exceptions are caught and logged, and a safe fallback
-        sample is returned.
+        applied.
+        
+        Args:
+            idx: Index of item to fetch
+            
+        Returns:
+            Dictionary containing image, labels, and metadata
+            
+        Raises:
+            IndexError: If index is out of bounds
+            RuntimeError: If critical error occurs during processing
         """
+        if idx < 0 or idx >= len(self.annotations):
+            raise IndexError(f"Index {idx} out of range for dataset with {len(self.annotations)} samples")
+        
+        anno = self.annotations[idx]
+        image_path = anno['image_path']
+        
+        # Track error count for this specific image
+        if not hasattr(self, '_error_counts'):
+            self._error_counts = {}
+        
+        error_count = self._error_counts.get(image_path, 0)
+        max_retries = 3
+        
         try:
-            anno = self.annotations[idx]
             # Load image (float32 tensor)
-            image = self._load_image(anno['image_path'])
+            image = self._load_image(image_path)
+            
             # Copy tags so we can mutate without altering the original
             tags = list(anno['tags'])
+            
             # Random horizontal flip with orientation tag swap
             if (
                 self.config.random_flip_prob > 0
@@ -348,14 +371,22 @@ class SimplifiedDataset(Dataset):
             ):
                 image = TF.hflip(image)
                 tags = [self.orientation_tag_map.get(t, t) for t in tags]
+            
             # Additional augmentation
             if self.augmentation is not None:
                 image = self.augmentation(image)
+            
             # Normalise
             image = self.normalize(image)
+            
             # Encode tags and rating
             tag_labels = self.vocab.encode_tags(tags)
             rating_label = self.vocab.rating_to_index.get(anno['rating'], self.vocab.rating_to_index['unknown'])
+            
+            # Reset error count on successful load
+            if image_path in self._error_counts:
+                del self._error_counts[image_path]
+            
             return {
                 'image': image,
                 'labels': {
@@ -372,22 +403,44 @@ class SimplifiedDataset(Dataset):
                     'rating': anno['rating'],
                 },
             }
+            
+        except (IOError, OSError) as e:
+            # File I/O errors - may be temporary
+            self._error_counts[image_path] = error_count + 1
+            
+            if error_count >= max_retries:
+                logger.error(f"Failed to load {image_path} after {max_retries} attempts: {e}")
+                # After multiple failures, raise to stop training
+                raise RuntimeError(f"Persistent failure loading {image_path}: {e}") from e
+            else:
+                logger.warning(f"Error loading {image_path} (attempt {error_count + 1}/{max_retries}): {e}")
+                # Return a black image for this attempt
+                return self._create_error_sample(idx, image_path, "io_error")
+                
         except Exception as e:
-            logger.error(f"Error in __getitem__ for index {idx}: {e}")
-            # Safe fallback sample
-            return {
-                'image': torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32),
-                'tag_labels': torch.zeros(len(self.vocab.tag_to_index), dtype=torch.float32),
-                'rating_label': torch.tensor(self.vocab.rating_to_index.get('unknown', 4), dtype=torch.long),
-                'metadata': {
-                    'index': idx,
-                    'path': f"error_{idx}",
-                    'num_tags': 0,
-                    'tags': [],
-                    'rating': 'unknown',
-                },
-            }
+            # Unexpected errors should not be silenced
+            logger.error(f"Unexpected error in __getitem__ for index {idx}, path {image_path}: {e}")
+            raise RuntimeError(f"Unexpected error processing sample {idx}") from e
 
+    def _create_error_sample(self, idx: int, image_path: str, error_type: str) -> Dict[str, Any]:
+        """Create an error sample with appropriate defaults.
+        
+        This should only be used for recoverable errors like temporary I/O issues.
+        """
+        logger.debug(f"Creating error sample for {image_path}, type: {error_type}")
+        return {
+            'image': torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32),
+            'tag_labels': torch.zeros(len(self.vocab.tag_to_index), dtype=torch.float32),
+            'rating_label': torch.tensor(self.vocab.rating_to_index.get('unknown', 4), dtype=torch.long),
+            'metadata': {
+                'index': idx,
+                'path': image_path,
+                'num_tags': 0,
+                'tags': [],
+                'rating': 'unknown',
+                'error_type': error_type,
+            },
+        }
 
 def create_dataloaders(
     data_dir: Path,

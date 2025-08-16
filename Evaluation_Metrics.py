@@ -149,57 +149,66 @@ class MetricComputer:
             
         Returns:
             Dictionary of all computed metrics
+        
+        Raises:
+            ValueError: If input validation fails
+            RuntimeError: If metric computation fails
         """
         # Validate inputs
         self._validate_inputs(predictions, targets)
         
         metrics = {}
+        failed_metrics = []
         
         # Convert to numpy for sklearn (with memory management)
         logger.info("Converting to numpy arrays...")
         pred_np = self._safe_to_numpy(predictions)
         target_np = self._safe_to_numpy(targets)
         
+        # Basic metrics (critical - should always work)
         try:
-            # Basic metrics
             logger.info("Computing basic metrics...")
             metrics.update(self._compute_basic_metrics(pred_np, target_np))
-            
-            # Top-k metrics
+        except Exception as e:
+            logger.error(f"Failed to compute basic metrics: {e}")
+            raise RuntimeError(f"Critical failure in basic metrics computation: {e}") from e
+        
+        # Top-k metrics (critical for evaluation)
+        try:
             logger.info("Computing top-k metrics...")
             metrics.update(self._compute_topk_metrics(predictions, targets))
-            
-            # Threshold analysis
-            logger.info("Computing threshold metrics...")
-            metrics.update(self._compute_threshold_metrics(pred_np, target_np))
-            
-            # Hierarchical metrics (for grouped tags)
-            if self._is_hierarchical(predictions):
-                logger.info("Computing hierarchical metrics...")
-                metrics.update(self._compute_hierarchical_metrics(predictions, targets))
-            
-            # Per-tag metrics
-            if self.config.compute_per_tag_metrics:
-                logger.info("Computing per-tag metrics...")
-                metrics.update(self._compute_per_tag_metrics(pred_np, target_np, tag_names))
-            
-            # Frequency-based metrics
-            if tag_frequencies is not None:
-                logger.info("Computing frequency-based metrics...")
-                metrics.update(self._compute_frequency_metrics(pred_np, target_np, tag_frequencies))
-            
-            # Coverage and diversity
-            logger.info("Computing coverage metrics...")
-            metrics.update(self._compute_coverage_metrics(pred_np, target_np))
-            
-            # Mean Average Precision
-            if self.config.compute_auc:
-                logger.info("Computing mAP...")
-                metrics['mAP'] = self._compute_map(pred_np, target_np)
-                
         except Exception as e:
-            logger.error(f"Error computing metrics: {str(e)}")
-            metrics['error'] = str(e)
+            logger.error(f"Failed to compute top-k metrics: {e}")
+            raise RuntimeError(f"Critical failure in top-k metrics computation: {e}") from e
+        
+        # Non-critical metrics with individual error handling
+        optional_computations = [
+            ("threshold", lambda: self._compute_threshold_metrics(pred_np, target_np)),
+            ("hierarchical", lambda: self._compute_hierarchical_metrics(predictions, targets) 
+            if self._is_hierarchical(predictions) else {}),
+            ("per_tag", lambda: self._compute_per_tag_metrics(pred_np, target_np, tag_names)
+            if self.config.compute_per_tag_metrics else {}),
+            ("frequency", lambda: self._compute_frequency_metrics(pred_np, target_np, tag_frequencies)
+            if tag_frequencies is not None else {}),
+            ("coverage", lambda: self._compute_coverage_metrics(pred_np, target_np)),
+            ("mAP", lambda: {"mAP": self._compute_map(pred_np, target_np)}
+            if self.config.compute_auc else {})
+        ]
+        
+        for metric_name, compute_fn in optional_computations:
+            try:
+                logger.info(f"Computing {metric_name} metrics...")
+                result = compute_fn()
+                if result:
+                    metrics.update(result)
+            except Exception as e:
+                logger.warning(f"Failed to compute {metric_name} metrics: {e}")
+                failed_metrics.append(metric_name)
+                # Continue with other metrics instead of failing completely
+        
+        if failed_metrics:
+            metrics['_failed_metrics'] = failed_metrics
+            logger.warning(f"Some metrics failed to compute: {failed_metrics}")
         
         return metrics
     
