@@ -1,0 +1,164 @@
+[
+  {
+    "issue": "Missing automated tests",
+    "description": "These issues should only be taken with a grain of salt",
+    "files": [
+      "All modules"
+    ]
+  },
+  {
+    "issue": "Large monolithic modules and functions",
+    "description": "Several files exceed 1 000 lines and contain very large functions that perform many unrelated tasks.  For example, `MetricComputer.compute_all_metrics` performs conversion to numpy, basic metrics, top‑k metrics, threshold metrics, hierarchical metrics and more in one method and catches all exceptions:contentReference[oaicite:0]{index=0}.  Likewise `Configuration_System.py` defines nested dataclasses and lengthy update logic in one file:contentReference[oaicite:1]{index=1}.  Such complexity hurts maintainability and testability.",
+    "files": [
+      "Evaluation_Metrics.py",
+      "Configuration_System.py",
+      "Dataset_Analysis.py",
+      "Monitor_log.py",
+      "ONNX_Export.py",
+      "train_direct.py",
+      "validation_loop.py",
+      "training_utils.py"
+    ]
+  },
+  {
+    "issue": "Code duplication – multiple TagVocabulary implementations",
+    "description": "Tag vocabulary logic is implemented repeatedly.  `HDF5_loader.py` defines a `TagVocabulary` class with methods to build, encode and save vocabularies:contentReference[oaicite:2]{index=2}, while `vocabulary.py` contains a nearly identical `TagVocabulary` meant to unify training and inference:contentReference[oaicite:3]{index=3}.  Maintaining multiple implementations risks inconsistencies and bugs.",
+    "files": [
+      "HDF5_loader.py",
+      "vocabulary.py",
+      "Inference_Engine.py (contains a similar TagVocabulary)",
+      "Any other module referencing tag vocabularies"
+    ]
+  },
+  {
+    "issue": "Inefficient memory usage in metric and data processing",
+    "description": "Metrics computation and data loaders convert entire tensors or datasets to NumPy arrays at once.  For example, `MetricComputer.compute_all_metrics` converts all predictions and targets to NumPy before computing metrics:contentReference[oaicite:4]{index=4}.  With up to 200 k tags, this approach uses enormous memory and can slow processing.  Dataset and analysis modules also load whole datasets into memory rather than streaming.",
+    "files": [
+      "Evaluation_Metrics.py",
+      "Dataset_Analysis.py",
+      "HDF5_loader.py",
+      "train_direct.py",
+      "validation_loop.py"
+    ]
+  },
+  {
+    "issue": "Poor error handling and hidden misconfigurations",
+    "description": "Many functions catch generic `Exception` and continue execution, masking problems.  For instance, `MetricComputer.compute_all_metrics` wraps all metric computations in a try/except and stores the exception string instead of failing:contentReference[oaicite:5]{index=5}.  `Configuration_System.from_dict` silently skips unknown configuration fields, only logging a warning:contentReference[oaicite:6]{index=6}.  Such patterns hide misconfigurations and make debugging difficult.",
+    "files": [
+      "Evaluation_Metrics.py",
+      "Configuration_System.py",
+      "Inference_Engine.py",
+      "HDF5_loader.py",
+      "Dataset_Analysis.py",
+      "train_direct.py"
+    ]
+  },
+  {
+    "issue": "Inconsistent naming conventions and style",
+    "description": "File names use inconsistent capitalization (e.g., `Configuration_System.py`, `Evaluation_Metrics.py`), and code style varies across modules.  Adhering to PEP8 (lower‑snake‑case file names, consistent indentation, etc.) and using tools like Black/Flake8 would improve readability.",
+    "files": [
+      "Entire codebase"
+    ]
+  },
+  {
+    "issue": "Insufficient docstrings and comments",
+    "description": "Many public classes and methods lack explanatory docstrings.  Complex algorithms (e.g., custom loss functions or dataset analysis) have minimal comments, making the code hard to understand and maintain.",
+    "files": [
+      "HDF5_loader.py",
+      "Configuration_System.py",
+      "Dataset_Analysis.py",
+      "Evaluation_Metrics.py",
+      "train_direct.py",
+      "training_utils.py",
+      "loss_functions.py",
+      "monitor_log.py",
+      "validation_loop.py"
+    ]
+  },
+  {
+    "issue": "Overly complex configuration system",
+    "description": "The configuration system uses nested dataclasses with methods to convert to/from dicts, YAML and JSON.  When reading configs, unknown fields are skipped with only a log message:contentReference[oaicite:7]{index=7}, which can hide typos.  The system is hard to extend and could be replaced with simpler libraries (e.g., `pydantic`).",
+    "files": [
+      "Configuration_System.py",
+      "configs/training_config.yaml",
+      "configs/inference_config.yaml",
+      "configs/export_config.yaml",
+      "configs/orientation_map.json"
+    ]
+  },
+  {
+    "issue": "Lack of separation of concerns",
+    "description": "Some modules mix unrelated responsibilities.  For example, `train_direct.py` handles argument parsing, data loading, model creation, training loops and orientation mapping in a single script.  `Dataset_Analysis.py` combines image analysis, tag statistics, duplicate detection and visualization in one file.  This violates the single‑responsibility principle and complicates maintenance.",
+    "files": [
+      "train_direct.py",
+      "Dataset_Analysis.py",
+      "training_utils.py",
+      "monitor_log.py",
+      "validation_loop.py"
+    ]
+  },
+  {
+    "issue": "Hard‑coded constants and magic numbers",
+    "description": "Many defaults (e.g., 100 000 tags, oversampling factors, dropout rates) are hard coded inside classes and functions.  Changing these values requires modifying source files rather than configuration.  Constants should be centralized in config files.",
+    "files": [
+      "model_architecture.py",
+      "HDF5_loader.py",
+      "Configuration_System.py",
+      "Evaluation_Metrics.py",
+      "loss_functions.py"
+    ]
+  },
+  {
+    "issue": "Optional dependencies and conditional imports clutter the code",
+    "description": "Modules repeatedly attempt to import optional packages (pandas, imagehash, GPUtil, TensorRT, etc.) and print warnings if missing.  This clutters the code and hides real errors.  Better to document required dependencies and fail clearly when they are missing.",
+    "files": [
+      "Dataset_Analysis.py",
+      "Monitor_log.py",
+      "ONNX_Export.py",
+      "train_direct.py",
+      "validation_loop.py"
+    ]
+  },
+  {
+    "issue": "Concurrency complexities without safeguards",
+    "description": "Modules employ multi‑processing (e.g., `ProcessPoolExecutor` in dataset analysis) and threading for caching without explicit concurrency control.  Global state and mutable objects may be shared across processes or threads, risking race conditions or deadlocks.  The design should be revisited with proper synchronization or simplified to avoid concurrency where not essential.",
+    "files": [
+      "Dataset_Analysis.py",
+      "HDF5_loader.py",
+      "train_direct.py"
+    ]
+  },
+  {
+    "issue": "Lack of type annotations and static analysis support",
+    "description": "While dataclasses use type hints, many functions and variables across the codebase lack type annotations.  Adding comprehensive type hints would help catch errors early through static analysis tools like mypy.",
+    "files": [
+      "Entire codebase"
+    ]
+  },
+  {
+    "issue": "Repeated logging configuration and possible global state",
+    "description": "Several modules configure logging independently rather than using a shared configuration.  Some code relies on global variables (e.g., global metric trackers, caches) which can cause unexpected behavior in multi‑process scenarios.",
+    "files": [
+      "Monitor_log.py",
+      "training_utils.py",
+      "validation_loop.py",
+      "train_direct.py"
+    ]
+  },
+  {
+    "issue": "Placeholder or unimplemented methods",
+    "description": "Some base classes define methods like `validate()` that are empty and rely on subclasses to implement them:contentReference[oaicite:8]{index=8}, yet there is no enforcement.  This may lead to missing validation of configuration values.",
+    "files": [
+      "Configuration_System.py",
+      "Any subclasses that should override validate"
+    ]
+  },
+  {
+    "issue": "Minimal explanation of complex mathematical code",
+    "description": "Modules implementing advanced algorithms (e.g., asymmetric focal loss) contain little commentary on the formulas or the rationale behind parameter choices, making them harder to audit or modify.",
+    "files": [
+      "loss_functions.py",
+      "model_architecture.py"
+    ]
+  }
+]
