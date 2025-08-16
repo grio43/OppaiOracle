@@ -1,23 +1,9 @@
 [
   {
     "issue": "Missing automated tests",
-    "description": "These issues should only be taken with a grain of salt",
+    "description": "These issues should only be taken with a recomendations and not full on issues",
     "files": [
       "All modules"
-    ]
-  },
-  {
-    "issue": "Large monolithic modules and functions",
-    "description": "Several files exceed 1 000 lines and contain very large functions that perform many unrelated tasks.  For example, `MetricComputer.compute_all_metrics` performs conversion to numpy, basic metrics, top‑k metrics, threshold metrics, hierarchical metrics and more in one method and catches all exceptions:contentReference[oaicite:0]{index=0}.  Likewise `Configuration_System.py` defines nested dataclasses and lengthy update logic in one file:contentReference[oaicite:1]{index=1}.  Such complexity hurts maintainability and testability.",
-    "files": [
-      "Evaluation_Metrics.py",
-      "Configuration_System.py",
-      "Dataset_Analysis.py",
-      "Monitor_log.py",
-      "ONNX_Export.py",
-      "train_direct.py",
-      "validation_loop.py",
-      "training_utils.py"
     ]
   },
   {
