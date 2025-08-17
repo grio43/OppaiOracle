@@ -72,7 +72,7 @@ class DanbooruDataPreprocessor:
         }
         
         # Statistics tracking
-        self.stats = {
+        batch_stats = {
             'total_duplicates_removed': 0,
             'files_with_duplicates': 0,
             'files_with_all_oov': 0,
@@ -138,8 +138,8 @@ class DanbooruDataPreprocessor:
                     # Track duplicate statistics
                     dedupe_count = original_count - len(tags_list)
                     if dedupe_count > 0:
-                        self.stats['total_duplicates_removed'] += dedupe_count
-                        self.stats['files_with_duplicates'] += 1
+                        batch_stats['total_duplicates_removed'] += dedupe_count
+                        batch_stats['files_with_duplicates'] += 1
                         logger.debug(f"Removed {dedupe_count} duplicate tags from {filename}")
                     
                     # Convert tags to indices
@@ -152,7 +152,7 @@ class DanbooruDataPreprocessor:
                         else:
                             # ISSUE-010 FIX: Track OOV tags
                             oov_count += 1
-                            self.stats['total_oov_tags'] += 1
+                            batch_stats['total_oov_tags'] += 1
                     
                     # Log OOV tags for debugging
                     if oov_count > 0:
@@ -161,7 +161,7 @@ class DanbooruDataPreprocessor:
                     
                     # ISSUE-007 FIX: Skip if no tags are in vocabulary
                     if not tag_indices:
-                        self.stats['files_with_all_oov'] += 1
+                        batch_stats['files_with_all_oov'] += 1
                         logger.warning(f"Skipping {filename}: all {len(tags_list)} tags are OOV")
                         continue
                     
@@ -191,6 +191,10 @@ class DanbooruDataPreprocessor:
                 # ISSUE-008 FIX: Log with file path
                 logger.error(f"Error processing {json_file}: {e}")
                 continue
+
+            # Return both results and stats
+            results['batch_stats'] = batch_stats
+
         
         return results
     
@@ -215,7 +219,7 @@ class DanbooruDataPreprocessor:
         logger.info(f"Processing {len(json_files)} metadata files")
         
         # Reset statistics
-        self.stats = {
+        aggregated_stats = {
             'total_duplicates_removed': 0,
             'files_with_duplicates': 0,
             'files_with_all_oov': 0,
@@ -241,7 +245,13 @@ class DanbooruDataPreprocessor:
             
             for future in tqdm(as_completed(futures), total=len(futures), desc="Processing batches"):
                 batch_results = future.result()
-                
+
+                # Aggregate statistics from batch
+                batch_stats = batch_results.pop('batch_stats', {})
+                for key in aggregated_stats:
+                    if key in batch_stats:
+                        aggregated_stats[key] += batch_stats[key]
+
                 # Convert to binary vectors
                 for indices in batch_results['tag_indices']:
                     binary_vector = np.zeros(self.vocab_size, dtype=np.float32)
@@ -255,9 +265,10 @@ class DanbooruDataPreprocessor:
         
         # Log statistics
         logger.info(f"Processed {len(all_results['filenames'])} valid images")
-        logger.info(f"Removed {self.stats['total_duplicates_removed']} duplicate tags from {self.stats['files_with_duplicates']} files")
-        logger.info(f"Skipped {self.stats['files_with_all_oov']} files with only OOV tags")
-        logger.info(f"Total OOV tags encountered: {self.stats['total_oov_tags']}")
+        logger.info(f"Removed {aggregated_stats['total_duplicates_removed']} duplicate tags from {aggregated_stats['files_with_duplicates']} files")
+        logger.info(f"Skipped {aggregated_stats['files_with_all_oov']} files with only OOV tags")
+        logger.info(f"Total OOV tags encountered: {aggregated_stats['total_oov_tags']}")
+
         
         # Apply stratified sampling if requested
         if stratified:
@@ -269,7 +280,7 @@ class DanbooruDataPreprocessor:
         self._save_to_hdf5(all_results)
         
         # Save metadata
-        self._save_metadata(all_results)
+        self._save_metadata(all_results, aggregated_stats)
         
         return all_results
     
@@ -363,7 +374,7 @@ class DanbooruDataPreprocessor:
         
         logger.info(f"Saved tag indices to {indices_file}")
     
-    def _save_metadata(self, results: Dict):
+    def _save_metadata(self, results: Dict, aggregated_stats: Dict):
         """Save dataset metadata and statistics"""
         # Calculate tag frequency in dataset
         tag_frequency = Counter()
@@ -397,7 +408,7 @@ class DanbooruDataPreprocessor:
                 'max': float(np.max(results['quality_scores'])),
                 'median': float(np.median(results['quality_scores']))
             },
-            'processing_stats': self.stats  # Include duplicate/OOV statistics
+            'processing_stats': aggregated_stats  # Include duplicate/OOV statistics
         }
         
         # Save metadata

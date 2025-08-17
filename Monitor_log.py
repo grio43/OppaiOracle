@@ -376,10 +376,12 @@ class SystemMonitor:
         self.config = config
         self.running = False
         self.thread = None
+        self._lock = threading.Lock()  # Add lock for thread safety
         self.metrics_queue = queue.Queue(maxsize=100)
         self.error_count = 0
         self.max_errors = 10
         
+        self._shutdown_event = threading.Event()
         # Initialize GPU monitoring
         self.gpu_available = False
         if config.track_gpu_metrics and GPUTIL_AVAILABLE:
@@ -397,24 +399,38 @@ class SystemMonitor:
     
     def start(self):
         """Start system monitoring"""
-        if self.running:
-            return
+        with self._lock:
+            if self.running:
+                return
+            
+            self.running = True
+            self.thread = threading.Thread(target=self._monitor_loop, daemon=True, name="SystemMonitor")
+            self.thread.start()
+            logger.info("System monitoring started")
         
-        self.running = True
-        self.thread = threading.Thread(target=self._monitor_loop, daemon=True, name="SystemMonitor")
-        self.thread.start()
-        logger.info("System monitoring started")
     
     def stop(self):
         """Stop system monitoring gracefully"""
-        if not self.running:
-            return
+        with self._lock:
+            if not self.running:
+                return
             
-        self.running = False
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=5)
-            if self.thread.is_alive():
+            self.running = False
+            thread_to_join = self.thread
+            
+        if thread_to_join and thread_to_join.is_alive():
+            thread_to_join.join(timeout=5)
+            if thread_to_join.is_alive():
                 logger.warning("System monitor thread did not stop gracefully")
+            # Set shutdown event to interrupt any blocking operations
+            self._shutdown_event.set()
+            # Give it one more chance to stop
+            thread_to_join.join(timeout=2)
+            if thread_to_join.is_alive():
+                logger.error("System monitor thread is unresponsive and may remain as zombie thread")
+                # Force cleanup of thread reference
+                self.thread = None
+            
         logger.info("System monitoring stopped")
     
     def _monitor_loop(self):
@@ -448,8 +464,11 @@ class SystemMonitor:
                     break
             
             # Sleep with interruptible check
-            for _ in range(int(self.config.system_metrics_interval * 10)):
+            sleep_iterations = int(self.config.system_metrics_interval * 10)
+            for _ in range(sleep_iterations):
                 if not self.running:
+                    break
+                if self._shutdown_event.is_set():
                     break
                 time.sleep(0.1)
     
@@ -475,7 +494,10 @@ class SystemMonitor:
             metrics['cpu']['per_cpu'] = psutil.cpu_percent(interval=0.1, percpu=True)
         except Exception as e:
             logger.debug(f"Failed to collect CPU metrics: {e}")
-        
+
+        if not self.running or self._shutdown_event.is_set():
+            return metrics
+                
         try:
             # Memory metrics
             mem = psutil.virtual_memory()
@@ -490,6 +512,10 @@ class SystemMonitor:
             metrics['memory']['swap_percent'] = swap.percent
         except Exception as e:
             logger.debug(f"Failed to collect memory metrics: {e}")
+
+        if not self.running or self._shutdown_event.is_set():
+            return metrics
+                        
         
         try:
             # Disk metrics
@@ -510,6 +536,9 @@ class SystemMonitor:
         except Exception as e:
             logger.debug(f"Failed to collect disk metrics: {e}")
         
+        if not self.running or self._shutdown_event.is_set():
+            return metrics
+           
         try:
             # GPU metrics (with fresh query)
             if self.gpu_available and GPUTIL_AVAILABLE:
@@ -548,7 +577,7 @@ class SystemMonitor:
                     logger.warning(f"GPUtil became unavailable, disabling GPU monitoring: {e}")
         except Exception as e:
             logger.debug(f"Failed to collect GPU metrics: {e}")
-                
+                    
         try:
             # Network metrics
             if self.config.track_network_io:
@@ -711,19 +740,41 @@ class TrainingMonitor:
             self.profiler = None
     
        
-    def signal_handler(signum, frame):
+    def _register_cleanup(self):
+        """Register cleanup handlers for graceful shutdown"""
+        def signal_handler(signum, frame):
+            """Signal handler function"""
             logger.info(f"Received signal {signum}, shutting down...")
-            cleanup()
+            if hasattr(self, 'system_monitor'):
+                self.system_monitor.stop()
+            if hasattr(self, 'writer') and self.writer:
+                try:
+                    self.writer.close()
+                except:
+                    pass
             sys.exit(0)
 
         # Only register signals that are available on the platform
-    signal_names = {signal.SIGINT: 'SIGINT', signal.SIGTERM: 'SIGTERM'}
-    for sig, sig_name in signal_names.items():
-        try:
-            signal.signal(sig, signal_handler)
-            logger.debug(f"Registered signal handler for {sig_name}")
-        except (OSError, ValueError, AttributeError) as e:
-            logger.debug(f"Could not register signal {sig_name}: {e}")
+        signal_names = {signal.SIGINT: 'SIGINT', signal.SIGTERM: 'SIGTERM'}
+        for sig, sig_name in signal_names.items():
+            try:
+                signal.signal(sig, signal_handler)
+                logger.debug(f"Registered signal handler for {sig_name}")
+            except (OSError, ValueError, AttributeError) as e:
+                logger.debug(f"Could not register signal {sig_name}: {e}")
+
+        def cleanup():
+            """Cleanup function for atexit"""
+            if hasattr(self, 'system_monitor'):
+                self.system_monitor.stop()
+            if hasattr(self, 'writer') and self.writer:
+                try:
+                    self.writer.close()
+                except:
+                    pass
+                
+        # Register atexit handler
+        atexit.register(cleanup)
     
     def log_step(
         self,
