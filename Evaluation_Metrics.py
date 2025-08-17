@@ -155,7 +155,7 @@ class MetricComputer:
             RuntimeError: If metric computation fails
         """
         # Validate inputs
-        self._validate_inputs(predictions, targets)
+        predictions, targets = self._validate_inputs(predictions, targets)
         
         metrics = {}
         failed_metrics = []
@@ -223,6 +223,7 @@ class MetricComputer:
         
         if not torch.all((targets == 0) | (targets == 1)):
             raise ValueError("Targets must be binary (0 or 1)")
+        return predictions, targets
     
     def _safe_to_numpy(self, tensor: torch.Tensor) -> np.ndarray:
         """Safely convert tensor to numpy array"""
@@ -544,6 +545,12 @@ class MetricComputer:
             if support == 0:
                 continue
             
+            # Binarize predictions for this tag
+            if self.config.adaptive_threshold:
+                tag_binary = (self._adaptive_threshold(
+                    predictions[:, [tag_idx]])[:, 0]).astype(np.int32)
+            else:
+                tag_binary = (tag_preds > self.config.prediction_threshold).astype(np.int32)
             tp = float(((tag_binary == 1) & (tag_targets == 1)).sum())
             fp = float(((tag_binary == 1) & (tag_targets == 0)).sum())
             fn = float(((tag_binary == 0) & (tag_targets == 1)).sum())
