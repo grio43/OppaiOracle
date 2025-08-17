@@ -102,7 +102,9 @@ class DistributedTrainingHelper:
         self.device = None
         
     def setup(self) -> torch.device:
-        """Setup distributed training environment"""
+        """Setup distributed training environment
+        Returns:            torch.device: True or False
+        """
         if 'WORLD_SIZE' in os.environ:
             self.is_distributed = True
             
