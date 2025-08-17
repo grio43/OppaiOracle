@@ -1,1193 +1,1274 @@
 #!/usr/bin/env python3
 """
-Inference Engine for Anime Image Tagger
-Production-ready inference pipeline with multiple interfaces
-FIXED: Normalization now matches training (0.5, 0.5, 0.5)
+Monitoring & Logging System for Anime Image Tagger
+Comprehensive monitoring for training, inference, and system resources
+Enhanced with proper error handling, thread safety, and complete implementations
 """
 
 import os
 import sys
 import json
 import logging
+import psutil
 import time
+import threading
+import queue
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
-from dataclasses import dataclass, field
-from collections import defaultdict
-import asyncio
-import threading
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-import io
-import base64
-import pickle
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from collections import defaultdict, deque
+import warnings
+import traceback
+import socket
+import subprocess
+from contextlib import contextmanager
+import atexit
+import signal
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.cuda.amp import autocast
-import torchvision.transforms as T
-from PIL import Image
-from vocabulary import TagVocabulary, load_vocabulary_for_training
+import torch.distributed as dist
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
 
-# Optional imports for API
+# Optional imports with proper handling
 try:
-    from fastapi import FastAPI, File, UploadFile, HTTPException
-    from fastapi.responses import JSONResponse
-    import uvicorn
-    FASTAPI_AVAILABLE = True
+    import GPUtil
+    GPUTIL_AVAILABLE = True
 except ImportError:
-    FASTAPI_AVAILABLE = False
+    GPUTIL_AVAILABLE = False
+    warnings.warn("GPUtil not available. GPU monitoring disabled.")
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+    pd = None
+
+try:
+    from prometheus_client import Counter, Gauge, Histogram, Summary, start_http_server
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Model Architecture Components (minimal implementation)
-# ============================================================================
-
 @dataclass
-class VisionTransformerConfig:
-    """Configuration for Vision Transformer model"""
-    image_size: int = 640
-    patch_size: int = 14  # Changed from 16
-    num_channels: int = 3
-    hidden_size: int = 1280  # Changed from 768
-    num_hidden_layers: int = 24  # Changed from 12
-    num_attention_heads: int = 16  # Changed from 12
-    intermediate_size: int = 5120  # Changed to 4x hidden_size
-    num_tags: int = 100000  # Changed from 10000
-    num_ratings: int = 5  # Added
-    dropout: float = 0.1
-    attention_dropout: float = 0.1
-    layer_norm_eps: float = 1e-6
-
-
-class SimpleViT(nn.Module):
-    """Simplified Vision Transformer for demonstration"""
+class MonitorConfig:
+    """Configuration for monitoring system"""
+    # Logging
+    log_level: str = "INFO"
+    log_dir: str = "./logs"
+    log_to_file: bool = True
+    log_to_console: bool = True
+    log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     
-    def __init__(self, config: VisionTransformerConfig):
-        super().__init__()
+    # Metrics tracking
+    track_system_metrics: bool = True
+    system_metrics_interval: float = 30.0  # seconds
+    track_gpu_metrics: bool = True
+    track_disk_io: bool = True
+    track_network_io: bool = False
+    
+    # Visualization
+    use_tensorboard: bool = True
+    tensorboard_dir: str = "./tensorboard"
+    use_wandb: bool = False
+    wandb_project: str = "anime-tagger"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    
+    # Alerts
+    enable_alerts: bool = True
+    alert_on_gpu_memory_threshold: float = 0.9  # 90% usage
+    alert_on_cpu_memory_threshold: float = 0.9
+    alert_on_disk_space_threshold: float = 0.95
+    alert_on_training_stuck_minutes: int = 30
+    alert_on_loss_explosion: float = 10.0
+    alert_on_nan_loss: bool = True
+    alert_webhook_url: Optional[str] = None  # For Slack/Discord alerts
+    
+    # Performance profiling
+    enable_profiling: bool = False
+    profile_interval_steps: int = 1000
+    profile_duration_steps: int = 10
+    profile_memory: bool = True
+    profile_shapes: bool = True
+    profile_output_dir: str = "./profiles"
+    
+    # Data pipeline monitoring
+    monitor_data_pipeline: bool = True
+    data_pipeline_stats_interval: int = 100  # batches
+    
+    # Remote monitoring
+    enable_prometheus: bool = False
+    prometheus_port: int = 8080
+    
+    # History
+    max_history_size: int = 10000
+    history_save_interval: int = 100
+    checkpoint_metrics: bool = True
+    
+    # Distributed training
+    distributed: bool = False
+    rank: int = 0
+    world_size: int = 1
+    
+    # Safety
+    auto_recovery: bool = True
+    max_retries: int = 3
+    safe_mode: bool = True  # Disable features that might crash
+
+
+class AlertSystem:
+    """System for sending alerts and notifications"""
+    
+    def __init__(self, config: MonitorConfig):
         self.config = config
+        self.alert_history = deque(maxlen=100)
+        self.alert_counts = defaultdict(int)
+        self.last_alert_time = defaultdict(float)
+        self.min_alert_interval = 300  # 5 minutes between same alerts
         
-        # Patch embedding
-        self.patch_embed = nn.Conv2d(
-            config.num_channels, 
-            config.hidden_size,
-            kernel_size=config.patch_size,
-            stride=config.patch_size
-        )
+    def send_alert(self, title: str, message: str, severity: str = "info"):
+        """Send an alert through configured channels"""
+        # Check if we should suppress this alert
+        alert_key = f"{title}_{severity}"
+        current_time = time.time()
         
-        # Position embedding
-        num_patches = (config.image_size // config.patch_size) ** 2
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, config.hidden_size))
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        if alert_key in self.last_alert_time:
+            if current_time - self.last_alert_time[alert_key] < self.min_alert_interval:
+                return  # Suppress duplicate alerts
         
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=config.hidden_size,
-                nhead=config.num_attention_heads,
-                dim_feedforward=config.intermediate_size,
-                dropout=config.dropout,
-                batch_first=True
-            )
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.last_alert_time[alert_key] = current_time
+        self.alert_counts[alert_key] += 1
         
-        # Classification head
-        self.norm = nn.LayerNorm(config.hidden_size)
-        self.head = nn.Linear(config.hidden_size, config.num_tags)
+        # Record alert
+        alert = {
+            'timestamp': datetime.now().isoformat(),
+            'title': title,
+            'message': message,
+            'severity': severity,
+            'count': self.alert_counts[alert_key]
+        }
+        self.alert_history.append(alert)
         
-    def forward(self, x):
-        B = x.shape[0]
+        # Log alert
+        log_method = getattr(logger, severity.lower(), logger.info)
+        log_method(f"ALERT: {title} - {message}")
         
-        # Patch embedding
-        x = self.patch_embed(x)
-        x = x.flatten(2).transpose(1, 2)
+        # Send to webhook if configured
+        if self.config.alert_webhook_url:
+            self._send_webhook_alert(alert)
         
-        # Add CLS token
-        cls_token = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_token, x], dim=1)
-        
-        # Add position embedding
-        x = x + self.pos_embed[:, :x.size(1), :]
-        
-        # Transformer blocks
-        for block in self.blocks:
-            x = block(x)
-        
-        # Classification
-        x = self.norm(x[:, 0])  # Use CLS token
-        logits = self.head(x)
-        
-        return {'logits': logits}
-
-
-def create_model(**kwargs):
-    """Create model from config"""
-    if 'num_classes' not in kwargs:
-        kwargs['num_classes'] = 10000  # Default number of tags
+        # Send to console with color
+        self._print_colored_alert(alert)
     
-    config = VisionTransformerConfig(**kwargs)
-    return SimpleViT(config)
-
-
-
-# ============================================================================
-# Memory Optimization Components
-# ============================================================================
-
-class MemoryOptimizer:
-    """Memory optimization utilities"""
+    def _send_webhook_alert(self, alert: dict):
+        """Send alert to webhook (Slack/Discord compatible)"""
+        try:
+            import requests
+            
+            # Format for common webhook formats
+            payload = {
+                'text': f"**{alert['severity'].upper()}**: {alert['title']}",
+                'attachments': [{
+                    'color': self._get_severity_color(alert['severity']),
+                    'fields': [
+                        {'title': 'Message', 'value': alert['message']},
+                        {'title': 'Time', 'value': alert['timestamp']},
+                        {'title': 'Occurrence', 'value': str(alert['count'])}
+                    ]
+                }]
+            }
+            
+            requests.post(self.config.alert_webhook_url, json=payload, timeout=5)
+        except Exception as e:
+            logger.error(f"Failed to send webhook alert: {e}")
     
-    @staticmethod
-    def optimize_model(model: nn.Module) -> nn.Module:
-        """Optimize model for inference"""
-        # Fuse batch norm layers if available
-        if hasattr(torch.jit, 'optimize_for_inference'):
+    def _print_colored_alert(self, alert: dict):
+        """Print colored alert to console"""
+        colors = {
+            'critical': '\033[91m',  # Red
+            'error': '\033[91m',     # Red
+            'warning': '\033[93m',   # Yellow
+            'info': '\033[94m',      # Blue
+            'success': '\033[92m'    # Green
+        }
+        reset = '\033[0m'
+        
+        color = colors.get(alert['severity'], '')
+        print(f"{color}[{alert['severity'].upper()}] {alert['title']}: {alert['message']}{reset}")
+    
+    def _get_severity_color(self, severity: str) -> str:
+        """Get color code for severity level"""
+        colors = {
+            'critical': '#FF0000',
+            'error': '#FF6B6B',
+            'warning': '#FFA500',
+            'info': '#0099CC',
+            'success': '#00AA00'
+        }
+        return colors.get(severity, '#808080')
+
+
+class ThreadSafeMetricsTracker:
+    """Thread-safe metrics tracker"""
+    
+    def __init__(self, config: MonitorConfig):
+        self.config = config
+        self.metrics = defaultdict(lambda: deque(maxlen=config.max_history_size))
+        self.counters = defaultdict(int)
+        self.timers = defaultdict(list)
+        self.current_timers = {}
+        self.lock = threading.RLock()
+        
+        # Prometheus metrics
+        self.prom_metrics = {}
+        if config.enable_prometheus and PROMETHEUS_AVAILABLE:
+            self._setup_prometheus_metrics()
+    
+    def _setup_prometheus_metrics(self):
+        """Setup Prometheus metrics"""
+        try:
+            self.prom_metrics['counters'] = {
+                'batches_processed': Counter('anime_tagger_batches_processed', 'Total batches processed'),
+                'images_processed': Counter('anime_tagger_images_processed', 'Total images processed'),
+                'errors': Counter('anime_tagger_errors', 'Total errors', ['error_type'])
+            }
+            
+            self.prom_metrics['gauges'] = {
+                'loss': Gauge('anime_tagger_loss', 'Current loss'),
+                'learning_rate': Gauge('anime_tagger_learning_rate', 'Current learning rate'),
+                'gpu_memory_used': Gauge('anime_tagger_gpu_memory_used_gb', 'GPU memory used (GB)', ['gpu_id']),
+                'gpu_utilization': Gauge('anime_tagger_gpu_utilization_percent', 'GPU utilization (%)', ['gpu_id'])
+            }
+            
+            self.prom_metrics['histograms'] = {
+                'batch_time': Histogram('anime_tagger_batch_time_seconds', 'Batch processing time'),
+                'data_load_time': Histogram('anime_tagger_data_load_time_seconds', 'Data loading time')
+            }
+        except Exception as e:
+            logger.error(f"Failed to setup Prometheus metrics: {e}")
+            self.prom_metrics = {}
+    
+    def add_metric(self, name: str, value: float, step: Optional[int] = None):
+        """Add a metric value (thread-safe)"""
+        with self.lock:
+            timestamp = time.time()
+            self.metrics[name].append({
+                'value': value,
+                'step': step,
+                'timestamp': timestamp
+            })
+            
+            # Update Prometheus
+            if self.prom_metrics and 'gauges' in self.prom_metrics:
+                if name in self.prom_metrics['gauges']:
+                    try:
+                        self.prom_metrics['gauges'][name].set(value)
+                    except Exception as e:
+                        logger.debug(f"Failed to update Prometheus gauge {name}: {e}")
+    
+    def increment_counter(self, name: str, value: int = 1):
+        """Increment a counter (thread-safe)"""
+        with self.lock:
+            self.counters[name] += value
+            
+            # Update Prometheus
+            if self.prom_metrics and 'counters' in self.prom_metrics:
+                if name in self.prom_metrics['counters']:
+                    try:
+                        self.prom_metrics['counters'][name].inc(value)
+                    except Exception as e:
+                        logger.debug(f"Failed to update Prometheus counter {name}: {e}")
+    
+    def start_timer(self, name: str):
+        """Start a timer (thread-safe)"""
+        with self.lock:
+            self.current_timers[name] = time.time()
+    
+    def end_timer(self, name: str) -> float:
+        """End a timer and record duration (thread-safe)"""
+        with self.lock:
+            if name not in self.current_timers:
+                return 0.0
+            
+            duration = time.time() - self.current_timers[name]
+            self.timers[name].append(duration)
+            del self.current_timers[name]
+            
+            # Update Prometheus
+            if self.prom_metrics and 'histograms' in self.prom_metrics:
+                if name in self.prom_metrics['histograms']:
+                    try:
+                        self.prom_metrics['histograms'][name].observe(duration)
+                    except Exception as e:
+                        logger.debug(f"Failed to update Prometheus histogram {name}: {e}")
+            
+            return duration
+    
+    def get_metric_stats(self, name: str) -> Dict[str, float]:
+        """Get statistics for a metric (thread-safe)"""
+        with self.lock:
+            if name not in self.metrics or len(self.metrics[name]) == 0:
+                return {}
+            
+            values = [m['value'] for m in self.metrics[name]]
+            return {
+                'current': values[-1],
+                'mean': np.mean(values),
+                'std': np.std(values),
+                'min': np.min(values),
+                'max': np.max(values),
+                'count': len(values)
+            }
+    
+    def get_timer_stats(self, name: str) -> Dict[str, float]:
+        """Get statistics for a timer (thread-safe)"""
+        with self.lock:
+            if name not in self.timers or len(self.timers[name]) == 0:
+                return {}
+            
+            durations = self.timers[name][-100:]  # Last 100 for efficiency
+            return {
+                'mean': np.mean(durations),
+                'std': np.std(durations),
+                'min': np.min(durations),
+                'max': np.max(durations),
+                'total': np.sum(self.timers[name]),
+                'count': len(self.timers[name])
+            }
+    
+    def save_metrics(self, filepath: str):
+        """Save metrics to file"""
+        with self.lock:
             try:
-                model = torch.jit.optimize_for_inference(torch.jit.script(model))
-            except:
-                pass  # Skip if scripting fails
-        return model
+                data = {
+                    'metrics': {k: list(v) for k, v in self.metrics.items()},
+                    'counters': dict(self.counters),
+                    'timer_stats': {k: self.get_timer_stats(k) for k in self.timers}
+                }
+                
+                with open(filepath, 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+                    
+                logger.info(f"Metrics saved to {filepath}")
+            except Exception as e:
+                logger.error(f"Failed to save metrics: {e}")
 
 
-# ============================================================================
-# Main Inference Components with FIXED Normalization
-# ============================================================================
-
-@dataclass
-class InferenceConfig:
-    """Configuration for inference with FIXED normalization"""
-    # Model settings
-    model_path: str
-    vocab_dir: str
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    use_fp16: bool = True
+class SystemMonitor:
+    """Monitors system resources with proper cleanup"""
     
-    # Image preprocessing - FIXED to match training
-    image_size: int = 640
-    # CRITICAL FIX: Use anime-optimized normalization to match training
-    # These values MUST match what was used during training (HDF5_loader.py)
-    normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)  # FIXED: was (0.485, 0.456, 0.406)
-    normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5)    # FIXED: was (0.229, 0.224, 0.225)
-    pad_color: Tuple[int, int, int] = (114, 114, 114)
-    
-    # Prediction settings
-    prediction_threshold: float = 0.5
-    adaptive_threshold: bool = True
-    min_predictions: int = 5
-    max_predictions: int = 50
-    top_k: Optional[int] = None
-    
-    # Tag filtering
-    filter_nsfw: bool = False
-    nsfw_tags: List[str] = field(default_factory=lambda: ['explicit', 'questionable'])
-    blacklist_tags: List[str] = field(default_factory=list)
-    whitelist_tags: Optional[List[str]] = None
-    
-    # Post-processing
-    apply_implications: bool = True
-    resolve_aliases: bool = True
-    group_by_category: bool = False
-    
-    # Performance
-    batch_size: int = 32
-    num_workers: int = 4
-    use_tensorrt: bool = False
-    optimize_for_speed: bool = False  # Disabled by default to avoid scripting issues
-    
-    # Output format
-    output_format: str = "json"  # json, text, csv
-    include_scores: bool = True
-    score_decimal_places: int = 3
-    
-    # API settings
-    enable_api: bool = False
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
-    api_max_image_size: int = 10 * 1024 * 1024  # 10MB
-    api_rate_limit: int = 100  # requests per minute
-    
-    def validate_normalization(self):
-        """Validate normalization parameters are correct for anime models"""
-        # Check if using incorrect ImageNet normalization
-        if (abs(self.normalize_mean[0] - 0.485) < 0.01 or 
-            abs(self.normalize_std[0] - 0.229) < 0.01):
-            logger.warning(
-                "⚠️ WARNING: Config appears to use ImageNet normalization!\n"
-                "  Anime models should use mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)\n"
-                "  Auto-correcting to anime normalization..."
-            )
-            # Auto-correct to anime normalization
-            self.normalize_mean = (0.5, 0.5, 0.5)
-            self.normalize_std = (0.5, 0.5, 0.5)
-            return False
-        return True
-
-
-class ImagePreprocessor:
-    """Optimized image preprocessing for inference"""
-    
-    def __init__(self, config: InferenceConfig):
+    def __init__(self, config: MonitorConfig):
         self.config = config
+        self.running = False
+        self.thread = None
+        self._lock = threading.Lock()  # Add lock for thread safety
+        self.metrics_queue = queue.Queue(maxsize=100)
+        self.error_count = 0
+        self.max_errors = 10
         
-        # Validate normalization on initialization
-        config.validate_normalization()
-        
-        # Create transforms with correct normalization
-        self.normalize = T.Normalize(mean=config.normalize_mean, std=config.normalize_std)
-        
-        # Pre-allocate tensors for efficiency
-        self.device = torch.device(config.device)
-        
-        # Log normalization being used
-        logger.info(f"ImagePreprocessor initialized with normalization:")
-        logger.info(f"  Mean: {config.normalize_mean}")
-        logger.info(f"  Std: {config.normalize_std}")
+        self._shutdown_event = threading.Event()
+        # Initialize GPU monitoring
+        self.gpu_available = False
+        if config.track_gpu_metrics and GPUTIL_AVAILABLE:
+            try:
+                # Test GPUtil functionality, not just presence
+                test_gpus = GPUtil.getGPUs()
+                self.gpu_available = test_gpus is not None and len(test_gpus) > 0
+                if self.gpu_available:
+                    logger.info(f"GPU monitoring enabled for {len(test_gpus)} GPU(s)")
+                else:
+                    logger.info("No GPUs detected for monitoring")
+            except (Exception, ImportError) as e:
+                logger.warning(f"GPU monitoring not available: {e}")
+                self.gpu_available = False
     
-    def preprocess_image(self, image: Union[str, Path, Image.Image, np.ndarray]) -> torch.Tensor:
-        """Preprocess single image"""
-        # Load image if path
-        if isinstance(image, (str, Path)):
-            image = Image.open(image).convert('RGB')
-        elif isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
-        elif not isinstance(image, Image.Image):
-            raise ValueError(f"Unsupported image type: {type(image)}")
-        
-        # Handle transparency
-        if image.mode in ('RGBA', 'LA', 'P'):
-            background = Image.new('RGB', image.size, self.config.pad_color)
-            if image.mode == 'P':
-                image = image.convert('RGBA')
-            if image.mode == 'RGBA':
-                background.paste(image, mask=image.getchannel('A'))
-            elif image.mode == 'LA':
-                background.paste(image, mask=image.getchannel('L'))
-            image = background
-        elif image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Letterbox resize
-        image = self._letterbox_image(image)
-        
-        # Convert to tensor
-        tensor = T.ToTensor()(image)
-        tensor = self.normalize(tensor)
-        
-        return tensor
-    
-    def _letterbox_image(self, image: Image.Image) -> Image.Image:
-        """Letterbox image to target size"""
-        w, h = image.size
-        target_size = self.config.image_size
-        
-        scale = min(target_size / w, target_size / h)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        
-        image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        
-        # Create canvas
-        canvas = Image.new('RGB', (target_size, target_size), self.config.pad_color)
-        paste_x = (target_size - new_w) // 2
-        paste_y = (target_size - new_h) // 2
-        canvas.paste(image, (paste_x, paste_y))
-        
-        return canvas
-    
-    def preprocess_batch(self, images: List[Union[str, Path, Image.Image]]) -> torch.Tensor:
-        """Preprocess batch of images"""
-        tensors = []
-        for image in images:
-            tensor = self.preprocess_image(image)
-            tensors.append(tensor)
-        
-        return torch.stack(tensors)
-
-
-class TagPostProcessor:
-    """Post-process predicted tags"""
-    
-    def __init__(self, vocab: TagVocabulary, config: InferenceConfig):
-        self.vocab = vocab
-        self.config = config
-        
-        # Load implications and aliases if available
-        self.implications = {}
-        self.aliases = {}
-        
-        # Build NSFW tag set
-        self.nsfw_indices = set()
-        if config.filter_nsfw:
-            for tag in config.nsfw_tags:
-                idx = vocab.get_tag_index(tag)
-                if idx != vocab.unk_index:
-                    self.nsfw_indices.add(idx)
-        
-        # Build blacklist indices
-        self.blacklist_indices = set()
-        for tag in config.blacklist_tags:
-            idx = vocab.get_tag_index(tag)
-            if idx != vocab.unk_index:
-                self.blacklist_indices.add(idx)
-        
-        # Build whitelist indices
-        self.whitelist_indices = None
-        if config.whitelist_tags:
-            self.whitelist_indices = set()
-            for tag in config.whitelist_tags:
-                idx = vocab.get_tag_index(tag)
-                if idx != vocab.unk_index:
-                    self.whitelist_indices.add(idx)
-    
-    def process_predictions(
-        self,
-        predictions: torch.Tensor,
-        scores: torch.Tensor
-    ) -> List[Tuple[str, float]]:
-        """Process predictions for a single image"""
-        # Get indices above threshold
-        if self.config.adaptive_threshold:
-            indices = self._adaptive_threshold(scores)
-        else:
-            indices = torch.where(scores > self.config.prediction_threshold)[0]
-        
-        # Apply top-k if specified
-        if self.config.top_k and len(indices) > self.config.top_k:
-            top_scores, top_indices = torch.topk(scores[indices], self.config.top_k)
-            indices = indices[top_indices]
-        
-        # Filter tags
-        filtered_tags = []
-        for idx in indices:
-            idx = idx.item()
+    def start(self):
+        """Start system monitoring"""
+        with self._lock:
+            if self.running:
+                return
             
-            # Skip if out of vocabulary range
-            if idx >= len(self.vocab):
-                continue
-            
-            # Skip blacklisted
-            if idx in self.blacklist_indices:
-                continue
-            
-            # Skip if not in whitelist
-            if self.whitelist_indices and idx not in self.whitelist_indices:
-                continue
-            
-            # Skip NSFW if filtering
-            if self.config.filter_nsfw and idx in self.nsfw_indices:
-                continue
-            
-            tag = self.vocab.get_tag_from_index(idx)
-            score = scores[idx].item()
-            
-            filtered_tags.append((tag, score))
-        
-        # Apply implications
-        if self.config.apply_implications:
-            filtered_tags = self._apply_implications(filtered_tags)
-        
-        # Sort by score
-        filtered_tags.sort(key=lambda x: x[1], reverse=True)
-        
-        return filtered_tags
+            self.running = True
+            self.thread = threading.Thread(target=self._monitor_loop, daemon=True, name="SystemMonitor")
+            self.thread.start()
+            logger.info("System monitoring started")
     
-    def _adaptive_threshold(self, scores: torch.Tensor) -> torch.Tensor:
-        """Apply adaptive thresholding"""
-        # Start with base threshold
-        threshold = self.config.prediction_threshold
-        indices = torch.where(scores > threshold)[0]
-        
-        # Adjust if too few predictions
-        if len(indices) < self.config.min_predictions:
-            # Get top min_predictions
-            k = min(self.config.min_predictions, len(scores))
-            _, indices = torch.topk(scores, k)
-        
-        # Adjust if too many predictions
-        elif len(indices) > self.config.max_predictions:
-            # Raise threshold
-            threshold_scores = scores[indices]
-            _, top_indices = torch.topk(threshold_scores, self.config.max_predictions)
-            indices = indices[top_indices]
-        
-        return indices
+    def stop(self):
+        """Stop system monitoring gracefully"""
+        with self._lock:
+            if not self.running:
+                return
+            
+            self.running = False
+            thread_to_join = self.thread
+            
+        if thread_to_join and thread_to_join.is_alive():
+            thread_to_join.join(timeout=5)
+            if thread_to_join.is_alive():
+                logger.warning("System monitor thread did not stop gracefully")
+            # Set shutdown event to interrupt any blocking operations
+            self._shutdown_event.set()
+            # Give it one more chance to stop
+            thread_to_join.join(timeout=2)
+            if thread_to_join.is_alive():
+                logger.error("System monitor thread is unresponsive and may remain as zombie thread")
+                # Force cleanup of thread reference
+                self.thread = None
+            
+        logger.info("System monitoring stopped")
     
-    def _apply_implications(self, tags: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
-        """Apply tag implications"""
-        tag_set = {tag for tag, _ in tags}
-        implied_tags = set()
-        
-        # Example implications
-        implications = {
-            'cat_ears': ['animal_ears'],
-            'dog_ears': ['animal_ears'],
-            'thighhighs': ['legwear'],
-            'pantyhose': ['legwear'],
+    def _monitor_loop(self):
+        """Main monitoring loop with error handling"""
+        while self.running:
+            try:
+                metrics = self._collect_metrics()
+                
+                # Try to put metrics in queue (non-blocking)
+                try:
+                    self.metrics_queue.put_nowait(metrics)
+                except queue.Full:
+                    # Remove oldest item and add new one
+                    try:
+                        self.metrics_queue.get_nowait()
+                        self.metrics_queue.put_nowait(metrics)
+                    except:
+                        pass
+                
+                # Reset error count on success
+                self.error_count = 0
+                
+            except Exception as e:
+                self.error_count += 1
+                logger.error(f"Error in system monitoring: {e}")
+                
+                # Stop monitoring if too many errors
+                if self.error_count >= self.max_errors:
+                    logger.critical("Too many errors in system monitoring. Stopping.")
+                    self.running = False
+                    break
+            
+            # Sleep with interruptible check
+            sleep_iterations = int(self.config.system_metrics_interval * 10)
+            for _ in range(sleep_iterations):
+                if not self.running:
+                    break
+                if self._shutdown_event.is_set():
+                    break
+                time.sleep(0.1)
+    
+    def _collect_metrics(self) -> Dict[str, Any]:
+        """Collect system metrics with error handling"""
+        metrics = {
+            'timestamp': time.time(),
+            'cpu': {},
+            'memory': {},
+            'disk': {},
+            'gpu': [],
+            'network': {}
         }
         
-        for tag, _ in tags:
-            if tag in implications:
-                for implied in implications[tag]:
-                    if implied not in tag_set:
-                        implied_tags.add(implied)
+        try:
+            # CPU metrics
+            metrics['cpu']['percent'] = psutil.cpu_percent(interval=0.1)
+            metrics['cpu']['count'] = psutil.cpu_count()
+            cpu_freq = psutil.cpu_freq()
+            metrics['cpu']['freq'] = cpu_freq.current if cpu_freq else 0
+            
+            # Per-CPU metrics
+            metrics['cpu']['per_cpu'] = psutil.cpu_percent(interval=0.1, percpu=True)
+        except Exception as e:
+            logger.debug(f"Failed to collect CPU metrics: {e}")
+
+        if not self.running or self._shutdown_event.is_set():
+            return metrics
+                
+        try:
+            # Memory metrics
+            mem = psutil.virtual_memory()
+            metrics['memory']['total_gb'] = mem.total / (1024**3)
+            metrics['memory']['used_gb'] = mem.used / (1024**3)
+            metrics['memory']['available_gb'] = mem.available / (1024**3)
+            metrics['memory']['percent'] = mem.percent
+            
+            # Swap memory
+            swap = psutil.swap_memory()
+            metrics['memory']['swap_used_gb'] = swap.used / (1024**3)
+            metrics['memory']['swap_percent'] = swap.percent
+        except Exception as e:
+            logger.debug(f"Failed to collect memory metrics: {e}")
+
+        if not self.running or self._shutdown_event.is_set():
+            return metrics
         
-        # Add implied tags with lower confidence
-        for implied in implied_tags:
-            tags.append((implied, 0.3))  # Lower confidence for implied
+        try:
+            # Disk metrics
+            if self.config.track_disk_io:
+                disk = psutil.disk_usage('/')
+                metrics['disk']['total_gb'] = disk.total / (1024**3)
+                metrics['disk']['used_gb'] = disk.used / (1024**3)
+                metrics['disk']['free_gb'] = disk.free / (1024**3)
+                metrics['disk']['percent'] = disk.percent
+                
+                # Disk I/O
+                io = psutil.disk_io_counters()
+                if io:
+                    metrics['disk']['read_mb'] = io.read_bytes / (1024**2)
+                    metrics['disk']['write_mb'] = io.write_bytes / (1024**2)
+                    metrics['disk']['read_count'] = io.read_count
+                    metrics['disk']['write_count'] = io.write_count
+        except Exception as e:
+            logger.debug(f"Failed to collect disk metrics: {e}")
         
-        return tags
+        if not self.running or self._shutdown_event.is_set():
+            return metrics
+           
+        try:
+            # GPU metrics (with fresh query)
+            if self.gpu_available and GPUTIL_AVAILABLE:
+                try:
+                    # Double-check GPUtil is still available and working
+                    gpus = GPUtil.getGPUs()
+                    if gpus is not None:  # Additional safety check
+                        for gpu in gpus:
+                            if gpu is not None:  # Check each GPU object
+                                # Safely get all values with proper null handling
+                                mem_total = getattr(gpu, 'memoryTotal', 0)
+                                mem_used = getattr(gpu, 'memoryUsed', 0)
+                                mem_free = getattr(gpu, 'memoryFree', 0)
+                                gpu_load = getattr(gpu, 'load', 0)
+                                
+                                # Ensure numeric values
+                                mem_total = float(mem_total) if mem_total is not None else 0
+                                mem_used = float(mem_used) if mem_used is not None else 0
+                                mem_free = float(mem_free) if mem_free is not None else 0
+                                gpu_load = float(gpu_load) if gpu_load is not None else 0
+                                
+                                gpu_metrics = {
+                                    'id': getattr(gpu, 'id', -1),
+                                    'name': getattr(gpu, 'name', 'Unknown'),
+                                    'memory_total_gb': mem_total / 1024 if mem_total > 0 else 0,
+                                    'memory_used_gb': mem_used / 1024 if mem_used > 0 else 0,
+                                    'memory_free_gb': mem_free / 1024 if mem_free > 0 else 0,
+                                    'memory_percent': (mem_used / mem_total * 100) if mem_total > 0 else 0,
+                                    'utilization': gpu_load * 100 if gpu_load >= 0 else 0,
+                                    'temperature': getattr(gpu, 'temperature', 0) or 0
+                                }
+                                metrics['gpu'].append(gpu_metrics)
+                except (AttributeError, ImportError, RuntimeError) as e:
+                    # GPUtil might become unavailable, disable it
+                    self.gpu_available = False
+                    logger.warning(f"GPUtil became unavailable, disabling GPU monitoring: {e}")
+        except Exception as e:
+            logger.debug(f"Failed to collect GPU metrics: {e}")
+                    
+        try:
+            # Network metrics
+            if self.config.track_network_io:
+                net = psutil.net_io_counters()
+                metrics['network']['sent_mb'] = net.bytes_sent / (1024**2)
+                metrics['network']['recv_mb'] = net.bytes_recv / (1024**2)
+                metrics['network']['packets_sent'] = net.packets_sent
+                metrics['network']['packets_recv'] = net.packets_recv
+                metrics['network']['errors'] = net.errin + net.errout
+                metrics['network']['drops'] = net.dropin + net.dropout
+        except Exception as e:
+            logger.debug(f"Failed to collect network metrics: {e}")
+        
+        return metrics
     
-    def format_output(self, tags: List[Tuple[str, float]], image_path: Optional[str] = None) -> Any:
-        """Format output based on config"""
-        if self.config.output_format == "json":
-            output = {
-                "tags": [{"tag": tag, "score": round(score, self.config.score_decimal_places)} 
-                        for tag, score in tags] if self.config.include_scores
-                else [tag for tag, _ in tags],
-                "count": len(tags)
-            }
-            if image_path:
-                output["image"] = str(image_path)
-            return output
-        
-        elif self.config.output_format == "text":
-            if self.config.include_scores:
-                return "\n".join([f"{tag}: {score:.{self.config.score_decimal_places}f}" 
-                                for tag, score in tags])
-            else:
-                return ", ".join([tag for tag, _ in tags])
-        
-        elif self.config.output_format == "csv":
-            if self.config.include_scores:
-                return ",".join([f"{tag},{score:.{self.config.score_decimal_places}f}" 
-                               for tag, score in tags])
-            else:
-                return ",".join([tag for tag, _ in tags])
-        
-        else:
-            return tags
+    def get_latest_metrics(self) -> Optional[Dict[str, Any]]:
+        """Get latest system metrics (non-blocking)"""
+        try:
+            return self.metrics_queue.get_nowait()
+        except queue.Empty:
+            return None
 
 
-class InferenceEngine:
-    """Main inference engine with normalization validation"""
+class TrainingMonitor:
+    """Main monitoring class for training with complete implementation"""
     
-    def __init__(self, config: InferenceConfig):
+    def __init__(self, config: MonitorConfig):
         self.config = config
-        self.device = torch.device(config.device)
+        self.start_time = time.time()
+        self.shutdown_handlers = []
         
-        # Load vocabulary
-        logger.info(f"Loading vocabulary from {config.vocab_dir}")
-        self.vocab = load_vocabulary_for_training(Path(config.vocab_dir))
-        
-        # Load model and validate normalization
-        logger.info(f"Loading model from {config.model_path}")
-        self.model = self._load_model()
-        
-        # Validate normalization parameters
-        self._validate_normalization()
+        # Setup logging first
+        self._setup_logging()
         
         # Initialize components
-        self.preprocessor = ImagePreprocessor(config)
-        self.postprocessor = TagPostProcessor(self.vocab, config)
+        self.metrics = ThreadSafeMetricsTracker(config)
+        self.system_monitor = SystemMonitor(config)
+        self.alerts = AlertSystem(config) if config.enable_alerts else None
         
-        # Warmup model
-        self._warmup()
-        
-        # Performance tracking
-        self.inference_times = []
-        self._inference_times_lock = threading.Lock()  # Add lock for thread safety
-    
-    def _validate_normalization(self):
-        """Validate that normalization parameters match training"""
-        try:
-            # Try to load normalization params from checkpoint
-            checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=False)
-            
-            if 'normalization_params' in checkpoint:
-                # If checkpoint contains normalization params, validate against config
-                saved_mean = checkpoint['normalization_params'].get('mean')
-                saved_std = checkpoint['normalization_params'].get('std')
-                
-                if saved_mean and saved_std:
-                    config_mean = self.config.normalize_mean
-                    config_std = self.config.normalize_std
-                    
-                    # Check if they match (with small tolerance for float precision)
-                    mean_match = all(abs(s - c) < 1e-6 for s, c in zip(saved_mean, config_mean))
-                    std_match = all(abs(s - c) < 1e-6 for s, c in zip(saved_std, config_std))
-                    
-                    if not (mean_match and std_match):
-                        logger.warning(
-                            f"⚠️ NORMALIZATION MISMATCH DETECTED!\n"
-                            f"  Training used: mean={saved_mean}, std={saved_std}\n"
-                            f"  Config has: mean={config_mean}, std={config_std}\n"
-                            f"  Updating config to match training values..."
-                        )
-                        # Auto-correct the mismatch
-                        self.config.normalize_mean = tuple(saved_mean)
-                        self.config.normalize_std = tuple(saved_std)
-                    else:
-                        logger.info("✓ Normalization parameters validated successfully")
-            else:
-                # No saved params in checkpoint, log expected values
-                logger.info(
-                    f"Normalization parameters not found in checkpoint.\n"
-                    f"Using config values: mean={self.config.normalize_mean}, "
-                    f"std={self.config.normalize_std}\n"
-                    f"⚠️ Please ensure these match training values!"
-                )
-                
-                # Add runtime warning if using ImageNet values
-                if (abs(self.config.normalize_mean[0] - 0.485) < 0.01 or 
-                    abs(self.config.normalize_std[0] - 0.229) < 0.01):
-                    logger.warning(
-                        "⚠️ Config appears to use ImageNet normalization!\n"
-                        "  Anime models typically use mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)\n"
-                        "  Auto-correcting to anime normalization..."
-                    )
-                    # Auto-correct to anime normalization
-                    self.config.normalize_mean = (0.5, 0.5, 0.5)
-                    self.config.normalize_std = (0.5, 0.5, 0.5)
-                    
-        except Exception as e:
-            logger.error(f"Could not validate normalization parameters: {e}")
-            # Default to anime normalization if validation fails
-            logger.info("Defaulting to anime normalization: mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)")
-            self.config.normalize_mean = (0.5, 0.5, 0.5)
-            self.config.normalize_std = (0.5, 0.5, 0.5)
-    
-    def _load_model(self) -> nn.Module:
-        """Load and optimize model"""
-        try:
-            # Load checkpoint
-            checkpoint = torch.load(self.config.model_path, map_location='cpu', weights_only=False)
-            
-            # Extract config and normalization params if available
-            if 'config' in checkpoint:
-                model_config = checkpoint['config']
-                if 'model_config' in model_config:
-                    model_config = model_config['model_config']
-                    
-                # Check for normalization params in config
-                if 'normalization_params' in model_config:
-                    norm_params = model_config['normalization_params']
-                    logger.info(f"Found normalization params in model config: {norm_params}")
-            else:
-                model_config = VisionTransformerConfig()
-            
-            # Create model
-            if isinstance(model_config, dict):
-                model = create_model(**model_config)
-            else:
-                model = create_model(**model_config.__dict__)
-            
-            # Load weights
-            if 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            else:
-                state_dict = checkpoint
-            
-            # Handle DDP weights
-            if any(k.startswith('module.') for k in state_dict.keys()):
-                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-            
-            model.load_state_dict(state_dict, strict=False)
-            
-        except Exception as e:
-            logger.warning(f"Could not load model from checkpoint: {e}")
-            logger.warning("Creating new model with default config")
-            model = create_model()
-        
-        model.to(self.device)
-        model.eval()
-        
-        # Optimize model if requested (disabled scripting to avoid issues)
-        if self.config.optimize_for_speed:
+        # Setup visualization backends
+        self.writer = None
+        if config.use_tensorboard:
             try:
-                model = torch.jit.script(model)
-                logger.info("Model optimized with TorchScript")
+                self.writer = SummaryWriter(config.tensorboard_dir)
+                logger.info(f"TensorBoard logging to {config.tensorboard_dir}")
             except Exception as e:
-                logger.warning(f"Could not optimize model: {e}")
+                logger.error(f"Failed to initialize TensorBoard: {e}")
         
-        # TensorRT optimization (if available)
-        if self.config.use_tensorrt:
-            model = self._optimize_tensorrt(model)
+        self.wandb_run = None
+        if config.use_wandb and WANDB_AVAILABLE:
+            try:
+                self.wandb_run = wandb.init(
+                    project=config.wandb_project,
+                    entity=config.wandb_entity,
+                    name=config.wandb_run_name,
+                    config=asdict(config)
+                )
+                logger.info("Weights & Biases logging initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize wandb: {e}")
         
-        logger.info(f"Model loaded successfully")
-        return model
+        # Profiler
+        self.profiler = None
+        self.profiler_step = 0
+        if config.enable_profiling:
+            self._setup_profiler()
+        
+        # Training state
+        self.last_step_time = time.time()
+        self.last_loss = None
+        self.steps_without_improvement = 0
+        self.best_val_metric = float('inf')
+        
+        # Data pipeline stats
+        self.data_stats = {
+            'load_times': deque(maxlen=1000),
+            'batch_sizes': deque(maxlen=1000),
+            'augmentation_times': deque(maxlen=1000)
+        }
+        
+        # Start system monitoring
+        if config.track_system_metrics:
+            self.system_monitor.start()
+        
+        # Prometheus server
+        self.prometheus_server = None
+        if config.enable_prometheus and PROMETHEUS_AVAILABLE:
+            try:
+                from prometheus_client import start_http_server
+                self.prometheus_server = start_http_server(config.prometheus_port)
+                logger.info(f"Prometheus metrics server started on port {config.prometheus_port}")
+            except Exception as e:
+                logger.error(f"Failed to start Prometheus server: {e}")
+        
+        # Register cleanup handlers
+        self._register_cleanup()
     
-    def _optimize_tensorrt(self, model: nn.Module) -> nn.Module:
-        """Optimize model with TensorRT"""
+    def _setup_logging(self):
+        """Setup logging configuration"""
+        log_level = getattr(logging, self.config.log_level.upper())
+        
+        # Remove existing handlers to avoid duplicates
+        root_logger = logging.getLogger()
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+        
+        # Create formatter
+        formatter = logging.Formatter(self.config.log_format)
+        
+        # Console handler
+        if self.config.log_to_console:
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(formatter)
+            console_handler.setLevel(log_level)
+            root_logger.addHandler(console_handler)
+        
+        # File handler
+        if self.config.log_to_file:
+            try:
+                log_dir = Path(self.config.log_dir)
+                log_dir.mkdir(parents=True, exist_ok=True)
+                
+                log_file = log_dir / f"training_{datetime.now():%Y%m%d_%H%M%S}.log"
+                file_handler = logging.FileHandler(log_file)
+                file_handler.setFormatter(formatter)
+                file_handler.setLevel(log_level)
+                root_logger.addHandler(file_handler)
+                
+                # Create symlink to latest log
+                latest_log = log_dir / "latest.log"
+                if latest_log.exists() or latest_log.is_symlink():
+                    latest_log.unlink()
+                latest_log.symlink_to(log_file.name)
+                
+            except Exception as e:
+                print(f"Failed to setup file logging: {e}")
+        
+        # Set overall log level
+        root_logger.setLevel(log_level)
+    
+    def _setup_profiler(self):
+        """Setup PyTorch profiler"""
         try:
-            import torch_tensorrt
+            profile_dir = Path(self.config.profile_output_dir)
+            profile_dir.mkdir(parents=True, exist_ok=True)
             
-            # Compile model
-            example_input = torch.randn(1, 3, self.config.image_size, self.config.image_size).to(self.device)
+            self.profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ] if torch.cuda.is_available() else [torch.profiler.ProfilerActivity.CPU],
+                record_shapes=self.config.profile_shapes,
+                profile_memory=self.config.profile_memory,
+                with_stack=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profile_dir))
+            )
+            logger.info(f"Profiler initialized, output to {profile_dir}")
+        except Exception as e:
+            logger.error(f"Failed to setup profiler: {e}")
+            self.profiler = None
+    
+    def _register_cleanup(self):
+        """Register cleanup handlers for graceful shutdown"""
+        def signal_handler(signum, frame):
+            """Signal handler function"""
+            logger.info(f"Received signal {signum}, shutting down...")
+            if hasattr(self, 'system_monitor'):
+                self.system_monitor.stop()
+            if hasattr(self, 'writer') and self.writer:
+                try:
+                    self.writer.close()
+                except:
+                    pass
+            sys.exit(0)
+
+        # Only register signals that are available on the platform
+        signal_names = {signal.SIGINT: 'SIGINT', signal.SIGTERM: 'SIGTERM'}
+        for sig, sig_name in signal_names.items():
+            try:
+                signal.signal(sig, signal_handler)
+                logger.debug(f"Registered signal handler for {sig_name}")
+            except (OSError, ValueError, AttributeError) as e:
+                logger.debug(f"Could not register signal {sig_name}: {e}")
+
+        def cleanup():
+            """Cleanup function for atexit"""
+            if hasattr(self, 'system_monitor'):
+                self.system_monitor.stop()
+            if hasattr(self, 'writer') and self.writer:
+                try:
+                    self.writer.close()
+                except:
+                    pass
+                
+        # Register atexit handler
+        atexit.register(cleanup)
+    
+    def log_step(
+        self,
+        step: int,
+        loss: float,
+        metrics: Dict[str, float] = None,
+        learning_rate: float = 0.0,
+        batch_size: int = 1
+    ):
+        """Log training step metrics with comprehensive monitoring"""
+        metrics = metrics or {}
+        
+        # Update metrics
+        self.metrics.add_metric('loss', loss, step)
+        self.metrics.add_metric('learning_rate', learning_rate, step)
+        
+        for name, value in metrics.items():
+            self.metrics.add_metric(name, value, step)
+        
+        # Track counters
+        self.metrics.increment_counter('batches_processed')
+        self.metrics.increment_counter('images_processed', batch_size)
+        
+        # Calculate step time
+        current_time = time.time()
+        step_time = current_time - self.last_step_time
+        self.metrics.add_metric('step_time', step_time, step)
+        self.last_step_time = current_time
+        
+        # Check for issues and send alerts
+        if self.alerts:
+            self._check_training_health(step, loss, step_time)
+        
+        # Update training state
+        if self.last_loss is not None and abs(loss - self.last_loss) < 1e-7:
+            self.steps_without_improvement += 1
+        else:
+            self.steps_without_improvement = 0
+        self.last_loss = loss
+        
+        # Log to visualization backends
+        self._log_to_backends(step, {
+            'train/loss': loss,
+            'train/learning_rate': learning_rate,
+            'train/step_time': step_time,
+            **{f'train/{k}': v for k, v in metrics.items()}
+        })
+        
+        # System metrics
+        if self.config.track_system_metrics and step % 10 == 0:
+            sys_metrics = self.system_monitor.get_latest_metrics()
+            if sys_metrics:
+                self._log_system_metrics(sys_metrics, step)
+        
+        # Update profiler
+        if self.profiler:
+            try:
+                self.profiler.step()
+                self.profiler_step += 1
+                
+                # Start/stop profiling at intervals
+                if self.profiler_step == self.config.profile_interval_steps:
+                    self.profiler.start()
+                elif self.profiler_step == self.config.profile_interval_steps + self.config.profile_duration_steps:
+                    self.profiler.stop()
+                    self.profiler_step = 0
+            except RuntimeError as e:
+                logger.warning(f"Profiler error (may be already stopped): {e}")
+                self.profiler = None  # Disable profiler on error
             
-            compiled_model = torch_tensorrt.compile(
-                model,
-                inputs=[example_input],
-                enabled_precisions={torch.float, torch.half} if self.config.use_fp16 else {torch.float}
+    def log_validation(
+        self,
+        step: int,
+        metrics: Dict[str, float]
+    ):
+        """Log validation metrics"""
+        for name, value in metrics.items():
+            self.metrics.add_metric(f'val_{name}', value, step)
+        
+        # Track best model
+        if 'loss' in metrics and metrics['loss'] < self.best_val_metric:
+            self.best_val_metric = metrics['loss']
+            if self.alerts:
+                self.alerts.send_alert(
+                    "New Best Model",
+                    f"Validation loss improved to {metrics['loss']:.4f}",
+                    severity="success"
+                )
+        
+        # Log to backends
+        self._log_to_backends(step, {f'val/{k}': v for k, v in metrics.items()})
+    
+    def log_epoch(
+        self,
+        epoch: int,
+        train_metrics: Dict[str, float],
+        val_metrics: Dict[str, float],
+        duration: float
+    ):
+        """Log epoch summary"""
+        logger.info(f"Epoch {epoch} completed in {duration:.2f}s")
+        logger.info(f"Train metrics: {train_metrics}")
+        logger.info(f"Val metrics: {val_metrics}")
+        
+        # Log to backends
+        epoch_metrics = {
+            **{f'epoch/train_{k}': v for k, v in train_metrics.items()},
+            **{f'epoch/val_{k}': v for k, v in val_metrics.items()},
+            'epoch/duration': duration
+        }
+        self._log_to_backends(epoch, epoch_metrics, use_epoch=True)
+        
+        # Save metrics checkpoint
+        if self.config.checkpoint_metrics:
+            self._save_metrics_checkpoint(epoch)
+    
+    def log_images(
+        self,
+        step: int,
+        images: torch.Tensor,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        tag_names: List[str],
+        num_images: int = 4,
+        prefix: str = "val"
+    ):
+        """Log example images with predictions"""
+        try:
+            # Ensure we're on CPU and in the right format
+            images = images.cpu()
+            predictions = predictions.cpu()
+            targets = targets.cpu()
+            
+            # Select random subset
+            batch_size = min(len(images), num_images)
+            indices = torch.randperm(len(images))[:batch_size]
+            
+            # Log to TensorBoard
+            if self.writer:
+                for i, idx in enumerate(indices):
+                    img = images[idx]
+                    pred = predictions[idx]
+                    target = targets[idx]
+                    
+                    # Ensure image is in correct format (C, H, W) with values in [0, 1]
+                    if img.dim() == 2:
+                        img = img.unsqueeze(0)
+                    if img.max() > 1:
+                        img = img / 255.0
+                    
+                    # Get top predictions
+                    top_k = min(10, len(pred))
+                    pred_scores, pred_indices = torch.topk(pred, top_k)
+                    
+                    # Create text caption
+                    pred_tags = [f"{tag_names[j.item()]}: {pred_scores[k].item():.2f}" 
+                                for k, j in enumerate(pred_indices) if j.item() < len(tag_names)]
+                    
+                    true_indices = torch.where(target > 0.5)[0][:top_k]
+                    true_tags = [tag_names[j.item()] for j in true_indices if j.item() < len(tag_names)]
+                    
+                    caption = (
+                        f"Predicted: {', '.join(pred_tags[:5])}\n"
+                        f"True: {', '.join(true_tags[:5])}"
+                    )
+                    
+                    # Log to tensorboard
+                    self.writer.add_image(f'{prefix}/image_{i}', img, step)
+                    self.writer.add_text(f'{prefix}/caption_{i}', caption, step)
+            
+            # Log to wandb
+            if self.wandb_run and WANDB_AVAILABLE:
+                wandb_images = []
+                for i, idx in enumerate(indices[:min(4, len(indices))]):
+                    img = images[idx]
+                    
+                    # Convert to numpy and proper shape (H, W, C)
+                    if img.dim() == 3:
+                        img_np = img.permute(1, 2, 0).numpy()
+                    else:
+                        img_np = img.numpy()
+                    
+                    # Normalize to [0, 1]
+                    if img_np.max() > 1:
+                        img_np = img_np / 255.0
+                    
+                    # Get predictions and targets
+                    pred_indices = torch.topk(predictions[idx], 5)[1]
+                    pred_tags = [tag_names[j.item()] for j in pred_indices if j.item() < len(tag_names)]
+                    
+                    true_indices = torch.where(targets[idx] > 0.5)[0][:5]
+                    true_tags = [tag_names[j.item()] for j in true_indices if j.item() < len(tag_names)]
+                    
+                    wandb_images.append(wandb.Image(
+                        img_np,
+                        caption=f"Pred: {', '.join(pred_tags)} | True: {', '.join(true_tags)}"
+                    ))
+                
+                wandb.log({f"{prefix}/images": wandb_images, "step": step})
+                
+        except Exception as e:
+            logger.error(f"Failed to log images: {e}")
+            if self.config.safe_mode:
+                logger.debug(traceback.format_exc())
+    
+    def log_data_pipeline_stats(self, load_time: float, batch_size: int, augmentation_time: float = 0):
+        """Log data pipeline statistics"""
+        self.data_stats['load_times'].append(load_time)
+        self.data_stats['batch_sizes'].append(batch_size)
+        self.data_stats['augmentation_times'].append(augmentation_time)
+        
+        # Log aggregated stats periodically
+        if len(self.data_stats['load_times']) >= self.config.data_pipeline_stats_interval:
+            avg_load_time = np.mean(self.data_stats['load_times'])
+            avg_batch_size = np.mean(self.data_stats['batch_sizes'])
+            avg_aug_time = np.mean(self.data_stats['augmentation_times'])
+            
+            self.metrics.add_metric('data_load_time_avg', avg_load_time)
+            self.metrics.add_metric('batch_size_avg', avg_batch_size)
+            self.metrics.add_metric('augmentation_time_avg', avg_aug_time)
+            
+            logger.debug(f"Data pipeline stats - Load: {avg_load_time:.3f}s, "
+                        f"Batch: {avg_batch_size:.1f}, Aug: {avg_aug_time:.3f}s")
+    
+    def _check_training_health(self, step: int, loss: float, step_time: float):
+        """Check training health and send alerts if needed"""
+        # NaN loss
+        if np.isnan(loss) and self.config.alert_on_nan_loss:
+            self.alerts.send_alert(
+                "NaN Loss Detected",
+                f"Loss became NaN at step {step}",
+                severity="critical"
+            )
+        
+        # Loss explosion
+        if loss > self.config.alert_on_loss_explosion:
+            self.alerts.send_alert(
+                "Loss Explosion",
+                f"Loss exceeded threshold: {loss:.4f} at step {step}",
+                severity="warning"
+            )
+        
+        # Training stuck
+        if self.steps_without_improvement > 100:
+            minutes_stuck = self.steps_without_improvement * step_time / 60
+            if minutes_stuck > self.config.alert_on_training_stuck_minutes:
+                self.alerts.send_alert(
+                    "Training Stuck",
+                    f"No improvement for {minutes_stuck:.1f} minutes",
+                    severity="warning"
+                )
+        
+        # Slow training
+        if step_time > 60:  # More than 1 minute per step
+            self.alerts.send_alert(
+                "Slow Training",
+                f"Step time is {step_time:.1f}s at step {step}",
+                severity="warning"
+            )
+    
+    def _log_system_metrics(self, metrics: Dict[str, Any], step: int):
+        """Log system metrics to backends"""
+        system_metrics = {}
+        
+        # CPU metrics
+        if 'cpu' in metrics:
+            system_metrics['system/cpu_percent'] = metrics['cpu'].get('percent', 0)
+            system_metrics['system/cpu_freq_mhz'] = metrics['cpu'].get('freq', 0)
+        
+        # Memory metrics  
+        if 'memory' in metrics:
+            system_metrics['system/memory_used_gb'] = metrics['memory'].get('used_gb', 0)
+            system_metrics['system/memory_percent'] = metrics['memory'].get('percent', 0)
+            
+            # Check memory threshold
+            if (self.alerts and 
+                metrics['memory'].get('percent', 0) > self.config.alert_on_cpu_memory_threshold * 100):
+                self.alerts.send_alert(
+                    "High Memory Usage",
+                    f"Memory usage is {metrics['memory']['percent']:.1f}%",
+                    severity="warning"
+                )
+        
+        # Disk metrics
+        if 'disk' in metrics:
+            system_metrics['system/disk_used_gb'] = metrics['disk'].get('used_gb', 0)
+            system_metrics['system/disk_percent'] = metrics['disk'].get('percent', 0)
+            
+            # Check disk threshold
+            if (self.alerts and 
+                metrics['disk'].get('percent', 0) > self.config.alert_on_disk_space_threshold * 100):
+                self.alerts.send_alert(
+                    "Low Disk Space",
+                    f"Disk usage is {metrics['disk']['percent']:.1f}%",
+                    severity="critical"
+                )
+        
+        # GPU metrics
+        if 'gpu' in metrics and metrics['gpu']:
+            for gpu in metrics['gpu']:
+                gpu_id = gpu['id']
+                system_metrics[f'system/gpu{gpu_id}_memory_gb'] = gpu.get('memory_used_gb', 0)
+                system_metrics[f'system/gpu{gpu_id}_memory_percent'] = gpu.get('memory_percent', 0)
+                system_metrics[f'system/gpu{gpu_id}_utilization'] = gpu.get('utilization', 0)
+                system_metrics[f'system/gpu{gpu_id}_temperature'] = gpu.get('temperature', 0)
+                
+                # Check GPU memory threshold
+                if (self.alerts and 
+                    gpu.get('memory_percent', 0) > self.config.alert_on_gpu_memory_threshold * 100):
+                    self.alerts.send_alert(
+                        f"High GPU {gpu_id} Memory",
+                        f"GPU {gpu_id} memory usage is {gpu['memory_percent']:.1f}%",
+                        severity="warning"
+                    )
+                
+                # Update Prometheus GPU metrics
+                if self.metrics.prom_metrics and 'gauges' in self.metrics.prom_metrics:
+                    if 'gpu_memory_used' in self.metrics.prom_metrics['gauges']:
+                        try:
+                            self.metrics.prom_metrics['gauges']['gpu_memory_used'].labels(
+                                gpu_id=str(gpu_id)
+                            ).set(gpu.get('memory_used_gb', 0))
+                        except:
+                            pass
+        
+        # Log to backends
+        self._log_to_backends(step, system_metrics)
+    
+    def _log_to_backends(self, step: int, metrics: Dict[str, float], use_epoch: bool = False):
+        """Log metrics to all configured backends"""
+        # TensorBoard
+        if self.writer:
+            try:
+                for name, value in metrics.items():
+                    if use_epoch:
+                        self.writer.add_scalar(name, value, step)
+                    else:
+                        self.writer.add_scalar(name, value, step)
+            except Exception as e:
+                logger.debug(f"Failed to log to TensorBoard: {e}")
+        
+        # Weights & Biases
+        if self.wandb_run and WANDB_AVAILABLE:
+            try:
+                log_dict = dict(metrics)
+                log_dict['step' if not use_epoch else 'epoch'] = step
+                wandb.log(log_dict)
+            except Exception as e:
+                logger.debug(f"Failed to log to wandb: {e}")
+    
+    def _save_metrics_checkpoint(self, epoch: int):
+        """Save metrics checkpoint to file"""
+        try:
+            checkpoint_dir = Path(self.config.log_dir) / "checkpoints"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            
+            checkpoint_file = checkpoint_dir / f"metrics_epoch_{epoch}.json"
+            self.metrics.save_metrics(str(checkpoint_file))
+            
+            # Keep only last N checkpoints
+            checkpoints = sorted(checkpoint_dir.glob("metrics_epoch_*.json"))
+            if len(checkpoints) > 5:
+                for old_checkpoint in checkpoints[:-5]:
+                    old_checkpoint.unlink()
+                    
+        except Exception as e:
+            logger.error(f"Failed to save metrics checkpoint: {e}")
+    
+    @contextmanager
+    def profile_section(self, name: str):
+        """Context manager for profiling code sections"""
+        self.metrics.start_timer(name)
+        try:
+            yield
+        finally:
+            duration = self.metrics.end_timer(name)
+            logger.debug(f"Section '{name}' took {duration:.3f}s")
+    
+    def get_summary(self) -> Dict[str, Any]:
+        """Get training summary statistics"""
+        summary = {
+            'duration_hours': (time.time() - self.start_time) / 3600,
+            'batches_processed': self.metrics.counters.get('batches_processed', 0),
+            'images_processed': self.metrics.counters.get('images_processed', 0),
+            'best_val_metric': self.best_val_metric,
+            'metrics': {}
+        }
+        
+        # Add metric statistics
+        for metric_name in ['loss', 'learning_rate', 'val_loss']:
+            stats = self.metrics.get_metric_stats(metric_name)
+            if stats:
+                summary['metrics'][metric_name] = stats
+        
+        # Add timer statistics
+        for timer_name in ['batch_time', 'data_load_time']:
+            stats = self.metrics.get_timer_stats(timer_name)
+            if stats:
+                summary['metrics'][f'{timer_name}_stats'] = stats
+        
+        return summary
+    
+    def close(self):
+        """Cleanup and close all resources"""
+        # Prevent multiple cleanup calls
+        if hasattr(self, '_closed') and self._closed:
+            return
+        self._closed = True
+        
+        logger.info("Closing training monitor...")
+        
+        # Stop system monitor
+        if self.system_monitor:
+            self.system_monitor.stop()
+            
+        # Close profiler
+        if self.profiler:
+            try:
+                self.profiler.stop()
+            except:
+                pass
+        
+        # Save final metrics
+        try:
+            final_metrics_file = Path(self.config.log_dir) / "final_metrics.json"
+            self.metrics.save_metrics(str(final_metrics_file))
+            
+            # Save summary
+            summary_file = Path(self.config.log_dir) / "training_summary.json"
+            with open(summary_file, 'w') as f:
+                json.dump(self.get_summary(), f, indent=2, default=str)
+        except Exception as e:
+            logger.error(f"Failed to save final metrics: {e}")
+        
+        # Close TensorBoard writer
+        if self.writer:
+            try:
+                self.writer.close()
+            except:
+                pass
+        
+        # Close wandb run
+        if self.wandb_run and WANDB_AVAILABLE:
+            try:
+                wandb.finish()
+            except:
+                pass
+        
+        logger.info("Training monitor closed")
+
+
+# Example usage
+if __name__ == "__main__":
+    # Example configuration
+    config = MonitorConfig(
+        log_level="INFO",
+        use_tensorboard=True,
+        use_wandb=False,
+        track_gpu_metrics=True,
+        enable_alerts=True,
+        enable_profiling=False,
+        enable_prometheus=False
+    )
+    
+    # Create monitor
+    monitor = TrainingMonitor(config)
+    
+    try:
+        # Simulate training loop
+        for step in range(100):
+            # Simulate metrics
+            loss = np.random.random() * 2
+            metrics = {
+                'accuracy': np.random.random(),
+                'precision': np.random.random(),
+                'recall': np.random.random()
+            }
+            
+            # Log step
+            monitor.log_step(
+                step=step,
+                loss=loss,
+                metrics=metrics,
+                learning_rate=0.001,
+                batch_size=32
             )
             
-            logger.info("Model optimized with TensorRT")
-            return compiled_model
-            
-        except ImportError:
-            logger.warning("TensorRT not available, using standard model")
-            return model
-        except Exception as e:
-            logger.warning(f"TensorRT optimization failed: {e}")
-            return model
-    
-    def _warmup(self):
-        """Warmup model with dummy inference"""
-        logger.info("Warming up model...")
-        dummy_input = torch.randn(1, 3, self.config.image_size, self.config.image_size).to(self.device)
-        
-        for _ in range(3):
-            with torch.no_grad():
-                try:
-                    _ = self.model(dummy_input)
-                except Exception as e:
-                    logger.warning(f"Warmup failed: {e}")
-                    break
-        
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize()
-    
-    @torch.no_grad()
-    def predict(
-        self,
-        image: Union[str, Path, Image.Image, np.ndarray]
-    ) -> Dict[str, Any]:
-        """Predict tags for single image"""
-        try:
-            # Preprocess
-            start_time = time.time()
-            tensor = self.preprocessor.preprocess_image(image)
-            tensor = tensor.unsqueeze(0).to(self.device)
-            
-            # Inference
-            if self.config.use_fp16 and self.device.type == 'cuda':
-                with autocast(enabled=True):
-                    outputs = self.model(tensor)
-            else:
-                outputs = self.model(tensor)
-            
-            logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-            
-            # Handle hierarchical output
-            if logits.dim() == 3:
-                logits = logits.view(logits.shape[0], -1)
-            
-            # Get probabilities
-            scores = torch.sigmoid(logits[0])
-            
-            # Post-process
-            tags = self.postprocessor.process_predictions(logits[0], scores)
-            
-            # Track timing
-            inference_time = time.time() - start_time
-            with self._inference_times_lock:
-                self.inference_times.append(inference_time)
-            
-            # Format output
-            result = self.postprocessor.format_output(tags, image if isinstance(image, (str, Path)) else None)
-            
-            if isinstance(result, dict):
-                result['inference_time'] = round(inference_time * 1000, 2)  # ms
-                result['normalization'] = {
-                    'mean': self.config.normalize_mean,
-                    'std': self.config.normalize_std
+            # Simulate validation every 10 steps
+            if step % 10 == 0:
+                val_metrics = {
+                    'loss': np.random.random() * 2,
+                    'accuracy': np.random.random()
                 }
+                monitor.log_validation(step, val_metrics)
             
-            return result
+            time.sleep(0.1)  # Simulate training time
             
-        except Exception as e:
-            logger.error(f"Error during prediction: {e}")
-            return {
-                "error": str(e),
-                "tags": [],
-                "count": 0
-            }
-    
-    @torch.no_grad()
-    def predict_batch(
-        self,
-        images: List[Union[str, Path, Image.Image, np.ndarray]],
-        return_scores: bool = True
-    ) -> List[Dict[str, Any]]:
-        """Predict tags for batch of images"""
-        results = []
-        
-        # Process in batches
-        for i in range(0, len(images), self.config.batch_size):
-            batch_images = images[i:i + self.config.batch_size]
-            
-            try:
-                # Preprocess batch
-                start_time = time.time()
-                batch_tensor = self.preprocessor.preprocess_batch(batch_images)
-                batch_tensor = batch_tensor.to(self.device)
-                
-                # Inference
-                if self.config.use_fp16 and self.device.type == 'cuda':
-                    with autocast(enabled=True):
-                        outputs = self.model(batch_tensor)
-                else:
-                    outputs = self.model(batch_tensor)
-                
-                logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-                
-                # Handle hierarchical output
-                if logits.dim() == 3:
-                    batch_size = logits.shape[0]
-                    logits = logits.view(batch_size, -1)
-                
-                # Get probabilities
-                scores = torch.sigmoid(logits)
-                
-                # Process each image
-                for j, (image_logits, image_scores) in enumerate(zip(logits, scores)):
-                    tags = self.postprocessor.process_predictions(image_logits, image_scores)
-                    
-                    image_path = batch_images[j] if isinstance(batch_images[j], (str, Path)) else None
-                    result = self.postprocessor.format_output(tags, image_path)
-                    
-                    results.append(result)
-                
-                # Track timing
-                batch_time = time.time() - start_time
-                with self._inference_times_lock:
-                    self.inference_times.extend([batch_time / len(batch_images)] * len(batch_images))
-                
-            except Exception as e:
-                logger.error(f"Error processing batch: {e}")
-                # Add error results for failed batch
-                for img in batch_images:
-                    results.append({
-                        "error": str(e),
-                        "tags": [],
-                        "count": 0
-                    })
-        
-        return results
-    
-    def predict_from_url(self, url: str) -> Dict[str, Any]:
-        """Predict tags from image URL"""
-        import requests
-        from io import BytesIO
-        
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            
-            image = Image.open(BytesIO(response.content))
-            return self.predict(image)
-            
-        except Exception as e:
-            logger.error(f"Error loading image from URL: {e}")
-            return {
-                "error": f"Failed to load image from URL: {str(e)}",
-                "tags": [],
-                "count": 0
-            }
-    
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get inference statistics"""
-        with self._inference_times_lock:
-            if not self.inference_times:
-                return {
-                    "normalization": {
-                        "mean": self.config.normalize_mean,
-                        "std": self.config.normalize_std,
-                        "scheme": "anime" if self.config.normalize_mean == (0.5, 0.5, 0.5) else "unknown"
-                }
-            
-        
-        # Make a copy to avoid holding the lock too long
-        times_ms = [t * 1000 for t in self.inference_times.copy()]
-        
-        return {
-            'avg_inference_time_ms': float(np.mean(times_ms)),
-            'std_inference_time_ms': float(np.std(times_ms)),
-            'min_inference_time_ms': float(np.min(times_ms)),
-            'max_inference_time_ms': float(np.max(times_ms)),
-            'total_images': len(self.inference_times),
-            'images_per_second': 1000 / np.mean(times_ms) if times_ms else 0,
-            'normalization': {
-                'mean': self.config.normalize_mean,
-                'std': self.config.normalize_std,
-                'scheme': 'anime' if self.config.normalize_mean == (0.5, 0.5, 0.5) else 'unknown'
-            }
-        }
-
-
-class BatchInferenceProcessor:
-    """Process large batches of images efficiently"""
-    
-    def __init__(self, engine: InferenceEngine, num_workers: int = 4):
-        self.engine = engine
-        self.num_workers = num_workers
-    
-    async def process_directory_async(
-        self,
-        directory: Path,
-        output_file: Optional[Path] = None,
-        extensions: List[str] = None
-    ) -> List[Dict[str, Any]]:
-        """Process directory asynchronously"""
-        if extensions is None:
-            extensions = ['.jpg', '.jpeg', '.png', '.webp']
-        
-        # Find all images
-        image_paths = []
-        for ext in extensions:
-            image_paths.extend(directory.rglob(f'*{ext}'))
-            image_paths.extend(directory.rglob(f'*{ext.upper()}'))
-        
-        logger.info(f"Found {len(image_paths)} images to process")
-        
-        # Process with thread pool
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            tasks = []
-            for path in image_paths:
-                task = loop.run_in_executor(executor, self.engine.predict, path)
-                tasks.append(task)
-            
-            results = await asyncio.gather(*tasks)
-        
-        # Save results if requested
-        if output_file:
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_file, 'w') as f:
-                json.dump(results, f, indent=2)
-        
-        return results
-    
-    def process_directory(
-        self,
-        directory: Union[str, Path],
-        output_file: Optional[Union[str, Path]] = None,
-        extensions: List[str] = None,
-        progress_callback: Optional[Callable] = None
-    ) -> List[Dict[str, Any]]:
-        """Process directory synchronously with optional progress callback"""
-        if extensions is None:
-            extensions = ['.jpg', '.jpeg', '.png', '.webp']
-        
-        directory = Path(directory)
-        
-        # Find all images
-        image_paths = []
-        for ext in extensions:
-            image_paths.extend(directory.rglob(f'*{ext}'))
-            image_paths.extend(directory.rglob(f'*{ext.upper()}'))
-        
-        # Remove duplicates
-        image_paths = list(set(image_paths))
-        
-        logger.info(f"Found {len(image_paths)} images to process")
-        
-        # Process images
-        results = []
-        for i, path in enumerate(image_paths):
-            try:
-                result = self.engine.predict(path)
-                results.append(result)
-                
-                # Progress callback
-                if progress_callback:
-                    progress_callback(i + 1, len(image_paths), path)
-                    
-            except Exception as e:
-                logger.error(f"Error processing {path}: {e}")
-                results.append({
-                    "image": str(path),
-                    "error": str(e),
-                    "tags": []
-                })
-        
-        # Save results if requested
-        if output_file:
-            output_file = Path(output_file)
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Add metadata about normalization
-            output_data = {
-                'results': results,
-                'metadata': {
-                    'total_images': len(results),
-                    'normalization': {
-                        'mean': self.engine.config.normalize_mean,
-                        'std': self.engine.config.normalize_std
-                    }
-                }
-            }
-            
-            with open(output_file, 'w') as f:
-                json.dump(output_data, f, indent=2)
-            
-            logger.info(f"Results saved to {output_file}")
-        
-        return results
-
-
-class InferenceAPI:
-    """FastAPI-based inference API"""
-    
-    def __init__(self, engine: InferenceEngine, config: InferenceConfig):
-        if not FASTAPI_AVAILABLE:
-            raise ImportError("FastAPI not installed. Install with: pip install fastapi uvicorn python-multipart")
-        
-        self.engine = engine
-        self.config = config
-        self.app = FastAPI(title="Anime Image Tagger API")
-        
-        # Setup routes
-        self._setup_routes()
-        
-    def _setup_routes(self):
-        """Setup API routes"""
-        
-        @self.app.get("/")
-        async def root():
-            return {
-                "message": "Anime Image Tagger API",
-                "version": "1.0.0",
-                "normalization": {
-                    "mean": self.config.normalize_mean,
-                    "std": self.config.normalize_std
-                }
-            }
-        
-        @self.app.post("/predict")
-        async def predict(file: UploadFile = File(...)):
-            """Predict tags for uploaded image"""
-            # Check file size
-            contents = await file.read()
-            if len(contents) > self.config.api_max_image_size:
-                raise HTTPException(400, f"File size exceeds {self.config.api_max_image_size} bytes")
-            
-            # Process image
-            try:
-                image = Image.open(io.BytesIO(contents))
-                result = self.engine.predict(image)
-                return JSONResponse(content=result)
-                
-            except Exception as e:
-                logger.error(f"Error processing image: {e}")
-                raise HTTPException(500, f"Error processing image: {str(e)}")
-        
-        @self.app.post("/predict_url")
-        async def predict_url(url: str):
-            """Predict tags from image URL"""
-            try:
-                result = self.engine.predict_from_url(url)
-                if "error" in result:
-                    raise HTTPException(400, result["error"])
-                return JSONResponse(content=result)
-                
-            except Exception as e:
-                logger.error(f"Error processing URL: {e}")
-                raise HTTPException(500, f"Error processing URL: {str(e)}")
-        
-        @self.app.get("/stats")
-        async def get_stats():
-            """Get inference statistics"""
-            return self.engine.get_statistics()
-        
-        @self.app.get("/health")
-        async def health_check():
-            """Health check endpoint"""
-            return {
-                "status": "healthy",
-                "normalization": {
-                    "mean": self.config.normalize_mean,
-                    "std": self.config.normalize_std,
-                    "valid": self.config.normalize_mean == (0.5, 0.5, 0.5)
-                }
-            }
-        
-        @self.app.get("/config")
-        async def get_config():
-            """Get current configuration"""
-            return {
-                "image_size": self.config.image_size,
-                "normalization": {
-                    "mean": self.config.normalize_mean,
-                    "std": self.config.normalize_std
-                },
-                "prediction_threshold": self.config.prediction_threshold,
-                "adaptive_threshold": self.config.adaptive_threshold,
-                "min_predictions": self.config.min_predictions,
-                "max_predictions": self.config.max_predictions
-            }
-    
-    def run(self):
-        """Run the API server"""
-        uvicorn.run(
-            self.app,
-            host=self.config.api_host,
-            port=self.config.api_port
-        )
-
-
-def verify_normalization_fix():
-    """Utility function to verify normalization is fixed"""
-    print("\n" + "="*60)
-    print("NORMALIZATION VERIFICATION")
-    print("="*60)
-    
-    # Check default config
-    config = InferenceConfig(
-        model_path="dummy.pt",
-        vocab_dir="."
-    )
-    
-    print(f"Default normalization:")
-    print(f"  Mean: {config.normalize_mean}")
-    print(f"  Std: {config.normalize_std}")
-    
-    if config.normalize_mean == (0.5, 0.5, 0.5) and config.normalize_std == (0.5, 0.5, 0.5):
-        print("✅ Normalization is CORRECT (anime-optimized)")
-    else:
-        print("❌ Normalization is INCORRECT (not anime-optimized)")
-    
-    # Test auto-correction
-    bad_config = InferenceConfig(
-        model_path="dummy.pt",
-        vocab_dir=".",
-        normalize_mean=(0.485, 0.456, 0.406),
-        normalize_std=(0.229, 0.224, 0.225)
-    )
-    
-    print(f"\nTesting auto-correction for ImageNet values:")
-    if bad_config.validate_normalization():
-        print("  No correction needed")
-    else:
-        print(f"  Auto-corrected to: mean={bad_config.normalize_mean}, std={bad_config.normalize_std}")
-    
-    print("\n" + "="*60)
-
-
-def main():
-    """Main entry point for CLI usage"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Anime Image Tagger Inference (FIXED)")
-    parser.add_argument("--model", required=True, help="Path to model checkpoint")
-    parser.add_argument("--vocab", required=True, help="Path to vocabulary directory")
-    parser.add_argument("--image", help="Path to single image")
-    parser.add_argument("--directory", help="Path to directory of images")
-    parser.add_argument("--url", help="URL of image")
-    parser.add_argument("--output", help="Output file for results")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Prediction threshold")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--api", action="store_true", help="Start API server")
-    parser.add_argument("--api-port", type=int, default=8000, help="API port")
-    parser.add_argument("--format", choices=["json", "text", "csv"], default="json", help="Output format")
-    parser.add_argument("--verify-fix", action="store_true", help="Verify normalization fix")
-    
-    args = parser.parse_args()
-    
-    # Setup logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Verify fix if requested
-    if args.verify_fix:
-        verify_normalization_fix()
-        return
-    
-    # Create config with FIXED normalization
-    config = InferenceConfig(
-        model_path=args.model,
-        vocab_dir=args.vocab,
-        device=args.device,
-        prediction_threshold=args.threshold,
-        batch_size=args.batch_size,
-        enable_api=args.api,
-        api_port=args.api_port,
-        output_format=args.format,
-        # Ensure correct normalization
-        normalize_mean=(0.5, 0.5, 0.5),
-        normalize_std=(0.5, 0.5, 0.5)
-    )
-    
-    # Log normalization being used
-    logger.info("="*60)
-    logger.info("INFERENCE ENGINE INITIALIZATION")
-    logger.info("="*60)
-    logger.info(f"Normalization Configuration:")
-    logger.info(f"  Mean: {config.normalize_mean}")
-    logger.info(f"  Std: {config.normalize_std}")
-    logger.info(f"  Scheme: {'anime' if config.normalize_mean == (0.5, 0.5, 0.5) else 'unknown'}")
-    logger.info("="*60)
-    
-    # Create engine
-    engine = InferenceEngine(config)
-    
-    # Handle different modes
-    if args.api:
-        # Start API server
-        api = InferenceAPI(engine, config)
-        api.run()
-        
-    elif args.image:
-        # Process single image
-        result = engine.predict(args.image)
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(result, f, indent=2)
-            print(f"Results saved to {args.output}")
-        else:
-            print(json.dumps(result, indent=2))
-        
-    elif args.url:
-        # Process URL
-        result = engine.predict_from_url(args.url)
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(result, f, indent=2)
-            print(f"Results saved to {args.output}")
-        else:
-            print(json.dumps(result, indent=2))
-        
-    elif args.directory:
-        # Process directory
-        processor = BatchInferenceProcessor(engine)
-        
-        def progress_callback(current, total, path):
-            print(f"Processing {current}/{total}: {path.name}")
-        
-        results = processor.process_directory(
-            args.directory,
-            args.output,
-            progress_callback=progress_callback
-        )
-        
-        print(f"\nProcessed {len(results)} images")
-        stats = engine.get_statistics()
-        if stats:
-            print(f"Average inference time: {stats.get('avg_inference_time_ms', 0):.2f}ms")
-            print(f"Images per second: {stats.get('images_per_second', 0):.2f}")
-            print(f"Normalization scheme: {stats['normalization']['scheme']}")
-        
-    else:
-        print("Please specify --image, --url, --directory, or --api")
-        print("Use --verify-fix to check normalization configuration")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+    finally:
+        # Always cleanup
+        monitor.close()
