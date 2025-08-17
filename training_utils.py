@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import shutil
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
@@ -808,16 +809,18 @@ class TrainingMetricsTracker:
         self.metrics = defaultdict(lambda: deque(maxlen=window_size))
         self.epoch_metrics = defaultdict(list)
         self.global_step = 0
+        self._lock = threading.RLock()  # Use RLock to allow recursive locking
         
     def update(self, metrics: Dict[str, float], step: Optional[int] = None):
         """Update metrics"""
-        if step is not None:
-            self.global_step = step
-        
-        for key, value in metrics.items():
-            if isinstance(value, torch.Tensor):
-                value = value.item()
-            self.metrics[key].append(value)
+        with self._lock:
+            if step is not None:
+                self.global_step = step
+            
+            for key, value in metrics.items():
+                if isinstance(value, torch.Tensor):
+                    value = value.item()
+                self.metrics[key].append(value)
     
     def update_epoch(self, metrics: Dict[str, float]):
         """Update epoch-level metrics"""
