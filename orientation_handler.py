@@ -171,8 +171,9 @@ class OrientationHandler:
         if any(tag in self.skip_flip_tags for tag in tags):
             unmapped = self._find_unmapped_orientation_tags(tags)
             if unmapped:
-                self.stats['skipped_flips'] += 1
-                self.stats['unmapped_tags'].update(unmapped)
+                with self._stats_lock:
+                    self.stats['skipped_flips'] += 1
+                    self.stats['unmapped_tags'].update(unmapped)
                 logger.debug(f"Skipping flip due to unmapped orientation tags: {unmapped}")
                 return True
         
@@ -322,7 +323,8 @@ class OrientationHandler:
             if eye_color_tags and not self.can_swap_eye_colors(eye_color_tags):
                 # Skip flip if we can't properly swap eye colors
                 logger.debug(f"Skipping flip due to complex heterochromia tags: {eye_color_tags}")
-                self.stats['skipped_flips'] += 1
+                with self._stats_lock:
+                    self.stats['skipped_flips'] += 1
                 return tags, False
         
         # Check for other complex asymmetric tags
@@ -332,7 +334,8 @@ class OrientationHandler:
                 if tag_info.get('requires_special_handling', False):
                     # For now, skip these unless we have specific handlers
                     logger.debug(f"Skipping flip due to complex tag requiring special handling: {tag}")
-                    self.stats['skipped_flips'] += 1
+                    with self._stats_lock:
+                        self.stats['skipped_flips'] += 1
                     return tags, False
         
         # Proceed with normal tag swapping
@@ -381,7 +384,7 @@ class OrientationHandler:
         # Only return non-empty issues
         return {k: v for k, v in issues.items() if v}
     
-    def validate_mappings(self) -> Dict[str, List[str]]:
+    def get_statistics(self) -> Dict[str, any]:
         """
         Validate the consistency of orientation mappings.
         
@@ -433,7 +436,7 @@ class OrientationHandler:
         
         return {k: v for k, v in issues.items() if v}
     
-def get_statistics(self) -> Dict[str, any]:
+    def get_statistics(self) -> Dict[str, any]:
         """Get usage statistics."""
         with self._stats_lock:
             total_flips = self.stats['total_flips']
