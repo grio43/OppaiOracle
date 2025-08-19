@@ -415,20 +415,13 @@ class SystemMonitor:
                 return
             
             self.running = False
+            self._shutdown_event.set()
             thread_to_join = self.thread
             
         if thread_to_join and thread_to_join.is_alive():
-            thread_to_join.join(timeout=5)
+            thread_to_join.join(timeout=7)
             if thread_to_join.is_alive():
                 logger.warning("System monitor thread did not stop gracefully")
-            # Set shutdown event to interrupt any blocking operations
-            self._shutdown_event.set()
-            # Give it one more chance to stop
-            thread_to_join.join(timeout=2)
-            if thread_to_join.is_alive():
-                logger.error("System monitor thread is unresponsive and may remain as zombie thread")
-                # Force cleanup of thread reference
-                self.thread = None
             
         logger.info("System monitoring stopped")
     
@@ -677,20 +670,23 @@ class TrainingMonitor:
         """Setup logging configuration"""
         log_level = getattr(logging, self.config.log_level.upper())
         
-        # Remove existing handlers to avoid duplicates
-        root_logger = logging.getLogger()
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
+        # Get logger for this module instead of modifying root logger
+        module_logger = logging.getLogger(__name__)
+        
+        # Remove existing handlers from module logger only
+        for handler in module_logger.handlers[:]:
+            module_logger.removeHandler(handler)
         
         # Create formatter
         formatter = logging.Formatter(self.config.log_format)
         
         # Console handler
         if self.config.log_to_console:
+            # Only add to root logger if no console handler exists
             console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setFormatter(formatter)
             console_handler.setLevel(log_level)
-            root_logger.addHandler(console_handler)
+            module_logger.addHandler(console_handler)
         
         # File handler
         if self.config.log_to_file:
@@ -702,7 +698,7 @@ class TrainingMonitor:
                 file_handler = logging.FileHandler(log_file)
                 file_handler.setFormatter(formatter)
                 file_handler.setLevel(log_level)
-                root_logger.addHandler(file_handler)
+                module_logger.addHandler(file_handler)
                 
                 # Create symlink to latest log
                 latest_log = log_dir / "latest.log"
@@ -713,8 +709,8 @@ class TrainingMonitor:
             except Exception as e:
                 print(f"Failed to setup file logging: {e}")
         
-        # Set overall log level
-        root_logger.setLevel(log_level)
+        # Set module log level
+        module_logger.setLevel(log_level)
     
     def _setup_profiler(self):
         """Setup PyTorch profiler"""
@@ -742,34 +738,32 @@ class TrainingMonitor:
         def signal_handler(signum, frame):
             """Signal handler function"""
             logger.info(f"Received signal {signum}, shutting down...")
-            if hasattr(self, 'system_monitor'):
-                self.system_monitor.stop()
-            if hasattr(self, 'writer') and self.writer:
-                try:
-                    self.writer.close()
-                except:
-                    pass
+            self.close()
             sys.exit(0)
 
-        # Only register signals that are available on the platform
-        signal_names = {signal.SIGINT: 'SIGINT', signal.SIGTERM: 'SIGTERM'}
-        for sig, sig_name in signal_names.items():
+        # Register signals that are commonly available
+        signals_to_register = []
+        if hasattr(signal, 'SIGINT'):
+            signals_to_register.append((signal.SIGINT, 'SIGINT'))
+        if hasattr(signal, 'SIGTERM'):
+            signals_to_register.append((signal.SIGTERM, 'SIGTERM'))
+            
+        for sig, sig_name in signals_to_register:
             try:
-                signal.signal(sig, signal_handler)
+                # Check if signal is supported on this platform
+                if hasattr(signal, 'signal'):
+                    signal.signal(sig, signal_handler)
                 logger.debug(f"Registered signal handler for {sig_name}")
-            except (OSError, ValueError, AttributeError) as e:
+            except (OSError, ValueError, AttributeError, NotImplementedError) as e:
+                # Some platforms don't support certain signals
                 logger.debug(f"Could not register signal {sig_name}: {e}")
 
         def cleanup():
             """Cleanup function for atexit"""
             if hasattr(self, 'system_monitor'):
                 self.system_monitor.stop()
-            if hasattr(self, 'writer') and self.writer:
-                try:
-                    self.writer.close()
-                except:
-                    pass
-                
+            self.close()
+            
         # Register atexit handler
         atexit.register(cleanup)
     
@@ -1176,10 +1170,15 @@ class TrainingMonitor:
     
     def close(self):
         """Cleanup and close all resources"""
-        # Prevent multiple cleanup calls
-        if hasattr(self, '_closed') and self._closed:
-            return
-        self._closed = True
+        # Use lock to prevent race conditions during cleanup
+        if not hasattr(self, '_close_lock'):
+            self._close_lock = threading.Lock()
+            
+        with self._close_lock:
+            # Prevent multiple cleanup calls
+            if hasattr(self, '_closed') and self._closed:
+                return
+            self._closed = True
         
         logger.info("Closing training monitor...")
         

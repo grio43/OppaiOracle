@@ -107,7 +107,9 @@ class SimplifiedDataset(Dataset):
             self.config = config
             self.split = split
             self.vocab = vocab
+            # List of annotation dictionaries loaded from JSON files
             self.annotations: List[Dict[str, Any]] = []
+            # LRU cache for loaded images
             self.cache: OrderedDict[str, torch.Tensor] = OrderedDict()
             # Initialize orientation handler for flip augmentation
             # Only needed for training split when flips are enabled
@@ -160,6 +162,24 @@ class SimplifiedDataset(Dataset):
             self.max_cache_size = int((config.cache_size_gb * (1024 ** 3)) / bytes_per_image)
             self.cache_precision = config.cache_precision
             self.cache_lock = threading.Lock()  # Add thread lock for cache operations
+
+            # Initialise locks and counters for error handling.  `_error_counts` is
+            # used to track temporary I/O failures per image and must be
+            # accessed under `_error_counts_lock` to ensure thread safety.
+            self._error_counts_lock = threading.Lock()
+            self._error_counts: Dict[str, int] = {}
+
+            # Load annotation metadata from the provided JSON files.  This
+            # populates ``self.annotations`` with valid entries.
+            self._load_annotations(json_files)
+            # Compute sampling weights if frequency‑weighted sampling is
+            # enabled and this is the training split; otherwise, assign
+            # ``None`` so that standard shuffling is used.
+            if self.config.frequency_weighted_sampling and split == 'train':
+                self._calculate_sample_weights()
+            else:
+                self.sample_weights = None
+
             logger.info(f"Dataset initialised with {len(self.annotations)} samples for split '{split}'")
 
     def _load_annotations(self, json_files: List[Path]) -> None:
@@ -362,11 +382,12 @@ class SimplifiedDataset(Dataset):
         anno = self.annotations[idx]
         image_path = anno['image_path']
         
-        # Track error count for this specific image
-        if not hasattr(self, '_error_counts'):
-            self._error_counts = {}
-        
-        error_count = self._error_counts.get(image_path, 0)
+        # Track error count for this specific image (thread‑safe).  The
+        # ``_error_counts`` dictionary is protected by
+        # ``_error_counts_lock`` so that concurrent dataloader workers
+        # correctly update the retry counters.
+        with self._error_counts_lock:
+            error_count = self._error_counts.get(image_path, 0)
         max_retries = 3
         
         try:
@@ -411,18 +432,23 @@ class SimplifiedDataset(Dataset):
             tag_labels = self.vocab.encode_tags(tags)
             rating_label = self.vocab.rating_to_index.get(anno['rating'], self.vocab.rating_to_index['unknown'])
             
-            # Reset error count on successful load
-            if image_path in self._error_counts:
-                del self._error_counts[image_path]
-            
+            # Reset error count on successful load.  We use a lock to
+            # ensure that concurrent workers do not race when updating
+            # ``_error_counts``.
+            with self._error_counts_lock:
+                if image_path in self._error_counts:
+                    del self._error_counts[image_path]
+
+            # Package the sample as a dictionary.  Labels are nested
+            # under a single ``labels`` key to avoid duplication.  Tag
+            # labels are returned as a multi‑hot vector and rating as an
+            # integer index.
             return {
                 'image': image,
                 'labels': {
                     'tags': tag_labels,
                     'rating': rating_label,
                 },
-                'tag_labels': tag_labels,
-                'rating_label': rating_label,
                 'metadata': {
                     'index': idx,
                     'path': anno['image_path'],
@@ -433,8 +459,11 @@ class SimplifiedDataset(Dataset):
             }
             
         except (IOError, OSError) as e:
-            # File I/O errors - may be temporary
-            self._error_counts[image_path] = error_count + 1
+            # File I/O errors – may be temporary.  Increment the retry count
+            # under the lock.  If the maximum number of retries is
+            # exceeded, propagate a runtime error to abort training.
+            with self._error_counts_lock:
+                self._error_counts[image_path] = error_count + 1
             
             if error_count >= max_retries:
                 logger.error(f"Failed to load {image_path} after {max_retries} attempts: {e}")
@@ -442,7 +471,7 @@ class SimplifiedDataset(Dataset):
                 raise RuntimeError(f"Persistent failure loading {image_path}: {e}") from e
             else:
                 logger.warning(f"Error loading {image_path} (attempt {error_count + 1}/{max_retries}): {e}")
-                # Return a black image for this attempt
+                # Return an error sample for this attempt
                 return self._create_error_sample(idx, image_path, "io_error")
                 
         except Exception as e:
@@ -458,8 +487,10 @@ class SimplifiedDataset(Dataset):
         logger.debug(f"Creating error sample for {image_path}, type: {error_type}")
         return {
             'image': torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32),
-            'tag_labels': torch.zeros(len(self.vocab.tag_to_index), dtype=torch.float32),
-            'rating_label': torch.tensor(self.vocab.rating_to_index.get('unknown', 4), dtype=torch.long),
+            'labels': {
+                'tags': torch.zeros(len(self.vocab.tag_to_index), dtype=torch.float32),
+                'rating': torch.tensor(self.vocab.rating_to_index.get('unknown', 4), dtype=torch.long),
+            },
             'metadata': {
                 'index': idx,
                 'path': image_path,
@@ -568,8 +599,10 @@ def create_dataloaders(
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Custom collate function to assemble a batch of samples."""
     images = torch.stack([item['image'] for item in batch])
-    tag_labels = torch.stack([item['tag_labels'] for item in batch])
-    rating_labels = torch.tensor([item['rating_label'] for item in batch], dtype=torch.long)
+    # Extract nested labels.  Tag labels are stacked into a 2D tensor and
+    # rating labels are collected into a 1D tensor.
+    tag_labels = torch.stack([item['labels']['tags'] for item in batch])
+    rating_labels = torch.tensor([item['labels']['rating'] for item in batch], dtype=torch.long)
     metadata = {
         'indices': [item['metadata']['index'] for item in batch],
         'paths': [item['metadata']['path'] for item in batch],
