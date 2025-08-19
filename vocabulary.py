@@ -34,7 +34,9 @@ class TagVocabulary:
         self.tag_frequencies: Dict[str, int] = {}
         self.min_frequency = min_frequency
         
-        # Special tokens
+        # Special tokens+        # Use distinct strings for padding and unknown tokens.
+        # The pad token (index 0) is reserved for masking and is not a valid output.
+        # The unk token (index 1) represents unknown or rare tags.
         self.pad_token = "<PAD>"
         self.unk_token = "<UNK>"
         
