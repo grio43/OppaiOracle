@@ -427,8 +427,41 @@ class SimplifiedDataset(Dataset):
                     return cached.clone()
         # Load from disk
         try:
-            image = Image.open(image_path).convert('RGB')
-            tensor = TF.to_tensor(image)  # returns float32 in [0, 1]
+            # Open without forcing RGB so we can properly handle alpha first
+            pil_img = Image.open(image_path)
+
+            # Resolve a safe, neutral gray pad/composite color from config (works with dict or object)
+            def _resolve_pad_color(cfg, default=(128, 128, 128)):
+                # cfg may be an object with attribute or a dict with key
+                val = getattr(cfg, "pad_color", None)
+                if val is None and isinstance(cfg, dict):
+                    val = cfg.get("pad_color", None)
+                if val is None:
+                    return default
+                # Accept [r,g,b] as ints 0..255 or floats 0..1
+                if isinstance(val, (list, tuple)):
+                    if len(val) >= 3:
+                        # If all floats in [0,1], scale to [0,255]
+                        if all(isinstance(v, float) for v in val) and all(0.0 <= v <= 1.0 for v in val[:3]):
+                            return tuple(int(round(255.0 * v)) for v in val[:3])
+                        return tuple(int(v) for v in val[:3])
+                if isinstance(val, int):
+                    return (val, val, val)
+                return default
+
+            pad_color = _resolve_pad_color(self.config)
+
+            # Composite transparent images onto neutral gray BEFORE any resizing/padding
+            # to avoid black halos/noise on edges.
+            if pil_img.mode in ('RGBA', 'LA') or ('transparency' in pil_img.info):
+                rgba = pil_img.convert('RGBA')
+                bg = Image.new('RGB', rgba.size, pad_color)
+                bg.paste(rgba, mask=rgba.split()[3])  # use alpha as mask
+                pil_img = bg  # now RGB on neutral gray background
+            else:
+                pil_img = pil_img.convert('RGB')
+
+            tensor = TF.to_tensor(pil_img)  # float32 in [0, 1]
             # Add to cache with LRU eviction if needed
             if self.cache_precision == 'uint8':
                 cached_tensor = (tensor * 255).to(torch.uint8)
@@ -692,9 +725,26 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'scales': [item['metadata'].get('scale') for item in batch],
         'pads': [item['metadata'].get('pad') for item in batch],
     }
+    # Derive a per-pixel padding mask (True=content, False=padding) so downstream
+    # modules (e.g., ViT attention) can ignore padded regions.
+    B, C, H, W = images.shape
+    padding_mask = torch.ones((B, H, W), dtype=torch.bool)
+    for i, pad in enumerate(metadata['pads']):
+        if pad is None:
+            continue
+        left, top, right, bottom = pad
+        if top > 0:
+            padding_mask[i, :top, :] = False
+        if bottom > 0:
+            padding_mask[i, H - bottom:, :] = False
+        if left > 0:
+            padding_mask[i, :, :left] = False
+        if right > 0:
+            padding_mask[i, :, W - right:] = False
     return {
         'images': images,
         'tag_labels': tag_labels,
         'rating_labels': rating_labels,
+        'padding_mask': padding_mask,  # (B, H, W), bool
         'metadata': metadata,
     }

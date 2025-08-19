@@ -318,7 +318,10 @@ def train_with_orientation_tracking():
             # Forward pass with mixed precision
             if config["amp"]:
                 with autocast():
-                    outputs = model(images)
+                    pmask = batch.get('padding_mask', None)
+                    if pmask is not None:
+                        pmask = pmask.to(device)
+                    outputs = model(images, padding_mask=pmask)
                     loss, losses = criterion(
                         outputs['tag_logits'],
                         outputs['rating_logits'],
@@ -328,7 +331,10 @@ def train_with_orientation_tracking():
                     )
                 scaler.scale(loss).backward()
             else:
-                outputs = model(images)
+                pmask = batch.get('padding_mask', None)
+                if pmask is not None:
+                    pmask = pmask.to(device)
+                outputs = model(images, padding_mask=pmask)
                 loss, losses = criterion(
                     outputs['tag_logits'],
                     outputs['rating_logits'],
@@ -379,7 +385,10 @@ def train_with_orientation_tracking():
                 tag_labels = batch['tag_labels'].to(device)
                 rating_labels = batch['rating_labels'].to(device)
                 
-                outputs = model(images)
+                pmask = batch.get('padding_mask', None)
+                if pmask is not None:
+                    pmask = pmask.to(device)
+                outputs = model(images, padding_mask=pmask)
                 loss, _ = criterion(
                     outputs['tag_logits'],
                     outputs['rating_logits'],

@@ -6,7 +6,7 @@ Vision Transformer adjusted for orientation-aware tagger
 
 import math
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -54,9 +54,12 @@ class TransformerBlock(nn.Module):
             nn.Dropout(config.dropout)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Self-attention with residual
-        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+        x = x + self.attn(
+            self.norm1(x), self.norm1(x), self.norm1(x),
+            key_padding_mask=key_padding_mask
+        )[0]
         # MLP with residual
         x = x + self.mlp(self.norm2(x))
         return x
@@ -110,7 +113,11 @@ class SimplifiedTagger(nn.Module):
             if module.bias is not None:
                 module.bias.data.zero_()
 
-    def forward(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,  # (B,H,W) or (B,1,H,W), True=content/keep
+    ) -> Dict[str, torch.Tensor]:
         B = pixel_values.shape[0]
         # Patch embedding
         x = self.patch_embed(pixel_values)
@@ -121,12 +128,35 @@ class SimplifiedTagger(nn.Module):
         # Add position embeddings
         x = x + self.pos_embed[:, :x.size(1), :]
         x = self.pos_drop(x)
+        # Build key-padding mask over tokens (CLS + patch tokens) from pixel-level mask.
+        # PyTorch MultiheadAttention expects True where positions should be MASKED/ignored.
+        attn_kpm: Optional[torch.Tensor] = None
+        if padding_mask is not None:
+            pm = padding_mask
+            if pm.dim() == 4:
+                pm = pm.squeeze(1)  # (B,H,W)
+            pm = pm.to(dtype=pixel_values.dtype)
+            # Downsample to patch grid via average pooling at patch stride.
+            ph = self.config.patch_size
+            grid = F.avg_pool2d(pm.unsqueeze(1), kernel_size=ph, stride=ph)  # (B,1,H/ps,W/ps)
+            grid = (grid.squeeze(1) > 0.999)  # True where fully valid (no padding inside patch)
+            token_valid = grid.flatten(1)  # (B, num_patches)
+            cls_valid = torch.ones(B, 1, dtype=torch.bool, device=token_valid.device)
+            token_valid = torch.cat([cls_valid, token_valid], dim=1)  # include CLS
+            attn_kpm = ~token_valid  # True = ignore
+
         # Transformer blocks with optional gradient checkpointing
         for block in self.blocks:
             if self.config.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x)
+                if attn_kpm is not None:
+                    # checkpoint requires tensor args; pass mask explicitly
+                    x = torch.utils.checkpoint.checkpoint(
+                        lambda _x, _m: block(_x, key_padding_mask=_m), x, attn_kpm
+                    )
+                else:
+                    x = torch.utils.checkpoint.checkpoint(block, x)
             else:
-                x = block(x)
+                x = block(x, key_padding_mask=attn_kpm)
         # Final norm
         x = self.norm(x)
         # Use CLS token for classification
