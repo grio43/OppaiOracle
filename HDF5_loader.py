@@ -274,11 +274,17 @@ class SimplifiedDataset(Dataset):
         """
         transforms: List[Any] = []
         # Random resized crop
-        if self.config.random_crop_scale != (1.0, 1.0):
+        # Convert random_crop_scale to a tuple for comparison; YAML may deserialize it as a list.
+        try:
+            scale_tuple = tuple(self.config.random_crop_scale)
+        except TypeError:
+            # If a single number is provided, replicate it to both elements
+            scale_tuple = (self.config.random_crop_scale, self.config.random_crop_scale)
+        if scale_tuple != (1.0, 1.0):
             transforms.append(
                 T.RandomResizedCrop(
                     self.config.image_size,
-                    scale=self.config.random_crop_scale,
+                    scale=scale_tuple,
                     ratio=(0.9, 1.1),
                     interpolation=T.InterpolationMode.LANCZOS,
                 )
