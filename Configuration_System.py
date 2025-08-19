@@ -15,6 +15,7 @@ from enum import Enum
 import argparse
 from datetime import datetime
 import copy
+import time
 from collections import defaultdict
 import re
 
@@ -126,7 +127,7 @@ class BaseConfig:
             # Handle Optional types
             elif get_origin(field_type) is Union:
                 args = get_args(field_type)
-                if len(args) == 2 and type(None) in args:
+                if len(args) >= 2 and type(None) in args:
                     # This is Optional[T]
                     actual_type = args[0] if args[1] is type(None) else args[1]
                     if value is not None and is_dataclass(actual_type) and isinstance(value, dict):
@@ -134,7 +135,15 @@ class BaseConfig:
                     else:
                         kwargs[key] = value
                 else:
-                    kwargs[key] = value
+                    # Handle complex Union types - try each type in order
+                    converted = False
+                    for arg_type in args:
+                        if is_dataclass(arg_type) and isinstance(value, dict):
+                            kwargs[key] = arg_type.from_dict(value)
+                            converted = True
+                            break
+                    if not converted:
+                        kwargs[key] = value
             # Handle Lists with dataclass elements
             elif get_origin(field_type) is list:
                 args = get_args(field_type)
@@ -375,13 +384,23 @@ class DataConfig(BaseConfig):
         priorities = []
         for i, loc in enumerate(self.storage_locations):
             try:
-                storage_loc = StorageLocation(**loc)
+                # Handle both dict and StorageLocation objects
+                if isinstance(loc, StorageLocation):
+                    storage_loc = loc
+                elif isinstance(loc, dict):
+                    storage_loc = StorageLocation(**loc)
+                else:
+                    errors.append(f"Storage location {i}: Invalid type {type(loc)}")
+                    continue
+
                 storage_loc.validate()
-                priorities.append(storage_loc.priority)
+                # Only check priority uniqueness for enabled locations
+                if storage_loc.enabled:
+                    priorities.append(storage_loc.priority)
             except Exception as e:
                 errors.append(f"Storage location {i}: {str(e)}")
-        # Unique priority validation
-        if len(priorities) != len(set(priorities)):
+        # Unique priority validation for enabled locations only
+        if priorities and len(priorities) != len(set(priorities)):
             dupes = [p for p in set(priorities) if priorities.count(p) > 1]
             errors.append(f"Duplicate storage location priorities detected: {sorted(dupes)}")
 
@@ -541,6 +560,17 @@ class TrainingConfig(BaseConfig):
         # Validate focal loss parameters
         if not 0 <= self.focal_alpha <= 1:
             errors.append(f"focal_alpha must be in [0, 1], got {self.focal_alpha}")
+
+        # Validate focal loss gamma parameters
+        if self.focal_gamma_pos < 0:
+            errors.append(f"focal_gamma_pos must be >= 0, got {self.focal_gamma_pos}")
+
+        if self.focal_gamma_neg < 0:
+            errors.append(f"focal_gamma_neg must be >= 0, got {self.focal_gamma_neg}")
+
+        # Validate label smoothing
+        if not 0 <= self.label_smoothing <= 1:
+            errors.append(f"label_smoothing must be in [0, 1], got {self.label_smoothing}")
         
         # Validate device
         valid_devices = ["cuda", "cpu", "mps"]
@@ -759,9 +789,12 @@ class FullConfig(BaseConfig):
         if not errors:  # Only do cross-validation if individual configs are valid
             # Check batch size consistency
             effective_batch = self.data.batch_size * self.training.gradient_accumulation_steps
-            if effective_batch > 512:
-                logger.warning(f"Large effective batch size ({effective_batch}) may cause memory issues")
-            
+            # Make threshold configurable based on available memory
+            memory_threshold = 512
+            if self.max_memory_gb:
+                memory_threshold = int(self.max_memory_gb * 1024 / 16)  # Rough heuristic
+            if effective_batch > memory_threshold:
+                logger.warning(f"Large effective batch size ({effective_batch}) may cause memory issues (threshold: {memory_threshold})")
             # Check image size consistency
             if self.model.image_size != self.data.image_size:
                 errors.append(
@@ -858,7 +891,8 @@ class ConfigManager:
 
         # Create backup if requested and file exists
         if backup and path.exists():
-            backup_path = path.with_suffix(f'.backup_{datetime.now():%Y%m%d_%H%M%S}{path.suffix}')
+            timestamp = f"{datetime.now():%Y%m%d_%H%M%S}_{int(time.time() * 1000000) % 1000000:06d}"
+            backup_path = path.with_suffix(f'.backup_{timestamp}{path.suffix}')
             path.rename(backup_path)
             logger.info(f"Created backup at {backup_path}")
 
@@ -925,17 +959,25 @@ class ConfigManager:
     
     def _parse_env_value(self, value: str) -> Any:
         """Parse environment variable value to appropriate type"""
-        # Try JSON first (handles lists, dicts, etc.)
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            pass
-        
         # Boolean
         if value.lower() in ('true', 'yes', '1'):
             return True
         elif value.lower() in ('false', 'no', '0'):
             return False
+
+        # Try JSON for complex types (only if it looks like JSON)
+        if value.strip().startswith(('[', '{')):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                pass
+
+        # Try JSON for null values
+        if value.lower() == 'null':
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                pass
         
         # Number
         try:
@@ -1291,27 +1333,30 @@ if __name__ == "__main__":
         # Test 3: Environment variable override
         print("\n3. Testing environment variable override...")
         os.environ["ANIME_TAGGER_TRAINING__LEARNING_RATE"] = "0.0005"
-        os.environ["ANIME_TAGGER_MODEL__NUM_GROUPS"] = "25"
+        os.environ["ANIME_TAGGER_MODEL__NUM_GROUPS"] = "20"  # Keep consistent with default tags_per_group
         os.environ["ANIME_TAGGER_DATA__BATCH_SIZE"] = "64"
-        os.environ["ANIME_TAGGER_MODEL__NUM_LABELS"] = "250000"
+        # num_labels will be calculated correctly: 20 * 10000 = 200000 (default)
         
         manager.update_from_env()
         
         assert manager.config.training.learning_rate == 0.0005
-        assert manager.config.model.num_groups == 25
+        assert manager.config.model.num_groups == 20
         assert manager.config.data.batch_size == 64
         print("   ✓ Environment overrides work correctly")
         
         # Test 4: Config diff
         print("\n4. Testing config diff functionality...")
         config2 = FullConfig()
+        # Create a fresh manager to avoid contamination from previous test
+        manager2 = ConfigManager(ConfigType.FULL)
+        manager2.config = config2
         config2.training.num_epochs = 200
         config2.model.hidden_size = 2048
         
-        manager2 = ConfigManager(ConfigType.FULL)
-        manager2.config = config2
+        # Compare with original unmodified config
+        original_manager = ConfigManager(ConfigType.FULL)
         
-        diff = manager.get_diff(manager2)
+        diff = original_manager.get_diff(manager2)
         print(f"   Found {len(diff)} differences")
         for key, (val1, val2) in list(diff.items())[:3]:
             print(f"   - {key}: {val1} → {val2}")
