@@ -1,3 +1,8 @@
 https://chatgpt.com/share/68a3e43b-399c-8001-b5d9-d52f9aec827a
 
 Figure out how do deal with padding and maintain quality training
+
+
+Compelted now need to check for bugs post implementation
+
+Also need to verify if adding gray backgrounds is still intact and the best way to handle that for images without backgrounds. 
