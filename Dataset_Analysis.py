@@ -23,6 +23,12 @@ import numpy as np
 from PIL import Image
 
 import matplotlib.pyplot as plt
+# Set backend for headless environments
+import matplotlib
+matplotlib.use('Agg')
+
+# Cache decorator for compiled regex patterns and other heavy computations
+from functools import lru_cache
 
 
 # Optional heavy dependencies with feature flags
@@ -55,14 +61,9 @@ try:
 except ImportError:
     NETWORKX_AVAILABLE = False
 
-# Optional imports with fallback
-try:
-    import pandas as pd
-    PANDAS_AVAILABLE = True
-except ImportError:
-    PANDAS_AVAILABLE = False
-    warnings.warn("pandas not available. Install with: pip install pandas")
-
+# Note: pandas support planned for future version
+# Will be used for advanced statistical analysis and data export
+PANDAS_AVAILABLE = False
 try:
     import imagehash
     IMAGEHASH_AVAILABLE = True
@@ -126,6 +127,9 @@ class AnalysisConfig:
     # Performance
     num_workers: int = min(8, mp.cpu_count())
     batch_size: int = 100
+    max_memory_mb: int = 2048  # Maximum memory for image stats
+    enable_parallel: bool = True  # Enable parallel processing
+    chunk_size: int = 1000  # Process images in chunks
     
     # Visualization
     create_visualizations: bool = True
@@ -348,12 +352,16 @@ class ImageAnalyzer:
                 stats.quality_issues.append("excessive_resolution")
         
         # Aspect ratio checks
-        if self.config.check_aspect_ratio and stats.height > 0:
-            aspect_ratio = stats.width / stats.height
-            if aspect_ratio < self.config.min_aspect_ratio:
-                stats.quality_issues.append("too_tall")
-            elif aspect_ratio > self.config.max_aspect_ratio:
-                stats.quality_issues.append("too_wide")
+        if self.config.check_aspect_ratio:
+            if stats.height > 0 and stats.width > 0:
+                aspect_ratio = stats.width / stats.height
+                if aspect_ratio < self.config.min_aspect_ratio:
+                    stats.quality_issues.append("too_tall")
+                elif aspect_ratio > self.config.max_aspect_ratio:
+                    stats.quality_issues.append("too_wide")
+            # Mark invalid dimensions when width or height is zero
+            elif stats.height == 0 or stats.width == 0:
+                stats.quality_issues.append("invalid_dimensions")
         
         # Brightness/contrast checks
         if stats.brightness is not None:
@@ -382,6 +390,22 @@ class TagAnalyzer:
         self.tag_cooccurrence = defaultdict(Counter)
         self.images_per_tag = defaultdict(set)
         self.tags_per_image = defaultdict(set)
+
+    @lru_cache(maxsize=128)
+    def _get_compiled_patterns(self) -> Dict[str, 're.Pattern']:
+        """Get compiled regex patterns for tag hierarchy analysis"""
+        import re
+        patterns = {
+            'hair_color': r'.*_(hair|haired)$',
+            'eye_color': r'.*_(eyes|eyed)$',
+            'clothing': r'.*(shirt|dress|pants|skirt|uniform|clothes|wear|outfit|costume|suit|kimono|bikini|underwear|pajamas|hoodie|jacket|coat).*',
+            'emotion': r'.*(smile|laugh|cry|angry|sad|happy|blush|embarrassed|surprised|scared|nervous|confused).*',
+            'pose': r'.*(sitting|standing|lying|running|walking|kneeling|squatting|jumping|flying|sleeping).*',
+            'character_count': r'^(solo|1girl|2girls|3girls|1boy|2boys|multiple_girls|multiple_boys)$',
+            'view_angle': r'.*(from_above|from_below|from_side|from_behind|front_view|portrait|close-up|cowboy_shot|full_body).*',
+            'background': r'.*(outdoors|indoors|sky|clouds|city|forest|beach|school|bedroom|kitchen|bathroom).*'
+        }
+        return {k: re.compile(v, re.IGNORECASE) for k, v in patterns.items()}
         
     def add_image_tags(self, image_path: str, tags: List[str]):
         """Add tags for an image"""
@@ -436,25 +460,12 @@ class TagAnalyzer:
         """Analyze tag hierarchies and relationships"""
         hierarchies = defaultdict(list)
         
-        # Common patterns for anime/manga tags
-        patterns = {
-            'hair_color': r'.*_(hair|haired)$',
-            'eye_color': r'.*_(eyes|eyed)$',
-            'clothing': r'.*(shirt|dress|pants|skirt|uniform|clothes|wear|outfit|costume|suit|kimono|bikini|underwear|pajamas|hoodie|jacket|coat).*',
-            'emotion': r'.*(smile|laugh|cry|angry|sad|happy|blush|embarrassed|surprised|scared|nervous|confused).*',
-            'pose': r'.*(sitting|standing|lying|running|walking|kneeling|squatting|jumping|flying|sleeping).*',
-            'character_count': r'^(solo|1girl|2girls|3girls|1boy|2boys|multiple_girls|multiple_boys)$',
-            'view_angle': r'.*(from_above|from_below|from_side|from_behind|front_view|portrait|close-up|cowboy_shot|full_body).*',
-            'background': r'.*(outdoors|indoors|sky|clouds|city|forest|beach|school|bedroom|kitchen|bathroom).*'
-        }
-        
-        import re
-        for category, pattern in patterns.items():
-            regex = re.compile(pattern, re.IGNORECASE)
+        # Use compiled patterns (cached) for efficiency
+        patterns = self._get_compiled_patterns()
+        for category, regex in patterns.items():
             for tag in self.tag_counts:
                 if regex.match(tag):
                     hierarchies[category].append(tag)
-        
         return dict(hierarchies)
     
     def find_tag_clusters(self, min_similarity: float = 0.5) -> List[Set[str]]:
@@ -478,8 +489,11 @@ class TagAnalyzer:
                     total1 = self.tag_counts[tag1]
                     total2 = self.tag_counts[tag2]
                     # Jaccard similarity
-                    denominator = total1 + total2 - cooc
-                    similarity = cooc / denominator if denominator > 0 else 0
+                    if total1 > 0 and total2 > 0:
+                        denominator = total1 + total2 - cooc
+                        similarity = cooc / denominator if denominator > 0 else 0
+                    else:
+                        similarity = 0
                     similarity_matrix[i, j] = similarity
         
         # Cluster using DBSCAN (if scikit-learn available)
@@ -546,13 +560,20 @@ class DuplicateDetector:
             
             for i in range(len(hashes)):
                 for j in range(i + 1, len(hashes)):
-                    hash1 = imagehash.hex_to_hash(hashes[i])
-                    hash2 = imagehash.hex_to_hash(hashes[j])
+                    try:
+                        # Skip empty or invalid hashes
+                        if not hashes[i] or not hashes[j]:
+                            continue
+                        hash1 = imagehash.hex_to_hash(hashes[i])
+                        hash2 = imagehash.hex_to_hash(hashes[j])
+                    except (ValueError, TypeError) as e:
+                        logger.debug(f"Invalid hash format: {e}")
+                        continue
                     
                     # Calculate hamming distance
                     distance = hash1 - hash2
                     max_distance = len(hash1.hash) ** 2
-                    similarity = 1 - (distance / max_distance) if max_distance > 0 else 0
+                    similarity = 1 - (distance / max_distance) if max_distance > 0 else 1.0
                     
                     if similarity >= self.config.duplicate_threshold:
                         paths1 = self.perceptual_hashes[hashes[i]]
@@ -579,6 +600,7 @@ class DatasetAnalyzer:
         
         # Results storage
         self.image_stats = []
+        self.image_stats_buffer = []  # Buffer for batch processing
         self.dataset_stats = DatasetStats()
         
         # Setup output directory
@@ -669,12 +691,65 @@ class DatasetAnalyzer:
             image_paths = random.sample(image_paths, self.config.sample_size_for_stats)
             logger.info(f"Sampling {len(image_paths)} images for analysis")
         
-        # Sequential processing (more stable for image operations)
-        for path in tqdm(image_paths, desc="Analyzing images"):
-            stats = self.image_analyzer.analyze_image(path)
-            if stats:
-                self.image_stats.append(stats)
-                self.duplicate_detector.add_image(stats)
+        # Process in chunks to manage memory
+        chunk_size = self.config.chunk_size
+        total_chunks = (len(image_paths) + chunk_size - 1) // chunk_size
+        
+        for chunk_idx in range(total_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min(start_idx + chunk_size, len(image_paths))
+            chunk_paths = image_paths[start_idx:end_idx]
+            
+            logger.info(f"Processing chunk {chunk_idx + 1}/{total_chunks} ({len(chunk_paths)} images)")
+            
+            if self.config.enable_parallel and self.config.num_workers > 1:
+                # Parallel processing for better performance
+                self._analyze_images_parallel(chunk_paths)
+            else:
+                # Sequential processing (more stable for debugging)
+                for path in tqdm(chunk_paths, desc=f"Analyzing images (chunk {chunk_idx + 1})"):
+                    try:
+                        stats = self.image_analyzer.analyze_image(path)
+                        if stats:
+                            self.image_stats_buffer.append(stats)
+                            self.duplicate_detector.add_image(stats)
+                    except Exception as e:
+                        logger.error(f"Error analyzing {path}: {e}")
+            
+            # Flush buffer periodically to manage memory
+            self._flush_stats_buffer()
+
+    def _analyze_images_parallel(self, image_paths: List[Path]):
+        """Analyze images in parallel"""
+        with ProcessPoolExecutor(max_workers=self.config.num_workers) as executor:
+            # Submit all tasks
+            future_to_path = {
+                executor.submit(self._analyze_single_image_safe, path): path
+                for path in image_paths
+            }
+            # Process results as they complete
+            for future in tqdm(future_to_path, desc="Analyzing images (parallel)"):
+                try:
+                    stats = future.result(timeout=30)
+                    if stats:
+                        self.image_stats_buffer.append(stats)
+                        self.duplicate_detector.add_image(stats)
+                except Exception as e:
+                    path = future_to_path[future]
+                    logger.error(f"Error analyzing {path}: {e}")
+    
+    def _analyze_single_image_safe(self, path: Path) -> Optional[ImageStats]:
+        """Safely analyze a single image (for parallel processing)"""
+        try:
+            return self.image_analyzer.analyze_image(path)
+        except Exception as e:
+            logger.error(f"Error analyzing {path}: {e}")
+            return None
+    
+    def _flush_stats_buffer(self):
+        """Flush stats buffer to main list"""
+        self.image_stats.extend(self.image_stats_buffer)
+        self.image_stats_buffer.clear()
     
     def _analyze_tags(self, image_paths: List[Path]) -> Dict[str, Any]:
         """Analyze tag distributions"""
@@ -692,10 +767,11 @@ class DatasetAnalyzer:
                 if tag_file.exists():
                     content = None
                     try:
-                        with open(tag_file, 'r', encoding='utf-8', errors='ignore') as f:
+                        # Use 'replace' instead of 'ignore' to preserve character count
+                        with open(tag_file, 'r', encoding='utf-8', errors='replace') as f:
                             content = f.read()
                     except (IOError, OSError) as e:
-                        logger.error(f"Error reading tag file {tag_file}: {e}")
+                        logger.warning(f"Error reading tag file {tag_file}: {e}")
                         continue
                     except Exception as e:
                         logger.error(f"Unexpected error loading tags from {tag_file}: {e}")
@@ -802,13 +878,16 @@ class DatasetAnalyzer:
         logger.info("Creating visualizations...")
         
         try:
-            # Set style (fall back if seaborn style missing)
+            # Set style with better fallback handling
             try:
-                plt.style.use('seaborn-v0_8-darkgrid')
+                # Try modern seaborn styles first
+                plt.style.use('seaborn-v0_8')
             except Exception:
                 try:
+                    # Fall back to older seaborn style
                     plt.style.use('seaborn-darkgrid')
                 except Exception:
+                    # Use default if seaborn not available
                     plt.style.use('default')
             if SEABORN_AVAILABLE:
                 sns.set_palette("husl")
@@ -907,7 +986,8 @@ class DatasetAnalyzer:
         """Create a word cloud of tags"""
         if not WORDCLOUD_AVAILABLE:
             return
-        fig = None
+        
+        plt.figure(figsize=(20, 10))
         try:
             # Prepare tag frequencies
             tag_freq = dict(self.tag_analyzer.tag_counts.most_common(200))
@@ -915,15 +995,13 @@ class DatasetAnalyzer:
             if tag_freq:
                 # Create word cloud
                 wordcloud = WordCloud(
-                    width=1600, 
-                    height=800, 
+                    width=1600,
+                    height=800,
                     background_color='white',
                     relative_scaling=0.5,
                     min_font_size=10
                 ).generate_from_frequencies(tag_freq)
                 
-                # Create figure
-                fig = plt.figure(figsize=(20, 10))
                 plt.imshow(wordcloud, interpolation='bilinear')
                 plt.axis('off')
                 plt.title('Tag Word Cloud', fontsize=20)
@@ -942,8 +1020,7 @@ class DatasetAnalyzer:
             logger.error(f"Error creating word cloud: {e}")
         finally:
             # Ensure matplotlib resources are always cleaned up
-            if fig is not None:
-                plt.close(fig)
+            plt.close('all')
     
     def _generate_report(self):
         """Generate analysis report"""
@@ -1080,7 +1157,9 @@ class DatasetAnalyzer:
         ]
         
         for metric, count, status in quality_metrics:
-            html.append(f'<tr><td>{metric}</td><td>{count}</td><td class="{status}">{"⚠️" if status != "success" else "✅"}</td></tr>')
+            # Use HTML entities instead of Unicode characters for better compatibility
+            icon = "&#9888;" if status != "success" else "&#10004;"  # Warning sign or checkmark
+            html.append(f'<tr><td>{metric}</td><td>{count}</td><td class="{status}">{icon}</td></tr>')
         
         html.append("</table>")
         
