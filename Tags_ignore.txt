@@ -31,3 +31,12 @@ partial_commentary
 copyright_request
 non-web_source
 english_commentary
+self-upload
+revision
+chinese_commentary
+japanese_commentary
+bad_pixiv_id
+md5_mismatch
+resolution_mismatch
+resized
+?

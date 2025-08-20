@@ -21,6 +21,7 @@ from pathlib import Path
 import json
 import threading
 import logging
+import random
 
 import numpy as np
 import torch
@@ -30,6 +31,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 
 from collections import OrderedDict
+from logging.handlers import QueueHandler
 
 from orientation_handler import OrientationHandler, OrientationMonitor  # type: ignore
 # Import TagVocabulary from the vocabulary module rather than a relative package path.
@@ -157,6 +159,9 @@ class SimplifiedDataConfig:
     augmentation_enabled: bool = True
     # Reduce flip probability because many tags encode left/right semantics
     random_flip_prob: float = 0.2
+    # Safer default: fail if flips requested but mapping invalid
+    strict_orientation_validation: bool = True
+    skip_unmapped: bool = True
     # Narrow crop scale range to preserve most of the subject in the frame.
     # When (1.0, 1.0) no random cropping is performed.
     random_crop_scale: Tuple[float, float] = (0.95, 1.0)
@@ -200,6 +205,37 @@ class SimplifiedDataConfig:
                 f"image_size ({self.image_size}) is not divisible by patch_size ({self.patch_size}); "
                 f"letterbox_resize will pad further to the next multiple."
             )
+
+
+def _make_worker_init_fn(base_seed: int, log_queue: Optional[object]):
+    """Seed torch/numpy/random per worker and disable file logging in workers.
+    If a logging queue is provided, attach a QueueHandler so logs go to main.
+    """
+    def _init_fn(worker_id: int):
+        seed = (base_seed + worker_id) % (2**31 - 1)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        # Remove any FileHandlers in workers (avoid cross-process file writes)
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            try:
+                from logging import FileHandler
+                if isinstance(h, FileHandler):
+                    root.removeHandler(h)
+            except Exception:
+                pass
+
+        # Attach QueueHandler if queue supplied
+        if log_queue is not None:
+            try:
+                qh = QueueHandler(log_queue)
+                qh.setLevel(logging.INFO)
+                root.addHandler(qh)
+            except Exception:
+                pass
+    return _init_fn
 
 
 class SimplifiedDataset(Dataset):
@@ -647,6 +683,9 @@ def create_dataloaders(
     frequency_sampling: bool = True,
     val_batch_size: Optional[int] = None,
     config_updates: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
+    log_queue: Optional[object] = None,
+    force_val_persistent_workers: bool = False,
 ) -> Tuple[DataLoader, DataLoader, TagVocabulary]:
     """Construct training and validation dataloaders along with the vocabulary.
 
@@ -705,6 +744,13 @@ def create_dataloaders(
         )
     # Determine validation batch size
     val_bs = val_batch_size or batch_size
+
+    # Deterministic generator and per-worker init
+    base_seed = int(seed if seed is not None else torch.initial_seed() % (2**31 - 1))
+    generator = torch.Generator()
+    generator.manual_seed(base_seed)
+    worker_init_fn = _make_worker_init_fn(base_seed, log_queue)
+
     # Build dataloaders
     train_loader = DataLoader(
         train_dataset,
@@ -716,6 +762,8 @@ def create_dataloaders(
         drop_last=True,
         persistent_workers=True if num_workers > 0 else False,
         collate_fn=collate_fn,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -724,8 +772,10 @@ def create_dataloaders(
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
-        persistent_workers=True if num_workers > 0 else False,
+        persistent_workers=(num_workers > 0 and force_val_persistent_workers),
         collate_fn=collate_fn,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
     )
     return train_loader, val_loader, vocab
 

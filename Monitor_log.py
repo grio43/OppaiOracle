@@ -616,16 +616,23 @@ class TrainingMonitor:
         self.metrics = ThreadSafeMetricsTracker(config)
         self.system_monitor = SystemMonitor(config)
         self.alerts = AlertSystem(config) if config.enable_alerts else None
-        
-        # Setup visualization backends
+
+        # Determine primary process
+        is_primary = True
+        try:
+            is_primary = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+        except Exception:
+            is_primary = True
+
+        # Setup visualization backends only on primary
         self.writer = None
-        if config.use_tensorboard:
+        if config.use_tensorboard and is_primary:
             try:
                 self.writer = SummaryWriter(config.tensorboard_dir)
                 logger.info(f"TensorBoard logging to {config.tensorboard_dir}")
             except Exception as e:
                 logger.error(f"Failed to initialize TensorBoard: {e}")
-        
+
         self.wandb_run = None
         if config.use_wandb and WANDB_AVAILABLE:
             try:
@@ -638,85 +645,63 @@ class TrainingMonitor:
                 logger.info("Weights & Biases logging initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize wandb: {e}")
-        
+
         # Profiler
         self.profiler = None
         self.profiler_step = 0
         if config.enable_profiling:
             self._setup_profiler()
-        
+
         # Training state
         self.last_step_time = time.time()
         self.last_loss = None
         self.steps_without_improvement = 0
         self.best_val_metric = float('inf')
-        
+
         # Data pipeline stats
         self.data_stats = {
             'load_times': deque(maxlen=1000),
             'batch_sizes': deque(maxlen=1000),
             'augmentation_times': deque(maxlen=1000)
         }
-        
+
         # Start system monitoring
         if config.track_system_metrics:
             self.system_monitor.start()
-        
-        # Prometheus server
+
+        # Prometheus server only on primary
         self.prometheus_server = None
-        if config.enable_prometheus and PROMETHEUS_AVAILABLE:
+        if config.enable_prometheus and PROMETHEUS_AVAILABLE and is_primary:
             try:
                 from prometheus_client import start_http_server
                 self.prometheus_server = start_http_server(config.prometheus_port)
                 logger.info(f"Prometheus metrics server started on port {config.prometheus_port}")
             except Exception as e:
                 logger.error(f"Failed to start Prometheus server: {e}")
-        
+
         # Register cleanup handlers
         self._register_cleanup()
     
     def _setup_logging(self):
         """Setup logging configuration"""
-        log_level = getattr(logging, self.config.log_level.upper())
-        
-        # Remove existing handlers to avoid duplicates
-        root_logger = logging.getLogger()
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-        
-        # Create formatter
-        formatter = logging.Formatter(self.config.log_format)
-        
-        # Console handler
-        if self.config.log_to_console:
-            console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setFormatter(formatter)
-            console_handler.setLevel(log_level)
-            root_logger.addHandler(console_handler)
-        
-        # File handler
-        if self.config.log_to_file:
-            try:
-                log_dir = Path(self.config.log_dir)
-                log_dir.mkdir(parents=True, exist_ok=True)
-                
-                log_file = log_dir / f"training_{datetime.now():%Y%m%d_%H%M%S}.log"
-                file_handler = logging.FileHandler(log_file)
-                file_handler.setFormatter(formatter)
-                file_handler.setLevel(log_level)
-                root_logger.addHandler(file_handler)
-                
-                # Create symlink to latest log
-                latest_log = log_dir / "latest.log"
-                if latest_log.exists() or latest_log.is_symlink():
-                    latest_log.unlink()
-                latest_log.symlink_to(log_file.name)
-                
-            except Exception as e:
-                print(f"Failed to setup file logging: {e}")
-        
-        # Set overall log level
-        root_logger.setLevel(log_level)
+        module_logger = logging.getLogger(__name__)
+        # Always console
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(logging.Formatter(self.config.log_format))
+        module_logger.addHandler(ch)
+        # Only rank 0 writes files
+        is_primary = True
+        try:
+            is_primary = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+        except Exception:
+            is_primary = True
+        if is_primary and self.config.log_to_file:
+            log_dir = Path(self.config.log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(log_dir / "training_{:%Y%m%d_%H%M%S}.log".format(datetime.now()))
+            fh.setFormatter(logging.Formatter(self.config.log_format))
+            module_logger.addHandler(fh)
+        module_logger.setLevel(getattr(logging, self.config.log_level.upper()))
     
     def _setup_profiler(self):
         """Setup PyTorch profiler"""
