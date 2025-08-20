@@ -25,3 +25,9 @@ tagme
 spoilers
 spoiler
 official_art
+bad_deviantart_id
+bad_link
+partial_commentary
+copyright_request
+non-web_source
+english_commentary
