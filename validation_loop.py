@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-\"""
+"""
 Validation Loop for Anime Image Tagger
 Comprehensive validation pipeline with multiple evaluation modes
-\"""
+"""
 
 import os
 import json
@@ -32,8 +32,17 @@ from sklearn.metrics import (
     roc_auc_score,
     confusion_matrix
 )
+# Headless/optional plotting setup
+import matplotlib as mpl
+# Use a non-interactive backend so validation can run headless (e.g., on CI)
+mpl.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
+try:
+    import seaborn as sns  # optional
+    _HAVE_SEABORN = True
+except Exception:  # pragma: no cover
+    sns = None     # type: ignore
+    _HAVE_SEABORN = False
 
 # Import our modules
 from Evaluation_Metrics import MetricComputer, MetricConfig
@@ -48,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ValidationConfig:
-    \"\"\"Configuration for validation\"\"\"
+    """Configuration for validation"""
     # Model and data paths
     model_path: Optional[str] = None
     checkpoint_path: Optional[str] = None
@@ -99,7 +108,7 @@ class ValidationConfig:
 
 
 class ValidationRunner:
-    \"\"\"Main validation runner\"\"\"
+    """Main validation runner"""
     
     def __init__(self, config: ValidationConfig):
         self.config = config
@@ -142,11 +151,11 @@ class ValidationRunner:
             self.config.frequency_bins = [0, 10, 100, 1000, 10000, float('inf')]
     
     def _metadata_dict_to_list(self, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
-        \"\"\"
+        """
         Convert a batch-level metadata dict-of-lists (as produced by the
         custom collate_fn) into a per-sample list of dicts so downstream
         code can serialize and analyze per-image results easily.
-        \"\"\"
+        """
         size = len(meta.get('paths', []))
         items: List[Dict[str, Any]] = []
         for i in range(size):
@@ -162,7 +171,7 @@ class ValidationRunner:
 
 
     def _setup_logging(self):
-        \"\"\"Setup validation-specific logging\"\"\"
+        """Setup validation-specific logging"""
         log_file = self.output_dir / f"validation_{datetime.now():%Y%m%d_%H%M%S}.log"
         
         file_handler = logging.FileHandler(log_file)
@@ -173,7 +182,7 @@ class ValidationRunner:
         logger.addHandler(file_handler)
     
     def _load_model(self) -> nn.Module:
-        \"\"\"Load model from checkpoint\"\"\"
+        """Load model from checkpoint"""
         if self.config.checkpoint_path:
             logger.info(f"Loading model from checkpoint: {self.config.checkpoint_path}")
             checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu')
@@ -221,7 +230,7 @@ class ValidationRunner:
         return model
     
     def create_dataloader(self) -> DataLoader:
-        \"\"\"Create validation dataloader\"\"\"
+        """Create validation dataloader"""
         # Data config
         data_config = SimplifiedDataConfig(
             data_dir=Path(self.config.data_dir),
@@ -233,7 +242,7 @@ class ValidationRunner:
         )
 
         # Create dataloader
-        _, val_loader = create_dataloaders(
+        _, val_loader, _ = create_dataloaders(
             data_dir=data_config.data_dir,
             json_dir=data_config.json_dir,
             vocab_path=data_config.vocab_path,
@@ -258,7 +267,7 @@ class ValidationRunner:
         return val_loader
     
     def validate(self) -> Dict[str, Any]:
-        \"\"\"Run validation based on configured mode\"\"\"
+        """Run validation based on configured mode"""
         logger.info(f"Starting validation in '{self.config.mode}' mode")
         
         # Create dataloader
@@ -289,7 +298,7 @@ class ValidationRunner:
         return results
     
     def validate_full(self, dataloader: DataLoader) -> Dict[str, Any]:
-        \"\"\"Complete validation with all metrics\"\"\"
+        """Complete validation with all metrics"""
         logger.info("Running full validation...")
         
         # Collect all predictions and targets
@@ -302,8 +311,8 @@ class ValidationRunner:
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validating")):
-                images = batch['image'].to(self.device)
-                labels = batch['labels']
+                images = batch['images'].to(self.device)
+                tag_labels = batch['tag_labels']
                 
                 # Time inference
                 if self.config.measure_inference_time and torch.cuda.is_available():
@@ -313,7 +322,7 @@ class ValidationRunner:
                 # Forward pass
                 with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
                     outputs = self.model(images)
-                    logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+                    logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
                 if self.config.measure_inference_time and torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -330,7 +339,7 @@ class ValidationRunner:
                 
                 # Collect results
                 all_predictions.append(predictions.cpu())
-                all_targets.append(labels['binary'].cpu())
+                all_targets.append(tag_labels.cpu())
                 # Normalize metadata to per-sample dict list
                 meta = batch.get('metadata', None)
                 if isinstance(meta, dict):
@@ -390,7 +399,7 @@ class ValidationRunner:
         return metrics
     
     def validate_fast(self, dataloader: DataLoader) -> Dict[str, Any]:
-        \"\"\"Fast validation with basic metrics only\"\"\"
+        """Fast validation with basic metrics only"""
         logger.info("Running fast validation...")
         
         # Temporarily disable expensive metrics
@@ -435,7 +444,7 @@ class ValidationRunner:
         return results
     
     def validate_specific_tags(self, dataloader: DataLoader) -> Dict[str, Any]:
-        \"\"\"Validate performance on specific tags\"\"\"
+        """Validate performance on specific tags"""
         if not self.config.specific_tags:
             raise ValueError("specific_tags must be provided for 'tags' mode")
         
@@ -461,13 +470,13 @@ class ValidationRunner:
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Validating specific tags"):
-                images = batch['image'].to(self.device)
-                labels = batch['labels']['binary']
+                images = batch['images'].to(self.device)
+                tag_labels = batch['tag_labels']
                 
                 # Forward pass
                 with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
                     outputs = self.model(images)
-                    logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+                    logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
                 # Handle hierarchical output
                 if logits.dim() == 3:
@@ -476,7 +485,7 @@ class ValidationRunner:
                 
                 # Get predictions for specific tags only
                 predictions = torch.sigmoid(logits[:, tag_indices])
-                targets = labels[:, tag_indices]
+                targets = tag_labels[:, tag_indices]
                 
                 all_predictions.append(predictions.cpu())
                 all_targets.append(targets.cpu())
@@ -543,7 +552,7 @@ class ValidationRunner:
         return results
     
     def validate_hierarchical(self, dataloader: DataLoader) -> Dict[str, Any]:
-        \"\"\"Validate hierarchical group structure\"\"\"
+        """Validate hierarchical group structure"""
         logger.info("Validating hierarchical structure...")
         
         # Collect predictions by group
@@ -552,30 +561,54 @@ class ValidationRunner:
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Validating hierarchical"):
-                images = batch['image'].to(self.device)
-                labels = batch['labels']['hierarchical']
+                images = batch['images'].to(self.device)
+                # Collate does not provide hierarchical labels; use flat tag labels
+                flat_labels = batch.get('tag_labels')
+                if flat_labels is None:
+                    logger.error("Batch is missing 'tag_labels'; cannot run hierarchical validation.")
+                    return {'error': "Batch missing 'tag_labels' for hierarchical validation"}
                 
                 # Forward pass
                 with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
                     outputs = self.model(images)
-                    logits = outputs['logits']
+                    tag_logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
-                # Should be (batch, num_groups, tags_per_group)
-                if logits.dim() != 3:
-                    raise ValueError("Model output is not hierarchical")
+                # Expect (batch, num_groups, tags_per_group)
+                if tag_logits.dim() != 3:
+                    logger.warning(
+                        "Model output is not hierarchical (got shape %s). "
+                        "Returning a helpful error instead of crashing. "
+                        "Use mode='full' or 'tags' with this checkpoint.",
+                        tuple(tag_logits.shape)
+                    )
+                    return {
+                        'error': "Model output is not hierarchical (expected 3D logits).",
+                        'hint': "Run with mode='full' or 'tags', or load a hierarchical checkpoint."
+                    }
                 
-                predictions = torch.sigmoid(logits)
+                predictions = torch.sigmoid(tag_logits)
                 
                 # Collect by group
-                for g in range(self.vocab.num_groups):
+                num_groups = predictions.size(1)
+                # Best-effort reshape of flat labels into (B, G, T) if sizes line up
+                B, G, T = predictions.size(0), predictions.size(1), predictions.size(2)
+                if flat_labels.size(1) == G * T:
+                    labels_h = flat_labels.view(B, G, T)
+                else:
+                    logger.warning(
+                        "Cannot reshape flat labels of shape %s into (B=%d, G=%d, T=%d); "
+                        "filling targets with zeros for metrics.", tuple(flat_labels.shape), B, G, T
+                    )
+                    labels_h = torch.zeros((B, G, T), dtype=flat_labels.dtype)
+                for g in range(num_groups):
                     group_predictions[g].append(predictions[:, g, :].cpu())
-                    group_targets[g].append(labels[:, g, :].cpu())
+                    group_targets[g].append(labels_h[:, g, :].cpu())
         
         # Compute metrics per group
         results = {'groups': {}}
         group_f1_scores = []
         
-        for g in range(self.vocab.num_groups):
+        for g in range(len(group_predictions)):
             if not group_predictions[g]:
                 continue
             
@@ -600,7 +633,9 @@ class ValidationRunner:
             f1 = 2 * precision * recall / (precision + recall + 1e-8)
             
             # Get group name
-            group_name = self.vocab.get_group_name(g) if hasattr(self.vocab, 'get_group_name') else f"Group_{g}"
+            group_name = (
+                self.vocab.get_group_name(g) if hasattr(self.vocab, 'get_group_name') else f"Group_{g}"
+            )
             
             results['groups'][group_name] = {
                 'precision': precision,
@@ -625,14 +660,14 @@ class ValidationRunner:
         return results
     
     def _compute_tag_frequencies(self, targets: torch.Tensor) -> np.ndarray:
-        \"\"\"Compute tag frequencies from targets\"\"\"
+        """Compute tag frequencies from targets"""
         # Sum across samples to get frequency counts
         tag_counts = targets.sum(dim=0).numpy()
         return tag_counts
     
     def _create_visualizations(self, predictions: torch.Tensor, targets: torch.Tensor, 
                               metrics: Dict, tag_names: List[str]):
-        \"\"\"Create comprehensive visualizations\"\"\"
+        """Create comprehensive visualizations"""
         logger.info("Creating visualizations...")
         
         # 1. Overall metrics bar plot
@@ -729,7 +764,7 @@ class ValidationRunner:
                 plt.close()
     
     def _create_tag_pr_curve(self, tag_name: str, predictions: np.ndarray, targets: np.ndarray):
-        \"\"\"Create precision-recall curve for a specific tag\"\"\"
+        """Create precision-recall curve for a specific tag"""
         precision, recall, thresholds = precision_recall_curve(targets, predictions)
         ap = average_precision_score(targets, predictions)
         
@@ -752,7 +787,7 @@ class ValidationRunner:
         plt.close()
     
     def _save_predictions(self, predictions: torch.Tensor, targets: torch.Tensor, metadata: List):
-        \"\"\"Save raw predictions to file\"\"\"
+        """Save raw predictions to file"""
         logger.info("Saving predictions...")
         
         save_dict = {
@@ -771,7 +806,7 @@ class ValidationRunner:
         logger.info(f"Saved predictions to {save_path}")
     
     def _save_per_image_results(self, predictions: torch.Tensor, targets: torch.Tensor, metadata: List):
-        \"\"\"Save per-image results to CSV\"\"\"
+        """Save per-image results to CSV"""
         logger.info("Saving per-image results...")
         
         csv_path = self.output_dir / 'per_image_results.csv'
@@ -807,7 +842,7 @@ class ValidationRunner:
         logger.info(f"Saved per-image results to {csv_path}")
     
     def _save_results(self, results: Dict[str, Any]):
-        \"\"\"Save validation results to JSON\"\"\"
+        """Save validation results to JSON"""
         logger.info("Saving validation results...")
         
         # Convert numpy types to native Python types
@@ -866,7 +901,7 @@ class ValidationRunner:
     
 
 def main():
-    \"\"\"Main entry point for validation\"\"\"
+    """Main entry point for validation"""
     import argparse
     
     parser = argparse.ArgumentParser(description='Validation script for anime tagger')
