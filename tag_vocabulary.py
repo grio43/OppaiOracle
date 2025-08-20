@@ -88,14 +88,17 @@ class DanbooruDataPreprocessor:
             if ignored_tags:
                 logger.info(f"Ignoring {len(ignored_tags)} additional tags specified in code")
         
-        # Load vocabulary (using pickle for speed)
-        vocab_pkl = vocab_path / 'vocabulary.pkl'
+        # Load vocabulary (using pickle for speed): changed to json for compatibility
+        vocab_pkl = vocab_path / 'vocabulary.json'
         if vocab_pkl.exists():
-            with open(vocab_pkl, 'rb') as f:
-                vocab_data = pickle.load(f)
+            #with open(vocab_pkl, 'rb') as f:
+                #vocab_data = pickle.load(f)
+            with open(vocab_pkl, 'r', encoding="utf-8") as f:
+                vocab_data = json.load(f)    
                 self.tag_to_index = vocab_data['tag_to_index']
-                self.tag_counts = vocab_data['tag_counts']
-                self.frequency_buckets = vocab_data['frequency_buckets']
+                self.index_to_tag = vocab_data['index_to_tag']
+                self.tag_counts = vocab_data['tag_frequencies']
+                # self.frequency_buckets = vocab_data['frequency_buckets']
         else:
             raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
         
@@ -524,9 +527,9 @@ class DanbooruDataPreprocessor:
             'train': train_indices.tolist(),
             'val': val_indices.tolist(),
             'test': test_indices.tolist(),
-            'n_train': n_train,
-            'n_val': n_val,
-            'n_test': n_test
+            'n_train': int(n_train), # need to convert to int for JSON serialization
+            'n_val': int(n_val),
+            'n_test': int(n_test)
         }
         
         with open(self.output_dir / 'splits.json', 'w') as f:

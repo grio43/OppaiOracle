@@ -1,0 +1,4 @@
+.venv
+vocabulary
+processed_data
+utils/__pycache__
