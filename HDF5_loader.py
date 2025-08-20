@@ -226,6 +226,10 @@ class SimplifiedDataset(Dataset):
             self.annotations: List[Dict[str, Any]] = []
             # LRU cache for loaded images
             self.cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+
+            # Ensure orientation_map_path is a Path object if provided
+            if config.orientation_map_path and isinstance(config.orientation_map_path, str):
+                config.orientation_map_path = Path(config.orientation_map_path)
             # Initialize orientation handler for flip augmentation
             # Only needed for training split when flips are enabled
             if split == 'train' and config.random_flip_prob > 0:

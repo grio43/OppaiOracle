@@ -111,7 +111,7 @@ class DanbooruDataPreprocessor:
         }
         
         # Statistics tracking
-        batch_stats = {
+        self.batch_stats = {
             'total_duplicates_removed': 0,
             'files_with_duplicates': 0,
             'files_with_all_oov': 0,
@@ -122,6 +122,14 @@ class DanbooruDataPreprocessor:
     
     def process_metadata_batch(self, json_files: List[Path]) -> Dict:
         """Process a batch of JSON metadata files - FIXED VERSION"""
+        # Reset batch statistics for this batch
+        batch_stats = {
+            'total_duplicates_removed': 0,
+            'files_with_duplicates': 0,
+            'files_with_all_oov': 0,
+            'total_oov_tags': 0
+        }
+
         results = {
             'filenames': [],
             'tag_indices': [],

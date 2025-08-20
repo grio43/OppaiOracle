@@ -384,7 +384,7 @@ class OrientationHandler:
         # Only return non-empty issues
         return {k: v for k, v in issues.items() if v}
     
-    def get_statistics(self) -> Dict[str, any]:
+    def validate_mappings(self) -> Dict[str, any]:
         """
         Validate the consistency of orientation mappings.
         
@@ -436,7 +436,7 @@ class OrientationHandler:
         
         return {k: v for k, v in issues.items() if v}
     
-    def get_statistics(self) -> Dict[str, any]:
+    def get_usage_statistics(self) -> Dict[str, any]:
         """Get usage statistics."""
         with self._stats_lock:
             total_flips = self.stats['total_flips']
@@ -453,6 +453,10 @@ class OrientationHandler:
             'num_unmapped_tags': num_unmapped,
             'unmapped_tags_sample': unmapped_sample
         }
+
+    def get_statistics(self) -> Dict[str, any]:
+        """Alias for get_usage_statistics for backwards compatibility."""
+        return self.get_usage_statistics()
 
 
 class OrientationMonitor:
