@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""
+
+\"""
 Validation Loop for Anime Image Tagger
 Comprehensive validation pipeline with multiple evaluation modes
-"""
+\"""
 
 import os
 import json
@@ -47,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ValidationConfig:
-    """Configuration for validation"""
+    \"\"\"Configuration for validation\"\"\"
     # Model and data paths
     model_path: Optional[str] = None
     checkpoint_path: Optional[str] = None
@@ -98,7 +99,7 @@ class ValidationConfig:
 
 
 class ValidationRunner:
-    """Main validation runner"""
+    \"\"\"Main validation runner\"\"\"
     
     def __init__(self, config: ValidationConfig):
         self.config = config
@@ -140,8 +141,28 @@ class ValidationRunner:
         if config.frequency_bins is None:
             self.config.frequency_bins = [0, 10, 100, 1000, 10000, float('inf')]
     
+    def _metadata_dict_to_list(self, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+        \"\"\"
+        Convert a batch-level metadata dict-of-lists (as produced by the
+        custom collate_fn) into a per-sample list of dicts so downstream
+        code can serialize and analyze per-image results easily.
+        \"\"\"
+        size = len(meta.get('paths', []))
+        items: List[Dict[str, Any]] = []
+        for i in range(size):
+            item: Dict[str, Any] = {}
+            for k, v in meta.items():
+                if isinstance(v, (list, tuple)):
+                    if i < len(v):
+                        item[k] = v[i]
+                else:
+                    item[k] = v
+            items.append(item)
+        return items
+
+
     def _setup_logging(self):
-        """Setup validation-specific logging"""
+        \"\"\"Setup validation-specific logging\"\"\"
         log_file = self.output_dir / f"validation_{datetime.now():%Y%m%d_%H%M%S}.log"
         
         file_handler = logging.FileHandler(log_file)
@@ -152,7 +173,7 @@ class ValidationRunner:
         logger.addHandler(file_handler)
     
     def _load_model(self) -> nn.Module:
-        """Load model from checkpoint"""
+        \"\"\"Load model from checkpoint\"\"\"
         if self.config.checkpoint_path:
             logger.info(f"Loading model from checkpoint: {self.config.checkpoint_path}")
             checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu')
@@ -200,7 +221,7 @@ class ValidationRunner:
         return model
     
     def create_dataloader(self) -> DataLoader:
-        """Create validation dataloader"""
+        \"\"\"Create validation dataloader\"\"\"
         # Data config
         data_config = SimplifiedDataConfig(
             data_dir=Path(self.config.data_dir),
@@ -237,7 +258,7 @@ class ValidationRunner:
         return val_loader
     
     def validate(self) -> Dict[str, Any]:
-        """Run validation based on configured mode"""
+        \"\"\"Run validation based on configured mode\"\"\"
         logger.info(f"Starting validation in '{self.config.mode}' mode")
         
         # Create dataloader
@@ -268,7 +289,7 @@ class ValidationRunner:
         return results
     
     def validate_full(self, dataloader: DataLoader) -> Dict[str, Any]:
-        """Complete validation with all metrics"""
+        \"\"\"Complete validation with all metrics\"\"\"
         logger.info("Running full validation...")
         
         # Collect all predictions and targets
@@ -310,7 +331,15 @@ class ValidationRunner:
                 # Collect results
                 all_predictions.append(predictions.cpu())
                 all_targets.append(labels['binary'].cpu())
-                all_metadata.extend(batch['metadata'])
+                # Normalize metadata to per-sample dict list
+                meta = batch.get('metadata', None)
+                if isinstance(meta, dict):
+                    all_metadata.extend(self._metadata_dict_to_list(meta))
+                elif isinstance(meta, list):
+                    all_metadata.extend(meta)
+                else:
+                    # Fallback: preserve count
+                    all_metadata.extend([{'index': j} for j in range(images.shape[0])])
                 
                 # Memory profiling
                 if self.config.profile_memory and batch_idx % 10 == 0 and torch.cuda.is_available():
@@ -361,7 +390,7 @@ class ValidationRunner:
         return metrics
     
     def validate_fast(self, dataloader: DataLoader) -> Dict[str, Any]:
-        """Fast validation with basic metrics only"""
+        \"\"\"Fast validation with basic metrics only\"\"\"
         logger.info("Running fast validation...")
         
         # Temporarily disable expensive metrics
@@ -406,7 +435,7 @@ class ValidationRunner:
         return results
     
     def validate_specific_tags(self, dataloader: DataLoader) -> Dict[str, Any]:
-        """Validate performance on specific tags"""
+        \"\"\"Validate performance on specific tags\"\"\"
         if not self.config.specific_tags:
             raise ValueError("specific_tags must be provided for 'tags' mode")
         
@@ -514,7 +543,7 @@ class ValidationRunner:
         return results
     
     def validate_hierarchical(self, dataloader: DataLoader) -> Dict[str, Any]:
-        """Validate hierarchical group structure"""
+        \"\"\"Validate hierarchical group structure\"\"\"
         logger.info("Validating hierarchical structure...")
         
         # Collect predictions by group
@@ -596,14 +625,14 @@ class ValidationRunner:
         return results
     
     def _compute_tag_frequencies(self, targets: torch.Tensor) -> np.ndarray:
-        """Compute tag frequencies from targets"""
+        \"\"\"Compute tag frequencies from targets\"\"\"
         # Sum across samples to get frequency counts
         tag_counts = targets.sum(dim=0).numpy()
         return tag_counts
     
     def _create_visualizations(self, predictions: torch.Tensor, targets: torch.Tensor, 
                               metrics: Dict, tag_names: List[str]):
-        """Create comprehensive visualizations"""
+        \"\"\"Create comprehensive visualizations\"\"\"
         logger.info("Creating visualizations...")
         
         # 1. Overall metrics bar plot
@@ -700,7 +729,7 @@ class ValidationRunner:
                 plt.close()
     
     def _create_tag_pr_curve(self, tag_name: str, predictions: np.ndarray, targets: np.ndarray):
-        """Create precision-recall curve for a specific tag"""
+        \"\"\"Create precision-recall curve for a specific tag\"\"\"
         precision, recall, thresholds = precision_recall_curve(targets, predictions)
         ap = average_precision_score(targets, predictions)
         
@@ -723,7 +752,7 @@ class ValidationRunner:
         plt.close()
     
     def _save_predictions(self, predictions: torch.Tensor, targets: torch.Tensor, metadata: List):
-        """Save raw predictions to file"""
+        \"\"\"Save raw predictions to file\"\"\"
         logger.info("Saving predictions...")
         
         save_dict = {
@@ -742,7 +771,7 @@ class ValidationRunner:
         logger.info(f"Saved predictions to {save_path}")
     
     def _save_per_image_results(self, predictions: torch.Tensor, targets: torch.Tensor, metadata: List):
-        """Save per-image results to CSV"""
+        \"\"\"Save per-image results to CSV\"\"\"
         logger.info("Saving per-image results...")
         
         csv_path = self.output_dir / 'per_image_results.csv'
@@ -778,7 +807,7 @@ class ValidationRunner:
         logger.info(f"Saved per-image results to {csv_path}")
     
     def _save_results(self, results: Dict[str, Any]):
-        """Save validation results to JSON"""
+        \"\"\"Save validation results to JSON\"\"\"
         logger.info("Saving validation results...")
         
         # Convert numpy types to native Python types
@@ -835,58 +864,9 @@ class ValidationRunner:
         
         logger.info(f"Saved summary to {summary_path}")
     
-    def compare_checkpoints(self, checkpoint_paths: List[str]) -> Dict[str, Any]:
-        """Compare multiple checkpoints"""
-        comparison_results = {}
-        
-        for checkpoint_path in checkpoint_paths:
-            logger.info(f"Validating checkpoint: {checkpoint_path}")
-            
-            # Update config
-            self.config.checkpoint_path = checkpoint_path
-            
-            # Reload model
-            self.model = self._load_model()
-            
-            # Run validation
-            results = self.validate()
-            
-            # Store results
-            checkpoint_name = Path(checkpoint_path).stem
-            comparison_results[checkpoint_name] = results
-        
-        # Create comparison plots
-        self._create_comparison_plots(comparison_results)
-        
-        return comparison_results
-    
-    def _create_comparison_plots(self, comparison_results: Dict[str, Any]):
-        """Create plots comparing multiple checkpoints"""
-        checkpoints = list(comparison_results.keys())
-        metrics = ['precision', 'recall', 'f1', 'mAP']
-        
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        axes = axes.flatten()
-        
-        for i, metric in enumerate(metrics):
-            values = [comparison_results[cp].get(metric, 0) for cp in checkpoints]
-            axes[i].bar(range(len(checkpoints)), values)
-            axes[i].set_xticks(range(len(checkpoints)))
-            axes[i].set_xticklabels(checkpoints, rotation=45, ha='right')
-            axes[i].set_ylabel(metric)
-            axes[i].set_title(f'{metric} Comparison')
-            axes[i].set_ylim(0, 1)
-            
-            for j, v in enumerate(values):
-                axes[i].text(j, v + 0.01, f'{v:.3f}', ha='center')
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_dir / 'checkpoint_comparison.png')
-        plt.close()
-
 
 def main():
-    """Main entry point for validation"""
+    \"\"\"Main entry point for validation\"\"\"
     import argparse
     
     parser = argparse.ArgumentParser(description='Validation script for anime tagger')
@@ -952,8 +932,8 @@ def main():
     
     for key in ['precision', 'recall', 'f1', 'mAP']:
         if key in results:
-            print(f"{key}: {results[key]:.4f}")
-
+            print(f"{results[key]:.4f}")
+    
 
 if __name__ == '__main__':
     main()
