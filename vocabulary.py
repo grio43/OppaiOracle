@@ -10,7 +10,6 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
-import threading
 import torch
 
 logger = logging.getLogger(__name__)
@@ -30,19 +29,22 @@ logger = logging.getLogger(__name__)
 # Each line in ``Tags_ignore.txt`` should contain a single tag.  Blank lines
 # and lines beginning with ``#`` are ignored.
 
-# Thread-local storage for ignored tag indices to avoid global state pollution
-_thread_local_data = threading.local()
+# Process-wide immutable default for ignored tag indices. DataLoader workers are separate
+# processes; thread-local state does not propagate, leading to silent divergence. Keep
+# a simple module-level tuple and pass copies into datasets.
+from typing import Iterable, Tuple
+from functools import lru_cache
 
-def get_ignore_tag_indices() -> List[int]:
-    """Get thread-local ignored tag indices."""
-    if not hasattr(_thread_local_data, 'ignore_tag_indices'):
-        _thread_local_data.ignore_tag_indices = []
-    return _thread_local_data.ignore_tag_indices  # type: ignore[return-value]
+IGNORE_TAG_INDICES: Tuple[int, ...] = tuple()
 
-def set_ignore_tag_indices(indices: List[int]):
-    """Set thread-local ignored tag indices."""
-    # Use copy to avoid external mutation
-    _thread_local_data.ignore_tag_indices = indices.copy()
+def get_ignore_tag_indices() -> Tuple[int, ...]:
+    """Get the tuple of ignored tag indices."""
+    return IGNORE_TAG_INDICES
+
+def set_ignore_tag_indices(indices: Iterable[int]) -> None:
+    """Set the ignored tag indices once at startup; avoids mutations during training."""
+    global IGNORE_TAG_INDICES
+    IGNORE_TAG_INDICES = tuple(sorted(set(int(i) for i in indices)))
 
 
 def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:

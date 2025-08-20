@@ -14,6 +14,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 import time
 from collections import defaultdict
+import gc
+import multiprocessing as mp
 import csv
 import pickle
 
@@ -113,7 +115,9 @@ class ValidationRunner:
     def __init__(self, config: ValidationConfig):
         self.config = config
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-        
+        # Logging queue used by workers
+        self._log_queue: Optional[mp.Queue] = mp.Queue()
+
         # Setup output directory
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -172,14 +176,35 @@ class ValidationRunner:
 
     def _setup_logging(self):
         """Setup validation-specific logging"""
-        log_file = self.output_dir / f"validation_{datetime.now():%Y%m%d_%H%M%S}.log"
-        
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.INFO)
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        
-        logger.addHandler(file_handler)
+
+        # Always have a console handler
+        sh = logging.StreamHandler()
+        sh.setFormatter(formatter)
+        sh.setLevel(logging.INFO)
+        logger.addHandler(sh)
+
+        # Only primary process writes files
+        is_primary = True
+        try:
+            is_primary = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+        except Exception:
+            is_primary = True
+
+        # Queue-based logging: main process listens & writes to file
+        if is_primary:
+            log_file = self.output_dir / f"validation_{datetime.now():%Y%m%d_%H%M%S}.log"
+            fh = logging.FileHandler(log_file)
+            fh.setLevel(logging.INFO)
+            fh.setFormatter(formatter)
+            try:
+                from logging.handlers import QueueListener
+                self._listener = QueueListener(self._log_queue, fh, respect_handler_level=True)
+                self._listener.start()
+            except Exception:
+                # Fallback to direct file handler if QueueListener unavailable
+                logger.addHandler(fh)
+        # else: workers only attach QueueHandler in worker_init_fn (see HDF5_loader)
     
     def _load_model(self) -> nn.Module:
         """Load model from checkpoint"""
@@ -248,7 +273,9 @@ class ValidationRunner:
             vocab_path=data_config.vocab_path,
             batch_size=self.config.batch_size,
             num_workers=self.config.num_workers,
-            distributed=self.config.distributed
+            distributed=self.config.distributed,
+            log_queue=self._log_queue,
+            force_val_persistent_workers=False
         )
         
         # Limit samples if requested
@@ -272,6 +299,8 @@ class ValidationRunner:
         
         # Create dataloader
         dataloader = self.create_dataloader()
+        # Store dataloader reference for cleanup
+        self._last_dataloader = dataloader
         
         # Run appropriate validation mode
         if self.config.mode == "full":
@@ -287,14 +316,28 @@ class ValidationRunner:
         
         # Save results
         self._save_results(results)
-        
+
         # Update history
         self.validation_history.append({
             'timestamp': datetime.now().isoformat(),
             'mode': self.config.mode,
             'results': results
         })
-        
+
+        # Best-effort worker shutdown for cleanliness
+        try:
+            dl = None
+            try:
+                dl = self._last_dataloader  # if stored
+            except AttributeError:
+                pass
+            for obj in filter(None, [dl]):
+                if hasattr(obj, "_iterator") and obj._iterator is not None:
+                    obj._iterator._shutdown_workers()  # noqa: SLF001
+        except Exception:
+            pass
+        gc.collect()
+
         return results
     
     def validate_full(self, dataloader: DataLoader) -> Dict[str, Any]:
