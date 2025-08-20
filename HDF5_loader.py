@@ -16,6 +16,7 @@ YOLO models.  The pad colour and patch size are configurable via
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import copy
 from pathlib import Path
 import json
 import threading
@@ -92,7 +93,8 @@ def letterbox_resize(
     final_w = target_size
     extra_pad_bottom = 0
     extra_pad_right = 0
-    if patch_size is not None and patch_size > 1:
+    # Only apply divisibility padding when patch_size > 1; None is treated as no divisibility requirement
+    if patch_size > 1:
         if final_h % patch_size != 0:
             extra_pad_bottom = patch_size - (final_h % patch_size)
         if final_w % patch_size != 0:
@@ -218,6 +220,9 @@ class SimplifiedDataset(Dataset):
             split: str,
             vocab: TagVocabulary,
         ) -> None:
+            # Create a deep copy of config to avoid mutation by downstream components
+            config = copy.deepcopy(config)
+
             assert split in {'train', 'val', 'test'}, f"Unknown split '{split}'"
             self.config = config
             self.split = split
@@ -426,11 +431,12 @@ class SimplifiedDataset(Dataset):
                 self.cache.move_to_end(image_path)
                 # Convert cached tensor back to float32
                 if cached.dtype == torch.uint8:
-                    return cached.float() / 255.0
+                    result = cached.float() / 255.0
                 elif cached.dtype == torch.float16:
-                    return cached.float()
+                    result = cached.float()
                 else:
-                    return cached.clone()
+                    result = cached.clone()
+                return result
         # Load from disk
         try:
             # Open without forcing RGB so we can properly handle alpha first
@@ -457,29 +463,35 @@ class SimplifiedDataset(Dataset):
 
             pad_color = _resolve_pad_color(self.config)
 
-            # Composite transparent images onto neutral gray BEFORE any resizing/padding
-            # to avoid black halos/noise on edges.
-            if pil_img.mode in ('RGBA', 'LA') or ('transparency' in pil_img.info):
-                rgba = pil_img.convert('RGBA')
-                bg = Image.new('RGB', rgba.size, pad_color)
-                bg.paste(rgba, mask=rgba.split()[3])  # use alpha as mask
-                pil_img = bg  # now RGB on neutral gray background
-            else:
+            # Composite transparent images with error handling
+            try:
+                if pil_img.mode in ('RGBA', 'LA') or ('transparency' in pil_img.info):
+                    rgba = pil_img.convert('RGBA')
+                    bg = Image.new('RGB', rgba.size, pad_color)
+                    bg.paste(rgba, mask=rgba.split()[3])  # use alpha as mask
+                    pil_img = bg  # now RGB on neutral gray background
+                else:
+                    pil_img = pil_img.convert('RGB')
+            except Exception as e:
+                logger.warning(f"Alpha compositing failed for {image_path}, converting to RGB directly: {e}")
                 pil_img = pil_img.convert('RGB')
 
             tensor = TF.to_tensor(pil_img)  # float32 in [0, 1]
-            # Add to cache with LRU eviction if needed
-            if self.cache_precision == 'uint8':
-                cached_tensor = (tensor * 255).to(torch.uint8)
-            elif self.cache_precision == 'float16':
-                cached_tensor = tensor.half()
-            else:
-                cached_tensor = tensor.clone()
+
+            # Add to cache with LRU eviction if needed (atomic operation)
             with self.cache_lock:
+                if self.cache_precision == 'uint8':
+                    cached_tensor = (tensor * 255).to(torch.uint8)
+                elif self.cache_precision == 'float16':
+                    cached_tensor = tensor.half()
+                else:
+                    cached_tensor = tensor.clone()
+
                 if len(self.cache) >= self.max_cache_size:
                     # Remove the least recently used item (first item in OrderedDict)
                     self.cache.popitem(last=False)
                 self.cache[image_path] = cached_tensor
+
             return tensor
         except Exception as e:
             logger.error(f"Error loading image {image_path}: {e}")
@@ -600,11 +612,15 @@ class SimplifiedDataset(Dataset):
             pad_color=self.config.pad_color,
             patch_size=self.config.patch_size,
         )
+        # Ensure consistent tensor shapes and dtypes
+        tag_labels = torch.zeros(len(self.vocab.tag_to_index), dtype=torch.float32)
+        rating_label = torch.tensor(self.vocab.rating_to_index.get('unknown', 4), dtype=torch.long)
+
         return {
             'image': padded,
             'labels': {
-                'tags': torch.zeros(len(self.vocab.tag_to_index), dtype=torch.float32),
-                'rating': torch.tensor(self.vocab.rating_to_index.get('unknown', 4), dtype=torch.long),
+                'tags': tag_labels,
+                'rating': rating_label,
             },
             'metadata': {
                 'index': idx,

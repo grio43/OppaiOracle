@@ -118,6 +118,14 @@ class SimplifiedTagger(nn.Module):
         pixel_values: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,  # (B,H,W) or (B,1,H,W), True=content/keep
     ) -> Dict[str, torch.Tensor]:
+        # Validate padding_mask shape if provided
+        if padding_mask is not None:
+            expected_shape = pixel_values.shape[:2]  # (B, C)
+            actual_shape = padding_mask.shape[:2] if padding_mask.dim() >= 2 else (0, 0)
+            if actual_shape[0] != expected_shape[0]:
+                raise ValueError(
+                    f"padding_mask batch size {actual_shape[0]} doesn't match pixel_values batch size {expected_shape[0]}"
+                )
         B = pixel_values.shape[0]
         # Patch embedding
         x = self.patch_embed(pixel_values)

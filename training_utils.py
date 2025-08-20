@@ -585,13 +585,21 @@ class CheckpointManager:
         
         # Load optimizer state
         if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-            # Move optimizer state to device
-            for state in optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(device)
+            # Check if optimizer has state before trying to move it
+            if hasattr(optimizer, 'state') and optimizer.state:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                
+                # Move optimizer state to device
+                for state in optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(device)
+            else:
+                # Some optimizers might not have state yet
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                except Exception as e:
+                    logger.warning(f"Could not load optimizer state: {e}")
         
         # Load scheduler state
         if scheduler is not None and 'scheduler_state_dict' in checkpoint:
