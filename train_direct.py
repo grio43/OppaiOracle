@@ -21,55 +21,33 @@ from orientation_handler import OrientationHandler
 try:
     from HDF5_loader import create_dataloaders
 except ImportError as e:
-    logging.error(f"Failed to import HDF5_loader: {e}")
-    logging.error("Please ensure HDF5_loader.py exists with create_dataloaders function")
-    create_dataloaders = None
+    error_msg = (
+        f"MISSING REQUIRED FILE: HDF5_loader.py\n"
+        f"Please ensure HDF5_loader.py exists in the current directory with create_dataloaders function.\n"
+        f"Import error: {e}"
+    )
+    raise ImportError(error_msg)
 
 try:
     from model_architecture import create_model
 except ImportError as e:
-    logging.error(f"Failed to import model_architecture: {e}")
-    logging.error("Please ensure model_architecture.py exists with create_model function")
-    create_model = None
+    error_msg = (
+        f"MISSING REQUIRED FILE: model_architecture.py\n"
+        f"Please ensure model_architecture.py exists in the current directory with create_model function.\n"
+        f"Import error: {e}"
+    )
+    raise ImportError(error_msg)
 
 try:
     from loss_functions import MultiTaskLoss, AsymmetricFocalLoss
 except ImportError as e:
-    logging.error(f"Failed to import loss_functions: {e}")
-    logging.error("Please ensure loss_functions.py exists with MultiTaskLoss and AsymmetricFocalLoss classes")
-    MultiTaskLoss = None
-    AsymmetricFocalLoss = None
+    error_msg = (
+        f"MISSING REQUIRED FILE: loss_functions.py\n"
+        f"Please ensure loss_functions.py exists in the current directory with MultiTaskLoss and AsymmetricFocalLoss classes.\n"
+        f"Import error: {e}"
+    )
+    raise ImportError(error_msg)
 
-# Fallback stub implementations if modules are missing
-if create_dataloaders is None:
-    def create_dataloaders(*args, **kwargs):
-        raise NotImplementedError(
-            "create_dataloaders is not implemented. "
-            "Please provide HDF5_loader.py with proper implementation"
-        )
-
-if create_model is None:
-    def create_model(*args, **kwargs):
-        raise NotImplementedError(
-            "create_model is not implemented. "
-            "Please provide model_architecture.py with proper implementation"
-        )
-
-if MultiTaskLoss is None:
-    class MultiTaskLoss:
-        def __init__(self, *args, **kwargs):
-            raise NotImplementedError(
-                "MultiTaskLoss is not implemented. "
-                "Please provide loss_functions.py with proper implementation"
-            )
-
-if AsymmetricFocalLoss is None:
-    class AsymmetricFocalLoss:
-        def __init__(self, *args, **kwargs):
-            raise NotImplementedError(
-                "AsymmetricFocalLoss is not implemented. "
-                "Please provide loss_functions.py with proper implementation"
-            )
 
 
 def setup_orientation_aware_training(
@@ -163,19 +141,7 @@ def setup_orientation_aware_training(
 def train_with_orientation_tracking():
     """Training loop with orientation handling and statistics tracking."""
     
-    # Validate required modules are available
-    missing_modules = []
-    if create_dataloaders is None:
-        missing_modules.append("HDF5_loader.create_dataloaders")
-    if create_model is None:
-        missing_modules.append("model_architecture.create_model")
-    if MultiTaskLoss is None or AsymmetricFocalLoss is None:
-        missing_modules.append("loss_functions.MultiTaskLoss/AsymmetricFocalLoss")
-    
-    if missing_modules:
-        error_msg = f"Cannot start training. Missing required modules: {', '.join(missing_modules)}"
-        logging.error(error_msg)
-        raise ImportError(error_msg)
+    # All required modules are imported at module load time; ImportErrors are raised immediately.
     
     # Enhanced configuration with orientation handling
     config = {

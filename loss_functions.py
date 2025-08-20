@@ -65,10 +65,13 @@ class AsymmetricFocalLoss(nn.Module):
         """
         # Detach targets to prevent gradient flow
         targets = targets.detach()
-        # Ignore pad class at index 0 by slicing
-        if logits.size(1) > 1:
-            logits = logits[:, 1:]
-            targets = targets[:, 1:]
+
+        # Ignore pad class at index 0 by slicing (with bounds checking)
+        if logits.size(1) > 1:  # Only slice if we have more than 1 column
+            # Validate dimensions before slicing
+            if targets.size(1) == logits.size(1):
+                logits = logits[:, 1:]
+                targets = targets[:, 1:]
         # Apply label smoothing if specified
         if self.label_smoothing > 0:
             targets = targets * (1 - self.label_smoothing) + self.label_smoothing / 2

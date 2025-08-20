@@ -3,6 +3,9 @@
 Monitoring & Logging System for Anime Image Tagger
 Comprehensive monitoring for training, inference, and system resources
 Enhanced with proper error handling, thread safety, and complete implementations
+
+NOTE: This file contains monitoring functionality. For the primary monitoring system,
+please use Monitor_log.py which contains the same functionality with better organization.
 """
 
 import os
@@ -40,19 +43,24 @@ try:
     GPUTIL_AVAILABLE = True
 except ImportError:
     GPUTIL_AVAILABLE = False
-    warnings.warn("GPUtil not available. GPU monitoring disabled.")
+    # Warn and note that GPU monitoring will be disabled
+    warnings.warn("GPUtil not available. GPU monitoring will be disabled.")
 
 try:
     import wandb
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+    # Warn that Weights & Biases logging will be disabled
+    warnings.warn("wandb not available. Weights & Biases logging will be disabled.")
     
 try:
     import pandas as pd
     PANDAS_AVAILABLE = True
 except ImportError:
     PANDAS_AVAILABLE = False
+    # Warn that pandas is not available and some data analysis features will be disabled
+    warnings.warn("pandas not available. Some data analysis features will be disabled.")
     pd = None
 
 try:
@@ -60,6 +68,8 @@ try:
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
+    # Warn that Prometheus client is not available and metrics will be disabled
+    warnings.warn("prometheus_client not available. Prometheus metrics will be disabled.")
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +390,9 @@ class SystemMonitor:
         self.metrics_queue = queue.Queue(maxsize=100)
         self.error_count = 0
         self.max_errors = 10
+        # Track GPU monitoring failures to disable after persistent errors
+        self.gpu_failure_count = 0
+        self.max_gpu_failures = 5
         
         self._shutdown_event = threading.Event()
         # Initialize GPU monitoring
@@ -414,14 +427,18 @@ class SystemMonitor:
             if not self.running:
                 return
             
+            # Set flags to stop the monitoring loop
             self.running = False
             self._shutdown_event.set()
             thread_to_join = self.thread
             
         if thread_to_join and thread_to_join.is_alive():
-            thread_to_join.join(timeout=7)
+            # Give thread time to exit gracefully
+            thread_to_join.join(timeout=3)
             if thread_to_join.is_alive():
-                logger.warning("System monitor thread did not stop gracefully")
+                # Thread is still running, log warning but don't block
+                logger.warning("System monitor thread did not stop within timeout, may continue running")
+                self.thread = None  # Clear reference to avoid issues
             
         logger.info("System monitoring stopped")
     
@@ -539,33 +556,46 @@ class SystemMonitor:
                     if gpus is not None:  # Additional safety check
                         for gpu in gpus:
                             if gpu is not None:  # Check each GPU object
-                                # Safely get all values with proper null handling
-                                mem_total = getattr(gpu, 'memoryTotal', 0)
-                                mem_used = getattr(gpu, 'memoryUsed', 0)
-                                mem_free = getattr(gpu, 'memoryFree', 0)
-                                gpu_load = getattr(gpu, 'load', 0)
-                                
-                                # Ensure numeric values
-                                mem_total = float(mem_total) if mem_total is not None else 0
-                                mem_used = float(mem_used) if mem_used is not None else 0
-                                mem_free = float(mem_free) if mem_free is not None else 0
-                                gpu_load = float(gpu_load) if gpu_load is not None else 0
-                                
-                                gpu_metrics = {
-                                    'id': getattr(gpu, 'id', -1),
-                                    'name': getattr(gpu, 'name', 'Unknown'),
-                                    'memory_total_gb': mem_total / 1024 if mem_total > 0 else 0,
-                                    'memory_used_gb': mem_used / 1024 if mem_used > 0 else 0,
-                                    'memory_free_gb': mem_free / 1024 if mem_free > 0 else 0,
-                                    'memory_percent': (mem_used / mem_total * 100) if mem_total > 0 else 0,
-                                    'utilization': gpu_load * 100 if gpu_load >= 0 else 0,
-                                    'temperature': getattr(gpu, 'temperature', 0) or 0
-                                }
-                                metrics['gpu'].append(gpu_metrics)
-                except (AttributeError, ImportError, RuntimeError) as e:
-                    # GPUtil might become unavailable, disable it
-                    self.gpu_available = False
-                    logger.warning(f"GPUtil became unavailable, disabling GPU monitoring: {e}")
+                                try:
+                                    # Safely get all values with proper null handling
+                                    mem_total = getattr(gpu, 'memoryTotal', 0)
+                                    mem_used = getattr(gpu, 'memoryUsed', 0)
+                                    mem_free = getattr(gpu, 'memoryFree', 0)
+                                    gpu_load = getattr(gpu, 'load', 0)
+
+                                    # Ensure numeric values
+                                    mem_total = float(mem_total) if mem_total is not None else 0
+                                    mem_used = float(mem_used) if mem_used is not None else 0
+                                    mem_free = float(mem_free) if mem_free is not None else 0
+                                    gpu_load = float(gpu_load) if gpu_load is not None else 0
+
+                                    gpu_metrics = {
+                                        'id': getattr(gpu, 'id', -1),
+                                        'name': getattr(gpu, 'name', 'Unknown'),
+                                        'memory_total_gb': mem_total / 1024 if mem_total > 0 else 0,
+                                        'memory_used_gb': mem_used / 1024 if mem_used > 0 else 0,
+                                        'memory_free_gb': mem_free / 1024 if mem_free > 0 else 0,
+                                        'memory_percent': (mem_used / mem_total * 100) if mem_total > 0 else 0,
+                                        'utilization': gpu_load * 100 if gpu_load >= 0 else 0,
+                                        'temperature': getattr(gpu, 'temperature', 0) or 0
+                                    }
+                                    metrics['gpu'].append(gpu_metrics)
+                                    # Reset failure count on success
+                                    self.gpu_failure_count = 0
+                                except Exception as gpu_err:
+                                    logger.debug(f"Failed to process GPU {getattr(gpu, 'id', '?')}: {gpu_err}")
+                except (AttributeError, ImportError, RuntimeError, Exception) as e:
+                    # Increment failure count and possibly disable GPU monitoring
+                    self.gpu_failure_count += 1
+                    logger.warning(
+                        f"GPU monitoring error (failure {self.gpu_failure_count}/{self.max_gpu_failures}): {e}"
+                    )
+                    # Disable GPU monitoring after persistent failures
+                    if self.gpu_failure_count >= self.max_gpu_failures:
+                        self.gpu_available = False
+                        logger.error(
+                            f"GPU monitoring disabled after {self.max_gpu_failures} failures"
+                        )
         except Exception as e:
             logger.debug(f"Failed to collect GPU metrics: {e}")
                     
@@ -755,8 +785,11 @@ class TrainingMonitor:
                     signal.signal(sig, signal_handler)
                 logger.debug(f"Registered signal handler for {sig_name}")
             except (OSError, ValueError, AttributeError, NotImplementedError) as e:
-                # Some platforms don't support certain signals
-                logger.debug(f"Could not register signal {sig_name}: {e}")
+                # Some platforms don't support certain signals - log only if important
+                if sig == signal.SIGTERM:
+                    logger.warning(f"Could not register signal {sig_name}: {e}")
+                else:
+                    logger.debug(f"Could not register signal {sig_name}: {e}")
 
         def cleanup():
             """Cleanup function for atexit"""

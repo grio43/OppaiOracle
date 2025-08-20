@@ -37,9 +37,18 @@ def compute_precision_recall_f1(
     # Remove pad column
     probs = probabilities.clone()
     targs = targets.clone()
-    if pad_index is not None:
-        probs = torch.cat([probs[:, :pad_index], probs[:, pad_index+1:]], dim=1)
-        targs = torch.cat([targs[:, :pad_index], targs[:, pad_index+1:]], dim=1)
+
+    # Validate bounds before concatenation
+    if pad_index is not None and 0 <= pad_index < probs.size(1):
+        if pad_index == 0:
+            probs = probs[:, 1:]
+            targs = targs[:, 1:]
+        elif pad_index == probs.size(1) - 1:
+            probs = probs[:, :pad_index]
+            targs = targs[:, :pad_index]
+        else:
+            probs = torch.cat([probs[:, :pad_index], probs[:, pad_index+1:]], dim=1)
+            targs = torch.cat([targs[:, :pad_index], targs[:, pad_index+1:]], dim=1)
     preds = (probs >= threshold).float()
     true = targs.float()
     tp = (preds * true).sum()
@@ -77,9 +86,18 @@ def average_precision_score(
         raise ValueError("probabilities and targets must be 2D tensors")
     probs = probabilities.clone()
     targs = targets.clone()
-    if pad_index is not None:
-        probs = torch.cat([probs[:, :pad_index], probs[:, pad_index+1:]], dim=1)
-        targs = torch.cat([targs[:, :pad_index], targs[:, pad_index+1:]], dim=1)
+
+    # Validate bounds before concatenation
+    if pad_index is not None and 0 <= pad_index < probs.size(1):
+        if pad_index == 0:
+            probs = probs[:, 1:]
+            targs = targs[:, 1:]
+        elif pad_index == probs.size(1) - 1:
+            probs = probs[:, :pad_index]
+            targs = targs[:, :pad_index]
+        else:
+            probs = torch.cat([probs[:, :pad_index], probs[:, pad_index+1:]], dim=1)
+            targs = torch.cat([targs[:, :pad_index], targs[:, pad_index+1:]], dim=1)
     B, C = probs.shape
     ap_values = []
     for c in range(C):

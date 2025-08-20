@@ -10,6 +10,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
+import threading
 import torch
 
 logger = logging.getLogger(__name__)
@@ -29,12 +30,19 @@ logger = logging.getLogger(__name__)
 # Each line in ``Tags_ignore.txt`` should contain a single tag.  Blank lines
 # and lines beginning with ``#`` are ignored.
 
-# A global list of vocabulary indices corresponding to ignored tags.  This
-# variable is populated when a ``TagVocabulary`` is initialised and is
-# intended for consumption by downstream modules such as metric
-# computation.  Modules that wish to mask out ignored tags from
-# predictions or targets should import this variable from ``vocabulary``.
-IGNORE_TAG_INDICES: List[int] = []  # noqa: N816 (uppercase to signal global constant)
+# Thread-local storage for ignored tag indices to avoid global state pollution
+_thread_local_data = threading.local()
+
+def get_ignore_tag_indices() -> List[int]:
+    """Get thread-local ignored tag indices."""
+    if not hasattr(_thread_local_data, 'ignore_tag_indices'):
+        _thread_local_data.ignore_tag_indices = []
+    return _thread_local_data.ignore_tag_indices  # type: ignore[return-value]
+
+def set_ignore_tag_indices(indices: List[int]):
+    """Set thread-local ignored tag indices."""
+    # Use copy to avoid external mutation
+    _thread_local_data.ignore_tag_indices = indices.copy()
 
 
 def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:
@@ -234,9 +242,8 @@ class TagVocabulary:
         self.ignored_tag_indices = [self.tag_to_index.get(tag) for tag in self.ignored_tags if tag in self.tag_to_index]
         # Filter out any None values (in case an ignored tag did not make it into the vocab)
         self.ignored_tag_indices = [i for i in self.ignored_tag_indices if i is not None]
-        # Broadcast to module level so other modules can import it
-        global IGNORE_TAG_INDICES
-        IGNORE_TAG_INDICES = self.ignored_tag_indices.copy()
+        # Use thread-local storage instead of global variable
+        set_ignore_tag_indices(self.ignored_tag_indices)
         
         # Update tags list for compatibility
         self.tags = sorted_tags
@@ -302,9 +309,8 @@ class TagVocabulary:
         self.ignored_tag_indices = [self.tag_to_index.get(tag) for tag in self.ignored_tags if tag in self.tag_to_index]
         # Filter out missing tags (None values) in case ignored tags are absent
         self.ignored_tag_indices = [i for i in self.ignored_tag_indices if i is not None]
-        # Propagate to module‑level constant so that downstream modules can mask these indices
-        global IGNORE_TAG_INDICES
-        IGNORE_TAG_INDICES = self.ignored_tag_indices.copy()
+        # Use thread-local storage instead of a global variable so that downstream modules can mask these indices
+        set_ignore_tag_indices(self.ignored_tag_indices)
 
         logger.info(f"Loaded vocabulary with {len(self.tag_to_index)} tags from {vocab_path}")
     
