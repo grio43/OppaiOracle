@@ -148,7 +148,7 @@ def setup_orientation_aware_training(
         "json_dir": json_dir,
         "vocab_path": vocab_path,
         "random_flip_prob": random_flip_prob,
-        "orientation_map_path": str(orientation_map_path) if orientation_map_path else None,
+        "orientation_map_path": orientation_map_path,  # Keep as Path object
         "strict_orientation": strict_orientation,
         "skip_unmapped": skip_unmapped,
         "dataloader_overrides": {
@@ -232,7 +232,11 @@ def train_with_orientation_tracking():
         )
         
         logger.info("Orientation handling configured successfully")
-        logger.info(f"Orientation config: {json.dumps(orientation_config, indent=2, default=str)}")
+        # Convert Path objects to strings for JSON serialization
+        config_for_logging = orientation_config.copy()
+        if config_for_logging.get('orientation_map_path'):
+            config_for_logging['orientation_map_path'] = str(config_for_logging['orientation_map_path'])
+        logger.info(f"Orientation config: {json.dumps(config_for_logging, indent=2, default=str)}")
         
     except (FileNotFoundError, ValueError) as e:
         logger.error(f"Orientation setup failed: {e}")
@@ -265,7 +269,8 @@ def train_with_orientation_tracking():
         val_batch_size=None,
         config_updates={
             "random_flip_prob": config["random_flip_prob"],
-            "orientation_map_path": config.get("orientation_map_path")
+            # Convert string back to Path if needed
+            "orientation_map_path": Path(config.get("orientation_map_path")) if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) else config.get("orientation_map_path")
         }
     )
     

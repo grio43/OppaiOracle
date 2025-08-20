@@ -51,8 +51,9 @@ class ValidationConfig:
     # Model and data paths
     model_path: Optional[str] = None
     checkpoint_path: Optional[str] = None
-    hdf5_dir: str = "/home/user/datasets/teacher_features"
-    vocab_dir: str = "/home/user/datasets/vocabulary"
+    data_dir: str = "data/images"
+    json_dir: str = "data/annotations"
+    vocab_path: str = "vocabulary.json"
     output_dir: str = "./validation_results"
     
     # Validation modes
@@ -115,7 +116,7 @@ class ValidationRunner:
         self._setup_logging()
         
         # Load vocabulary
-        self.vocab = load_vocabulary_for_training(Path(config.vocab_dir))
+        self.vocab = load_vocabulary_for_training(Path(config.vocab_path))
         logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
         
         # Load model
@@ -185,7 +186,7 @@ class ValidationRunner:
             
         elif self.config.model_path:
             logger.info(f"Loading model from path: {self.config.model_path}")
-            model = create_model(pretrained=self.config.model_path)
+            model = torch.load(self.config.model_path, map_location='cpu')
         else:
             raise ValueError("Either checkpoint_path or model_path must be provided")
         
@@ -202,18 +203,19 @@ class ValidationRunner:
         """Create validation dataloader"""
         # Data config
         data_config = SimplifiedDataConfig(
-             hdf5_dir=Path(self.config.hdf5_dir),
-             vocab_dir=Path(self.config.vocab_dir),
-             normalize_mean=(0.485, 0.456, 0.406),
-             normalize_std=(0.229, 0.224, 0.225),
-             augmentation_enabled=False  # No augmentation for validation
-         )
+            data_dir=Path(self.config.data_dir),
+            json_dir=Path(self.config.json_dir),
+            vocab_path=Path(self.config.vocab_path),
+            normalize_mean=(0.485, 0.456, 0.406),
+            normalize_std=(0.229, 0.224, 0.225),
+            augmentation_enabled=False  # No augmentation for validation
+        )
 
-        
         # Create dataloader
         _, val_loader = create_dataloaders(
-            hdf5_dir=data_config.hdf5_dir,
-            vocab_dir=data_config.vocab_dir,
+            data_dir=data_config.data_dir,
+            json_dir=data_config.json_dir,
+            vocab_path=data_config.vocab_path,
             batch_size=self.config.batch_size,
             num_workers=self.config.num_workers,
             distributed=self.config.distributed
@@ -894,8 +896,9 @@ def main():
     parser.add_argument('--model', type=str, help='Path to model')
     
     # Data arguments
-    parser.add_argument('--hdf5-dir', type=str, default='/home/user/datasets/teacher_features')
-    parser.add_argument('--vocab-dir', type=str, default='/home/user/datasets/vocabulary')
+    parser.add_argument('--data-dir', type=str, default='data/images')
+    parser.add_argument('--json-dir', type=str, default='data/annotations')
+    parser.add_argument('--vocab-path', type=str, default='vocabulary.json')
     
     # Validation arguments
     parser.add_argument('--mode', type=str, default='full', 
@@ -920,8 +923,9 @@ def main():
     config = ValidationConfig(
         checkpoint_path=args.checkpoint,
         model_path=args.model,
-        hdf5_dir=args.hdf5_dir,
-        vocab_dir=args.vocab_dir,
+        data_dir=args.data_dir,
+        json_dir=args.json_dir,
+        vocab_path=args.vocab_path,
         mode=args.mode,
         specific_tags=args.specific_tags,
         batch_size=args.batch_size,
