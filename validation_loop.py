@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Validation Loop for Anime Image Tagger
 Comprehensive validation pipeline with multiple evaluation modes
@@ -13,6 +14,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 import time
 from collections import defaultdict
+import gc
+import multiprocessing as mp
 import csv
 import pickle
 
@@ -31,8 +34,17 @@ from sklearn.metrics import (
     roc_auc_score,
     confusion_matrix
 )
+# Headless/optional plotting setup
+import matplotlib as mpl
+# Use a non-interactive backend so validation can run headless (e.g., on CI)
+mpl.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
+try:
+    import seaborn as sns  # optional
+    _HAVE_SEABORN = True
+except Exception:  # pragma: no cover
+    sns = None     # type: ignore
+    _HAVE_SEABORN = False
 
 # Import our modules
 from Evaluation_Metrics import MetricComputer, MetricConfig
@@ -51,8 +63,9 @@ class ValidationConfig:
     # Model and data paths
     model_path: Optional[str] = None
     checkpoint_path: Optional[str] = None
-    hdf5_dir: str = "/home/user/datasets/teacher_features"
-    vocab_dir: str = "/home/user/datasets/vocabulary"
+    data_dir: str = "data/images"
+    json_dir: str = "data/annotations"
+    vocab_path: str = "vocabulary.json"
     output_dir: str = "./validation_results"
     
     # Validation modes
@@ -102,7 +115,9 @@ class ValidationRunner:
     def __init__(self, config: ValidationConfig):
         self.config = config
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-        
+        # Logging queue used by workers
+        self._log_queue: Optional[mp.Queue] = mp.Queue()
+
         # Setup output directory
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +130,7 @@ class ValidationRunner:
         self._setup_logging()
         
         # Load vocabulary
-        self.vocab = load_vocabulary_for_training(Path(config.vocab_dir))
+        self.vocab = load_vocabulary_for_training(Path(config.vocab_path))
         logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
         
         # Load model
@@ -139,16 +154,57 @@ class ValidationRunner:
         if config.frequency_bins is None:
             self.config.frequency_bins = [0, 10, 100, 1000, 10000, float('inf')]
     
+    def _metadata_dict_to_list(self, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Convert a batch-level metadata dict-of-lists (as produced by the
+        custom collate_fn) into a per-sample list of dicts so downstream
+        code can serialize and analyze per-image results easily.
+        """
+        size = len(meta.get('paths', []))
+        items: List[Dict[str, Any]] = []
+        for i in range(size):
+            item: Dict[str, Any] = {}
+            for k, v in meta.items():
+                if isinstance(v, (list, tuple)):
+                    if i < len(v):
+                        item[k] = v[i]
+                else:
+                    item[k] = v
+            items.append(item)
+        return items
+
+
     def _setup_logging(self):
         """Setup validation-specific logging"""
-        log_file = self.output_dir / f"validation_{datetime.now():%Y%m%d_%H%M%S}.log"
-        
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.INFO)
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        
-        logger.addHandler(file_handler)
+
+        # Always have a console handler
+        sh = logging.StreamHandler()
+        sh.setFormatter(formatter)
+        sh.setLevel(logging.INFO)
+        logger.addHandler(sh)
+
+        # Only primary process writes files
+        is_primary = True
+        try:
+            is_primary = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+        except Exception:
+            is_primary = True
+
+        # Queue-based logging: main process listens & writes to file
+        if is_primary:
+            log_file = self.output_dir / f"validation_{datetime.now():%Y%m%d_%H%M%S}.log"
+            fh = logging.FileHandler(log_file)
+            fh.setLevel(logging.INFO)
+            fh.setFormatter(formatter)
+            try:
+                from logging.handlers import QueueListener
+                self._listener = QueueListener(self._log_queue, fh, respect_handler_level=True)
+                self._listener.start()
+            except Exception:
+                # Fallback to direct file handler if QueueListener unavailable
+                logger.addHandler(fh)
+        # else: workers only attach QueueHandler in worker_init_fn (see HDF5_loader)
     
     def _load_model(self) -> nn.Module:
         """Load model from checkpoint"""
@@ -185,7 +241,7 @@ class ValidationRunner:
             
         elif self.config.model_path:
             logger.info(f"Loading model from path: {self.config.model_path}")
-            model = create_model(pretrained=self.config.model_path)
+            model = torch.load(self.config.model_path, map_location='cpu')
         else:
             raise ValueError("Either checkpoint_path or model_path must be provided")
         
@@ -202,21 +258,24 @@ class ValidationRunner:
         """Create validation dataloader"""
         # Data config
         data_config = SimplifiedDataConfig(
-             hdf5_dir=Path(self.config.hdf5_dir),
-             vocab_dir=Path(self.config.vocab_dir),
-             normalize_mean=(0.485, 0.456, 0.406),
-             normalize_std=(0.229, 0.224, 0.225),
-             augmentation_enabled=False  # No augmentation for validation
-         )
+            data_dir=Path(self.config.data_dir),
+            json_dir=Path(self.config.json_dir),
+            vocab_path=Path(self.config.vocab_path),
+            normalize_mean=(0.485, 0.456, 0.406),
+            normalize_std=(0.229, 0.224, 0.225),
+            augmentation_enabled=False  # No augmentation for validation
+        )
 
-        
         # Create dataloader
-        _, val_loader = create_dataloaders(
-            hdf5_dir=data_config.hdf5_dir,
-            vocab_dir=data_config.vocab_dir,
+        _, val_loader, _ = create_dataloaders(
+            data_dir=data_config.data_dir,
+            json_dir=data_config.json_dir,
+            vocab_path=data_config.vocab_path,
             batch_size=self.config.batch_size,
             num_workers=self.config.num_workers,
-            distributed=self.config.distributed
+            distributed=self.config.distributed,
+            log_queue=self._log_queue,
+            force_val_persistent_workers=False
         )
         
         # Limit samples if requested
@@ -240,6 +299,8 @@ class ValidationRunner:
         
         # Create dataloader
         dataloader = self.create_dataloader()
+        # Store dataloader reference for cleanup
+        self._last_dataloader = dataloader
         
         # Run appropriate validation mode
         if self.config.mode == "full":
@@ -255,14 +316,28 @@ class ValidationRunner:
         
         # Save results
         self._save_results(results)
-        
+
         # Update history
         self.validation_history.append({
             'timestamp': datetime.now().isoformat(),
             'mode': self.config.mode,
             'results': results
         })
-        
+
+        # Best-effort worker shutdown for cleanliness
+        try:
+            dl = None
+            try:
+                dl = self._last_dataloader  # if stored
+            except AttributeError:
+                pass
+            for obj in filter(None, [dl]):
+                if hasattr(obj, "_iterator") and obj._iterator is not None:
+                    obj._iterator._shutdown_workers()  # noqa: SLF001
+        except Exception:
+            pass
+        gc.collect()
+
         return results
     
     def validate_full(self, dataloader: DataLoader) -> Dict[str, Any]:
@@ -279,8 +354,8 @@ class ValidationRunner:
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validating")):
-                images = batch['image'].to(self.device)
-                labels = batch['labels']
+                images = batch['images'].to(self.device)
+                tag_labels = batch['tag_labels']
                 
                 # Time inference
                 if self.config.measure_inference_time and torch.cuda.is_available():
@@ -290,7 +365,7 @@ class ValidationRunner:
                 # Forward pass
                 with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
                     outputs = self.model(images)
-                    logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+                    logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
                 if self.config.measure_inference_time and torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -307,8 +382,16 @@ class ValidationRunner:
                 
                 # Collect results
                 all_predictions.append(predictions.cpu())
-                all_targets.append(labels['binary'].cpu())
-                all_metadata.extend(batch['metadata'])
+                all_targets.append(tag_labels.cpu())
+                # Normalize metadata to per-sample dict list
+                meta = batch.get('metadata', None)
+                if isinstance(meta, dict):
+                    all_metadata.extend(self._metadata_dict_to_list(meta))
+                elif isinstance(meta, list):
+                    all_metadata.extend(meta)
+                else:
+                    # Fallback: preserve count
+                    all_metadata.extend([{'index': j} for j in range(images.shape[0])])
                 
                 # Memory profiling
                 if self.config.profile_memory and batch_idx % 10 == 0 and torch.cuda.is_available():
@@ -430,13 +513,13 @@ class ValidationRunner:
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Validating specific tags"):
-                images = batch['image'].to(self.device)
-                labels = batch['labels']['binary']
+                images = batch['images'].to(self.device)
+                tag_labels = batch['tag_labels']
                 
                 # Forward pass
                 with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
                     outputs = self.model(images)
-                    logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+                    logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
                 # Handle hierarchical output
                 if logits.dim() == 3:
@@ -445,7 +528,7 @@ class ValidationRunner:
                 
                 # Get predictions for specific tags only
                 predictions = torch.sigmoid(logits[:, tag_indices])
-                targets = labels[:, tag_indices]
+                targets = tag_labels[:, tag_indices]
                 
                 all_predictions.append(predictions.cpu())
                 all_targets.append(targets.cpu())
@@ -521,30 +604,54 @@ class ValidationRunner:
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Validating hierarchical"):
-                images = batch['image'].to(self.device)
-                labels = batch['labels']['hierarchical']
+                images = batch['images'].to(self.device)
+                # Collate does not provide hierarchical labels; use flat tag labels
+                flat_labels = batch.get('tag_labels')
+                if flat_labels is None:
+                    logger.error("Batch is missing 'tag_labels'; cannot run hierarchical validation.")
+                    return {'error': "Batch missing 'tag_labels' for hierarchical validation"}
                 
                 # Forward pass
                 with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
                     outputs = self.model(images)
-                    logits = outputs['logits']
+                    tag_logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
-                # Should be (batch, num_groups, tags_per_group)
-                if logits.dim() != 3:
-                    raise ValueError("Model output is not hierarchical")
+                # Expect (batch, num_groups, tags_per_group)
+                if tag_logits.dim() != 3:
+                    logger.warning(
+                        "Model output is not hierarchical (got shape %s). "
+                        "Returning a helpful error instead of crashing. "
+                        "Use mode='full' or 'tags' with this checkpoint.",
+                        tuple(tag_logits.shape)
+                    )
+                    return {
+                        'error': "Model output is not hierarchical (expected 3D logits).",
+                        'hint': "Run with mode='full' or 'tags', or load a hierarchical checkpoint."
+                    }
                 
-                predictions = torch.sigmoid(logits)
+                predictions = torch.sigmoid(tag_logits)
                 
                 # Collect by group
-                for g in range(self.vocab.num_groups):
+                num_groups = predictions.size(1)
+                # Best-effort reshape of flat labels into (B, G, T) if sizes line up
+                B, G, T = predictions.size(0), predictions.size(1), predictions.size(2)
+                if flat_labels.size(1) == G * T:
+                    labels_h = flat_labels.view(B, G, T)
+                else:
+                    logger.warning(
+                        "Cannot reshape flat labels of shape %s into (B=%d, G=%d, T=%d); "
+                        "filling targets with zeros for metrics.", tuple(flat_labels.shape), B, G, T
+                    )
+                    labels_h = torch.zeros((B, G, T), dtype=flat_labels.dtype)
+                for g in range(num_groups):
                     group_predictions[g].append(predictions[:, g, :].cpu())
-                    group_targets[g].append(labels[:, g, :].cpu())
+                    group_targets[g].append(labels_h[:, g, :].cpu())
         
         # Compute metrics per group
         results = {'groups': {}}
         group_f1_scores = []
         
-        for g in range(self.vocab.num_groups):
+        for g in range(len(group_predictions)):
             if not group_predictions[g]:
                 continue
             
@@ -569,7 +676,9 @@ class ValidationRunner:
             f1 = 2 * precision * recall / (precision + recall + 1e-8)
             
             # Get group name
-            group_name = self.vocab.get_group_name(g) if hasattr(self.vocab, 'get_group_name') else f"Group_{g}"
+            group_name = (
+                self.vocab.get_group_name(g) if hasattr(self.vocab, 'get_group_name') else f"Group_{g}"
+            )
             
             results['groups'][group_name] = {
                 'precision': precision,
@@ -833,55 +942,6 @@ class ValidationRunner:
         
         logger.info(f"Saved summary to {summary_path}")
     
-    def compare_checkpoints(self, checkpoint_paths: List[str]) -> Dict[str, Any]:
-        """Compare multiple checkpoints"""
-        comparison_results = {}
-        
-        for checkpoint_path in checkpoint_paths:
-            logger.info(f"Validating checkpoint: {checkpoint_path}")
-            
-            # Update config
-            self.config.checkpoint_path = checkpoint_path
-            
-            # Reload model
-            self.model = self._load_model()
-            
-            # Run validation
-            results = self.validate()
-            
-            # Store results
-            checkpoint_name = Path(checkpoint_path).stem
-            comparison_results[checkpoint_name] = results
-        
-        # Create comparison plots
-        self._create_comparison_plots(comparison_results)
-        
-        return comparison_results
-    
-    def _create_comparison_plots(self, comparison_results: Dict[str, Any]):
-        """Create plots comparing multiple checkpoints"""
-        checkpoints = list(comparison_results.keys())
-        metrics = ['precision', 'recall', 'f1', 'mAP']
-        
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        axes = axes.flatten()
-        
-        for i, metric in enumerate(metrics):
-            values = [comparison_results[cp].get(metric, 0) for cp in checkpoints]
-            axes[i].bar(range(len(checkpoints)), values)
-            axes[i].set_xticks(range(len(checkpoints)))
-            axes[i].set_xticklabels(checkpoints, rotation=45, ha='right')
-            axes[i].set_ylabel(metric)
-            axes[i].set_title(f'{metric} Comparison')
-            axes[i].set_ylim(0, 1)
-            
-            for j, v in enumerate(values):
-                axes[i].text(j, v + 0.01, f'{v:.3f}', ha='center')
-        
-        plt.tight_layout()
-        plt.savefig(self.plot_dir / 'checkpoint_comparison.png')
-        plt.close()
-
 
 def main():
     """Main entry point for validation"""
@@ -894,8 +954,9 @@ def main():
     parser.add_argument('--model', type=str, help='Path to model')
     
     # Data arguments
-    parser.add_argument('--hdf5-dir', type=str, default='/home/user/datasets/teacher_features')
-    parser.add_argument('--vocab-dir', type=str, default='/home/user/datasets/vocabulary')
+    parser.add_argument('--data-dir', type=str, default='data/images')
+    parser.add_argument('--json-dir', type=str, default='data/annotations')
+    parser.add_argument('--vocab-path', type=str, default='vocabulary.json')
     
     # Validation arguments
     parser.add_argument('--mode', type=str, default='full', 
@@ -920,8 +981,9 @@ def main():
     config = ValidationConfig(
         checkpoint_path=args.checkpoint,
         model_path=args.model,
-        hdf5_dir=args.hdf5_dir,
-        vocab_dir=args.vocab_dir,
+        data_dir=args.data_dir,
+        json_dir=args.json_dir,
+        vocab_path=args.vocab_path,
         mode=args.mode,
         specific_tags=args.specific_tags,
         batch_size=args.batch_size,
@@ -948,8 +1010,8 @@ def main():
     
     for key in ['precision', 'recall', 'f1', 'mAP']:
         if key in results:
-            print(f"{key}: {results[key]:.4f}")
-
+            print(f"{results[key]:.4f}")
+    
 
 if __name__ == '__main__':
     main()

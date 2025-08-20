@@ -15,6 +15,7 @@ from enum import Enum
 import argparse
 from datetime import datetime
 import copy
+import time
 from collections import defaultdict
 import re
 
@@ -38,7 +39,7 @@ class ConfigType(Enum):
     """Types of configuration files"""
     TRAINING = "training"
     INFERENCE = "inference"
-    VALIDATION = "validation"
+    MODEL = "model"
     EXPORT = "export"
     PREPROCESSING = "preprocessing"
     FULL = "full"
@@ -68,6 +69,8 @@ class BaseConfig:
                 value = value.to_dict(exclude_private)
             elif isinstance(value, list):
                 value = [v.to_dict(exclude_private) if is_dataclass(v) else v for v in value]
+            elif isinstance(value, tuple):
+                value = list(value)
             elif isinstance(value, dict):
                 value = {k: v.to_dict(exclude_private) if is_dataclass(v) else v 
                         for k, v in value.items()}
@@ -124,7 +127,7 @@ class BaseConfig:
             # Handle Optional types
             elif get_origin(field_type) is Union:
                 args = get_args(field_type)
-                if len(args) == 2 and type(None) in args:
+                if len(args) >= 2 and type(None) in args:
                     # This is Optional[T]
                     actual_type = args[0] if args[1] is type(None) else args[1]
                     if value is not None and is_dataclass(actual_type) and isinstance(value, dict):
@@ -132,7 +135,15 @@ class BaseConfig:
                     else:
                         kwargs[key] = value
                 else:
-                    kwargs[key] = value
+                    # Handle complex Union types - try each type in order
+                    converted = False
+                    for arg_type in args:
+                        if is_dataclass(arg_type) and isinstance(value, dict):
+                            kwargs[key] = arg_type.from_dict(value)
+                            converted = True
+                            break
+                    if not converted:
+                        kwargs[key] = value
             # Handle Lists with dataclass elements
             elif get_origin(field_type) is list:
                 args = get_args(field_type)
@@ -231,7 +242,7 @@ class ModelConfig(BaseConfig):
     
     # Vision specific
     image_size: int = 640
-    patch_size: int = 14
+    patch_size: int = 16
     num_channels: int = 3
     
     # Special tokens
@@ -368,38 +379,70 @@ class DataConfig(BaseConfig):
     def validate(self):
         """Validate data configuration"""
         errors = []
-        
-        # Validate storage locations
+
+        # Validate storage locations and check unique priorities
+        priorities = []
         for i, loc in enumerate(self.storage_locations):
             try:
-                storage_loc = StorageLocation(**loc)
+                # Handle both dict and StorageLocation objects
+                if isinstance(loc, StorageLocation):
+                    storage_loc = loc
+                elif isinstance(loc, dict):
+                    storage_loc = StorageLocation(**loc)
+                else:
+                    errors.append(f"Storage location {i}: Invalid type {type(loc)}")
+                    continue
+
                 storage_loc.validate()
+                # Only check priority uniqueness for enabled locations
+                if storage_loc.enabled:
+                    priorities.append(storage_loc.priority)
             except Exception as e:
                 errors.append(f"Storage location {i}: {str(e)}")
-        
+        # Unique priority validation for enabled locations only
+        if priorities and len(priorities) != len(set(priorities)):
+            dupes = [p for p in set(priorities) if priorities.count(p) > 1]
+            errors.append(f"Duplicate storage location priorities detected: {sorted(dupes)}")
+
         if self.batch_size <= 0:
             errors.append(f"batch_size must be positive, got {self.batch_size}")
-        
+
         if self.num_workers < 0:
             errors.append(f"num_workers must be non-negative, got {self.num_workers}")
-        
+
         if self.cache_size_gb < 0:
             errors.append(f"cache_size_gb must be non-negative, got {self.cache_size_gb}")
-        
+
+        # New bounds checks
+        if self.prefetch_factor < 1:
+            errors.append(f"prefetch_factor must be >= 1, got {self.prefetch_factor}")
+        if self.preload_files < 0:
+            errors.append(f"preload_files must be >= 0, got {self.preload_files}")
+        if self.random_rotation_degrees < 0:
+            errors.append(f"random_rotation_degrees must be >= 0, got {self.random_rotation_degrees}")
+
         # Validate normalization parameters
         for param_name, param_value in [('normalize_mean', self.normalize_mean), 
                                         ('normalize_std', self.normalize_std)]:
             if len(param_value) != 3:
                 errors.append(f"{param_name} must have 3 values, got {len(param_value)}")
-        
+
+        # Validate pad_color
+        if len(self.pad_color) != 3:
+            errors.append(f"pad_color must have 3 values, got {len(self.pad_color)}")
+        else:
+            for i, c in enumerate(self.pad_color):
+                if not isinstance(c, int) or not (0 <= c <= 255):
+                    errors.append(f"pad_color[{i}] must be int in [0,255], got {c}")
+
         # Validate augmentation parameters
         if self.random_flip_prob < 0 or self.random_flip_prob > 1:
             errors.append(f"random_flip_prob must be in [0, 1], got {self.random_flip_prob}")
-        
+
         scale_min, scale_max = self.random_crop_scale
         if not (0 < scale_min <= scale_max <= 1):
             errors.append(f"random_crop_scale must satisfy 0 < min <= max <= 1, got {self.random_crop_scale}")
-        
+
         if errors:
             raise ConfigValidationError("Data config validation failed:\n" + "\n".join(errors))
 
@@ -481,6 +524,15 @@ class TrainingConfig(BaseConfig):
         """Validate training configuration"""
         errors = []
         
+        # cuDNN benchmark can conflict with deterministic execution
+        if self.deterministic and self.benchmark:
+            logger.warning("deterministic=True forces benchmark=False to ensure repeatability")
+            self.benchmark = False
+        
+        # AMP backend note
+        if self.use_amp and self.amp_opt_level:
+            logger.warning("amp_opt_level appears to target NVIDIA Apex; if using torch.cuda.amp, prefer configuring amp_dtype and ignore amp_opt_level")
+        
         if self.learning_rate <= 0:
             errors.append(f"learning_rate must be positive, got {self.learning_rate}")
         
@@ -508,6 +560,17 @@ class TrainingConfig(BaseConfig):
         # Validate focal loss parameters
         if not 0 <= self.focal_alpha <= 1:
             errors.append(f"focal_alpha must be in [0, 1], got {self.focal_alpha}")
+
+        # Validate focal loss gamma parameters
+        if self.focal_gamma_pos < 0:
+            errors.append(f"focal_gamma_pos must be >= 0, got {self.focal_gamma_pos}")
+
+        if self.focal_gamma_neg < 0:
+            errors.append(f"focal_gamma_neg must be >= 0, got {self.focal_gamma_neg}")
+
+        # Validate label smoothing
+        if not 0 <= self.label_smoothing <= 1:
+            errors.append(f"label_smoothing must be in [0, 1], got {self.label_smoothing}")
         
         # Validate device
         valid_devices = ["cuda", "cpu", "mps"]
@@ -574,31 +637,52 @@ class InferenceConfig(BaseConfig):
     def validate(self):
         """Validate inference configuration"""
         errors = []
-        
+
+        # Security posture warnings if API is enabled
+        if self.enable_api:
+            if self.api_host == '0.0.0.0':
+                logger.warning("API is bound to 0.0.0.0; consider 127.0.0.1 or a firewall in production")
+            if self.api_cors_origins and ('*' in self.api_cors_origins):
+                logger.warning("API CORS origins allow '*'; require explicit origins for production")
+
         if self.model_path and not Path(self.model_path).exists():
             logger.warning(f"Model path does not exist: {self.model_path}")
-        
+
         if not 0 <= self.prediction_threshold <= 1:
             errors.append(f"prediction_threshold must be in [0, 1], got {self.prediction_threshold}")
-        
+
         if self.min_predictions > self.max_predictions:
             errors.append(
                 f"min_predictions ({self.min_predictions}) > max_predictions ({self.max_predictions})"
             )
-        
+
         if self.min_predictions < 0:
             errors.append(f"min_predictions must be non-negative, got {self.min_predictions}")
-        
+
         valid_formats = ["json", "text", "csv", "xml", "yaml"]
         if self.output_format not in valid_formats:
             errors.append(f"Unknown output_format: {self.output_format}. Must be one of {valid_formats}")
-        
+
         if self.score_decimal_places < 0 or self.score_decimal_places > 10:
             errors.append(f"score_decimal_places must be in [0, 10], got {self.score_decimal_places}")
-        
+
         if self.api_port < 1 or self.api_port > 65535:
             errors.append(f"api_port must be in [1, 65535], got {self.api_port}")
-        
+
+        # Additional field validations
+        if self.top_k is not None and self.top_k <= 0:
+            errors.append(f"top_k must be > 0 when set, got {self.top_k}")
+        if self.api_workers < 1:
+            errors.append(f"api_workers must be >= 1, got {self.api_workers}")
+        if self.api_rate_limit < 0:
+            errors.append(f"api_rate_limit must be >= 0, got {self.api_rate_limit}")
+        if self.cache_ttl_seconds < 0:
+            errors.append(f"cache_ttl_seconds must be >= 0, got {self.cache_ttl_seconds}")
+        if self.max_batch_size <= 0:
+            errors.append(f"max_batch_size must be >= 1, got {self.max_batch_size}")
+        if self.batch_timeout_ms < 0:
+            errors.append(f"batch_timeout_ms must be >= 0, got {self.batch_timeout_ms}")
+
         if errors:
             raise ConfigValidationError("Inference config validation failed:\n" + "\n".join(errors))
 
@@ -705,9 +789,12 @@ class FullConfig(BaseConfig):
         if not errors:  # Only do cross-validation if individual configs are valid
             # Check batch size consistency
             effective_batch = self.data.batch_size * self.training.gradient_accumulation_steps
-            if effective_batch > 512:
-                logger.warning(f"Large effective batch size ({effective_batch}) may cause memory issues")
-            
+            # Make threshold configurable based on available memory
+            memory_threshold = 512
+            if self.max_memory_gb:
+                memory_threshold = int(self.max_memory_gb * 1024 / 16)  # Rough heuristic
+            if effective_batch > memory_threshold:
+                logger.warning(f"Large effective batch size ({effective_batch}) may cause memory issues (threshold: {memory_threshold})")
             # Check image size consistency
             if self.model.image_size != self.data.image_size:
                 errors.append(
@@ -739,11 +826,6 @@ class ConfigManager:
         self.config_type = config_type
         self.config = self._create_default_config()
         self.config_history: List[Dict[str, Any]] = []
-        self._env_pattern = re.compile(
-            r'^([A-Z0-9_]+)__([A-Z0-9_]+)(?:__(.+))?$',
-            re.IGNORECASE
-        )
-    
     def _create_default_config(self) -> BaseConfig:
         """Create default configuration based on type"""
         config_map = {
@@ -796,40 +878,47 @@ class ConfigManager:
     def save_to_file(self, path: Union[str, Path], backup: bool = True):
         """
         Save configuration to file
-        
+
         Args:
             path: Output path
             backup: Whether to create backup if file exists
         """
         path = Path(path)
-        
+
+        # Normalize extension first so backups follow the final filename
+        if path.suffix not in ['.yaml', '.yml', '.json']:
+            path = path.with_suffix('.yaml')
+
         # Create backup if requested and file exists
         if backup and path.exists():
-            backup_path = path.with_suffix(f'.backup_{datetime.now():%Y%m%d_%H%M%S}{path.suffix}')
+            timestamp = f"{datetime.now():%Y%m%d_%H%M%S}_{int(time.time() * 1000000) % 1000000:06d}"
+            backup_path = path.with_suffix(f'.backup_{timestamp}{path.suffix}')
             path.rename(backup_path)
             logger.info(f"Created backup at {backup_path}")
-        
+
         # Create directory if needed
         path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Save based on extension
         if path.suffix in ['.yaml', '.yml']:
             self.config.to_yaml(path)
         elif path.suffix == '.json':
             self.config.to_json(path)
         else:
-            # Default to YAML
-            path = path.with_suffix('.yaml')
-            self.config.to_yaml(path)
-        
+            # Fallback to YAML
+            self.config.to_yaml(path.with_suffix('.yaml'))
+
         logger.info(f"Saved config to {path}")
-    
+
+
     def update_from_env(self, prefix: str = "ANIME_TAGGER_"):
         """
         Update configuration from environment variables
         
-        Format: ANIME_TAGGER_<SECTION>__<FIELD>[__<NESTED_FIELD>]
-        Example: ANIME_TAGGER_TRAINING__LEARNING_RATE=0.001
+        Format: ANIME_TAGGER_<SECTION>__<FIELD>[__<SUBFIELD>[__<...>]]
+        Examples:
+            ANIME_TAGGER_TRAINING__LEARNING_RATE=0.001
+            ANIME_TAGGER_MODEL__HEADS__ATTN=16
         """
         updates = defaultdict(dict)
         
@@ -848,20 +937,20 @@ class ConfigManager:
             # Parse value
             parsed_value = self._parse_env_value(value)
             
-            # Build nested update dictionary
-            if len(parts) == 2:
-                section, field = parts
-                updates[section][field] = parsed_value
-            elif len(parts) == 3:
-                section, field, subfield = parts
-                if section not in updates:
-                    updates[section] = {}
-                if field not in updates[section]:
-                    updates[section][field] = {}
-                updates[section][field][subfield] = parsed_value
-            else:
-                logger.warning(f"Too many nesting levels in env var: {key}")
-        
+            # Build nested update dictionary for arbitrary depth
+            section, *rest = parts
+            if section not in updates:
+                updates[section] = {}
+            cursor = updates[section]
+            if not rest:
+                logger.warning(f"Missing field name in env var: {key}")
+                continue
+            for subkey in rest[:-1]:
+                if subkey not in cursor or not isinstance(cursor[subkey], dict):
+                    cursor[subkey] = {}
+                cursor = cursor[subkey]
+            cursor[rest[-1]] = parsed_value
+
         # Apply updates
         if updates:
             self._apply_nested_updates(self.config, dict(updates))
@@ -870,17 +959,25 @@ class ConfigManager:
     
     def _parse_env_value(self, value: str) -> Any:
         """Parse environment variable value to appropriate type"""
-        # Try JSON first (handles lists, dicts, etc.)
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            pass
-        
         # Boolean
         if value.lower() in ('true', 'yes', '1'):
             return True
         elif value.lower() in ('false', 'no', '0'):
             return False
+
+        # Try JSON for complex types (only if it looks like JSON)
+        if value.strip().startswith(('[', '{')):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                pass
+
+        # Try JSON for null values
+        if value.lower() == 'null':
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                pass
         
         # Number
         try:
@@ -899,7 +996,7 @@ class ConfigManager:
         updates = {}
         
         for key, value in vars(args).items():
-            if value is not None and key != 'config' and key != 'output_config':
+            if value is not None and key not in {'config', 'output_config', 'validate_only'}:
                 updates[key] = value
         
         if updates:
@@ -1031,7 +1128,7 @@ def create_config_parser(config_type: ConfigType = ConfigType.FULL) -> argparse.
     # General arguments
     parser.add_argument('--config', type=str, help='Path to config file')
     parser.add_argument('--output-config', type=str, help='Save final config to file')
-    parser.add_argument('--validate-only', action='store_true', help='Only validate config and exit')
+    parser.add_argument('--validate-only', action='store_true', default=None, help='Only validate config and exit')
     
     # Create subparsers for different config sections
     if config_type == ConfigType.FULL:
@@ -1055,7 +1152,7 @@ def create_config_parser(config_type: ConfigType = ConfigType.FULL) -> argparse.
         train_group.add_argument('--training.learning_rate', type=float, help='Learning rate')
         train_group.add_argument('--training.weight_decay', type=float, help='Weight decay')
         train_group.add_argument('--training.device', type=str, help='Device (cuda/cpu)')
-        train_group.add_argument('--training.distributed', action='store_true', help='Use distributed training')
+        train_group.add_argument('--training.distributed', action='store_true', default=None, help='Use distributed training')
         train_group.add_argument('--training.seed', type=int, help='Random seed')
         
         # Inference arguments
@@ -1063,13 +1160,13 @@ def create_config_parser(config_type: ConfigType = ConfigType.FULL) -> argparse.
         infer_group.add_argument('--inference.model_path', type=str, help='Path to model')
         infer_group.add_argument('--inference.prediction_threshold', type=float, help='Prediction threshold')
         infer_group.add_argument('--inference.top_k', type=int, help='Top-k predictions')
-        infer_group.add_argument('--inference.filter_nsfw', action='store_true', help='Filter NSFW tags')
+        infer_group.add_argument('--inference.filter_nsfw', action='store_true', default=None, help='Filter NSFW tags')
         
         # Export arguments
         export_group = parser.add_argument_group('export')
         export_group.add_argument('--export.export_format', type=str, help='Export format')
-        export_group.add_argument('--export.optimize', action='store_true', help='Optimize exported model')
-        export_group.add_argument('--export.quantize', action='store_true', help='Quantize model')
+        export_group.add_argument('--export.optimize', action='store_true', default=None, help='Optimize exported model')
+        export_group.add_argument('--export.quantize', action='store_true', default=None, help='Quantize model')
     
     return parser
 
@@ -1236,26 +1333,30 @@ if __name__ == "__main__":
         # Test 3: Environment variable override
         print("\n3. Testing environment variable override...")
         os.environ["ANIME_TAGGER_TRAINING__LEARNING_RATE"] = "0.0005"
-        os.environ["ANIME_TAGGER_MODEL__NUM_GROUPS"] = "25"
+        os.environ["ANIME_TAGGER_MODEL__NUM_GROUPS"] = "20"  # Keep consistent with default tags_per_group
         os.environ["ANIME_TAGGER_DATA__BATCH_SIZE"] = "64"
+        # num_labels will be calculated correctly: 20 * 10000 = 200000 (default)
         
         manager.update_from_env()
         
         assert manager.config.training.learning_rate == 0.0005
-        assert manager.config.model.num_groups == 25
+        assert manager.config.model.num_groups == 20
         assert manager.config.data.batch_size == 64
         print("   ✓ Environment overrides work correctly")
         
         # Test 4: Config diff
         print("\n4. Testing config diff functionality...")
         config2 = FullConfig()
+        # Create a fresh manager to avoid contamination from previous test
+        manager2 = ConfigManager(ConfigType.FULL)
+        manager2.config = config2
         config2.training.num_epochs = 200
         config2.model.hidden_size = 2048
         
-        manager2 = ConfigManager(ConfigType.FULL)
-        manager2.config = config2
+        # Compare with original unmodified config
+        original_manager = ConfigManager(ConfigType.FULL)
         
-        diff = manager.get_diff(manager2)
+        diff = original_manager.get_diff(manager2)
         print(f"   Found {len(diff)} differences")
         for key, (val1, val2) in list(diff.items())[:3]:
             print(f"   - {key}: {val1} → {val2}")
