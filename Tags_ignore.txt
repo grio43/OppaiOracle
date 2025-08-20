@@ -39,4 +39,6 @@ bad_pixiv_id
 md5_mismatch
 resolution_mismatch
 resized
-?
+bad_twitter_id
+original
+official_art
