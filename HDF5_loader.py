@@ -31,7 +31,9 @@ from PIL import Image
 from collections import OrderedDict
 
 from orientation_handler import OrientationHandler, OrientationMonitor  # type: ignore
-from ..utils.vocabulary import TagVocabulary
+# Import TagVocabulary from the vocabulary module rather than a relative package path.
+# The vocabulary module should reside on the Python path for this import to succeed.
+from vocabulary import TagVocabulary
 
 logger = logging.getLogger(__name__)
 
