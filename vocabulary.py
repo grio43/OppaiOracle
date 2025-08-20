@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 from typing import Iterable, Tuple
 from functools import lru_cache
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 IGNORE_TAG_INDICES: Tuple[int, ...] = tuple()
 
 def get_ignore_tag_indices() -> Tuple[int, ...]:
@@ -199,25 +203,24 @@ class TagVocabulary:
             try:
                 with open(json_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                for entry in data:
-                    tags_field = entry.get('tags')
-                    if not tags_field:
-                        continue
+                #for entry in data: # loop is redundant
+                tags_field = data['tags']
+                if not tags_field:
+                    continue
+                # Accept both space‑delimited strings and lists
+                tags_list: List[str]
+                if isinstance(tags_field, str):
+                    tags_list = tags_field.split()
+                elif isinstance(tags_field, list):
+                    tags_list = tags_field
+                else:
+                    continue
 
-                    # Accept both space‑delimited strings and lists
-                    tags_list: List[str]
-                    if isinstance(tags_field, str):
-                        tags_list = tags_field.split()
-                    elif isinstance(tags_field, list):
-                        tags_list = tags_field
-                    else:
+                for tag in tags_list:
+                    # Skip ignored tags entirely when building the vocabulary
+                    if tag in self.ignored_tags:
                         continue
-
-                    for tag in tags_list:
-                        # Skip ignored tags entirely when building the vocabulary
-                        if tag in self.ignored_tags:
-                            continue
-                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
             except Exception as e:
                 logger.warning(f"Failed to parse {json_file}: {e}")
         
@@ -380,10 +383,50 @@ def load_vocabulary_for_training(vocab_dir: Path) -> TagVocabulary:
     vocab.index_to_tag = {0: vocab.pad_token, 1: vocab.unk_token}
     vocab.unk_index = 1
     
-    for idx, tag in enumerate(dummy_tags, start=2):
-        vocab.tag_to_index[tag] = idx
-        vocab.index_to_tag[idx] = tag
+    #for idx, tag in enumerate(dummy_tags, start=2):
+    #    vocab.tag_to_index[tag] = idx
+    #    vocab.index_to_tag[idx] = tag
     
     vocab.tags = dummy_tags
     
     return vocab
+
+def create_vocabulary_from_datasets(dataset_path: Optional[List[Path]] = None):
+    """Create vocabulary from datasets (for training).
+    
+    This function scans the dataset directories for JSON annotation files,
+    builds a vocabulary, and saves it to vocabulary/vocabulary.json.
+    """
+    from pathlib import Path
+
+    json_files: List[str] = []
+    data_dir = Path(dataset_path[0])
+    for file in data_dir.rglob('*.json'):
+        json_files.append(str(file))
+
+    vocab = TagVocabulary(min_frequency=5)
+    vocab.build_from_annotations([Path(f) for f in json_files], top_k=5000)
+    
+    vocab_dir = Path('vocabulary/')
+    vocab_dir.mkdir(parents=True, exist_ok=True)
+    vocab.save_vocabulary(vocab_dir / 'vocabulary.json')
+    
+    logger.info(f"Created vocabulary with {len(vocab)} tags and saved to {vocab_dir / 'vocabulary.json'}")
+    
+    return vocab
+
+
+def main():
+    # Main function for command-line usage
+    import argparse    
+    parser = argparse.ArgumentParser(description='Generate vocabulary from anime image dataset')
+    parser.add_argument('dataset_paths', nargs='+', help='Paths to dataset directories or images')
+    args = parser.parse_args()
+    create_vocabulary_from_datasets(args.dataset_paths)
+    vocab = load_vocabulary_for_training(Path('./vocabulary'))
+    logger.info(f"Vocabulary size: {len(vocab)} tags")
+    logger.info("Vocabulary preparation complete!")
+
+
+if __name__ == "__main__":
+    main()
