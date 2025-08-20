@@ -30,6 +30,17 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
+# Attempt to import the list of indices corresponding to ignored tags.  If
+# ``vocabulary.py`` defines this list it will be used to mask out those
+# columns from predictions and targets before metrics are accumulated.  If
+# the import fails (for example during unit tests), fall back to an empty
+# list which leaves tensors unchanged.
+try:
+    from vocabulary import IGNORE_TAG_INDICES as _IGNORE_TAG_INDICES  # noqa: F401
+    IGNORE_TAG_INDICES: List[int] = list(_IGNORE_TAG_INDICES)
+except Exception:
+    IGNORE_TAG_INDICES = []
+
 
 @dataclass
 class MetricConfig:
@@ -92,6 +103,24 @@ class MetricTracker:
         # Validate inputs
         if predictions.shape != targets.shape:
             raise ValueError(f"Shape mismatch: predictions {predictions.shape} vs targets {targets.shape}")
+
+        # If there are tag indices to ignore, mask them out from both
+        # predictions and targets before storing.  This ensures that
+        # ignored tags do not contribute to loss or metrics.  The mask is
+        # constructed on the same device as the incoming tensors to avoid
+        # unnecessary transfers.  Note that after masking the tensors are
+        # detached and moved to CPU for memory efficiency below.
+        if IGNORE_TAG_INDICES:
+            # Create a boolean mask with True for columns to keep
+            device = predictions.device
+            num_tags = predictions.size(1)
+            mask = torch.ones(num_tags, dtype=torch.bool, device=device)
+            # Guard against out of range indices
+            valid_ignore = [idx for idx in IGNORE_TAG_INDICES if 0 <= idx < num_tags]
+            if valid_ignore:
+                mask[valid_ignore] = False
+                predictions = predictions[:, mask]
+                targets = targets[:, mask]
         
         # Ensure CPU tensors for memory efficiency
         self.predictions.append(predictions.detach().cpu())
@@ -155,7 +184,7 @@ class MetricComputer:
             RuntimeError: If metric computation fails
         """
         # Validate inputs
-        self._validate_inputs(predictions, targets)
+        predictions, targets = self._validate_inputs(predictions, targets)
         
         metrics = {}
         failed_metrics = []
@@ -223,6 +252,7 @@ class MetricComputer:
         
         if not torch.all((targets == 0) | (targets == 1)):
             raise ValueError("Targets must be binary (0 or 1)")
+        return predictions, targets
     
     def _safe_to_numpy(self, tensor: torch.Tensor) -> np.ndarray:
         """Safely convert tensor to numpy array"""
@@ -544,6 +574,12 @@ class MetricComputer:
             if support == 0:
                 continue
             
+            # Binarize predictions for this tag
+            if self.config.adaptive_threshold:
+                tag_binary = (self._adaptive_threshold(
+                    predictions[:, [tag_idx]])[:, 0]).astype(np.int32)
+            else:
+                tag_binary = (tag_preds > self.config.prediction_threshold).astype(np.int32)
             tp = float(((tag_binary == 1) & (tag_targets == 1)).sum())
             fp = float(((tag_binary == 1) & (tag_targets == 0)).sum())
             fn = float(((tag_binary == 0) & (tag_targets == 1)).sum())

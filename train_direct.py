@@ -9,6 +9,9 @@ import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 import sys
+import multiprocessing as mp
+import random
+import torch.distributed as dist
 
 import torch
 from torch.cuda.amp import GradScaler, autocast
@@ -21,55 +24,32 @@ from orientation_handler import OrientationHandler
 try:
     from HDF5_loader import create_dataloaders
 except ImportError as e:
-    logging.error(f"Failed to import HDF5_loader: {e}")
-    logging.error("Please ensure HDF5_loader.py exists with create_dataloaders function")
-    create_dataloaders = None
+    error_msg = (
+        f"""MISSING REQUIRED FILE: HDF5_loader.py
+Please ensure HDF5_loader.py exists in the current directory with create_dataloaders function.
+Import error: {e}"""
+    )
+    raise ImportError(error_msg)
 
 try:
     from model_architecture import create_model
 except ImportError as e:
-    logging.error(f"Failed to import model_architecture: {e}")
-    logging.error("Please ensure model_architecture.py exists with create_model function")
-    create_model = None
+    error_msg = (
+        f"""MISSING REQUIRED FILE: model_architecture.py
+Please ensure model_architecture.py exists in the current directory with create_model function.
+Import error: {e}"""
+    )
+    raise ImportError(error_msg)
 
 try:
     from loss_functions import MultiTaskLoss, AsymmetricFocalLoss
 except ImportError as e:
-    logging.error(f"Failed to import loss_functions: {e}")
-    logging.error("Please ensure loss_functions.py exists with MultiTaskLoss and AsymmetricFocalLoss classes")
-    MultiTaskLoss = None
-    AsymmetricFocalLoss = None
-
-# Fallback stub implementations if modules are missing
-if create_dataloaders is None:
-    def create_dataloaders(*args, **kwargs):
-        raise NotImplementedError(
-            "create_dataloaders is not implemented. "
-            "Please provide HDF5_loader.py with proper implementation"
-        )
-
-if create_model is None:
-    def create_model(*args, **kwargs):
-        raise NotImplementedError(
-            "create_model is not implemented. "
-            "Please provide model_architecture.py with proper implementation"
-        )
-
-if MultiTaskLoss is None:
-    class MultiTaskLoss:
-        def __init__(self, *args, **kwargs):
-            raise NotImplementedError(
-                "MultiTaskLoss is not implemented. "
-                "Please provide loss_functions.py with proper implementation"
-            )
-
-if AsymmetricFocalLoss is None:
-    class AsymmetricFocalLoss:
-        def __init__(self, *args, **kwargs):
-            raise NotImplementedError(
-                "AsymmetricFocalLoss is not implemented. "
-                "Please provide loss_functions.py with proper implementation"
-            )
+    error_msg = (
+        f"""MISSING REQUIRED FILE: loss_functions.py
+Please ensure loss_functions.py exists in the current directory with MultiTaskLoss and AsymmetricFocalLoss classes.
+Import error: {e}"""
+    )
+    raise ImportError(error_msg)
 
 
 def setup_orientation_aware_training(
@@ -148,7 +128,7 @@ def setup_orientation_aware_training(
         "json_dir": json_dir,
         "vocab_path": vocab_path,
         "random_flip_prob": random_flip_prob,
-        "orientation_map_path": str(orientation_map_path) if orientation_map_path else None,
+        "orientation_map_path": orientation_map_path,  # Keep as Path object
         "strict_orientation": strict_orientation,
         "skip_unmapped": skip_unmapped,
         "dataloader_overrides": {
@@ -163,19 +143,7 @@ def setup_orientation_aware_training(
 def train_with_orientation_tracking():
     """Training loop with orientation handling and statistics tracking."""
     
-    # Validate required modules are available
-    missing_modules = []
-    if create_dataloaders is None:
-        missing_modules.append("HDF5_loader.create_dataloaders")
-    if create_model is None:
-        missing_modules.append("model_architecture.create_model")
-    if MultiTaskLoss is None or AsymmetricFocalLoss is None:
-        missing_modules.append("loss_functions.MultiTaskLoss/AsymmetricFocalLoss")
-    
-    if missing_modules:
-        error_msg = f"Cannot start training. Missing required modules: {', '.join(missing_modules)}"
-        logging.error(error_msg)
-        raise ImportError(error_msg)
+    # All required modules are imported at module load time; ImportErrors are raised immediately.
     
     # Enhanced configuration with orientation handling
     config = {
@@ -208,16 +176,45 @@ def train_with_orientation_tracking():
         },
     }
     
-    # Setup logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('training_with_orientation.log'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
+    # Seeding & determinism BEFORE spawning workers/loaders
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        torch.use_deterministic_algorithms(True)  # raise if an op is nondeterministic
+    except Exception:
+        pass
+    try:
+        import torch.backends.cudnn as cudnn
+        cudnn.deterministic = True
+        cudnn.benchmark = False
+    except Exception:
+        pass
+
+    # Queue-based, rank-safe logging
+    from logging.handlers import QueueListener
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    log_queue = mp.Queue()
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(formatter)
+    sh.setLevel(logging.INFO)
     logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    logger.addHandler(sh)
+
+    is_primary = True
+    try:
+        is_primary = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+    except Exception:
+        is_primary = True
+
+    if is_primary:
+        fh = logging.FileHandler('training_with_orientation.log')
+        fh.setFormatter(formatter)
+        fh.setLevel(logging.INFO)
+        _listener = QueueListener(log_queue, fh, respect_handler_level=True)
+        _listener.start()
     
     # Validate and setup orientation handling
     try:
@@ -232,7 +229,11 @@ def train_with_orientation_tracking():
         )
         
         logger.info("Orientation handling configured successfully")
-        logger.info(f"Orientation config: {json.dumps(orientation_config, indent=2, default=str)}")
+        # Convert Path objects to strings for JSON serialization
+        config_for_logging = orientation_config.copy()
+        if config_for_logging.get('orientation_map_path'):
+            config_for_logging['orientation_map_path'] = str(config_for_logging['orientation_map_path'])
+        logger.info(f"Orientation config: {json.dumps(config_for_logging, indent=2, default=str)}")
         
     except (FileNotFoundError, ValueError) as e:
         logger.error(f"Orientation setup failed: {e}")
@@ -265,8 +266,12 @@ def train_with_orientation_tracking():
         val_batch_size=None,
         config_updates={
             "random_flip_prob": config["random_flip_prob"],
-            "orientation_map_path": config.get("orientation_map_path")
-        }
+            # Convert string back to Path if needed
+            "orientation_map_path": Path(config.get("orientation_map_path")) if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) else config.get("orientation_map_path")
+        },
+        seed=seed,
+        log_queue=log_queue,
+        force_val_persistent_workers=False,
     )
     
     # Model setup
@@ -318,7 +323,10 @@ def train_with_orientation_tracking():
             # Forward pass with mixed precision
             if config["amp"]:
                 with autocast():
-                    outputs = model(images)
+                    pmask = batch.get('padding_mask', None)
+                    if pmask is not None:
+                        pmask = pmask.to(device)
+                    outputs = model(images, padding_mask=pmask)
                     loss, losses = criterion(
                         outputs['tag_logits'],
                         outputs['rating_logits'],
@@ -328,7 +336,10 @@ def train_with_orientation_tracking():
                     )
                 scaler.scale(loss).backward()
             else:
-                outputs = model(images)
+                pmask = batch.get('padding_mask', None)
+                if pmask is not None:
+                    pmask = pmask.to(device)
+                outputs = model(images, padding_mask=pmask)
                 loss, losses = criterion(
                     outputs['tag_logits'],
                     outputs['rating_logits'],
@@ -379,7 +390,10 @@ def train_with_orientation_tracking():
                 tag_labels = batch['tag_labels'].to(device)
                 rating_labels = batch['rating_labels'].to(device)
                 
-                outputs = model(images)
+                pmask = batch.get('padding_mask', None)
+                if pmask is not None:
+                    pmask = pmask.to(device)
+                outputs = model(images, padding_mask=pmask)
                 loss, _ = criterion(
                     outputs['tag_logits'],
                     outputs['rating_logits'],
@@ -468,7 +482,7 @@ def validate_orientation_mappings():
         "text",
         "standing"
     ]
-    
+
     print("\n" + "="*60)
     print("Testing sample tags:")
     for tag in test_tags:
