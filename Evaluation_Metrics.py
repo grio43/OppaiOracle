@@ -30,6 +30,17 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
+# Attempt to import the list of indices corresponding to ignored tags.  If
+# ``vocabulary.py`` defines this list it will be used to mask out those
+# columns from predictions and targets before metrics are accumulated.  If
+# the import fails (for example during unit tests), fall back to an empty
+# list which leaves tensors unchanged.
+try:
+    from vocabulary import IGNORE_TAG_INDICES as _IGNORE_TAG_INDICES  # noqa: F401
+    IGNORE_TAG_INDICES: List[int] = list(_IGNORE_TAG_INDICES)
+except Exception:
+    IGNORE_TAG_INDICES = []
+
 
 @dataclass
 class MetricConfig:
@@ -92,6 +103,24 @@ class MetricTracker:
         # Validate inputs
         if predictions.shape != targets.shape:
             raise ValueError(f"Shape mismatch: predictions {predictions.shape} vs targets {targets.shape}")
+
+        # If there are tag indices to ignore, mask them out from both
+        # predictions and targets before storing.  This ensures that
+        # ignored tags do not contribute to loss or metrics.  The mask is
+        # constructed on the same device as the incoming tensors to avoid
+        # unnecessary transfers.  Note that after masking the tensors are
+        # detached and moved to CPU for memory efficiency below.
+        if IGNORE_TAG_INDICES:
+            # Create a boolean mask with True for columns to keep
+            device = predictions.device
+            num_tags = predictions.size(1)
+            mask = torch.ones(num_tags, dtype=torch.bool, device=device)
+            # Guard against out of range indices
+            valid_ignore = [idx for idx in IGNORE_TAG_INDICES if 0 <= idx < num_tags]
+            if valid_ignore:
+                mask[valid_ignore] = False
+                predictions = predictions[:, mask]
+                targets = targets[:, mask]
         
         # Ensure CPU tensors for memory efficiency
         self.predictions.append(predictions.detach().cpu())

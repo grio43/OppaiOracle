@@ -9,10 +9,64 @@ management for both training and inference, eliminating code duplication.
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 import torch
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Ignore tag handling
+#
+# Tags listed in a plain text file called ``Tags_ignore.txt`` located in the
+# repository root will be automatically excluded from both the vocabulary and
+# the training labels.  This allows callers to specify words that should be
+# entirely ignored by the system – no learning signal is generated for them
+# and they are omitted from scoring.  The list is loaded once when the
+# ``TagVocabulary`` is constructed and stored in the module‑level
+# ``IGNORE_TAG_INDICES`` so that other modules (e.g. metrics) can access
+# the indices to be removed from predictions and targets.
+#
+# Each line in ``Tags_ignore.txt`` should contain a single tag.  Blank lines
+# and lines beginning with ``#`` are ignored.
+
+# A global list of vocabulary indices corresponding to ignored tags.  This
+# variable is populated when a ``TagVocabulary`` is initialised and is
+# intended for consumption by downstream modules such as metric
+# computation.  Modules that wish to mask out ignored tags from
+# predictions or targets should import this variable from ``vocabulary``.
+IGNORE_TAG_INDICES: List[int] = []  # noqa: N816 (uppercase to signal global constant)
+
+
+def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:
+    """Load ignore tags from a plain text file.
+
+    If ``ignore_file`` is not provided, this attempts to locate a
+    ``Tags_ignore.txt`` file in the same directory as this module.  Each
+    non‑empty, non‑comment line of the file is treated as a tag to ignore.
+
+    Returns:
+        A set of tag strings that should be ignored.
+    """
+    # Determine the default ignore file location relative to this script.
+    if ignore_file is None:
+        # ``__file__`` points to this module; the ignore list resides in
+        # the repository root alongside this file.  Using ``parent`` twice
+        # ascends from ``vocabulary.py`` to the repository root.
+        module_path = Path(__file__).resolve()
+        ignore_file = module_path.parent / 'Tags_ignore.txt'
+    ignored: Set[str] = set()
+    try:
+        if ignore_file and ignore_file.exists():
+            with open(ignore_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    tag = line.strip()
+                    # Skip blank lines or comments
+                    if not tag or tag.startswith('#'):
+                        continue
+                    ignored.add(tag)
+    except Exception as e:
+        logger.warning(f"Failed to load ignore tags from {ignore_file}: {e}")
+    return ignored
 
 
 class TagVocabulary:
@@ -33,6 +87,17 @@ class TagVocabulary:
         self.index_to_tag: Dict[int, str] = {}
         self.tag_frequencies: Dict[str, int] = {}
         self.min_frequency = min_frequency
+
+        # Load the ignore list once.  ``ignored_tags`` holds the set of tag
+        # strings that should be ignored entirely.  ``ignored_tag_indices`` is
+        # derived later once the vocabulary is built or loaded.  These
+        # attributes are instance specific so that unit tests or multiple
+        # vocabularies can operate independently; however, the indices are also
+        # broadcast via the module‑level ``IGNORE_TAG_INDICES`` so that
+        # downstream code may mask out the ignored tags without a direct
+        # reference to this instance.
+        self.ignored_tags: Set[str] = _load_ignore_tags()
+        self.ignored_tag_indices: List[int] = []
         
         # Special tokens+        # Use distinct strings for padding and unknown tokens.
         # The pad token (index 0) is reserved for masking and is not a valid output.
@@ -77,7 +142,13 @@ class TagVocabulary:
             Multi-hot tensor of shape (vocab_size,)
         """
         vector = torch.zeros(len(self.tag_to_index), dtype=torch.float32)
+        # Skip any tags that are marked as ignored.  Ignored tags are not
+        # encoded at all; they do not contribute to the label vector and
+        # therefore produce no training signal.  Unknown tags are still
+        # mapped to the <UNK> index as before.
         for tag in tags:
+            if tag in self.ignored_tags:
+                continue
             idx = self.tag_to_index.get(tag, self.tag_to_index.get(self.unk_token, self.unk_index))
             vector[idx] = 1.0
         return vector
@@ -122,7 +193,8 @@ class TagVocabulary:
                     tags_field = entry.get('tags')
                     if not tags_field:
                         continue
-                    
+
+                    # Accept both space‑delimited strings and lists
                     tags_list: List[str]
                     if isinstance(tags_field, str):
                         tags_list = tags_field.split()
@@ -130,8 +202,11 @@ class TagVocabulary:
                         tags_list = tags_field
                     else:
                         continue
-                    
+
                     for tag in tags_list:
+                        # Skip ignored tags entirely when building the vocabulary
+                        if tag in self.ignored_tags:
+                            continue
                         tag_counts[tag] = tag_counts.get(tag, 0) + 1
             except Exception as e:
                 logger.warning(f"Failed to parse {json_file}: {e}")
@@ -154,6 +229,14 @@ class TagVocabulary:
             self.tag_to_index[tag] = idx
             self.index_to_tag[idx] = tag
             self.tag_frequencies[tag] = tag_counts[tag]
+
+        # Update ignored tag indices and propagate to module‑level constant
+        self.ignored_tag_indices = [self.tag_to_index.get(tag) for tag in self.ignored_tags if tag in self.tag_to_index]
+        # Filter out any None values (in case an ignored tag did not make it into the vocab)
+        self.ignored_tag_indices = [i for i in self.ignored_tag_indices if i is not None]
+        # Broadcast to module level so other modules can import it
+        global IGNORE_TAG_INDICES
+        IGNORE_TAG_INDICES = self.ignored_tag_indices.copy()
         
         # Update tags list for compatibility
         self.tags = sorted_tags
@@ -215,6 +298,14 @@ class TagVocabulary:
         self.tags = [tag for tag in self.tag_to_index.keys() 
                      if tag not in (self.pad_token, self.unk_token)]
         
+        # Compute ignored tag indices based on the loaded vocabulary.
+        self.ignored_tag_indices = [self.tag_to_index.get(tag) for tag in self.ignored_tags if tag in self.tag_to_index]
+        # Filter out missing tags (None values) in case ignored tags are absent
+        self.ignored_tag_indices = [i for i in self.ignored_tag_indices if i is not None]
+        # Propagate to module‑level constant so that downstream modules can mask these indices
+        global IGNORE_TAG_INDICES
+        IGNORE_TAG_INDICES = self.ignored_tag_indices.copy()
+
         logger.info(f"Loaded vocabulary with {len(self.tag_to_index)} tags from {vocab_path}")
     
     @classmethod
