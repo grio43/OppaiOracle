@@ -34,7 +34,9 @@ class DanbooruDataPreprocessor:
     def __init__(self, 
                  vocab_path: Path,
                  output_dir: Path,
-                 num_workers: int = None):
+                 num_workers: int = None,
+                 ignore_tags_file: Optional[Path] = None,
+                 ignored_tags: Optional[List[str]] = None):
         """
         Initialize preprocessor
         
@@ -48,6 +50,43 @@ class DanbooruDataPreprocessor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         self.num_workers = num_workers or mp.cpu_count()
+
+        # ------------------------------------------------------------------
+        # Tag ignoring support
+        #
+        # Some training setups require excluding certain tags from the label
+        # vocabulary.  For example, you might want the model to learn from the
+        # images but *not* treat particular tags as targets or use them for
+        # evaluation.  Two mechanisms are supported:
+        #
+        #  1. `ignore_tags_file`: a path to a text file containing one tag per
+        #     line.  Any tag found in this file will be excluded from
+        #     training/labeling.  Blank lines and comments (lines starting with
+        #     '#') are ignored.
+        #
+        #  2. `ignored_tags`: a Python list of tag strings to ignore.  This is
+        #     convenient if you want to hard‑code the ignore list in your
+        #     configuration or script.
+        #
+        # If both are provided, the union of the two sets is used.  If
+        # neither is provided, no tags are ignored.
+        self.ignore_tags: set[str] = set()
+        if ignore_tags_file:
+            try:
+                with open(ignore_tags_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        self.ignore_tags.add(line)
+                if self.ignore_tags:
+                    logger.info(f"Loaded {len(self.ignore_tags)} tags to ignore from {ignore_tags_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load ignore tags from {ignore_tags_file}: {e}")
+        if ignored_tags:
+            self.ignore_tags.update(ignored_tags)
+            if ignored_tags:
+                logger.info(f"Ignoring {len(ignored_tags)} additional tags specified in code")
         
         # Load vocabulary (using pickle for speed)
         vocab_pkl = vocab_path / 'vocabulary.pkl'
@@ -134,6 +173,21 @@ class DanbooruDataPreprocessor:
                     
                     # ISSUE-003 FIX: Remove duplicates while preserving order
                     tags_list = dedupe_preserve_order(tags_list)
+
+                    # ------------------------------------------------------------------
+                    # Remove ignored tags
+                    #
+                    # If an ignore list is provided (either via a file or an in‑memory
+                    # list), filter those tags out before any further processing.
+                    # This ensures they are not counted towards the label vectors
+                    # and do not influence quality scores.  Images will still be
+                    # retained as long as at least one remaining tag maps to the
+                    # vocabulary.
+                    if self.ignore_tags:
+                        tags_list = [t for t in tags_list if t not in self.ignore_tags]
+                        if not tags_list:
+                            logger.debug(f"Skipping {filename}: all tags are in ignore list")
+                            continue
                     
                     # Track duplicate statistics
                     dedupe_count = original_count - len(tags_list)
