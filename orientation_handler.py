@@ -8,7 +8,7 @@ import re
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Counter
 import warnings
 import threading
 
@@ -54,6 +54,7 @@ class OrientationHandler:
             'total_flips': 0,
             'skipped_flips': 0,
             'unmapped_tags': set(),
+            'unmapped_tag_frequency': {},  # Track how often each unmapped tag appears
             'mapped_tags': set()
         }
         self._stats_lock = threading.Lock()
@@ -181,6 +182,8 @@ class OrientationHandler:
                 with self._stats_lock:
                     self.stats['skipped_flips'] += 1
                     self.stats['unmapped_tags'].update(unmapped)
+                    for tag in unmapped:
+                        self.stats['unmapped_tag_frequency'][tag] = self.stats['unmapped_tag_frequency'].get(tag, 0) + 1
                 logger.debug(f"Skipping flip due to unmapped orientation tags: {unmapped}")
                 return True
         
@@ -253,6 +256,7 @@ class OrientationHandler:
         if any(keyword in tag for keyword in ['left', 'right', 'asymmetric']):
             with self._stats_lock:
                 self.stats['unmapped_tags'].add(tag)
+                self.stats['unmapped_tag_frequency'][tag] = self.stats['unmapped_tag_frequency'].get(tag, 0) + 1
 
         return tag
     
@@ -459,6 +463,12 @@ class OrientationHandler:
             num_mapped = len(self.stats['mapped_tags'])
             num_unmapped = len(self.stats['unmapped_tags'])
             unmapped_sample = list(self.stats['unmapped_tags'])[:20]
+            # Sort unmapped tags by frequency
+            unmapped_by_freq = sorted(
+                self.stats['unmapped_tag_frequency'].items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:20]            
         
         return {
             'total_flips': total_flips,
@@ -466,12 +476,60 @@ class OrientationHandler:
             'skip_rate': skipped_flips / max(1, total_flips + skipped_flips),
             'num_mapped_tags': num_mapped,
             'num_unmapped_tags': num_unmapped,
-            'unmapped_tags_sample': unmapped_sample
+            'unmapped_tags_sample': unmapped_sample,
+            'unmapped_tags_by_frequency': unmapped_by_freq
         }
 
     def get_statistics(self) -> Dict[str, any]:
         """Alias for get_usage_statistics for backwards compatibility."""
         return self.get_usage_statistics()
+    
+    def suggest_mappings(self, unmapped_tags: Optional[Set[str]] = None) -> Dict[str, str]:
+        """
+        Auto-suggest potential mappings for unmapped tags.
+        
+        Args:
+            unmapped_tags: Set of tags to analyze, or None to use all tracked unmapped tags
+            
+        Returns:
+            Dictionary of suggested mappings
+        """
+        if unmapped_tags is None:
+            with self._stats_lock:
+                unmapped_tags = self.stats['unmapped_tags'].copy()
+        
+        suggestions = {}
+        
+        for tag in unmapped_tags:
+            # Try simple left/right swapping
+            if 'left' in tag:
+                suggested = tag.replace('left', 'right')
+                suggestions[tag] = suggested
+            elif 'right' in tag:
+                suggested = tag.replace('right', 'left')
+                suggestions[tag] = suggested
+            # Try pattern-based suggestions
+            elif tag.startswith('single_'):
+                # Single items typically don't have a direct swap
+                suggestions[tag] = tag  # Map to itself (symmetric)
+            elif 'asymmetric' in tag:
+                # Asymmetric items are typically self-referential
+                suggestions[tag] = tag  # Map to itself (symmetric)
+        
+        return suggestions
+    
+    def validate_for_ci(self, max_unmapped_threshold: int = 50) -> bool:
+        """
+        Validate handler state for CI/CD pipelines.
+        
+        Args:
+            max_unmapped_threshold: Maximum allowed unmapped tags
+            
+        Returns:
+            True if validation passes, False otherwise
+        """
+        stats = self.get_usage_statistics()
+        return stats['num_unmapped_tags'] <= max_unmapped_threshold
 
 
 class OrientationMonitor:
@@ -522,13 +580,20 @@ class OrientationMonitor:
             )
             self.warning_issued = True
             
-            # Optionally save unmapped tags to file for review
+            # Save unmapped tags with frequency and suggestions to file for review
             unmapped_file = Path("unmapped_orientation_tags.txt")
             with open(unmapped_file, 'w') as f:
                 f.write("# Unmapped orientation tags found during training\n")
                 f.write("# Add these to orientation_map.json if needed\n\n")
-                for tag in sorted(stats['unmapped_tags_sample']):
-                    f.write(f"{tag}\n")
+                f.write("# Format: tag (frequency) -> suggested_mapping\n\n")
+                
+                # Get suggestions
+                suggestions = handler.suggest_mappings()
+                
+                # Write tags sorted by frequency
+                for tag, freq in stats['unmapped_tags_by_frequency']:
+                    suggested = suggestions.get(tag, "# No suggestion")
+                    f.write(f"{tag} ({freq}x) -> {suggested}\n")
             logger.info(f"Saved unmapped tags to {unmapped_file}")
         
         self.last_unmapped_count = unmapped_count
@@ -605,6 +670,15 @@ def test_orientation_handler():
         
         # Print statistics
         print(f"\nStatistics: {handler.get_statistics()}")
+
+        # Test auto-suggestions
+        test_unmapped = {"left_shoulder_tattoo", "right_knee_pad", "asymmetrical_outfit"}
+        suggestions = handler.suggest_mappings(test_unmapped)
+        print(f"\nAuto-suggestions: {suggestions}")
+        
+        # Test CI validation
+        ci_valid = handler.validate_for_ci(max_unmapped_threshold=10)
+        print(f"\nCI validation (threshold=10): {'PASS' if ci_valid else 'FAIL'}")
         
     finally:
         # Cleanup
@@ -613,6 +687,44 @@ def test_orientation_handler():
     
     print("\nAll tests passed!")
 
+def validate_dataset_orientation_tags(dataset_tags_file: Path, mapping_file: Path, 
+                                      fail_on_unmapped: bool = False,
+                                      max_unmapped_threshold: int = 50) -> int:
+    """
+    Standalone validation script for CI/CD pipelines.
+    
+    Args:
+        dataset_tags_file: Path to file containing all dataset tags (one per line)
+        mapping_file: Path to orientation mapping JSON
+        fail_on_unmapped: If True, exit with error code if unmapped tags found
+        max_unmapped_threshold: Maximum allowed unmapped tags before failure
+        
+    Returns:
+        Exit code (0 for success, 1 for failure)
+    """
+    # Load dataset tags
+    with open(dataset_tags_file, 'r') as f:
+        all_tags = set(line.strip() for line in f if line.strip())
+    
+    # Create handler and validate
+    handler = OrientationHandler(mapping_file=mapping_file, strict_mode=True)
+    issues = handler.validate_dataset_tags(all_tags)
+    
+    if issues:
+        print("Validation issues found:")
+        for issue_type, tags in issues.items():
+            print(f"\n{issue_type}: {len(tags)} tags")
+            for tag in tags[:10]:  # Show first 10
+                print(f"  - {tag}")
+    
+    # Check threshold
+    unmapped_count = len(issues.get('unmapped_orientation_tags', []))
+    if fail_on_unmapped and unmapped_count > max_unmapped_threshold:
+        print(f"\n❌ FAILED: {unmapped_count} unmapped tags exceeds threshold of {max_unmapped_threshold}")
+        return 1
+    
+    print(f"\n✅ Validation passed: {unmapped_count} unmapped tags within threshold")
+    return 0
 
 if __name__ == "__main__":
     test_orientation_handler()
