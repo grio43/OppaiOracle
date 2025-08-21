@@ -210,6 +210,7 @@ def train_with_orientation_tracking():
     except Exception:
         is_primary = True
 
+    _listener = None
     if is_primary:
         fh = logging.FileHandler('training_with_orientation.log')
         fh.setFormatter(formatter)
@@ -442,6 +443,14 @@ def train_with_orientation_tracking():
             logger.info(f"\nSaved unmapped tags to {unmapped_file}")
     
     logger.info("\nTraining complete with orientation-aware augmentation!")
+    
+    # Cleanup: Stop the QueueListener if it was started
+    if _listener is not None:
+        try:
+            _listener.stop()
+            logger.info("QueueListener stopped successfully")
+        except Exception as e:
+            logger.warning(f"Error stopping QueueListener: {e}")
 
 
 def validate_orientation_mappings():
