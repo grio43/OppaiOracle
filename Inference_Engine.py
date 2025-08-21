@@ -37,6 +37,12 @@ except ImportError:
     warnings.warn("Monitor_log not available. Monitoring will be disabled.")
     MONITORING_AVAILABLE = False
 
+# Import the actual model architecture
+try:
+    from model_architecture import SimplifiedTagger, VisionTransformerConfig
+except ImportError:
+    raise ImportError("model_architecture.py not found. Cannot load SimplifiedTagger model.")   
+
 logger = logging.getLogger(__name__)
 
 
@@ -170,17 +176,58 @@ class ModelWrapper:
                 with open(self.config.config_path, 'r') as f:
                     model_config = json.load(f)
                     self.tag_names = model_config.get('tag_names', [])
+            else:
+                logger.warning(f"Config file not found at {self.config.config_path}")
+                model_config = {}                    
             
             # Load checkpoint
             checkpoint = torch.load(self.config.model_path, map_location=self.device)
             
-            # Create model (placeholder - should match your actual model architecture)
-            # This is where you'd instantiate your actual model
-            # For now, using a dummy model structure
-            from torchvision import models
-            self.model = models.resnet50(pretrained=False)
-            num_classes = len(self.tag_names) if self.tag_names else checkpoint.get('num_classes', 1000)
-            self.model.fc = nn.Linear(self.model.fc.in_features, num_classes)
+            # Extract model configuration from checkpoint or use defaults
+            vit_config_dict = checkpoint.get('model_config', {})
+            
+            # Merge with config file if available
+            if 'vit_config' in model_config:
+                vit_config_dict.update(model_config['vit_config'])
+            
+            # Set number of tags based on checkpoint or tag_names
+            if 'num_tags' not in vit_config_dict:
+                if self.tag_names:
+                    vit_config_dict['num_tags'] = len(self.tag_names)
+                elif 'num_classes' in checkpoint:
+                    vit_config_dict['num_tags'] = checkpoint['num_classes']
+                else:
+                    # Default fallback
+                    vit_config_dict['num_tags'] = 100000
+                    logger.warning("num_tags not found in config, using default 100000")
+            
+            # Ensure critical parameters are present with sensible defaults
+            vit_config_defaults = {
+                'image_size': self.config.image_size if self.config.image_size != 448 else 640,
+                'patch_size': 16,
+                'num_channels': 3,
+                'hidden_size': 1280,
+                'num_hidden_layers': 24,
+                'num_attention_heads': 16,
+                'intermediate_size': 5120,
+                'num_ratings': 5,
+                'dropout': 0.1,
+                'attention_dropout': 0.1,
+                'layer_norm_eps': 1e-6,
+                'use_flash_attention': True,
+                'padding_mask_keep_threshold': 0.9,
+                'gradient_checkpointing': False  # Disable for inference
+            }
+            
+            # Apply defaults for missing values
+            for key, default_value in vit_config_defaults.items():
+                if key not in vit_config_dict:
+                    vit_config_dict[key] = default_value
+                    logger.debug(f"Using default value for {key}: {default_value}")
+            
+            # Create Vision Transformer model with correct architecture
+            vit_config = VisionTransformerConfig(**vit_config_dict)
+            self.model = SimplifiedTagger(vit_config)
             
             # Load weights
             if 'model_state_dict' in checkpoint:
@@ -199,7 +246,11 @@ class ModelWrapper:
             if self.use_fp16:
                 self.model = self.model.half()
             
-            logger.info(f"Model loaded successfully with {num_classes} classes")
+            logger.info(f"SimplifiedTagger model loaded successfully:")
+            logger.info(f"  - Image size: {vit_config.image_size}")
+            logger.info(f"  - Patch size: {vit_config.patch_size}")
+            logger.info(f"  - Number of tags: {vit_config.num_tags}")
+            logger.info(f"  - Number of ratings: {vit_config.num_ratings}")
             return True
             
         except Exception as e:
@@ -216,8 +267,16 @@ class ModelWrapper:
         
         outputs = self.model(images)
         
-        # Apply sigmoid for multi-label classification
-        predictions = torch.sigmoid(outputs)
+        # Handle dictionary output from SimplifiedTagger
+        if isinstance(outputs, dict):
+            # Use tag_logits for predictions
+            tag_outputs = outputs.get('tag_logits', outputs.get('logits'))
+            if tag_outputs is None:
+                raise ValueError("Model output missing 'tag_logits' or 'logits' key")
+            predictions = torch.sigmoid(tag_outputs)
+        else:
+            # Fallback for tensor output
+            predictions = torch.sigmoid(outputs)
         
         return predictions.cpu().float()
 
@@ -629,15 +688,41 @@ class InferenceEngine:
 # Example usage
 if __name__ == "__main__":
     # Configure inference
+    # Note: image_size should match the training configuration (640 for ViT, not 448)
     config = InferenceConfig(
         model_path="./checkpoints/best_model.pth",
+        config_path="./checkpoints/model_config.json",
         batch_size=32,
         threshold=0.5,
         top_k=10,
         enable_monitoring=True,
-        enable_cache=True
+        enable_cache=True,
+        image_size=640  # Match training image size for ViT
     )
-    
+
+    # Example of saving model config during training (should be done in training script)
+    # This shows what the config file should contain:
+    example_model_config = {
+        "tag_names": ["tag1", "tag2", "..."],  # List of all tag names
+        "vit_config": {
+            "image_size": 640,
+            "patch_size": 16,
+            "num_channels": 3,
+            "hidden_size": 1280,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "intermediate_size": 5120,
+            "num_tags": 100000,  # Should match len(tag_names)
+            "num_ratings": 5,
+            "dropout": 0.1,
+            "attention_dropout": 0.1,
+            "layer_norm_eps": 1e-6,
+            "use_flash_attention": True,
+            "padding_mask_keep_threshold": 0.9,
+            "gradient_checkpointing": False  # Disabled for inference
+        }
+    }
+       
     # Create inference engine
     engine = InferenceEngine(config)
     

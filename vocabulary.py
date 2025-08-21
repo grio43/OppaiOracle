@@ -19,37 +19,16 @@ logger = logging.getLogger(__name__)
 #
 # Tags listed in a plain text file called ``Tags_ignore.txt`` located in the
 # repository root will be automatically excluded from both the vocabulary and
-# the training labels.  This allows callers to specify words that should be
+# the training labels. This allows callers to specify words that should be
 # entirely ignored by the system – no learning signal is generated for them
-# and they are omitted from scoring.  The list is loaded once when the
-# ``TagVocabulary`` is constructed and stored in the module‑level
-# ``IGNORE_TAG_INDICES`` so that other modules (e.g. metrics) can access
-# the indices to be removed from predictions and targets.
+# and they are omitted from scoring
 #
-# Each line in ``Tags_ignore.txt`` should contain a single tag.  Blank lines
+# Each line in ``Tags_ignore.txt`` should contain a single tag. Blank lines
 # and lines beginning with ``#`` are ignored.
 
-# Process-wide immutable default for ignored tag indices. DataLoader workers are separate
-# processes; thread-local state does not propagate, leading to silent divergence. Keep
-# a simple module-level tuple and pass copies into datasets.
-from typing import Iterable, Tuple
-from functools import lru_cache
-
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-IGNORE_TAG_INDICES: Tuple[int, ...] = tuple()
-
-def get_ignore_tag_indices() -> Tuple[int, ...]:
-    """Get the tuple of ignored tag indices."""
-    return IGNORE_TAG_INDICES
-
-def set_ignore_tag_indices(indices: Iterable[int]) -> None:
-    """Set the ignored tag indices once at startup; avoids mutations during training."""
-    global IGNORE_TAG_INDICES
-    IGNORE_TAG_INDICES = tuple(sorted(set(int(i) for i in indices)))
-
+# IMPORTANT: Due to PyTorch DataLoader multiprocessing, ignored indices must be
+# passed explicitly to dataset constructors. Global module state does not
+# propagate to worker processes.
 
 def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:
     """Load ignore tags from a plain text file.
@@ -88,6 +67,10 @@ class TagVocabulary:
     
     This class combines functionality from both HDF5_loader.py and Inference_Engine.py
     to provide a single, comprehensive vocabulary implementation.
+    
+    Note: When using with PyTorch DataLoader in multiprocessing mode, ignored_tag_indices
+    must be explicitly passed to dataset constructors as global state does not propagate
+    to worker processes.
     """
     
     def __init__(self, vocab_path: Optional[Path] = None, min_frequency: int = 1) -> None:
@@ -104,12 +87,9 @@ class TagVocabulary:
 
         # Load the ignore list once.  ``ignored_tags`` holds the set of tag
         # strings that should be ignored entirely.  ``ignored_tag_indices`` is
-        # derived later once the vocabulary is built or loaded.  These
+        # derived later once the vocabulary is built or loaded. These
         # attributes are instance specific so that unit tests or multiple
-        # vocabularies can operate independently; however, the indices are also
-        # broadcast via the module‑level ``IGNORE_TAG_INDICES`` so that
-        # downstream code may mask out the ignored tags without a direct
-        # reference to this instance.
+        # vocabularies can operate independently.
         self.ignored_tags: Set[str] = _load_ignore_tags()
         self.ignored_tag_indices: List[int] = []
         
@@ -142,6 +122,13 @@ class TagVocabulary:
     def __len__(self) -> int:
         """Return the size of the vocabulary."""
         return len(self.tag_to_index)
+    
+    def get_ignored_indices(self) -> List[int]:
+        """Get the list of ignored tag indices.
+        
+        This should be passed to dataset constructors when using multiprocessing.
+        """
+        return self.ignored_tag_indices.copy()
     
     def encode_tags(self, tags: Iterable[str]) -> torch.Tensor:
         """Encode a list of tag strings into a multi-hot tensor.
@@ -243,12 +230,10 @@ class TagVocabulary:
             self.index_to_tag[idx] = tag
             self.tag_frequencies[tag] = tag_counts[tag]
 
-        # Update ignored tag indices and propagate to module‑level constant
+        # Update ignored tag indices
         self.ignored_tag_indices = [self.tag_to_index.get(tag) for tag in self.ignored_tags if tag in self.tag_to_index]
         # Filter out any None values (in case an ignored tag did not make it into the vocab)
         self.ignored_tag_indices = [i for i in self.ignored_tag_indices if i is not None]
-        # Use thread-local storage instead of global variable
-        set_ignore_tag_indices(self.ignored_tag_indices)
         
         # Update tags list for compatibility
         self.tags = sorted_tags
@@ -314,8 +299,6 @@ class TagVocabulary:
         self.ignored_tag_indices = [self.tag_to_index.get(tag) for tag in self.ignored_tags if tag in self.tag_to_index]
         # Filter out missing tags (None values) in case ignored tags are absent
         self.ignored_tag_indices = [i for i in self.ignored_tag_indices if i is not None]
-        # Use thread-local storage instead of a global variable so that downstream modules can mask these indices
-        set_ignore_tag_indices(self.ignored_tag_indices)
 
         logger.info(f"Loaded vocabulary with {len(self.tag_to_index)} tags from {vocab_path}")
     
@@ -390,6 +373,24 @@ def load_vocabulary_for_training(vocab_dir: Path) -> TagVocabulary:
     vocab.tags = dummy_tags
     
     return vocab
+
+def create_dataset_config(vocab: TagVocabulary) -> Dict:
+    """Create a configuration dictionary for dataset initialization.
+    
+    This ensures ignored indices are properly passed to datasets when using
+    multiprocessing with DataLoader.
+    
+    Args:
+        vocab: TagVocabulary instance
+        
+    Returns:
+        Dictionary with configuration including ignored_indices
+    """
+    return {
+        'vocabulary': vocab,
+        'ignored_indices': vocab.get_ignored_indices(),
+        # Add other dataset configuration parameters as needed
+    }
 
 def create_vocabulary_from_datasets(dataset_path: Optional[List[Path]] = None):
     """Create vocabulary from datasets (for training).
