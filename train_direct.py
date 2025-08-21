@@ -169,6 +169,7 @@ def train_with_orientation_tracking():
         # Model configuration
         "model_config": {
             "hidden_size": 768,
+            "intermediate_size": 3072,  
             "num_hidden_layers": 12,
             "num_attention_heads": 12,
             "patch_size": 16,
