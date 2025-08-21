@@ -281,8 +281,8 @@ class SimplifiedDataset(Dataset):
                 self.orientation_handler = OrientationHandler(
                     mapping_file=config.orientation_map_path,
                     random_flip_prob=config.random_flip_prob,
-                    strict_mode=False,  # Don't fail if mapping is incomplete
-                    skip_unmapped=True   # Skip flipping images with unmapped orientation tags
+                    strict_mode=config.strict_orientation_validation,
+                    skip_unmapped=config.skip_unmapped
                 )
 
                 # Pre-compute mappings if vocabulary is available for better performance
@@ -389,11 +389,20 @@ class SimplifiedDataset(Dataset):
                     else:
                         continue
                     # Build annotation record
+
+                # Deduplicate tags while preserving order
+                seen = set()
+                deduplicated_tags = []
+                for tag in tags_list:
+                    if tag and tag not in seen:  # Also filter out empty strings
+                        seen.add(tag)
+                        deduplicated_tags.append(tag)
+
                     record: Dict[str, Any] = {
                         'image_path': str(self.config.data_dir / filename),
-                        'tags': tags_list,
+                        'tags': deduplicated_tags,
                         'rating': entry.get('rating', 'unknown'),
-                        'num_tags': len(tags_list),
+                        'num_tags': len(deduplicated_tags)
                     }
                     self.annotations.append(record)
             except Exception as e:
