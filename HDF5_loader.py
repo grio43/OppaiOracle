@@ -175,6 +175,10 @@ class SimplifiedDataConfig:
     # mapping is loaded on dataset initialisation.
     orientation_map_path: Optional[Path] = None
 
+    # Transparency handling
+    update_transparency_tags: bool = True  # Whether to update tags when compositing transparent images
+    composite_background_tag: str = "gray_background"  # Tag to add when compositing
+
     # Sampling settings
     frequency_weighted_sampling: bool = True
     sample_weight_power: float = 0.5
@@ -449,22 +453,23 @@ class SimplifiedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.annotations)
 
-    def _load_image(self, image_path: str) -> torch.Tensor:
+    def _load_image(self, image_path: str) -> Tuple[torch.Tensor, bool]
         """Load an image from disk or cache and return it as a float tensor.
-
-        Images are loaded at their original resolution without resizing.
-        Resizing and padding are handled later via ``letterbox_resize``.
-        A copy of the image may be cached to accelerate repeated accesses.
-        The cache stores images in the precision specified by
-        ``cache_precision``; loaded images are always returned as ``float32``
-        tensors in the [0, 1] range.
         """
         # Check cache first
         with self.cache_lock:
             if image_path in self.cache:
-                cached = self.cache[image_path]
+                cached_data = self.cache[image_path]
                 # Move to end to mark as recently used (LRU behavior)
                 self.cache.move_to_end(image_path)
+
+                # Handle both old cache format (just tensor) and new (tuple with flag)
+                if isinstance(cached_data, tuple):
+                    cached, was_composited = cached_data
+                else:
+                    cached = cached_data
+                    was_composited = False
+
                 # Convert cached tensor back to float32
                 if cached.dtype == torch.uint8:
                     result = cached.float() / 255.0
@@ -472,11 +477,12 @@ class SimplifiedDataset(Dataset):
                     result = cached.float()
                 else:
                     result = cached.clone()
-                return result
+                return result, was_composited
         # Load from disk
         try:
             # Open without forcing RGB so we can properly handle alpha first
             pil_img = Image.open(image_path)
+            was_composited = False
 
             # Resolve a safe, neutral gray pad/composite color from config (works with dict or object)
             def _resolve_pad_color(cfg, default=(128, 128, 128)):
@@ -502,6 +508,7 @@ class SimplifiedDataset(Dataset):
             # Composite transparent images with error handling
             try:
                 if pil_img.mode in ('RGBA', 'LA') or ('transparency' in pil_img.info):
+                    was_composited = True  # Mark that we're compositing
                     rgba = pil_img.convert('RGBA')
                     bg = Image.new('RGB', rgba.size, pad_color)
                     bg.paste(rgba, mask=rgba.split()[3])  # use alpha as mask
@@ -511,6 +518,7 @@ class SimplifiedDataset(Dataset):
             except Exception as e:
                 logger.warning(f"Alpha compositing failed for {image_path}, converting to RGB directly: {e}")
                 pil_img = pil_img.convert('RGB')
+                was_composited = False
 
             tensor = TF.to_tensor(pil_img)  # float32 in [0, 1]
 
@@ -526,13 +534,14 @@ class SimplifiedDataset(Dataset):
                 if len(self.cache) >= self.max_cache_size:
                     # Remove the least recently used item (first item in OrderedDict)
                     self.cache.popitem(last=False)
-                self.cache[image_path] = cached_tensor
+                # Store as tuple with composite flag
+                self.cache[image_path] = (cached_tensor, was_composited)
 
-            return tensor
+            return tensor, was_composited
         except Exception as e:
             logger.error(f"Error loading image {image_path}: {e}")
             # Return black image to avoid crashing caller
-            return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32)
+            return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32), False
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Fetch an item for training or validation.
@@ -561,10 +570,19 @@ class SimplifiedDataset(Dataset):
             error_count = self._error_counts.get(image_path, 0)
         max_retries = 3
         try:
-            # Load image tensor (float32)
-            image = self._load_image(image_path)
+            # Load image tensor and get composite flag
+            image, was_composited = self._load_image(image_path)
             # Copy tags so we can mutate without altering the original
             tags = list(anno['tags'])
+
+            # Update tags if image was composited from transparency
+            if was_composited:
+                # Remove transparent_background if present
+                tags = [t for t in tags if t != 'transparent_background']
+                # Add gray_background if not already present
+                if 'gray_background' not in tags:
+                    tags.append('gray_background')
+
             # Random horizontal flip with orientation-aware tag swapping
             if (
                 self.orientation_handler is not None
@@ -610,11 +628,12 @@ class SimplifiedDataset(Dataset):
                 'metadata': {
                     'index': idx,
                     'path': anno['image_path'],
-                    'num_tags': anno['num_tags'],
-                    'tags': tags,
+                    'num_tags': len(tags),  # Updated count
+                    'tags': tags,  # Updated tags
                     'rating': anno['rating'],
                     'scale': lb_info['scale'],
                     'pad': lb_info['pad'],
+                    'was_composited': was_composited,  # Add to metadata for debugging
                 },
             }
         except (IOError, OSError) as e:
@@ -667,6 +686,7 @@ class SimplifiedDataset(Dataset):
                 'error_type': error_type,
                 'scale': lb_info['scale'],
                 'pad': lb_info['pad'],
+                'was_composited': False,
             },
         }
 
