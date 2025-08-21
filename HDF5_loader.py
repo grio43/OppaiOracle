@@ -194,6 +194,10 @@ class SimplifiedDataConfig:
     cache_precision: str = 'float16'  # 'float32', 'float16' or 'uint8'
     preload_metadata: bool = True
 
+    # Error handling settings
+    skip_error_samples: bool = True 
+    validate_on_init: bool = True  
+
     def __post_init__(self) -> None:
         # Validate flip probability
         if not 0.0 <= self.random_flip_prob <= 1.0:
@@ -334,6 +338,15 @@ class SimplifiedDataset(Dataset):
             # accessed under `_error_counts_lock` to ensure thread safety.
             self._error_counts_lock = threading.Lock()
             self._error_counts: Dict[str, int] = {}
+            # Track permanently failed images
+            self._failed_images: set[str] = set()
+
+            # Optionally validate all images are readable at initialization
+            if config.validate_on_init and split == 'train':
+                self._validate_dataset_images()
+
+            # Filter out known bad images if skip_error_samples is enabled
+            self._filter_failed_images()            
 
             # Load annotation metadata from the provided JSON files.  This
             # populates ``self.annotations`` with valid entries.
@@ -407,6 +420,50 @@ class SimplifiedDataset(Dataset):
                     self.annotations.append(record)
             except Exception as e:
                 logger.warning(f"Failed to parse {json_file}: {e}")
+
+    def _validate_dataset_images(self) -> None:
+        """Validate that all images in the dataset are readable.
+        
+        This runs at initialization to identify problematic images early
+        rather than discovering them during training.
+        """
+        logger.info("Validating dataset images...")
+        failed_count = 0
+        total = len(self.annotations)
+        
+        for i, anno in enumerate(self.annotations):
+            if i % 1000 == 0:
+                logger.info(f"Validated {i}/{total} images...")
+            
+            image_path = anno['image_path']
+            try:
+                # Quick validation - just try to open and get size
+                with Image.open(image_path) as img:
+                    _ = img.size
+            except Exception as e:
+                logger.warning(f"Image validation failed for {image_path}: {e}")
+                self._failed_images.add(image_path)
+                failed_count += 1
+        
+        if failed_count > 0:
+            logger.warning(
+                f"Found {failed_count}/{total} ({failed_count/total*100:.1f}%) unreadable images. "
+                f"These will be {'skipped' if self.config.skip_error_samples else 'replaced with blank samples'}."
+            )
+            # Save report of failed images
+            report_path = Path("failed_images_report.txt")
+            with open(report_path, 'w') as f:
+                for path in sorted(self._failed_images):
+                    f.write(f"{path}\n")
+            logger.info(f"Saved list of failed images to {report_path}")
+
+    def _filter_failed_images(self) -> None:
+        """Remove known failed images from annotations if skip_error_samples is enabled."""
+        if self.config.skip_error_samples and self._failed_images:
+            original_count = len(self.annotations)
+            self.annotations = [a for a in self.annotations if a['image_path'] not in self._failed_images]
+            filtered_count = original_count - len(self.annotations)
+            logger.info(f"Filtered out {filtered_count} samples with known bad images")
 
     def _calculate_sample_weights(self) -> None:
         """Compute sampling weights for frequency‑weighted sampling."""
@@ -591,6 +648,14 @@ class SimplifiedDataset(Dataset):
             raise IndexError(f"Index {idx} out of range for dataset with {len(self.annotations)} samples")
         anno = self.annotations[idx]
         image_path = anno['image_path']
+
+        # Skip if this is a known failed image and skip_error_samples is enabled
+        if self.config.skip_error_samples and image_path in self._failed_images:
+            # Return next valid sample (with wraparound)
+            next_idx = (idx + 1) % len(self.annotations)
+            logger.debug(f"Skipping known failed image at index {idx}, using index {next_idx}")
+            return self.__getitem__(next_idx)
+
         # Track error count for this specific image (thread‑safe).
         with self._error_counts_lock:
             error_count = self._error_counts.get(image_path, 0)
@@ -667,12 +732,23 @@ class SimplifiedDataset(Dataset):
             # under the lock.  If the maximum number of retries is
             # exceeded, propagate a runtime error to abort training.
             with self._error_counts_lock:
-                self._error_counts[image_path] = error_count + 1
+                self._error_counts[image_path] = error_count + 1               
+                if error_count >= max_retries:
+                    self._failed_images.add(image_path)
+
             if error_count >= max_retries:
                 logger.error(f"Failed to load {image_path} after {max_retries} attempts: {e}")
-                raise RuntimeError(f"Persistent failure loading {image_path}: {e}") from e
+                if self.config.skip_error_samples:
+                    # Skip to next sample instead of crashing
+                    next_idx = (idx + 1) % len(self.annotations)
+                    logger.info(f"Skipping permanently failed image, moving to index {next_idx}")
+                    return self.__getitem__(next_idx)
+                else:
+                    raise RuntimeError(f"Persistent failure loading {image_path}: {e}") from e
             else:
                 logger.warning(f"Error loading {image_path} (attempt {error_count + 1}/{max_retries}): {e}")
+                if self.config.skip_error_samples:
+                    return self.__getitem__((idx + 1) % len(self.annotations))                
                 return self._create_error_sample(idx, image_path, "io_error")
         except Exception as e:
             # Unexpected errors should not be silenced
