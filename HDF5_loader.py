@@ -359,7 +359,24 @@ class SimplifiedDataset(Dataset):
             try:
                 with open(json_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+
+                # Normalize to list format: single dict → [dict], invalid → skip
+                if isinstance(data, dict):
+                    # Single annotation object - wrap in list
+                    data = [data]
+                elif not isinstance(data, list):
+                    # Neither dict nor list - invalid format
+                    logger.warning(
+                        f"Skipping {json_file}: expected list or dict, got {type(data).__name__}"
+                    )
+                    continue
+
                 for entry in data:
+                    # Validate entry is a dict before accessing keys
+                    if not isinstance(entry, dict):
+                        logger.warning(f"Skipping non-dict entry in {json_file}: {type(entry).__name__}")
+                        continue
+
                     filename = entry.get('filename')
                     tags_field = entry.get('tags')
                     if not filename or not tags_field:
