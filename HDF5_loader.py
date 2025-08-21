@@ -453,7 +453,7 @@ class SimplifiedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.annotations)
 
-    def _load_image(self, image_path: str) -> Tuple[torch.Tensor, bool]
+    def _load_image(self, image_path: str) -> Tuple[torch.Tensor, bool]:
         """Load an image from disk or cache and return it as a float tensor.
         """
         # Check cache first
