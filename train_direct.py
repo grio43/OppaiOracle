@@ -267,7 +267,9 @@ def train_with_orientation_tracking():
         config_updates={
             "random_flip_prob": config["random_flip_prob"],
             # Convert string back to Path if needed
-            "orientation_map_path": Path(config.get("orientation_map_path")) if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) else config.get("orientation_map_path")
+            "orientation_map_path": Path(config.get("orientation_map_path")) if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) else config.get("orientation_map_path"),
+            "skip_unmapped": config.get("skip_unmapped", True),
+            "strict_orientation_validation": config.get("strict_orientation", True)
         },
         seed=seed,
         log_queue=log_queue,
