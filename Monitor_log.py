@@ -14,6 +14,7 @@ import psutil
 import time
 import threading
 import queue
+import concurrent.futures
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
@@ -384,6 +385,9 @@ class SystemMonitor:
         # Track GPU monitoring failures to disable after persistent errors
         self.gpu_failure_count = 0
         self.max_gpu_failures = 5
+
+        # Use ThreadPoolExecutor for timeout handling
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="SystemMetrics")        
         
         self._shutdown_event = threading.Event()
         # Initialize GPU monitoring
@@ -421,19 +425,18 @@ class SystemMonitor:
             
             self.running = False
             thread_to_join = self.thread
+
+        # Shutdown executor first to cancel any ongoing metric collection
+        if hasattr(self, '_executor'):
+            self._executor.shutdown(wait=False)
+            
+        # Signal shutdown to interrupt any blocking operations
+        self._shutdown_event.set()            
             
         if thread_to_join and thread_to_join.is_alive():
-            thread_to_join.join(timeout=5)
+            thread_to_join.join(timeout=2) 
             if thread_to_join.is_alive():
-                logger.warning("System monitor thread did not stop gracefully")
-            # Set shutdown event to interrupt any blocking operations
-            self._shutdown_event.set()
-            # Give it one more chance to stop
-            thread_to_join.join(timeout=2)
-            if thread_to_join.is_alive():
-                logger.error("System monitor thread is unresponsive and may remain as zombie thread")
-                # Force cleanup of thread reference
-                self.thread = None
+                logger.warning("System monitor thread did not stop gracefully within timeout")
             
         logger.info("System monitoring stopped")
     
@@ -441,7 +444,17 @@ class SystemMonitor:
         """Main monitoring loop with error handling"""
         while self.running:
             try:
-                metrics = self._collect_metrics()
+                # Use executor with timeout for metric collection
+                future = self._executor.submit(self._collect_metrics_safe)
+                try:
+                    metrics = future.result(timeout=self.config.system_metrics_interval * 0.8)
+                except concurrent.futures.TimeoutError:
+                    logger.warning("Metric collection timed out, skipping this cycle")
+                    future.cancel()
+                    continue
+                except Exception as e:
+                    logger.error(f"Error in metric collection: {e}")
+                    continue
                 
                 # Try to put metrics in queue (non-blocking)
                 try:
@@ -467,17 +480,22 @@ class SystemMonitor:
                     self.running = False
                     break
             
-            # Sleep with interruptible check
-            sleep_iterations = int(self.config.system_metrics_interval * 10)
-            for _ in range(sleep_iterations):
-                if not self.running:
-                    break
-                if self._shutdown_event.is_set():
-                    break
-                time.sleep(0.1)
+            # Use Event.wait() for interruptible sleeping
+            if self._shutdown_event.wait(timeout=self.config.system_metrics_interval):
+                break  # Shutdown event was set
+    
+    def _collect_metrics_safe(self) -> Dict[str, Any]:
+        """Wrapper for metric collection with frequent shutdown checks"""
+        if self._shutdown_event.is_set():
+            return {}
+        return self._collect_metrics()
     
     def _collect_metrics(self) -> Dict[str, Any]:
         """Collect system metrics with error handling"""
+        # Early return if shutdown requested
+        if self._shutdown_event.is_set():
+            return {}
+
         metrics = {
             'timestamp': time.time(),
             'cpu': {},
@@ -489,17 +507,23 @@ class SystemMonitor:
         
         try:
             # CPU metrics
-            metrics['cpu']['percent'] = psutil.cpu_percent(interval=0.1)
+            # Use shorter interval to be more responsive to shutdown
+            if self._shutdown_event.is_set():
+                return metrics
+            metrics['cpu']['percent'] = psutil.cpu_percent(interval=0.01)
+  
             metrics['cpu']['count'] = psutil.cpu_count()
             cpu_freq = psutil.cpu_freq()
             metrics['cpu']['freq'] = cpu_freq.current if cpu_freq else 0
             
             # Per-CPU metrics
-            metrics['cpu']['per_cpu'] = psutil.cpu_percent(interval=0.1, percpu=True)
+            if not self._shutdown_event.is_set():
+                metrics['cpu']['per_cpu'] = psutil.cpu_percent(interval=0.01, percpu=True)
         except Exception as e:
             logger.debug(f"Failed to collect CPU metrics: {e}")
 
-        if not self.running or self._shutdown_event.is_set():
+        # Check shutdown more frequently
+        if self._shutdown_event.is_set():            
             return metrics
                 
         try:
@@ -518,12 +542,15 @@ class SystemMonitor:
             logger.debug(f"Failed to collect memory metrics: {e}")
 
         if not self.running or self._shutdown_event.is_set():
-            return metrics
+            if self._shutdown_event.is_set():
+                return metrics
                         
         
         try:
             # Disk metrics
             if self.config.track_disk_io:
+                if self._shutdown_event.is_set():
+                    return metrics                
                 disk = psutil.disk_usage('/')
                 metrics['disk']['total_gb'] = disk.total / (1024**3)
                 metrics['disk']['used_gb'] = disk.used / (1024**3)
@@ -540,13 +567,15 @@ class SystemMonitor:
         except Exception as e:
             logger.debug(f"Failed to collect disk metrics: {e}")
         
-        if not self.running or self._shutdown_event.is_set():
+        if self._shutdown_event.is_set():
             return metrics
            
         try:
             # GPU metrics (with fresh query)
             if self.gpu_available and GPUTIL_AVAILABLE:
                 try:
+                    if self._shutdown_event.is_set():
+                        return metrics                    
                     # Double-check GPUtil is still available and working
                     gpus = GPUtil.getGPUs()
                     if gpus is not None:  # Additional safety check
@@ -598,6 +627,8 @@ class SystemMonitor:
         try:
             # Network metrics
             if self.config.track_network_io:
+                if self._shutdown_event.is_set():
+                    return metrics                
                 net = psutil.net_io_counters()
                 metrics['network']['sent_mb'] = net.bytes_sent / (1024**2)
                 metrics['network']['recv_mb'] = net.bytes_recv / (1024**2)
@@ -1186,12 +1217,23 @@ class TrainingMonitor:
         if hasattr(self, '_closed') and self._closed:
             return
         self._closed = True
+
+        # Set shutdown event early to signal all threads
+        if hasattr(self.system_monitor, '_shutdown_event'):
+            self.system_monitor._shutdown_event.set()        
         
         logger.info("Closing training monitor...")
         
         # Stop system monitor
         if self.system_monitor:
             self.system_monitor.stop()
+
+        # Cleanup executor
+        if hasattr(self.system_monitor, '_executor'):
+            try:
+                self.system_monitor._executor.shutdown(wait=True, timeout=1)
+            except:
+                pass            
             
         # Close profiler
         if self.profiler:
