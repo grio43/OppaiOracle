@@ -169,6 +169,13 @@ class OrientationHandler:
         """
         # Check for tags that should never be flipped (text, signatures, etc.)
         if any(tag in self.skip_flip_tags for tag in tags):
+            with self._stats_lock:
+                self.stats['skipped_flips'] += 1
+            logger.debug(f"Skipping flip due to skip_flip_tag present")
+            return True
+        
+        # Second check: if skip_unmapped is enabled, check for unmapped orientation tags
+        if self.skip_unmapped:
             unmapped = self._find_unmapped_orientation_tags(tags)
             if unmapped:
                 with self._stats_lock:
