@@ -220,44 +220,45 @@ class OrientationHandler:
         Returns:
             Swapped tag or original if no swap needed
         """
-        with self._stats_lock:
-            # Check if symmetric (no swap needed)
-            if tag in self.symmetric_tags:
-                return tag
+        # Check if symmetric (no swap needed)
+        if tag in self.symmetric_tags:
+            return tag
 
-            # Check explicit mappings first (highest priority)
-            if tag in self.explicit_mappings:
+        # Check explicit mappings first (highest priority)
+        if tag in self.explicit_mappings:
+            with self._stats_lock:
                 self.stats['mapped_tags'].add(tag)
-                return self.explicit_mappings[tag]
+            return self.explicit_mappings[tag]
 
-            # Check reverse mappings
-            if tag in self.reverse_mappings:
+        # Check reverse mappings
+        if tag in self.reverse_mappings:
+            with self._stats_lock:
                 self.stats['mapped_tags'].add(tag)
-                return self.reverse_mappings[tag]
+            return self.reverse_mappings[tag]
 
-        # Try regex patterns (outside lock to avoid holding lock during regex operations)
-        result_tag = tag
-        matched = False
+        # Try regex patterns
         for regex_data in self.regex_patterns:
             pattern = regex_data['pattern']
             if pattern.match(tag):
                 try:
                     swapped = pattern.sub(regex_data['replacement'], tag)
                     if swapped != tag:  # Only count if actually changed
-                        result_tag = swapped
-                        matched = True
-                        break
+                        with self._stats_lock:
+                            self.stats['mapped_tags'].add(tag)
+                        return swapped
                 except Exception as e:
                     logger.error(f"Regex substitution failed for tag '{tag}': {e}")
 
-        # Update statistics
-        with self._stats_lock:
-            if matched:
-                self.stats['mapped_tags'].add(tag)
-            elif any(keyword in tag for keyword in ['left', 'right', 'asymmetric']):
+        # No mapping found - check if it's an orientation tag we should track
+        if any(keyword in tag for keyword in ['left', 'right', 'asymmetric']):
+            with self._stats_lock:
                 self.stats['unmapped_tags'].add(tag)
 
-        return result_tag
+        return tag
+    
+    def _swap_tag_unlocked(self, tag: str) -> str:
+        """Internal version of swap_tag that doesn't acquire locks. For use when lock is already held."""
+        return self.swap_tag(tag)   
     
     def swap_tags(self, tags: List[str]) -> Tuple[List[str], bool]:
         """
@@ -273,11 +274,13 @@ class OrientationHandler:
         if self.should_skip_flip(tags):
             return tags, False
 
-        # Swap all tags and update statistics atomically
+        # Swap all tags
+        swapped_tags: List[str] = []
+        for tag in tags:
+            swapped_tags.append(self.swap_tag(tag))
+
+        # Update flip counter
         with self._stats_lock:
-            swapped_tags: List[str] = []
-            for tag in tags:
-                swapped_tags.append(self.swap_tag(tag))
             self.stats['total_flips'] += 1
 
         return swapped_tags, True
