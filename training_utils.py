@@ -840,26 +840,32 @@ class TrainingMetricsTracker:
             self.epoch_metrics[key].append(value)
     
     def get_average(self, metric_name: str) -> float:
-        """Get average of recent metric values"""
-        if metric_name in self.metrics and len(self.metrics[metric_name]) > 0:
-            return np.mean(self.metrics[metric_name])
-        return 0.0
+        with self._lock:
+            if metric_name in self.metrics and len(self.metrics[metric_name]) > 0:
+                # Create a copy to avoid issues if deque is modified during mean calculation
+                values = list(self.metrics[metric_name])
+                return np.mean(values)
+            return 0.0
     
     def get_last(self, metric_name: str) -> float:
         """Get last value of metric"""
-        if metric_name in self.metrics and len(self.metrics[metric_name]) > 0:
-            return self.metrics[metric_name][-1]
-        return 0.0
+        with self._lock:
+            if metric_name in self.metrics and len(self.metrics[metric_name]) > 0:
+                return self.metrics[metric_name][-1]
+            return 0.0
     
     def get_summary(self) -> Dict[str, float]:
         """Get summary of all metrics"""
-        summary = {}
-        for key, values in self.metrics.items():
-            if len(values) > 0:
-                summary[f'{key}_avg'] = np.mean(values)
-                summary[f'{key}_std'] = np.std(values)
-                summary[f'{key}_last'] = values[-1]
-        return summary
+        with self._lock:
+            summary = {}
+            for key, values in self.metrics.items():
+                if len(values) > 0:
+                    # Create a copy to avoid issues during statistical calculations
+                    values_copy = list(values)
+                    summary[f'{key}_avg'] = np.mean(values_copy)
+                    summary[f'{key}_std'] = np.std(values_copy)
+                    summary[f'{key}_last'] = values_copy[-1]
+            return summary
     
     def reset(self):
         """Reset metrics"""
