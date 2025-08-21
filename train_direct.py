@@ -245,14 +245,11 @@ def train_with_orientation_tracking():
             logger.warning("Continuing without proper orientation handling (not recommended)")
             config["random_flip_prob"] = 0  # Disable flips
     
-    # Initialize orientation handler for statistics tracking
-    orientation_handler = None
-    if config["random_flip_prob"] > 0 and config.get("orientation_map_path"):
-        orientation_handler = OrientationHandler(
-            mapping_file=config["orientation_map_path"],
-            random_flip_prob=config["random_flip_prob"],
-            strict_mode=config["strict_orientation"],
-            skip_unmapped=config.get("skip_unmapped", False)
+    
+    if config["num_workers"] > 0 and config["random_flip_prob"] > 0:
+        logger.warning(
+            f"WARNING: Orientation statistics will be incomplete with num_workers={config['num_workers']}. "
+            f"Each worker tracks stats independently. For accurate stats, use num_workers=0."
         )
     
     device = torch.device(config["device"])
@@ -309,7 +306,24 @@ def train_with_orientation_tracking():
     )
     
     scaler = GradScaler() if config["amp"] else None
-    
+
+    # Helper function to safely get orientation stats
+    def get_dataset_orientation_stats():
+        """Get orientation stats from the dataset if available."""
+        try:
+            if hasattr(train_loader.dataset, 'get_orientation_stats'):
+                return train_loader.dataset.get_orientation_stats()
+        except Exception as e:
+            logger.debug(f"Could not get orientation stats: {e}")
+        
+        return {
+            'total_flips': 0,
+            'skipped_flips': 0,
+            'flip_rate': 0.0,
+            'has_handler': False,
+            'worker_local': True
+        }
+        
     # Training loop with orientation statistics
     global_step = 0
     orientation_stats_interval = 100  # Log orientation stats every N batches
@@ -362,22 +376,7 @@ def train_with_orientation_tracking():
                     scaler.update()
                 else:
                     optimizer.step()
-                optimizer.zero_grad()
-            
-            # Log orientation statistics periodically
-            if orientation_handler and step % orientation_stats_interval == 0:
-                stats = orientation_handler.get_statistics()
-                logger.info(
-                    f"Orientation stats - Flips: {stats['total_flips']}, "
-                    f"Skipped: {stats['skipped_flips']} ({stats['skip_rate']:.1%}), "
-                    f"Mapped tags: {stats['num_mapped_tags']}, "
-                    f"Unmapped: {stats['num_unmapped_tags']}"
-                )
-                
-                if stats['unmapped_tags_sample']:
-                    logger.warning(
-                        f"Sample of unmapped orientation tags: {stats['unmapped_tags_sample'][:5]}"
-                    )
+                optimizer.zero_grad()       
             
             global_step += 1
         
@@ -409,38 +408,30 @@ def train_with_orientation_tracking():
         
         avg_val_loss = val_loss / max(1, len(val_loader))
         logger.info(f"Epoch {epoch + 1}/{config['num_epochs']}: Avg val loss = {avg_val_loss:.4f}")
+
+        # Log orientation statistics at end of epoch
+        if config["random_flip_prob"] > 0:
+            stats = get_dataset_orientation_stats()
+            if stats['has_handler']:
+                logger.info(
+                    f"Epoch {epoch + 1} orientation stats (worker-local): "
+                    f"Flips: {stats['total_flips']}, "
+                    f"Skipped: {stats['skipped_flips']}, "
+                    f"Flip rate: {stats['flip_rate']:.1%}"
+                )
+                if config["num_workers"] > 0:
+                    logger.info(
+                        "Note: These stats are from the main process only. "
+                        "Actual flip counts across all workers will be higher."
+                    )        
     
-    # Final orientation statistics
-    if orientation_handler:
-        final_stats = orientation_handler.get_statistics()
-        logger.info("\n" + "="*50)
-        logger.info("FINAL ORIENTATION STATISTICS")
-        logger.info("="*50)
-        logger.info(f"Total horizontal flips performed: {final_stats['total_flips']}")
-        logger.info(f"Flips skipped: {final_stats['skipped_flips']}")
-        logger.info(f"Skip rate: {final_stats['skip_rate']:.2%}")
-        logger.info(f"Unique tags mapped: {final_stats['num_mapped_tags']}")
-        logger.info(f"Unique unmapped orientation tags found: {final_stats['num_unmapped_tags']}")
-        
-        if final_stats['unmapped_tags_sample']:
-            logger.warning("\nUnmapped orientation tags (should be added to orientation_map.json):")
-            for tag in final_stats['unmapped_tags_sample']:
-                logger.warning(f"  - {tag}")
-        
-        # Save unmapped tags for future reference
-        if final_stats['num_unmapped_tags'] > 0:
-            unmapped_file = Path("unmapped_orientation_tags.json")
-            with open(unmapped_file, 'w') as f:
-                json.dump({
-                    "unmapped_tags": list(orientation_handler.stats['unmapped_tags']),
-                    "total_count": final_stats['num_unmapped_tags'],
-                    "training_run": {
-                        "epochs": config["num_epochs"],
-                        "flip_prob": config["random_flip_prob"],
-                        "total_flips": final_stats['total_flips']
-                    }
-                }, f, indent=2)
-            logger.info(f"\nSaved unmapped tags to {unmapped_file}")
+    # Log final warning about statistics limitation
+    if config["num_workers"] > 0 and config["random_flip_prob"] > 0:
+        logger.info("\n" + "="*60)
+        logger.info("IMPORTANT: Orientation statistics limitation")
+        logger.info("Statistics shown above are incomplete due to multi-worker data loading.")
+        logger.info("For accurate flip statistics, re-run with num_workers=0")
+        logger.info("="*60)
     
     logger.info("\nTraining complete with orientation-aware augmentation!")
     
