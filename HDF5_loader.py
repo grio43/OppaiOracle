@@ -277,6 +277,7 @@ class SimplifiedDataset(Dataset):
             self.cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
             # Ensure orientation_map_path is a Path object if provided
+            self._orientation_stats = {'flips': 0, 'skipped': 0, 'processed': 0}           
             if config.orientation_map_path and isinstance(config.orientation_map_path, str):
                 config.orientation_map_path = Path(config.orientation_map_path)
             # Initialize orientation handler for flip augmentation
@@ -401,15 +402,13 @@ class SimplifiedDataset(Dataset):
                         tags_list = tags_field
                     else:
                         continue
-                    # Build annotation record
-
-                # Deduplicate tags while preserving order
-                seen = set()
-                deduplicated_tags = []
-                for tag in tags_list:
-                    if tag and tag not in seen:  # Also filter out empty strings
-                        seen.add(tag)
-                        deduplicated_tags.append(tag)
+                    # Deduplicate tags while preserving order
+                    seen = set()
+                    deduplicated_tags = []
+                    for tag in tags_list:
+                        if tag and tag not in seen:  # Also filter out empty strings
+                            seen.add(tag)
+                            deduplicated_tags.append(tag)
 
                     record: Dict[str, Any] = {
                         'image_path': str(self.config.data_dir / filename),
@@ -683,9 +682,13 @@ class SimplifiedDataset(Dataset):
                 swapped_tags, should_flip = self.orientation_handler.handle_complex_tags(tags)
                 if should_flip:
                     image = TF.hflip(image)
-                    tags = swapped_tags
-                    if self.orientation_monitor:
-                        self.orientation_monitor.check_health(self.orientation_handler)
+                    self._orientation_stats['flips'] += 1
+                else:
+                    self._orientation_stats['skipped'] += 1
+                self._orientation_stats['processed'] += 1
+                tags = swapped_tags
+                if self.orientation_monitor:
+                    self.orientation_monitor.check_health(self.orientation_handler)
             # Perform letterbox resize to preserve aspect ratio
             image, lb_info = letterbox_resize(
                 image,
@@ -792,6 +795,39 @@ class SimplifiedDataset(Dataset):
             },
         }
 
+
+    def get_orientation_stats(self) -> Dict[str, Any]:
+        """Get orientation statistics from this dataset instance.
+        
+        Note: In multi-worker settings, these are local to this worker process.
+        Statistics are not aggregated across workers automatically.
+        
+        Returns:
+            Dictionary with orientation statistics
+        """
+        if not hasattr(self, '_orientation_stats'):
+            return {
+                'total_flips': 0,
+                'skipped_flips': 0,
+                'processed_samples': 0,
+                'flip_rate': 0.0,
+                'skip_rate': 0.0,
+                'has_handler': False,
+                'worker_local': True
+            }
+        
+        stats = self._orientation_stats.copy()
+        processed = stats.get('processed', 0)
+        
+        return {
+            'total_flips': stats.get('flips', 0),
+            'skipped_flips': stats.get('skipped', 0),
+            'processed_samples': processed,
+            'flip_rate': stats['flips'] / max(1, processed),
+            'skip_rate': stats['skipped'] / max(1, processed),
+            'has_handler': self.orientation_handler is not None,
+            'worker_local': True  # Flag to indicate these are worker-local stats
+        }
 
 def create_dataloaders(
     data_dir: Path,
