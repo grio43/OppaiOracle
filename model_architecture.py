@@ -39,13 +39,28 @@ class TransformerBlock(nn.Module):
     """Single transformer block"""
     def __init__(self, config: VisionTransformerConfig):
         super().__init__()
+        self.config = config
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.attn = nn.MultiheadAttention(
-            config.hidden_size,
-            config.num_attention_heads,
-            dropout=config.attention_dropout,
-            batch_first=True
-        )
+
+        # Use flash attention if available and requested
+        self.use_flash = config.use_flash_attention and hasattr(F, 'scaled_dot_product_attention')
+        
+        if self.use_flash:
+            # For flash attention, we need separate projection layers
+            self.num_heads = config.num_attention_heads
+            self.head_dim = config.hidden_size // config.num_attention_heads
+            self.qkv = nn.Linear(config.hidden_size, 3 * config.hidden_size)
+            self.proj = nn.Linear(config.hidden_size, config.hidden_size)
+            self.attn_dropout = config.attention_dropout
+        else:
+            # Standard MultiheadAttention
+            self.attn = nn.MultiheadAttention(
+                config.hidden_size,
+                config.num_attention_heads,
+                dropout=config.attention_dropout,
+                batch_first=True
+            )
+
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = nn.Sequential(
             nn.Linear(config.hidden_size, config.intermediate_size),
@@ -57,10 +72,32 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Self-attention with residual
-        x = x + self.attn(
-            self.norm1(x), self.norm1(x), self.norm1(x),
-            key_padding_mask=key_padding_mask
-        )[0]
+        normed_x = self.norm1(x)
+        
+        if self.use_flash:
+            # Flash attention path
+            B, L, D = normed_x.shape
+            qkv = self.qkv(normed_x).reshape(B, L, 3, self.num_heads, self.head_dim)
+            q, k, v = qkv.unbind(2)
+            q = q.transpose(1, 2)  # (B, num_heads, L, head_dim)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            
+            # Use scaled_dot_product_attention with flash backend when available
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=key_padding_mask.unsqueeze(1).unsqueeze(2) if key_padding_mask is not None else None,
+                dropout_p=self.attn_dropout if self.training else 0.0
+            )
+            attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
+            x = x + self.proj(attn_out)
+        else:
+            # Standard attention path
+            x = x + self.attn(
+                normed_x, normed_x, normed_x,
+               key_padding_mask=key_padding_mask
+            )[0]
+      
         # MLP with residual
         x = x + self.mlp(self.norm2(x))
         return x
