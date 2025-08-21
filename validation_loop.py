@@ -117,6 +117,7 @@ class ValidationRunner:
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
         # Logging queue used by workers
         self._log_queue: Optional[mp.Queue] = mp.Queue()
+        self._listener = None  # Initialize listener attribute
 
         # Setup output directory
         self.output_dir = Path(config.output_dir)
@@ -324,6 +325,9 @@ class ValidationRunner:
             'results': results
         })
 
+        # Cleanup logging resources
+        self._cleanup_logging()
+
         # Best-effort worker shutdown for cleanliness
         try:
             dl = None
@@ -339,7 +343,20 @@ class ValidationRunner:
         gc.collect()
 
         return results
-    
+
+    def _cleanup_logging(self):
+        """Clean up logging resources including QueueListener"""
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+                logger.info("QueueListener stopped successfully")
+                self._listener = None
+            except Exception as e:
+                logger.warning(f"Error stopping QueueListener: {e}")
+        # Clear the queue reference
+        self._log_queue = None
+     
+
     def validate_full(self, dataloader: DataLoader) -> Dict[str, Any]:
         """Complete validation with all metrics"""
         logger.info("Running full validation...")
@@ -1011,7 +1028,18 @@ def main():
     for key in ['precision', 'recall', 'f1', 'mAP']:
         if key in results:
             print(f"{results[key]:.4f}")
-    
+
+    # Ensure cleanup happens even if there's an exception
+    try:
+        # Explicitly cleanup if not already done
+        if hasattr(runner, '_cleanup_logging'):
+            runner._cleanup_logging()
+    except Exception as e:
+        print(f"Warning: Error during cleanup: {e}")
+    finally:
+        # Force cleanup of any remaining resources
+        import gc
+        gc.collect()    
 
 if __name__ == '__main__':
     main()
