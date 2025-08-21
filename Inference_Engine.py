@@ -62,8 +62,9 @@ class InferenceConfig:
     
     # Image preprocessing
     image_size: int = 448
-    normalize_mean: List[float] = field(default_factory=lambda: [0.485, 0.456, 0.406])
-    normalize_std: List[float] = field(default_factory=lambda: [0.229, 0.224, 0.225])
+    # Use same normalization as training (anime-optimized, not ImageNet)
+    normalize_mean: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
+    normalize_std: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
     
     # Inference settings
     threshold: float = 0.5
@@ -166,6 +167,7 @@ class ModelWrapper:
         self.device = torch.device(config.device)
         self.model = None
         self.tag_names = []
+        self.normalization_params = None  
         self.use_fp16 = config.use_fp16 and config.device == "cuda"
         
     def load_model(self):
@@ -182,6 +184,17 @@ class ModelWrapper:
             
             # Load checkpoint
             checkpoint = torch.load(self.config.model_path, map_location=self.device)
+            # Load normalization parameters from checkpoint if available
+            if 'normalization_params' in checkpoint:
+                self.normalization_params = checkpoint['normalization_params']
+                # Update config with training normalization parameters
+                self.config.normalize_mean = self.normalization_params['mean']
+                self.config.normalize_std = self.normalization_params['std']
+                logger.info(f"Loaded normalization params from checkpoint: "
+                          f"mean={self.config.normalize_mean}, std={self.config.normalize_std}")
+            else:
+                logger.warning("Normalization params not found in checkpoint. "
+                             "Using config defaults (should match training values)")            
             
             # Extract model configuration from checkpoint or use defaults
             vit_config_dict = checkpoint.get('model_config', {})
@@ -428,6 +441,10 @@ class InferenceEngine:
             self.config,
             self.model_wrapper.tag_names
         )
+
+        # Update preprocessor with loaded normalization params if available
+        if self.model_wrapper.normalization_params:
+            self.preprocessor = ImagePreprocessor(self.config)        
         
         # Setup monitoring
         if self.config.enable_monitoring and MONITORING_AVAILABLE:
@@ -700,10 +717,31 @@ if __name__ == "__main__":
         image_size=640  # Match training image size for ViT
     )
 
+    # Example of what should be saved during training (add to training script):
+    # When saving checkpoint in training script, include normalization params:
+    """
+    # In your training script when saving checkpoint:
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'model_config': vit_config_dict,
+        'normalization_params': {
+            'mean': [0.5, 0.5, 0.5],  # From SimplifiedDataConfig
+            'std': [0.5, 0.5, 0.5]     # From SimplifiedDataConfig
+        },
+        'tag_names': vocab.tag_names,
+        # ... other checkpoint data
+    }
+    torch.save(checkpoint, 'best_model.pth')
+    """
+
     # Example of saving model config during training (should be done in training script)
     # This shows what the config file should contain:
     example_model_config = {
         "tag_names": ["tag1", "tag2", "..."],  # List of all tag names
+        "normalization_params": {
+            "mean": [0.5, 0.5, 0.5],  # Must match training config
+            "std": [0.5, 0.5, 0.5]    # Must match training config  
+        },
         "vit_config": {
             "image_size": 640,
             "patch_size": 16,
