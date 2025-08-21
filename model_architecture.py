@@ -30,6 +30,7 @@ class VisionTransformerConfig:
     attention_dropout: float = 0.1
     layer_norm_eps: float = 1e-6
     use_flash_attention: bool = True
+    padding_mask_keep_threshold: float = 0.9  # Keep patches with >90% valid pixels
     # Enable gradient checkpointing by default to reduce memory usage
     gradient_checkpointing: bool = True
 
@@ -147,7 +148,9 @@ class SimplifiedTagger(nn.Module):
             # Downsample to patch grid via average pooling at patch stride.
             ph = self.config.patch_size
             grid = F.avg_pool2d(pm.unsqueeze(1), kernel_size=ph, stride=ph)  # (B,1,H/ps,W/ps)
-            grid = (grid.squeeze(1) > 0.999)  # True where fully valid (no padding inside patch)
+            # Use configurable threshold - patches with ratio of valid pixels above threshold are kept
+            keep_thresh = self.config.padding_mask_keep_threshold
+            grid = (grid.squeeze(1) > keep_thresh)  # True where sufficiently valid
             token_valid = grid.flatten(1)  # (B, num_patches)
             cls_valid = torch.ones(B, 1, dtype=torch.bool, device=token_valid.device)
             token_valid = torch.cat([cls_valid, token_valid], dim=1)  # include CLS
