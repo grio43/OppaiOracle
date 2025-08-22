@@ -28,7 +28,7 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import _LRScheduler
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import torch.backends.cudnn as cudnn
 
 logger = logging.getLogger(__name__)
@@ -303,7 +303,10 @@ class GradientAccumulator:
         self.max_grad_norm = max_grad_norm
         self.use_amp = use_amp
         
-        self.scaler = GradScaler() if use_amp else None
+        if use_amp and torch.cuda.is_available():
+            self.scaler = GradScaler(device='cuda')
+        else:
+            self.scaler = None
         self.current_step = 0
         
     def backward(self, loss: torch.Tensor, retain_graph: bool = False):
@@ -741,8 +744,11 @@ class MixedPrecisionTrainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
         
-        # Create gradient scaler for FP16
-        self.scaler = GradScaler() if self.use_amp and self.amp_dtype == torch.float16 else None
+        # Create gradient scaler for FP16 with new API
+        if self.use_amp and self.amp_dtype == torch.float16:
+            self.scaler = GradScaler(device='cuda')
+        else:
+            self.scaler = None
     
     def train_step(
         self,
@@ -758,7 +764,8 @@ class MixedPrecisionTrainer:
             Loss value and additional outputs
         """
         # Forward pass with autocast
-        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+        device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+        with autocast(device_type=device_type, enabled=self.use_amp, dtype=self.amp_dtype):
             outputs = model(batch['image'], labels=batch.get('labels'))
             
             if isinstance(outputs, dict):
