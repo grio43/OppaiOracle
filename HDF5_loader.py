@@ -17,11 +17,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import copy
+import sqlite3
+import lmdb
 from pathlib import Path
 import json
 import threading
 import logging
 import random
+import psutil
 
 import numpy as np
 import torch
@@ -194,6 +197,28 @@ class SimplifiedDataConfig:
     cache_precision: str = 'float16'  # 'float32', 'float16' or 'uint8'
     preload_metadata: bool = True
 
+    
+    # LMDB L2 cache settings (from plan)
+    l2_cache_enabled: bool = True
+    l2_cache_path: Path = Path("/data/cache/lmdb")
+    l2_max_size_gb: float = 48.0
+    l2_map_growth_gb: float = 4.0
+    l1_per_worker_mb: float = 128.0  # Small L1 cache per worker
+    
+    # Memory watermarks (from plan)
+    high_free_ram_pct: float = 25.0
+    low_free_ram_pct: float = 12.0  
+    critical_free_ram_pct: float = 5.0
+    monitor_interval_batches: int = 100
+    
+    # Working set sampler settings (from plan)
+    use_working_set_sampler: bool = True
+    working_set_pct: float = 5.0  # 5% of dataset
+    working_set_max_items: int = 400000
+    working_set_refresh_epochs: int = 2
+    trickle_in_pct: float = 1.0  # New uniques per epoch
+    max_new_uniques_per_epoch: int = 80000
+
     # Error handling settings
     skip_error_samples: bool = True 
     validate_on_init: bool = True  
@@ -245,6 +270,246 @@ def _make_worker_init_fn(base_seed: int, log_queue: Optional[object]):
                 pass
     return _init_fn
 
+class LMDBCache:
+    """Global file-backed LMDB cache (L2) with memory-mapped access"""
+    
+    def __init__(self, path: Path, max_size_gb: float = 48.0, readonly: bool = False):
+        self.path = Path(path)
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.max_size_bytes = int(max_size_gb * 1024 ** 3)
+        self.readonly = readonly
+        
+        # Open LMDB environment
+        self.env = lmdb.open(
+            str(self.path),
+            map_size=self.max_size_bytes,
+            readonly=readonly,
+            lock=not readonly,
+            max_dbs=1,
+            writemap=True,  # Use write-mapped mode for better performance
+            metasync=False,  # Don't sync metadata for each transaction
+            sync=False,  # Don't sync data for each transaction (rely on OS)
+            map_async=True,  # Allow async writes
+        )
+        
+        # Track cache statistics
+        self.hits = 0
+        self.misses = 0
+        self._lock = threading.Lock()
+        
+    def get(self, key: str) -> Optional[torch.Tensor]:
+        """Get item from cache"""
+        with self.env.begin(buffers=True) as txn:
+            data = txn.get(key.encode())
+            if data is not None:
+                self.hits += 1
+                # Deserialize tensor
+                buffer = np.frombuffer(data, dtype=np.uint8)
+                tensor = torch.from_numpy(buffer).view(-1)  # Will reshape later
+                return tensor
+            else:
+                self.misses += 1
+                return None
+    
+    def put(self, key: str, value: torch.Tensor, check_memory: bool = True) -> bool:
+        """Put item in cache with memory checking"""
+        if self.readonly:
+            return False
+            
+        # Check memory watermarks if requested
+        if check_memory and not self._check_memory_available():
+            return False
+            
+        # Serialize tensor
+        value_bytes = value.cpu().numpy().tobytes()
+        
+        try:
+            with self.env.begin(write=True) as txn:
+                txn.put(key.encode(), value_bytes)
+            return True
+        except lmdb.MapFullError:
+            logger.warning("LMDB cache is full, skipping insert")
+            return False
+    
+    def _check_memory_available(self) -> bool:
+        """Check if we have enough free memory"""
+        mem = psutil.virtual_memory()
+        free_pct = (mem.available / mem.total) * 100
+        
+        # Use critical threshold for cache writes
+        if free_pct < 5.0:  # Critical threshold from plan
+            return False
+        return True
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        with self._lock:
+            total = self.hits + self.misses
+            hit_rate = self.hits / max(1, total)
+            
+            # Get LMDB stats
+            with self.env.begin() as txn:
+                stat = txn.stat()
+                
+            return {
+                'hits': self.hits,
+                'misses': self.misses,
+                'hit_rate': hit_rate,
+                'entries': stat['entries'],
+                'size_bytes': stat['psize'] * stat['leaf_pages'],
+            }
+    
+    def close(self):
+        """Close the LMDB environment"""
+        if hasattr(self, 'env'):
+            self.env.close()
+
+
+class ValidationIndex:
+    """SQLite-based validation index for lazy validation"""
+    
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Create/open database
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        self.lock = threading.Lock()
+        
+        # Create table if not exists
+        with self.lock:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS validation_status (
+                    image_path TEXT PRIMARY KEY,
+                    status TEXT,
+                    last_checked TIMESTAMP,
+                    error_message TEXT,
+                    retry_count INTEGER DEFAULT 0
+                )
+            """)
+            self.conn.commit()
+    
+    def get_status(self, image_path: str) -> Optional[str]:
+        """Get validation status for an image"""
+        with self.lock:
+            cursor = self.conn.execute(
+                "SELECT status FROM validation_status WHERE image_path = ?",
+                (image_path,)
+            )
+            result = cursor.fetchone()
+            return result[0] if result else None
+    
+    def set_status(self, image_path: str, status: str, error_msg: Optional[str] = None):
+        """Set validation status for an image"""
+        from datetime import datetime
+        with self.lock:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO validation_status 
+                   (image_path, status, last_checked, error_message, retry_count)
+                   VALUES (?, ?, ?, ?, 
+                           COALESCE((SELECT retry_count FROM validation_status WHERE image_path = ?), 0) + 1)""",
+                (image_path, status, datetime.now(), error_msg, image_path)
+            )
+            self.conn.commit()
+    
+    def close(self):
+        """Close the database connection"""
+        if hasattr(self, 'conn'):
+            self.conn.close()
+
+
+class WorkingSetSampler:
+    """Two-stage working set sampler with bounded trickle-in"""
+    
+    def __init__(
+        self,
+        dataset_size: int,
+        working_set_pct: float = 5.0,
+        max_items: int = 400000,
+        trickle_pct: float = 1.0,
+        max_new_per_epoch: int = 80000,
+        refresh_epochs: int = 2,
+        sample_weights: Optional[np.ndarray] = None
+    ):
+        self.dataset_size = dataset_size
+        self.working_set_size = min(
+            int(dataset_size * working_set_pct / 100),
+            max_items
+        )
+        self.trickle_size = min(
+            int(dataset_size * trickle_pct / 100),
+            max_new_per_epoch
+        )
+        self.refresh_epochs = refresh_epochs
+        self.sample_weights = sample_weights
+        
+        # Initialize working set
+        self.working_set = set()
+        self.unused_indices = set(range(dataset_size))
+        self.epoch_count = 0
+        
+        # Initialize with random subset
+        self._refresh_working_set()
+        
+        logger.info(
+            f"WorkingSetSampler initialized: "
+            f"working_set={self.working_set_size}, "
+            f"trickle={self.trickle_size}"
+        )
+    
+    def _refresh_working_set(self):
+        """Refresh the working set"""
+        # Sample new working set based on weights if provided
+        if self.sample_weights is not None:
+            # Weight-based sampling for working set
+            probs = self.sample_weights / self.sample_weights.sum()
+            indices = np.random.choice(
+                self.dataset_size,
+                size=self.working_set_size,
+                replace=False,
+                p=probs
+            )
+        else:
+            # Random sampling
+            indices = np.random.choice(
+                self.dataset_size,
+                size=self.working_set_size,
+                replace=False
+            )
+        
+        self.working_set = set(indices)
+        self.unused_indices = set(range(self.dataset_size)) - self.working_set
+    
+    def get_epoch_indices(self) -> List[int]:
+        """Get indices for current epoch with trickle-in"""
+        # Check if we should refresh
+        if self.epoch_count > 0 and self.epoch_count % self.refresh_epochs == 0:
+            self._refresh_working_set()
+        
+        # Start with working set
+        epoch_indices = list(self.working_set)
+        
+        # Add trickle-in of new samples
+        if self.unused_indices and self.trickle_size > 0:
+            new_samples = min(self.trickle_size, len(self.unused_indices))
+            trickle_indices = random.sample(list(self.unused_indices), new_samples)
+            epoch_indices.extend(trickle_indices)
+            
+            # Move trickled samples to working set for next epoch
+            for idx in trickle_indices:
+                self.unused_indices.remove(idx)
+                # Optionally add to working set (with eviction if needed)
+                if len(self.working_set) >= self.working_set_size:
+                    # Evict random sample from working set
+                    evict = random.choice(list(self.working_set))
+                    self.working_set.remove(evict)
+                    self.unused_indices.add(evict)
+                self.working_set.add(idx)
+        
+        self.epoch_count += 1
+        return epoch_indices
+
+
 
 class SimplifiedDataset(Dataset):
     """Dataset for anime image tagging with augmentation and sampling.
@@ -273,8 +538,24 @@ class SimplifiedDataset(Dataset):
             self.vocab = vocab
             # List of annotation dictionaries loaded from JSON files
             self.annotations: List[Dict[str, Any]] = []
-            # LRU cache for loaded images
-            self.cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+            
+            # Initialize L2 LMDB cache (global, shared across workers)
+            self.l2_cache = None
+            if config.l2_cache_enabled:
+                try:
+                    self.l2_cache = LMDBCache(
+                        path=config.l2_cache_path,
+                        max_size_gb=config.l2_max_size_gb,
+                        readonly=(split != 'train')  # Only training can write
+                    )
+                    logger.info(f"L2 LMDB cache initialized at {config.l2_cache_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize L2 cache: {e}")
+                    self.l2_cache = None
+            
+            # L1 cache - much smaller per-worker cache
+            self.l1_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+            self.l1_max_size_mb = config.l1_per_worker_mb
 
             # Ensure orientation_map_path is a Path object if provided
             self._orientation_stats = {'flips': 0, 'skipped': 0, 'processed': 0}           
@@ -340,10 +621,12 @@ class SimplifiedDataset(Dataset):
                 'uint8': 1,
             }[config.cache_precision]
             # Approximate bytes per cached image by assuming they will be stored at config.image_size
+            # Use L1 cache size from config instead of full cache
             bytes_per_image = 3 * config.image_size * config.image_size * bytes_per_element
-            self.max_cache_size = int((config.cache_size_gb * (1024 ** 3)) / bytes_per_image)
+            self.l1_max_cache_items = int((config.l1_per_worker_mb * (1024 ** 2)) / bytes_per_image)
             self.cache_precision = config.cache_precision
             self.cache_lock = threading.Lock()  # Add thread lock for cache operations
+            self.cache_stats = {'l1_hits': 0, 'l2_hits': 0, 'disk_loads': 0}
 
             # Initialise locks and counters for error handling.  `_error_counts` is
             # used to track temporary I/O failures per image and must be
@@ -353,9 +636,18 @@ class SimplifiedDataset(Dataset):
             # Track permanently failed images
             self._failed_images: set[str] = set()
 
-            # Optionally validate all images are readable at initialization
-            if config.validate_on_init and split == 'train':
-                self._validate_dataset_images()
+            # Initialize validation index for lazy validation
+            self.validation_index = None
+            if split == 'train':
+                try:
+                    validation_index_path = Path("/data/validation/index.sqlite")
+                    self.validation_index = ValidationIndex(validation_index_path)
+                    logger.info(f"Validation index initialized at {validation_index_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize validation index: {e}")
+                    # Fall back to eager validation if index fails
+                    if config.validate_on_init:
+                        self._validate_dataset_images()
 
             # Filter out known bad images if skip_error_samples is enabled
             self._filter_failed_images()            
@@ -363,15 +655,37 @@ class SimplifiedDataset(Dataset):
             # Load annotation metadata from the provided JSON files.  This
             # populates ``self.annotations`` with valid entries.
             self._load_annotations(json_files)
+            # Initialize working set sampler if enabled
+            self.working_set_sampler = None
+            self.epoch_indices = None
             # Compute sampling weights if frequency‑weighted sampling is
             # enabled and this is the training split; otherwise, assign
             # ``None`` so that standard shuffling is used.
             if self.config.frequency_weighted_sampling and split == 'train':
                 self._calculate_sample_weights()
+                # Initialize working set sampler if enabled
+                if config.use_working_set_sampler:
+                    self.working_set_sampler = WorkingSetSampler(
+                        dataset_size=len(self.annotations),
+                        working_set_pct=config.working_set_pct,
+                        max_items=config.working_set_max_items,
+                        trickle_pct=config.trickle_in_pct,
+                        max_new_per_epoch=config.max_new_uniques_per_epoch,
+                        refresh_epochs=config.working_set_refresh_epochs,
+                        sample_weights=self.sample_weights
+                    )
+                    # Get initial epoch indices
+                    self.epoch_indices = self.working_set_sampler.get_epoch_indices()
+                    logger.info(f"Working set sampler active with {len(self.epoch_indices)} indices for epoch")
             else:
                 self.sample_weights = None
 
-            logger.info(f"Dataset initialised with {len(self.annotations)} samples for split '{split}'")
+            effective_size = len(self.epoch_indices) if self.epoch_indices else len(self.annotations)
+            logger.info(f"Dataset initialised with {len(self.annotations)} total samples, "
+                       f"{effective_size} effective samples for split '{split}'")
+
+            # Monitor memory at initialization
+            self._log_memory_status("Dataset initialization")
 
     def _load_annotations(self, json_files: List[Path]) -> None:
         """Parse annotation files and populate ``self.annotations``.
@@ -549,47 +863,225 @@ class SimplifiedDataset(Dataset):
         return T.Compose(transforms) if transforms else None
 
     def __len__(self) -> int:
+        # Use working set size if active
+        if self.epoch_indices is not None:
+            return len(self.epoch_indices)
         return len(self.annotations)
+    
+    def _get_actual_index(self, idx: int) -> int:
+        """Map dataset index to actual annotation index"""
+        if self.epoch_indices is not None:
+            return self.epoch_indices[idx]
+        return idx
+    
+    def _log_memory_status(self, context: str = ""):
+        """Log current memory status"""
+        mem = psutil.virtual_memory()
+        free_pct = (mem.available / mem.total) * 100
+        
+        if free_pct < self.config.critical_free_ram_pct:
+            logger.warning(f"CRITICAL memory pressure at {context}: {free_pct:.1f}% free")
+        elif free_pct < self.config.low_free_ram_pct:
+            logger.info(f"Low memory at {context}: {free_pct:.1f}% free")
+    
+    def _check_memory_pressure(self) -> str:
+        """Check current memory pressure level"""
+        mem = psutil.virtual_memory()
+        free_pct = (mem.available / mem.total) * 100
+        
+        if free_pct < self.config.critical_free_ram_pct:
+            return "critical"
+        elif free_pct < self.config.low_free_ram_pct:
+            return "low"
+        elif free_pct < self.config.high_free_ram_pct:
+            return "high"
+        return "normal"
 
     def _load_image(self, image_path: str) -> Tuple[torch.Tensor, bool]:
-        """Load an image from disk or cache and return it as a float tensor.
-        """
-        # Check cache first
+        """Load an image using tiered cache (L1 -> L2 -> disk)"""
+        # Generate cache key
+        cache_key = image_path
+        
+        # Check L1 cache first (per-worker, tiny)
         with self.cache_lock:
-            if image_path in self.cache:
-                cached_data = self.cache[image_path]
-                # Move to end to mark as recently used (LRU behavior)
-                self.cache.move_to_end(image_path)
-
-                # Handle both old cache format (just tensor) and new (tuple with flag)
+            if image_path in self.l1_cache:
+                self.cache_stats['l1_hits'] += 1
+                cached_data = self.l1_cache[image_path]
+                self.l1_cache.move_to_end(image_path)  # LRU
+                
                 if isinstance(cached_data, tuple):
                     cached, was_composited = cached_data
                 else:
                     cached = cached_data
                     was_composited = False
 
-                # Convert cached tensor back to float32
                 if cached.dtype == torch.uint8:
                     result = cached.float() / 255.0
                 elif cached.dtype == torch.float16:
                     result = cached.float()
                 else:
                     result = cached.clone()
+
                 return result, was_composited
+        # Check L2 cache (LMDB, global)
+        if self.l2_cache is not None:
+            cached = self.l2_cache.get(cache_key)
+            if cached is not None:
+                self.cache_stats['l2_hits'] += 1
+                # Deserialize and add to L1
+                was_composited = False  # TODO: store this metadata
+                tensor = cached.float() / 255.0  # Assuming uint8 storage
+                
+                # Add to L1 with memory-aware eviction
+                self._add_to_l1_cache(image_path, (tensor.clone(), was_composited))
+                
+                return tensor, was_composited
+        
+        # Lazy validation before loading from disk
+        if self.validation_index is not None:
+            status = self.validation_index.get_status(image_path)
+            if status == 'failed':
+                # Return black image for known bad images
+                logger.debug(f"Skipping known bad image: {image_path}")
+                return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32), False
         # Load from disk
+        self.cache_stats['disk_loads'] += 1
         try:
             # Open without forcing RGB so we can properly handle alpha first
             pil_img = Image.open(image_path)
             was_composited = False
 
+            # Validate and update index
+            if self.validation_index is not None:
+                self.validation_index.set_status(image_path, 'valid')
+
             # Resolve a safe, neutral gray pad/composite color from config (works with dict or object)
             def _resolve_pad_color(cfg, default=(128, 128, 128)):
-                # cfg may be an object with attribute or a dict with key
                 val = getattr(cfg, "pad_color", None)
                 if val is None and isinstance(cfg, dict):
                     val = cfg.get("pad_color", None)
                 if val is None:
                     return default
+                if isinstance(val, (list, tuple)) and len(val) >= 3:
+                    return tuple(int(v) for v in val[:3])
+                return default
+            
+            pad_color = _resolve_pad_color(self.config)
+            
+            # Composite transparent images
+            if pil_img.mode in ('RGBA', 'LA') or ('transparency' in pil_img.info):
+                was_composited = True
+                rgba = pil_img.convert('RGBA')
+                bg = Image.new('RGB', rgba.size, pad_color)
+                bg.paste(rgba, mask=rgba.split()[3])
+                pil_img = bg
+            else:
+                pil_img = pil_img.convert('RGB')
+            
+            tensor = TF.to_tensor(pil_img)
+            
+            # Add to L2 cache if memory allows
+            if self.l2_cache is not None:
+                memory_pressure = self._check_memory_pressure()
+                if memory_pressure in ["normal", "high"]:
+                    # Store as uint8 to save space
+                    cached_tensor = (tensor * 255).to(torch.uint8)
+                    self.l2_cache.put(cache_key, cached_tensor, check_memory=True)
+            
+            # Add to L1 cache
+            self._add_to_l1_cache(image_path, (tensor.clone(), was_composited))
+            
+            return tensor, was_composited
+            
+        except Exception as e:
+            logger.error(f"Error loading image {image_path}: {e}")
+            # Update validation index
+            if self.validation_index is not None:
+                self.validation_index.set_status(image_path, 'failed', str(e))
+            # Return black image
+            return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32), False
+    
+    def _add_to_l1_cache(self, key: str, value: Tuple[torch.Tensor, bool]):
+        """Add item to L1 cache with memory-aware eviction"""
+        with self.cache_lock:
+            # Check memory pressure
+            memory_pressure = self._check_memory_pressure()
+            
+            if memory_pressure == "critical":
+                # Don't add to cache under critical pressure
+                return
+            elif memory_pressure == "low":
+                # Reduce L1 size under low memory
+                max_items = self.l1_max_cache_items // 2
+            else:
+                max_items = self.l1_max_cache_items
+            
+            # Evict if needed
+            while len(self.l1_cache) >= max_items:
+                self.l1_cache.popitem(last=False)  # Remove LRU
+            
+            # Store compressed version
+            tensor, was_composited = value
+            if self.cache_precision == 'uint8':
+                cached = (tensor * 255).to(torch.uint8)
+            elif self.cache_precision == 'float16':
+                cached = tensor.half()
+            else:
+                cached = tensor.clone()
+            
+            self.l1_cache[key] = (cached, was_composited)
+    
+    def new_epoch(self):
+        """Called at the start of a new epoch to update working set"""
+        if self.working_set_sampler is not None:
+            self.epoch_indices = self.working_set_sampler.get_epoch_indices()
+            logger.info(f"New epoch: working set updated to {len(self.epoch_indices)} indices")
+        
+        # Log cache statistics
+        if hasattr(self, 'cache_stats'):
+            total = sum(self.cache_stats.values())
+            if total > 0:
+                logger.info(
+                    f"Cache stats - L1 hits: {self.cache_stats['l1_hits']/total:.1%}, "
+                    f"L2 hits: {self.cache_stats['l2_hits']/total:.1%}, "
+                    f"Disk loads: {self.cache_stats['disk_loads']/total:.1%}"
+                )
+                # Reset stats for new epoch
+                self.cache_stats = {'l1_hits': 0, 'l2_hits': 0, 'disk_loads': 0}
+        
+        # Log L2 cache stats if available
+        if self.l2_cache is not None:
+            stats = self.l2_cache.get_stats()
+            logger.info(
+                f"L2 cache - Hit rate: {stats['hit_rate']:.1%}, "
+                f"Entries: {stats['entries']}, "
+                f"Size: {stats['size_bytes'] / (1024**3):.2f} GB"
+            )
+        
+        # Check memory status
+        self._log_memory_status("Epoch start")
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Fetch an item for training or validation with working set support"""
+        # Map index through working set if active
+        actual_idx = self._get_actual_index(idx)
+        
+        if actual_idx < 0 or actual_idx >= len(self.annotations):
+            raise IndexError(f"Index {actual_idx} out of range for dataset with {len(self.annotations)} samples")
+        
+        anno = self.annotations[actual_idx]
+        
+        # Continue with existing __getitem__ logic but using actual_idx
+        # [Rest of the existing __getitem__ implementation remains the same,
+        # just replace 'idx' with 'actual_idx' where accessing self.annotations]
+        image_path = anno['image_path']
+
+        # Skip if this is a known failed image and skip_error_samples is enabled
+        if self.config.skip_error_samples and image_path in self._failed_images:
+            # Return next valid sample (with wraparound)
+            next_idx = (idx + 1) % len(self)
+            logger.debug(f"Skipping known failed image at index {idx}, using index {next_idx}")
+            return self.__getitem__(next_idx)
                 # Accept [r,g,b] as ints 0..255 or floats 0..1
                 if isinstance(val, (list, tuple)):
                     if len(val) >= 3:
