@@ -59,6 +59,7 @@ def setup_orientation_aware_training(
     orientation_map_path: Optional[Path] = None,
     random_flip_prob: float = 0.2,
     strict_orientation: bool = True,
+    safety_mode: str = "conservative",
     skip_unmapped: bool = False
 ) -> Dict[str, Any]:
     """
@@ -112,6 +113,7 @@ def setup_orientation_aware_training(
                 mapping_file=orientation_map_path,
                 random_flip_prob=random_flip_prob,
                 strict_mode=strict_orientation,
+                safety_mode=safety_mode,
                 skip_unmapped=skip_unmapped
             )
             
