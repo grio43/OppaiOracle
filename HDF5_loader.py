@@ -946,6 +946,18 @@ class SimplifiedDataset(Dataset):
                 return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32), False
         # Load from disk
         self.cache_stats['disk_loads'] += 1
+        
+        # Helper function to resolve pad color
+        def _resolve_pad_color(cfg, default=(128, 128, 128)):
+            val = getattr(cfg, "pad_color", None)
+            if val is None and isinstance(cfg, dict):
+                val = cfg.get("pad_color", None)
+            if val is None:
+                return default
+            if isinstance(val, (list, tuple)) and len(val) >= 3:
+                return tuple(int(v) for v in val[:3])
+            return default
+        
         try:
             # Open without forcing RGB so we can properly handle alpha first
             pil_img = Image.open(image_path)
@@ -954,17 +966,6 @@ class SimplifiedDataset(Dataset):
             # Validate and update index
             if self.validation_index is not None:
                 self.validation_index.set_status(image_path, 'valid')
-
-            # Resolve a safe, neutral gray pad/composite color from config (works with dict or object)
-            def _resolve_pad_color(cfg, default=(128, 128, 128)):
-                val = getattr(cfg, "pad_color", None)
-                if val is None and isinstance(cfg, dict):
-                    val = cfg.get("pad_color", None)
-                if val is None:
-                    return default
-                if isinstance(val, (list, tuple)) and len(val) >= 3:
-                    return tuple(int(v) for v in val[:3])
-                return default
             
             pad_color = _resolve_pad_color(self.config)
             
@@ -1061,77 +1062,6 @@ class SimplifiedDataset(Dataset):
         # Check memory status
         self._log_memory_status("Epoch start")
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Fetch an item for training or validation with working set support"""
-        # Map index through working set if active
-        actual_idx = self._get_actual_index(idx)
-        
-        if actual_idx < 0 or actual_idx >= len(self.annotations):
-            raise IndexError(f"Index {actual_idx} out of range for dataset with {len(self.annotations)} samples")
-        
-        anno = self.annotations[actual_idx]
-        
-        # Continue with existing __getitem__ logic but using actual_idx
-        # [Rest of the existing __getitem__ implementation remains the same,
-        # just replace 'idx' with 'actual_idx' where accessing self.annotations]
-        image_path = anno['image_path']
-
-        # Skip if this is a known failed image and skip_error_samples is enabled
-        if self.config.skip_error_samples and image_path in self._failed_images:
-            # Return next valid sample (with wraparound)
-            next_idx = (idx + 1) % len(self)
-            logger.debug(f"Skipping known failed image at index {idx}, using index {next_idx}")
-            return self.__getitem__(next_idx)
-                # Accept [r,g,b] as ints 0..255 or floats 0..1
-                if isinstance(val, (list, tuple)):
-                    if len(val) >= 3:
-                        # If all floats in [0,1], scale to [0,255]
-                        if all(isinstance(v, float) for v in val) and all(0.0 <= v <= 1.0 for v in val[:3]):
-                            return tuple(int(round(255.0 * v)) for v in val[:3])
-                        return tuple(int(v) for v in val[:3])
-                if isinstance(val, int):
-                    return (val, val, val)
-                return default
-
-            pad_color = _resolve_pad_color(self.config)
-
-            # Composite transparent images with error handling
-            try:
-                if pil_img.mode in ('RGBA', 'LA') or ('transparency' in pil_img.info):
-                    was_composited = True  # Mark that we're compositing
-                    rgba = pil_img.convert('RGBA')
-                    bg = Image.new('RGB', rgba.size, pad_color)
-                    bg.paste(rgba, mask=rgba.split()[3])  # use alpha as mask
-                    pil_img = bg  # now RGB on neutral gray background
-                else:
-                    pil_img = pil_img.convert('RGB')
-            except Exception as e:
-                logger.warning(f"Alpha compositing failed for {image_path}, converting to RGB directly: {e}")
-                pil_img = pil_img.convert('RGB')
-                was_composited = False
-
-            tensor = TF.to_tensor(pil_img)  # float32 in [0, 1]
-
-            # Add to cache with LRU eviction if needed (atomic operation)
-            with self.cache_lock:
-                if self.cache_precision == 'uint8':
-                    cached_tensor = (tensor * 255).to(torch.uint8)
-                elif self.cache_precision == 'float16':
-                    cached_tensor = tensor.half()
-                else:
-                    cached_tensor = tensor.clone()
-
-                if len(self.cache) >= self.max_cache_size:
-                    # Remove the least recently used item (first item in OrderedDict)
-                    self.cache.popitem(last=False)
-                # Store as tuple with composite flag
-                self.cache[image_path] = (cached_tensor, was_composited)
-
-            return tensor, was_composited
-        except Exception as e:
-            logger.error(f"Error loading image {image_path}: {e}")
-            # Return black image to avoid crashing caller
-            return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32), False
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Fetch an item for training or validation.
@@ -1151,9 +1081,14 @@ class SimplifiedDataset(Dataset):
             IndexError: If index is out of bounds
             RuntimeError: If critical error occurs during processing
         """
-        if idx < 0 or idx >= len(self.annotations):
-            raise IndexError(f"Index {idx} out of range for dataset with {len(self.annotations)} samples")
-        anno = self.annotations[idx]
+        # Map index through working set if active
+        actual_idx = self._get_actual_index(idx)
+        
+        if actual_idx < 0 or actual_idx >= len(self.annotations):
+            raise IndexError(f"Index {actual_idx} out of range for dataset with {len(self.annotations)} samples")
+        
+        # Use actual_idx instead of idx when accessing annotations
+        anno = self.annotations[actual_idx]
         image_path = anno['image_path']
 
         # Skip if this is a known failed image and skip_error_samples is enabled
@@ -1248,7 +1183,7 @@ class SimplifiedDataset(Dataset):
                     'rating': rating_label,
                 },
                 'metadata': {
-                    'index': idx,
+                    'index': actual_idx,  # Use actual_idx for the true dataset index
                     'path': anno['image_path'],
                     'num_tags': len(tags),  # Updated count
                     'tags': tags,  # Updated tags
