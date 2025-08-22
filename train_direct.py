@@ -188,21 +188,32 @@ def train_with_orientation_tracking():
     if torch.cuda.is_available():
         ws = os.getenv("CUBLAS_WORKSPACE_CONFIG")
         if ws not in (":4096:8", ":16:8"):
-            raise RuntimeError(
-                "Deterministic mode is enabled, but CUBLAS_WORKSPACE_CONFIG is not set "
-                "to ':4096:8' (preferred) or ':16:8'. Set it in your shell before "
-                "launching Python, e.g.:\n\n"
-                "    export CUBLAS_WORKSPACE_CONFIG=:4096:8\n\n"
-                "Alternatively, run via scripts/run_train_deterministic.sh"
+            # Automatically set the environment variable for deterministic behavior
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+            logger.info(
+                "Setting CUBLAS_WORKSPACE_CONFIG=:4096:8 for deterministic cuBLAS operations. "
+                "To avoid this message, set the environment variable before running:\n"
+                "    export CUBLAS_WORKSPACE_CONFIG=:4096:8\n"
+                "Or run via: scripts/run_train_deterministic.sh"
             )
-   
+        else:
+            logger.info(f"Using existing CUBLAS_WORKSPACE_CONFIG={ws}")
+    
+    # Add configuration option for deterministic mode
+    deterministic_mode = config.get("deterministic_mode", True)
+    if not deterministic_mode:
+        logger.info("Deterministic mode disabled - training may have slight variations between runs")
+    
 
     seed = 42
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     try:
-        torch.use_deterministic_algorithms(True)  # raise if an op is nondeterministic
+        if deterministic_mode:
+            torch.use_deterministic_algorithms(True)  # raise if an op is nondeterministic
+        else:
+            torch.use_deterministic_algorithms(False)
     except Exception:
         pass
     try:
