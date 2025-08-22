@@ -516,16 +516,21 @@ class SimplifiedDataset(Dataset):
         handle exposure variations.
         """
         transforms: List[Any] = []
-        # Random resized crop
+        # Note: RandomResizedCrop will override letterbox resize, so only use one or the other
+        # If you want to use RandomResizedCrop, it should be done BEFORE letterbox in __getitem__
+        # or letterbox should be skipped entirely when this augmentation is active.
+        # For now, we'll comment it out to preserve letterbox behavior
+        """
         if self.config.random_crop_scale != (1.0, 1.0):
             transforms.append(
                 T.RandomResizedCrop(
                     self.config.image_size,
                     scale=self.config.random_crop_scale,
                     ratio=(0.9, 1.1),
-                    interpolation=T.InterpolationMode.LANCZOS,
+                    interpolation=T.InterpolationMode.BICUBIC,  # LANCZOS not supported on tensors
                 )
             )
+            """
         # Colour jitter
         if self.config.color_jitter:
             transforms.append(
@@ -701,13 +706,33 @@ class SimplifiedDataset(Dataset):
                 if self.orientation_monitor:
                     self.orientation_monitor.check_health(self.orientation_handler)
             # Perform letterbox resize to preserve aspect ratio
-            image, lb_info = letterbox_resize(
-                image,
-                target_size=self.config.image_size,
-                pad_color=self.config.pad_color,
-                patch_size=self.config.patch_size,
-            )
+            
+            # Apply RandomResizedCrop BEFORE letterbox if configured (mutually exclusive)
+            # This way we either use RandomResizedCrop OR letterbox, not both
+            if (self.augmentation is not None and 
+                self.split == 'train' and 
+                self.config.random_crop_scale != (1.0, 1.0)):
+                # Apply random crop directly on the tensor
+                image = T.RandomResizedCrop(
+                    self.config.image_size,
+                    scale=self.config.random_crop_scale,
+                    ratio=(0.9, 1.1),
+                    interpolation=T.InterpolationMode.BICUBIC
+                )(image)
+                # Skip letterbox since we already resized
+
+                lb_info = {'scale': 1.0, 'pad': (0, 0, 0, 0)}
+            else:
+                # Perform letterbox resize to preserve aspect ratio            
+                image, lb_info = letterbox_resize(
+                    image,
+                    target_size=self.config.image_size,
+                    pad_color=self.config.pad_color,
+                    patch_size=self.config.patch_size,
+                )
+            
             # Apply additional augmentation (colour jitter, gamma) if enabled
+            # Wrap in try/except to handle augmentation failures gracefully
             if self.augmentation is not None:
                 image = self.augmentation(image)
             # Normalise

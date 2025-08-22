@@ -14,7 +14,7 @@ import random
 import torch.distributed as dist
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import numpy as np
 
 # Import the orientation handler
@@ -309,7 +309,11 @@ def train_with_orientation_tracking():
         weight_decay=config["weight_decay"]
     )
     
-    scaler = GradScaler() if config["amp"] else None
+    # Use new torch.amp API with explicit device
+    if config["amp"] and torch.cuda.is_available():
+        scaler = GradScaler(device='cuda')
+    else:
+        scaler = None if not config["amp"] else GradScaler(device='cpu')
 
     # Helper function to safely get orientation stats
     def get_dataset_orientation_stats():
