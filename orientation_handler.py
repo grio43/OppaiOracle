@@ -192,7 +192,10 @@ class OrientationHandler:
     def _find_unmapped_orientation_tags(self, tags: List[str]) -> Set[str]:
         """Find orientation tags that don't have mappings."""
         unmapped = set()
-        orientation_keywords = ['left', 'right', 'asymmetric', 'single_', 'heterochromia']
+        # Only tags with explicit left/right directionality need mapping
+        # Tags like 'asymmetric', 'single_', etc. don't change meaning when flipped
+        # so they don't need mappings at all
+        orientation_keywords = ['left', 'right']
         
         for tag in tags:
             # Skip if it's symmetric or already has explicit mapping
@@ -201,7 +204,10 @@ class OrientationHandler:
             
             # Check if tag contains orientation keywords
             if any(keyword in tag for keyword in orientation_keywords):
-                # Check if it matches any regex pattern
+                # Skip tags that contain left/right but are actually style descriptors
+                # that don't change with orientation
+                if any(skip in tag for skip in ['asymmetric', 'single_']):
+                    continue
                 matched = False
                 for regex_data in self.regex_patterns:
                     if regex_data['pattern'].match(tag):
