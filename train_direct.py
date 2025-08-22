@@ -5,6 +5,7 @@ Demonstrates integration of the orientation handler with fail-fast behavior and 
 """
 
 import logging
+import os
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -156,8 +157,8 @@ def train_with_orientation_tracking():
         "warmup_steps": 10_000,
         "weight_decay": 0.01,
         "label_smoothing": 0.05,
-        "data_dir": Path("data/images"),
-        "json_dir": Path("data/annotations"),
+        "data_dir": Path("/media/andrewk/qnap-public/docker/workspace/shard_00022/"),
+        "json_dir": Path("/media/andrewk/qnap-public/docker/workspace/shard_00022/"),
         "vocab_path": Path("vocabulary.json"),
         "num_workers": 4,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -181,6 +182,21 @@ def train_with_orientation_tracking():
     }
     
     # Seeding & determinism BEFORE spawning workers/loaders
+    # Enforce deterministic cuBLAS workspace requirement (CUDA >= 10.2)
+    # NOTE: This environment variable must be set *before* any cuBLAS kernels run.
+    # If it isn't set here, abort early with a clear message instead of failing deep in backward().
+    if torch.cuda.is_available():
+        ws = os.getenv("CUBLAS_WORKSPACE_CONFIG")
+        if ws not in (":4096:8", ":16:8"):
+            raise RuntimeError(
+                "Deterministic mode is enabled, but CUBLAS_WORKSPACE_CONFIG is not set "
+                "to ':4096:8' (preferred) or ':16:8'. Set it in your shell before "
+                "launching Python, e.g.:\n\n"
+                "    export CUBLAS_WORKSPACE_CONFIG=:4096:8\n\n"
+                "Alternatively, run via scripts/run_train_deterministic.sh"
+            )
+   
+
     seed = 42
     random.seed(seed)
     np.random.seed(seed)
@@ -309,11 +325,18 @@ def train_with_orientation_tracking():
         weight_decay=config["weight_decay"]
     )
     
-    # Use new torch.amp API with explicit device
-    if config["amp"] and torch.cuda.is_available():
-        scaler = GradScaler(device='cuda')
+    # AMP setup (prefer BF16 on modern NVIDIA GPUs like Blackwell when available)
+    is_cuda = config["device"].startswith("cuda") and torch.cuda.is_available()
+    device_type = "cuda" if is_cuda else "cpu"
+    # DTYPE: BF16 on CUDA if supported; BF16 on CPU; otherwise FP16
+    if is_cuda and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+    elif device_type == "cpu":
+        amp_dtype = torch.bfloat16
     else:
-        scaler = None if not config["amp"] else GradScaler(device='cpu')
+        amp_dtype = torch.float16
+    # GradScaler is only needed for FP16 on CUDA
+    scaler = GradScaler(device='cuda') if (config["amp"] and is_cuda and amp_dtype == torch.float16) else None
 
     # Helper function to safely get orientation stats
     def get_dataset_orientation_stats():
@@ -348,7 +371,7 @@ def train_with_orientation_tracking():
             
             # Forward pass with mixed precision
             if config["amp"]:
-                with autocast():
+                with autocast(device_type=device_type, enabled=True, dtype=amp_dtype):
                     pmask = batch.get('padding_mask', None)
                     if pmask is not None:
                         pmask = pmask.to(device)
@@ -360,7 +383,10 @@ def train_with_orientation_tracking():
                         rating_labels,
                         sample_weights=None
                     )
-                scaler.scale(loss).backward()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
             else:
                 pmask = batch.get('padding_mask', None)
                 if pmask is not None:
@@ -379,7 +405,7 @@ def train_with_orientation_tracking():
             
             # Gradient accumulation
             if (step + 1) % config["gradient_accumulation"] == 0:
-                if config["amp"]:
+                if config["amp"] and scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
