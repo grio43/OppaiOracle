@@ -147,6 +147,18 @@ def train_with_orientation_tracking():
     """Training loop with orientation handling and statistics tracking."""
     
     # All required modules are imported at module load time; ImportErrors are raised immediately.
+
+    # Set up logger early so it's available for all messages
+    import logging
+    from logging.handlers import QueueListener
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    log_queue = mp.Queue()
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(formatter)
+    sh.setLevel(logging.INFO)
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    logger.addHandler(sh)
     
     # Enhanced configuration with orientation handling
     config = {
@@ -223,16 +235,7 @@ def train_with_orientation_tracking():
     except Exception:
         pass
 
-    # Queue-based, rank-safe logging
-    from logging.handlers import QueueListener
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    log_queue = mp.Queue()
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(formatter)
-    sh.setLevel(logging.INFO)
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    logger.addHandler(sh)
+    # Set up file logging for primary process
 
     is_primary = True
     try:
