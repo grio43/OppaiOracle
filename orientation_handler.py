@@ -25,7 +25,8 @@ class OrientationHandler:
         self,
         mapping_file: Optional[Path] = None,
         random_flip_prob: float = 0.0,
-        strict_mode: bool = True,
+        strict_mode: bool = False,  # Changed default to False
+        safety_mode: str = "conservative",  # New: "conservative", "balanced", "permissive"
         skip_unmapped: bool = False
     ):
         """
@@ -35,10 +36,12 @@ class OrientationHandler:
             mapping_file: Path to JSON file with orientation mappings
             random_flip_prob: Probability of random horizontal flips
             strict_mode: If True, fail if flips are enabled but no mapping provided
+            safety_mode: How conservative to be about flipping
             skip_unmapped: If True, skip flipping images with unmapped orientation tags
         """
         self.random_flip_prob = random_flip_prob
         self.strict_mode = strict_mode
+        self.safety_mode = safety_mode
         self.skip_unmapped = skip_unmapped
         
         # Initialize mappings
@@ -55,7 +58,12 @@ class OrientationHandler:
             'skipped_flips': 0,
             'unmapped_tags': set(),
             'unmapped_tag_frequency': {},  # Track how often each unmapped tag appears
-            'mapped_tags': set()
+            'mapped_tags': set(),
+            'blocked_by_text': 0,
+            'blocked_by_safety': 0,
+            'safe_flips': 0,
+            'images_analyzed': 0,
+            'unmapped_blocking_frequency': {}  # Track which unmapped tags block flips
         }
         self._stats_lock = threading.Lock()
         
@@ -157,6 +165,73 @@ class OrientationHandler:
         ]
         
         logger.warning("Using minimal default orientation mappings")
+
+    def can_safely_flip(self, tags: List[str]) -> Tuple[bool, List[str]]:
+        """
+        Determine if an image can be safely flipped using conservative logic.
+       
+        Args:
+            tags: List of tags for the image
+            
+        Returns:
+            Tuple of (can_flip, list_of_reasons)
+        """
+        reasons = []
+        
+        # Track that we analyzed this image
+        with self._stats_lock:
+            self.stats['images_analyzed'] += 1
+        
+        # 1. NEVER flip if text/watermarks present
+        if any(tag in self.skip_flip_tags for tag in tags):
+            with self._stats_lock:
+                self.stats['blocked_by_text'] += 1
+            return False, ["Contains text/watermark/signature"]
+        
+        # 2. Check safety mode
+        if self.safety_mode == "conservative":
+            # Only flip if we have explicit mappings for ALL orientation tags
+            orientation_indicators = ['left', 'right', 'facing', 'looking', 'pointing', 
+                                     'turned', 'profile', 'view_from']
+            
+            orientation_tags = []
+            for tag in tags:
+                # More precise: only tags that truly indicate orientation
+                if any(indicator in tag.lower() for indicator in orientation_indicators):
+                    # Skip false positives
+                    if any(skip in tag for skip in ['copyright', 'bright', 'upright', 
+                                                     'straight', 'light', 'fight']):
+                        continue
+                    # Skip style descriptors that don't need flipping
+                    if any(skip in tag for skip in ['asymmetric', 'single_']):
+                        continue
+                    orientation_tags.append(tag)
+            
+            # If NO orientation tags → SAFE to flip
+            if not orientation_tags:
+                with self._stats_lock:
+                    self.stats['safe_flips'] += 1
+                return True, ["No orientation-specific tags found"]
+            
+            # Check if ALL orientation tags are mapped
+            unmapped = []
+            for tag in orientation_tags:
+                swapped = self.swap_tag(tag)
+                if swapped == tag:  # No mapping found
+                    unmapped.append(tag)
+            
+            if unmapped:
+                with self._stats_lock:
+                    self.stats['blocked_by_safety'] += 1
+                    for tag in unmapped:
+                        self.stats['unmapped_blocking_frequency'][tag] = \
+                            self.stats['unmapped_blocking_frequency'].get(tag, 0) + 1
+                return False, [f"Unmapped orientation tags: {unmapped[:3]}..."]
+        
+        # All checks passed
+        with self._stats_lock:
+            self.stats['safe_flips'] += 1
+        return True, ["All orientation tags have mappings"]
     
     def should_skip_flip(self, tags: List[str]) -> bool:
         """
@@ -168,29 +243,20 @@ class OrientationHandler:
         Returns:
             True if flip should be skipped
         """
-        # Check for tags that should never be flipped (text, signatures, etc.)
-        if any(tag in self.skip_flip_tags for tag in tags):
+        # Use the new safety logic
+        can_flip, reasons = self.can_safely_flip(tags)
+        
+        if not can_flip:
             with self._stats_lock:
                 self.stats['skipped_flips'] += 1
-            logger.debug(f"Skipping flip due to skip_flip_tag present")
+            logger.debug(f"Skipping flip: {reasons[0]}")
             return True
-        
-        # Second check: if skip_unmapped is enabled, check for unmapped orientation tags
-        if self.skip_unmapped:
-            unmapped = self._find_unmapped_orientation_tags(tags)
-            if unmapped:
-                with self._stats_lock:
-                    self.stats['skipped_flips'] += 1
-                    self.stats['unmapped_tags'].update(unmapped)
-                    for tag in unmapped:
-                        self.stats['unmapped_tag_frequency'][tag] = self.stats['unmapped_tag_frequency'].get(tag, 0) + 1
-                logger.debug(f"Skipping flip due to unmapped orientation tags: {unmapped}")
-                return True
         
         return False
     
     def _find_unmapped_orientation_tags(self, tags: List[str]) -> Set[str]:
-        """Find orientation tags that don't have mappings."""
+        """Find orientation tags that don't have mappings.
+        NOTE: This method is being phased out in favor of can_safely_flip."""
         unmapped = set()
         # Only tags with explicit left/right directionality need mapping
         # Tags like 'asymmetric', 'single_', etc. don't change meaning when flipped
@@ -381,11 +447,17 @@ class OrientationHandler:
             'conflicting_patterns': []
         }
         
-        orientation_indicators = ['left', 'right', 'asymmetric', 'single_']
+        # CHANGED: Only validate tags that actually need orientation mapping
+        # Skip asymmetric and single_ as they don't need mapping
+        orientation_indicators = ['left', 'right', 'facing', 'looking', 'pointing']
+        skip_indicators = ['asymmetric', 'single_', 'copyright', 'bright', 'upright']
         
         for tag in all_tags:
             # Check if this might be an orientation tag
             if any(indicator in tag for indicator in orientation_indicators):
+                # Skip false positives and style descriptors
+                if any(skip in tag for skip in skip_indicators):
+                    continue                
                 # Skip if it's known to be symmetric
                 if tag in self.symmetric_tags:
                     continue
@@ -483,7 +555,13 @@ class OrientationHandler:
             'num_mapped_tags': num_mapped,
             'num_unmapped_tags': num_unmapped,
             'unmapped_tags_sample': unmapped_sample,
-            'unmapped_tags_by_frequency': unmapped_by_freq
+            'unmapped_tags_by_frequency': unmapped_by_freq,
+            'flip_safety_stats': {
+                'blocked_by_text': self.stats.get('blocked_by_text', 0),
+                'blocked_by_safety': self.stats.get('blocked_by_safety', 0),
+                'safe_flips': self.stats.get('safe_flips', 0),
+                'images_analyzed': self.stats.get('images_analyzed', 0)
+            }
         }
 
     def get_statistics(self) -> Dict[str, any]:
@@ -536,6 +614,66 @@ class OrientationHandler:
         """
         stats = self.get_usage_statistics()
         return stats['num_unmapped_tags'] <= max_unmapped_threshold
+
+    def generate_safety_report(self, output_path: Optional[Path] = None) -> Dict[str, any]:
+        """
+        Generate a comprehensive safety report for flip decisions.
+        
+        Args:
+            output_path: Optional path to save the report
+            
+        Returns:
+            Dictionary containing the safety report
+        """
+        with self._stats_lock:
+            stats = self.stats.copy()
+        
+        total_analyzed = stats.get('images_analyzed', 1)  # Avoid division by zero
+        
+        report = {
+            'summary': {
+                'total_images_analyzed': total_analyzed,
+                'images_safely_flipped': stats.get('safe_flips', 0),
+                'images_blocked_by_text': stats.get('blocked_by_text', 0),
+                'images_blocked_by_unmapped': stats.get('blocked_by_safety', 0),
+                'total_flips_performed': stats.get('total_flips', 0),
+                'flip_rate': stats.get('safe_flips', 0) / total_analyzed,
+                'block_rate': stats.get('skipped_flips', 0) / total_analyzed
+            },
+            'top_blocking_tags': sorted(
+                stats.get('unmapped_blocking_frequency', {}).items(),
+                key=lambda x: x[1],
+                reverse=True
+            )[:50],
+            'recommendations': self._generate_recommendations(stats)
+        }
+        
+        if output_path:
+            with open(output_path, 'w') as f:
+                json.dump(report, f, indent=2)
+            logger.info(f"Safety report saved to {output_path}")
+        
+        return report
+    
+    def _generate_recommendations(self, stats: Dict) -> List[str]:
+        """Generate actionable recommendations based on statistics."""
+        recommendations = []
+        
+        blocking_freq = stats.get('unmapped_blocking_frequency', {})
+        if blocking_freq:
+            top_blockers = sorted(blocking_freq.items(), key=lambda x: x[1], reverse=True)[:10]
+            total_blocked = sum(count for _, count in top_blockers)
+            recommendations.append(
+                f"Adding mappings for top 10 tags would unblock ~{total_blocked} images: "
+                f"{', '.join(tag for tag, _ in top_blockers[:5])}"
+            )
+        
+        if stats.get('blocked_by_text', 0) > stats.get('safe_flips', 0):
+            recommendations.append(
+                "Many images contain text/watermarks. Consider filtering these from training set."
+            )
+        
+        return recommendations
 
 
 class OrientationMonitor:

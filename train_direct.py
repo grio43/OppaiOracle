@@ -163,8 +163,9 @@ def train_with_orientation_tracking():
         # Orientation-specific settings
         "random_flip_prob": 0.2,  # 20% chance of horizontal flip
         "orientation_map_path": Path("configs/orientation_map.json"),
-        "strict_orientation": True,  # Fail if orientation map missing
-        "skip_unmapped": False,  # Don't skip images with unmapped tags
+        "strict_orientation": False,  # Changed: Don't fail on unmapped tags
+        "skip_unmapped": True,  # Changed: DO skip unmapped for safety
+        "orientation_safety_mode": "conservative",  # New: safe by default
         "log_orientation_stats": True,
         # Model configuration
         "model_config": {
@@ -227,6 +228,7 @@ def train_with_orientation_tracking():
             orientation_map_path=config.get("orientation_map_path"),
             random_flip_prob=config["random_flip_prob"],
             strict_orientation=config["strict_orientation"],
+            safety_mode=config.get("orientation_safety_mode", "conservative"),
             skip_unmapped=config.get("skip_unmapped", False)
         )
         
@@ -424,7 +426,21 @@ def train_with_orientation_tracking():
                         "Note: These stats are from the main process only. "
                         "Actual flip counts across all workers will be higher."
                     )        
+    # Generate and save flip safety report if requested
+    if config.get("generate_flip_report", False):
+        try:
+            if hasattr(train_loader.dataset, 'orientation_handler'):
+                handler = train_loader.dataset.orientation_handler
+                if handler:
+                    report_path = Path("flip_safety_report.json")
+                    report = handler.generate_safety_report(report_path)
+                    logger.info(f"Flip safety report saved to {report_path}")
+                    logger.info(f"Flip rate: {report['summary']['flip_rate']:.1%}")
+                    logger.info(f"Block rate: {report['summary']['block_rate']:.1%}")
+        except Exception as e:
+            logger.warning(f"Could not generate flip safety report: {e}")
     
+
     # Log final warning about statistics limitation
     if config["num_workers"] > 0 and config["random_flip_prob"] > 0:
         logger.info("\n" + "="*60)
