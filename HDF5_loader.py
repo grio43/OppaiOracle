@@ -298,7 +298,12 @@ class SimplifiedDataset(Dataset):
                     # Validate mappings and log any issues
                     validation_issues = self.orientation_handler.validate_dataset_tags(all_tags)
                     if validation_issues:
-                        logger.warning(f"Orientation mapping validation issues: {validation_issues}")
+                        # Changed: More informative warning
+                        num_unmapped = len(validation_issues.get('unmapped_orientation_tags', []))
+                        logger.warning(
+                            f"Found {num_unmapped} orientation tags without mappings. "
+                            f"These images will be skipped for flipping in conservative mode."
+                        )
 
                         # Save validation report for review
                         from pathlib import Path as _Path  # avoid namespace confusion in compiled docs
@@ -307,9 +312,15 @@ class SimplifiedDataset(Dataset):
                             json.dump(validation_issues, f, indent=2)
                         logger.info(f"Saved validation report to {validation_report_path}")
 
-                        # Optionally fail if strict validation is enabled
+                        # Changed: Only fail if strict mode AND issues are truly critical
                         if hasattr(config, 'strict_orientation_validation') and config.strict_orientation_validation:
-                            raise ValueError(f"Critical orientation mapping issues found. Check {validation_report_path}")
+                            # Don't fail for unmapped tags in conservative mode
+                            if not config.skip_unmapped:
+                                raise ValueError(
+                                    f"Critical: Found {num_unmapped} unmapped orientation tags "
+                                    f"but skip_unmapped=False. Either set skip_unmapped=True "
+                                    f"or add mappings. Check {validation_report_path}"
+                                )
                 else:
                     self.precomputed_mappings = None
 
