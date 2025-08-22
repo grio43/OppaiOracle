@@ -17,9 +17,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import copy
+import multiprocessing as mp
 import sqlite3
 import lmdb
 from pathlib import Path
+import hashlib
 import json
 import threading
 import logging
@@ -30,6 +32,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler
 import torchvision.transforms as T
+from logging.handlers import RotatingFileHandler, QueueHandler
 import torchvision.transforms.functional as TF
 from PIL import Image
 
@@ -220,6 +223,14 @@ class SimplifiedDataConfig:
     max_new_uniques_per_epoch: int = 80000
 
     # Error handling settings
+    # Cache budget and admission control
+    l2_max_value_mb: float = 32.0  # Max size per cached item
+    l2_grace_margin_pct: float = 5.0  # Grace margin for capacity
+    canonical_cache_dtype: str = 'uint8'  # Canonical storage format
+    
+    # Frequency weighting limits
+    max_weight_multiplier: float = 5.0  # Clip extreme weights
+    weight_warmup_epochs: int = 2  # Warmup before full weighting
     skip_error_samples: bool = True 
     validate_on_init: bool = True  
 
@@ -295,7 +306,12 @@ class LMDBCache:
         # Track cache statistics
         self.hits = 0
         self.misses = 0
+        self.duplicate_keys = 0
+        self.rejection_count = 0
+        self.size_bytes = 0
         self._lock = threading.Lock()
+        self.grace_margin = 0.05  # 5% grace margin
+        self.max_value_bytes = int(32 * 1024 * 1024)  # 32MB max per value
         
     def get(self, key: str) -> Optional[torch.Tensor]:
         """Get item from cache"""
@@ -313,15 +329,44 @@ class LMDBCache:
     
     def put(self, key: str, value: torch.Tensor, check_memory: bool = True) -> bool:
         """Put item in cache with memory checking"""
-        if self.readonly:
-            return False
+        with self._lock:
+            if self.readonly:
+                return False
             
-        # Check memory watermarks if requested
-        if check_memory and not self._check_memory_available():
-            return False
+            # Check if key already exists (track duplicates)
+            with self.env.begin(buffers=True) as txn:
+                if txn.get(key.encode()) is not None:
+                    self.duplicate_keys += 1
+                    return True  # Already cached
             
-        # Serialize tensor
-        value_bytes = value.cpu().numpy().tobytes()
+            # Serialize tensor with canonical dtype
+            if value.dtype != torch.uint8:
+                # Convert to canonical dtype for consistent sizing
+                value = (value * 255).to(torch.uint8) if value.dtype.is_floating_point else value.to(torch.uint8)
+            
+            value_np = value.cpu().numpy()
+            value_bytes = value_np.tobytes()
+            
+            # Check value size limit
+            if len(value_bytes) > self.max_value_bytes:
+                logger.warning(f"Value too large ({len(value_bytes)/1024/1024:.1f}MB > {self.max_value_bytes/1024/1024:.1f}MB), rejecting")
+                self.rejection_count += 1
+                return False
+            
+            # Check capacity with grace margin
+            with self.env.begin() as txn:
+                stat = txn.stat()
+                current_size = stat['psize'] * stat['leaf_pages']
+                
+            max_allowed = self.max_size_bytes * (1 - self.grace_margin)
+            if current_size + len(value_bytes) > max_allowed:
+                logger.warning(f"Cache approaching capacity limit with grace margin, rejecting insert")
+                self.rejection_count += 1
+                return False
+            
+            # Check memory watermarks if requested
+            if check_memory and not self._check_memory_available():
+                return False
         
         try:
             with self.env.begin(write=True) as txn:
@@ -336,9 +381,18 @@ class LMDBCache:
         mem = psutil.virtual_memory()
         free_pct = (mem.available / mem.total) * 100
         
-        # Use critical threshold for cache writes
-        if free_pct < 5.0:  # Critical threshold from plan
+        # Three-tier watermark system
+        if free_pct < 5.0:  # Critical
+            logger.warning(f"Critical memory pressure: {free_pct:.1f}% free")
             return False
+        elif free_pct < 12.0:  # Low
+            # Throttle writes
+            import time
+            time.sleep(0.01)  # Small delay to reduce pressure
+            return True
+        elif free_pct < 25.0:  # High
+            # Continue but monitor closely
+            return True
         return True
     
     def get_stats(self) -> Dict[str, Any]:
@@ -355,8 +409,11 @@ class LMDBCache:
                 'hits': self.hits,
                 'misses': self.misses,
                 'hit_rate': hit_rate,
+                'duplicate_keys': self.duplicate_keys,
+                'duplicate_rate': self.duplicate_keys / max(1, self.hits + self.misses),
                 'entries': stat['entries'],
                 'size_bytes': stat['psize'] * stat['leaf_pages'],
+                'rejections': self.rejection_count,
             }
     
     def close(self):
@@ -509,6 +566,28 @@ class WorkingSetSampler:
         self.epoch_count += 1
         return epoch_indices
 
+def _compute_cache_key(
+    image_path: str,
+    transform_signature: Optional[str] = None,
+    target_shape: Optional[Tuple[int, ...]] = None,
+    dtype: Optional[str] = None
+) -> str:
+    """
+    Compute deduplicated cache key including transform parameters.
+    """
+    key_parts = [image_path]
+    
+    if transform_signature:
+        key_parts.append(f"transform_{transform_signature}")
+    if target_shape:
+        key_parts.append(f"shape_{target_shape}")
+    if dtype:
+        key_parts.append(f"dtype_{dtype}")
+    
+    # Create hash for compact key
+    key_str = "|".join(str(p) for p in key_parts)
+    return hashlib.md5(key_str.encode()).hexdigest()
+
 
 
 class SimplifiedDataset(Dataset):
@@ -555,12 +634,17 @@ class SimplifiedDataset(Dataset):
             
             # L1 cache - much smaller per-worker cache
             self.l1_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+            self.l1_cache_bytes = 0  # Track actual bytes in L1
             self.l1_max_size_mb = config.l1_per_worker_mb
+            self.l1_min_size_mb = 32  # Minimum L1 size when shrinking
 
             # Ensure orientation_map_path is a Path object if provided
             self._orientation_stats = {'flips': 0, 'skipped': 0, 'processed': 0}           
             if config.orientation_map_path and isinstance(config.orientation_map_path, str):
                 config.orientation_map_path = Path(config.orientation_map_path)
+            # RSS tracking for stability monitoring
+            self.epoch_rss_history = []
+            self.current_epoch = 0
             # Initialize orientation handler for flip augmentation
             # Only needed for training split when flips are enabled
             if split == 'train' and config.random_flip_prob > 0:
@@ -808,10 +892,6 @@ class SimplifiedDataset(Dataset):
                     has_orientation_tag = True
             # Average over number of tags to avoid biasing multi‑tag images
             w = w / max(1, len(anno['tags']))
-            # Apply orientation oversample factor if needed
-            if has_orientation_tag:
-                w *= self.config.orientation_oversample_factor
-            weights.append(w)
         weights_arr = np.array(weights, dtype=np.float64)
         # Normalise weights to sum to one
         weights_arr = weights_arr / weights_arr.sum() if weights_arr.sum() > 0 else weights_arr
@@ -899,8 +979,14 @@ class SimplifiedDataset(Dataset):
 
     def _load_image(self, image_path: str) -> Tuple[torch.Tensor, bool]:
         """Load an image using tiered cache (L1 -> L2 -> disk)"""
-        # Generate cache key
-        cache_key = image_path
+        # Generate deduplicated cache key with transform signature
+        transform_sig = f"size{self.config.image_size}_norm{hash(self.config.normalize_mean)}"
+        cache_key = _compute_cache_key(
+            image_path,
+            transform_signature=transform_sig,
+            target_shape=(3, self.config.image_size, self.config.image_size),
+            dtype=self.config.canonical_cache_dtype
+        )
         
         # Check L1 cache first (per-worker, tiny)
         with self.cache_lock:
@@ -1010,19 +1096,35 @@ class SimplifiedDataset(Dataset):
             
             if memory_pressure == "critical":
                 # Don't add to cache under critical pressure
+                logger.debug(f"Critical memory: skipping L1 cache add")
                 return
             elif memory_pressure == "low":
                 # Reduce L1 size under low memory
-                max_items = self.l1_max_cache_items // 2
+                target_mb = max(self.l1_min_size_mb, self.l1_max_size_mb // 2)
+                max_bytes = target_mb * 1024 * 1024
+            elif memory_pressure == "high":
+                # Slightly reduce L1 under high memory
+                target_mb = self.l1_max_size_mb * 0.75
+                max_bytes = target_mb * 1024 * 1024
             else:
-                max_items = self.l1_max_cache_items
+                max_bytes = self.l1_max_size_mb * 1024 * 1024
             
             # Evict if needed
-            while len(self.l1_cache) >= max_items:
-                self.l1_cache.popitem(last=False)  # Remove LRU
+            tensor, was_composited = value
+            
+            # Calculate actual bytes for this tensor
+            tensor_bytes = tensor.element_size() * tensor.numel()
+            
+            # Evict until we have space
+            while self.l1_cache_bytes + tensor_bytes > max_bytes and len(self.l1_cache) > 0:
+                evicted_key, evicted_value = self.l1_cache.popitem(last=False)  # Remove LRU
+                if isinstance(evicted_value, tuple):
+                    evicted_tensor = evicted_value[0]
+                else:
+                    evicted_tensor = evicted_value
+                self.l1_cache_bytes -= evicted_tensor.element_size() * evicted_tensor.numel()
             
             # Store compressed version
-            tensor, was_composited = value
             if self.cache_precision == 'uint8':
                 cached = (tensor * 255).to(torch.uint8)
             elif self.cache_precision == 'float16':
@@ -1031,12 +1133,35 @@ class SimplifiedDataset(Dataset):
                 cached = tensor.clone()
             
             self.l1_cache[key] = (cached, was_composited)
+            self.l1_cache_bytes += cached.element_size() * cached.numel()
+
     
     def new_epoch(self):
         """Called at the start of a new epoch to update working set"""
+        self.current_epoch += 1
+        
+        # Track RSS for stability monitoring
+        mem = psutil.Process().memory_info()
+        current_rss_gb = mem.rss / (1024**3)
+        self.epoch_rss_history.append(current_rss_gb)
+        
+        # Check RSS stability over last 3 epochs
+        if len(self.epoch_rss_history) >= 3:
+            recent_rss = self.epoch_rss_history[-3:]
+            rss_variation = (max(recent_rss) - min(recent_rss)) / max(recent_rss) * 100
+            
+            if rss_variation > 10:
+                logger.warning(f"RSS variation over last 3 epochs: {rss_variation:.1f}% (target <=10%)")
+            else:
+                logger.info(f"RSS stable: {rss_variation:.1f}% variation over last 3 epochs")
+  
         if self.working_set_sampler is not None:
             self.epoch_indices = self.working_set_sampler.get_epoch_indices()
             logger.info(f"New epoch: working set updated to {len(self.epoch_indices)} indices")
+
+            # Track unique IDs
+            unique_ratio = len(set(self.epoch_indices)) / len(self.epoch_indices)
+            logger.info(f"Unique sample ratio: {unique_ratio:.1%}")
         
         # Log cache statistics
         if hasattr(self, 'cache_stats'):
@@ -1056,9 +1181,15 @@ class SimplifiedDataset(Dataset):
             logger.info(
                 f"L2 cache - Hit rate: {stats['hit_rate']:.1%}, "
                 f"Entries: {stats['entries']}, "
-                f"Size: {stats['size_bytes'] / (1024**3):.2f} GB"
+                f"Size: {stats['size_bytes'] / (1024**3):.2f} GB, "
+                f"Duplicate rate: {stats['duplicate_rate']:.1%}"
             )
-        
+
+            # Check L2 size within cap
+            size_pct = (stats['size_bytes'] / (self.config.l2_max_size_gb * 1024**3)) * 100
+            if size_pct > 103:  # 3% tolerance
+                logger.warning(f"L2 cache size {size_pct:.1f}% of cap (target <=103%)")        
+
         # Check memory status
         self._log_memory_status("Epoch start")
 
@@ -1307,15 +1438,81 @@ def create_dataloaders(
     seed: Optional[int] = None,
     log_queue: Optional[object] = None,
     force_val_persistent_workers: bool = False,
+    pin_memory_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[DataLoader, DataLoader, TagVocabulary]:
-    """Construct training and validation dataloaders along with the vocabulary.
-
-    Splits JSON annotation files into 90 % training and 10 % validation.  If a
-    vocabulary file exists it is loaded; otherwise it is built from all
-    annotations and saved.  The returned validation batch size defaults to
-    ``batch_size`` if not explicitly provided.  Both dataloaders use a
-    custom collate function defined below.
-    """
+    """Construct training and validation dataloaders with enhanced memory control."""
+    
+    # Set up bounded logging queue if needed
+    if log_queue is None:
+        log_queue = mp.Queue(maxsize=5000)  # Bounded queue
+        
+        # Configure worker logging with rotation
+        def setup_worker_logging(worker_id):
+            """Setup per-worker rotating log files"""
+            worker_log_dir = Path("/logs/workers")
+            worker_log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create rotating file handler
+            log_file = worker_log_dir / f"worker_{worker_id}.log"
+            handler = RotatingFileHandler(
+                log_file,
+                maxBytes=64 * 1024 * 1024,  # 64MB
+                backupCount=5,
+                encoding='utf-8'
+            )
+            handler.setLevel(logging.INFO)
+            
+            # Attach queue handler for main process
+            queue_handler = QueueHandler(log_queue)
+            queue_handler.setLevel(logging.INFO)
+            
+            logger = logging.getLogger()
+            logger.addHandler(handler)
+            logger.addHandler(queue_handler)
+    
+    # Default pin memory config
+    if pin_memory_config is None:
+        pin_memory_config = {
+            'enabled': torch.cuda.is_available(),
+            'prefetch_factor': 2,
+            'max_inflight_per_worker': 2,
+            'global_max_inflight': 16,
+            'adaptive': True,
+        }
+    
+    # Adaptive prefetch controller
+    class PrefetchController:
+        """Controls prefetch factor based on memory pressure"""
+        def __init__(self, config):
+            self.config = config
+            self.original_prefetch = config['prefetch_factor']
+            self.cooldown_counter = 0
+            
+        def check_and_adapt(self, loader):
+            """Adapt prefetch based on memory pressure"""
+            mem = psutil.virtual_memory()
+            free_pct = (mem.available / mem.total) * 100
+            
+            if free_pct < 5 and self.config['enabled']:
+                # Emergency unpin
+                logger.warning(f"Critical memory ({free_pct:.1f}%), disabling pinned memory")
+                loader.pin_memory = False
+                self.cooldown_counter = 300
+            elif free_pct < 15 and loader.prefetch_factor > 1:
+                # Reduce prefetch
+                logger.info(f"Low memory ({free_pct:.1f}%), reducing prefetch")
+                loader.prefetch_factor = 1
+            elif free_pct > 20 and self.cooldown_counter == 0:
+                # Restore settings
+                loader.prefetch_factor = self.original_prefetch
+                if self.config['enabled']:
+                    loader.pin_memory = True
+            
+            if self.cooldown_counter > 0:
+                self.cooldown_counter -= 1
+    
+    prefetch_controller = PrefetchController(pin_memory_config)
+    
     json_files = list(json_dir.glob("*.json"))
     if not json_files:
         raise ValueError(f"No JSON files found in {json_dir}")
@@ -1379,7 +1576,8 @@ def create_dataloaders(
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=pin_memory_config['enabled'],
+        prefetch_factor=pin_memory_config['prefetch_factor'],
         drop_last=True,
         persistent_workers=True if num_workers > 0 else False,
         collate_fn=collate_fn,
@@ -1391,13 +1589,17 @@ def create_dataloaders(
         batch_size=val_bs,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=pin_memory_config['enabled'],
+        prefetch_factor=1,  # Conservative for validation
         drop_last=False,
         persistent_workers=(num_workers > 0 and force_val_persistent_workers),
         collate_fn=collate_fn,
         worker_init_fn=worker_init_fn,
         generator=generator,
     )
+    # Attach prefetch controller to loaders
+    train_loader._prefetch_controller = prefetch_controller
+
     return train_loader, val_loader, vocab
 
 
