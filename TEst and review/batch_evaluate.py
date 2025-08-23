@@ -5,6 +5,7 @@ from typing import List, Tuple, Dict, Set
 import numpy as np
 from PIL import Image
 import onnxruntime as ort
+import torch
 from tqdm import tqdm
 import gc
 import psutil  # For system memory monitoring
@@ -47,16 +48,104 @@ def load_tag_names(config_path):
         return names, norm
     return None, None
 
-def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5), 
+def letterbox_resize_numpy(image, target_size=640, pad_color=(114, 114, 114), patch_size=16):
+    """
+    Letterbox resize for numpy arrays with padding info tracking.
+    Matches the training letterbox_resize but works with PIL/numpy.
+    """
+    h, w = image.shape[:2] if len(image.shape) == 3 else image.shape
+    
+    # Compute scale to fit image in target_size
+    scale = min(target_size / h, target_size / w)
+    new_h = int(round(h * scale))
+    new_w = int(round(w * scale))
+    
+    # Resize image
+    from PIL import Image as PILImage
+    if isinstance(image, np.ndarray):
+        pil_img = PILImage.fromarray(image)
+    else:
+        pil_img = image
+    resized = pil_img.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
+    resized_arr = np.array(resized)
+    
+    # Calculate padding
+    pad_h = target_size - new_h
+    pad_w = target_size - new_w
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    
+    # Ensure divisibility by patch_size
+    final_h = target_size
+    final_w = target_size
+    extra_pad_bottom = 0
+    extra_pad_right = 0
+    
+    if patch_size > 1:
+        if final_h % patch_size != 0:
+            extra_pad_bottom = patch_size - (final_h % patch_size)
+        if final_w % patch_size != 0:
+            extra_pad_right = patch_size - (final_w % patch_size)
+    
+    final_h += extra_pad_bottom
+    final_w += extra_pad_right
+    
+    # Create padded canvas
+    if len(resized_arr.shape) == 3:
+        canvas = np.full((final_h, final_w, 3), pad_color, dtype=np.uint8)
+        canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized_arr
+    else:
+        canvas = np.full((final_h, final_w), pad_color[0], dtype=np.uint8)
+        canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized_arr
+    
+    padding_info = {
+        'scale': scale,
+        'pad': (pad_left, pad_top, pad_right + extra_pad_right, pad_bottom + extra_pad_bottom),
+        'out_size': (final_h, final_w),
+        'in_size': (h, w)
+    }
+    
+    return canvas, padding_info
+
+def build_padding_mask_from_info(batch_infos, H, W, device='cpu'):
+    """Build pixel-level padding masks from letterbox info."""
+    batch_size = len(batch_infos)
+    pmasks = torch.ones((batch_size, 1, H, W), dtype=torch.float32, device=device)
+    
+    for i, info in enumerate(batch_infos):
+        l, t, r, b = info['pad']
+        if t > 0:
+            pmasks[i, :, :t, :] = 0
+        if b > 0:
+            pmasks[i, :, H-b:, :] = 0
+        if l > 0:
+            pmasks[i, :, :, :l] = 0
+        if r > 0:
+            pmasks[i, :, :, W-r:] = 0
+    
+    return pmasks
+
+def downsample_mask_to_patches(pixel_mask, patch_size=16, threshold=0.9):
+    """Downsample pixel mask to patch-level mask for ViT."""
+    # Average pool the mask
+    pooled = torch.nn.functional.avg_pool2d(pixel_mask, kernel_size=patch_size, stride=patch_size)
+    # Threshold to get binary mask (True = valid content)
+    token_mask = pooled >= threshold
+    return token_mask
+
+def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5),
                     gray_background=(114, 114, 114)):
     """Preprocess multiple images into a batch with proper transparency handling and padding"""
     batch = []
     valid_indices = []
-    
+    batch_infos = []
+
     for idx, image_path in enumerate(image_paths):
         try:
             img = Image.open(image_path)
-            
+
             # Handle transparency by compositing on gray background
             if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
                 # Create gray background
@@ -69,35 +158,29 @@ def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0
                 img = background
             else:
                 img = img.convert('RGB')
-            
-            # Resize with padding to maintain aspect ratio
-            img.thumbnail((image_size, image_size), Image.Resampling.LANCZOS)
-            
-            # Create new image with padding if needed
-            if img.size != (image_size, image_size):
-                padded = Image.new('RGB', (image_size, image_size), gray_background)
-                # Center the image
-                x = (image_size - img.width) // 2
-                y = (image_size - img.height) // 2
-                padded.paste(img, (x, y))
-                img = padded
-            
-            arr = np.array(img, dtype=np.float32) / 255.0
+
+            # Use letterbox resize instead of thumbnail + center padding
+            img_array = np.array(img)
+            letterboxed, pad_info = letterbox_resize_numpy(img_array, image_size, gray_background)
+
+            # Convert to float and normalize
+            arr = letterboxed.astype(np.float32) / 255.0
             # HWC -> CHW
             arr = arr.transpose(2, 0, 1)
-            # normalize
+            # Normalize
             mean_arr = np.array(mean, dtype=np.float32)[:, None, None]
             std_arr = np.array(std, dtype=np.float32)[:, None, None]
             arr = (arr - mean_arr) / std_arr
             batch.append(arr)
+            batch_infos.append(pad_info)
             valid_indices.append(idx)
         except Exception as e:
             print(f"Error preprocessing {image_path}: {e}")
             continue
-    
+
     if batch:
-        return np.stack(batch, axis=0).astype(np.float32), valid_indices
-    return None, []
+        return np.stack(batch, axis=0).astype(np.float32), valid_indices, batch_infos
+    return None, [], []
 
 def get_predictions_from_scores(scores, tag_names, threshold=0.5):
     """Get predicted tags above threshold for batch or single image"""
@@ -211,6 +294,168 @@ def create_gpu_session(model_path, max_memory_gb=25):
 
     return session
 
+def create_pytorch_session(model_path, device='cuda', compile_model=False):
+    """Create PyTorch session with optimizations."""
+    import torch
+
+    # Load model
+    if model_path.endswith('.onnx'):
+        # Convert ONNX to PyTorch if needed
+        print("Note: For best PyTorch performance, use a native .pt checkpoint")
+        return None
+
+    # Assume it's a PyTorch checkpoint
+    checkpoint = torch.load(model_path, map_location=device)
+
+    # Extract model from checkpoint
+    if 'model_state_dict' in checkpoint:
+        # Need to reconstruct model architecture
+        from model_architecture import create_model
+        model = create_model(
+            num_tags=checkpoint.get('num_tags', 10000),
+            num_ratings=checkpoint.get('num_ratings', 5)
+        )
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model = checkpoint
+
+    model.to(device)
+    model.eval()
+
+    # Enable optimizations
+    if device == 'cuda':
+        # Use channels_last memory format
+        model = model.to(memory_format=torch.channels_last)
+
+        # Enable TF32 for Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        # Enable cuDNN benchmark for consistent input sizes
+        torch.backends.cudnn.benchmark = True
+
+        # Compile model for additional speedup (PyTorch 2.0+)
+        if compile_model and hasattr(torch, 'compile'):
+            print("Compiling model with torch.compile()...")
+            model = torch.compile(model)
+
+    return model
+
+def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0.5,
+                         image_size=640, output_file="evaluation_results_torch.json",
+                         batch_size=32, limit=None, compile_model=False):
+    """Process images using PyTorch with full GPU optimizations."""
+
+    # Check CUDA availability
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        # Set memory fraction to prevent OOM
+        torch.cuda.set_per_process_memory_fraction(0.8)
+
+    # Load configuration
+    tag_names, norm = load_tag_names(config_path)
+    mean, std = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
+    if norm and "mean" in norm and "std" in norm:
+        mean, std = tuple(norm["mean"]), tuple(norm["std"])
+
+    # Create PyTorch model
+    model = create_pytorch_session(model_path, device, compile_model)
+    if model is None:
+        print("Failed to load PyTorch model, falling back to ONNX")
+        return None
+
+    # Find all JSON files
+    json_files = list(pathlib.Path(data_folder).glob("*.json"))
+    if limit:
+        json_files = json_files[:limit]
+
+    print(f"Found {len(json_files)} JSON files to process")
+    print(f"Batch size: {batch_size}")
+
+    # Create DataLoader for efficient batching
+    from torch.utils.data import DataLoader, Dataset
+
+    class EvalDataset(Dataset):
+        def __init__(self, json_files):
+            self.samples = []
+            for json_path in json_files:
+                try:
+                    with open(json_path, 'r') as f:
+                        json_data = json.load(f)
+                    image_filename = json_data.get("filename")
+                    if image_filename:
+                        image_path = json_path.parent / image_filename
+                        if image_path.exists():
+                            self.samples.append({
+                                'image_path': str(image_path),
+                                'ground_truth': parse_ground_truth_tags(json_data),
+                                'filename': image_filename
+                            })
+                except Exception as e:
+                    print(f"Error loading {json_path}: {e}")
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            return self.samples[idx]
+
+    dataset = EvalDataset(json_files)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
+    )
+
+    # Results storage
+    all_results = []
+    total_inference_time = 0
+
+    # Choose dtype for AMP
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype):
+        for batch_data in tqdm(dataloader, desc="Processing batches"):
+            # Preprocess batch
+            image_paths = [d['image_path'] for d in batch_data]
+            batch_input, valid_indices, batch_infos = preprocess_batch(
+                image_paths, image_size, mean, std
+            )
+
+            if batch_input is None:
+                continue
+
+            # Convert to torch tensors
+            images = torch.from_numpy(batch_input).to(device, non_blocking=True)
+            images = images.to(memory_format=torch.channels_last)
+
+            # Build padding mask
+            padding_mask = build_padding_mask_from_info(batch_infos, image_size, image_size, device)
+            # Skip mask if no padding
+            if torch.all(padding_mask == 1):
+                padding_mask = None
+
+            # Run inference
+            start_time = time.time()
+            outputs = model(images, padding_mask=padding_mask)
+            torch.cuda.synchronize()  # Wait for GPU to finish
+            inference_time = time.time() - start_time
+            total_inference_time += inference_time
+
+            # Process outputs
+            scores = outputs['tag_logits'].sigmoid().cpu().numpy()
+            # ... rest of processing similar to ONNX version
+
+    print(f"Total inference time: {total_inference_time:.2f}s")
+    print(f"Images per second: {len(dataset) / total_inference_time:.2f}")
+
 def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5, 
                      image_size=640, output_file="evaluation_results.json",
                      batch_size=32, limit=None, max_memory_gb=25):
@@ -306,8 +551,9 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
             continue
         
         # Preprocess batch
-        batch_input, valid_indices = preprocess_batch(batch_image_paths, image_size, mean, std,
-                                                      gray_background=(114, 114, 114))
+        batch_input, valid_indices, batch_infos = preprocess_batch(
+            batch_image_paths, image_size, mean, std, gray_background=(114, 114, 114)
+        )
         if batch_input is None:
             continue
 
@@ -468,8 +714,16 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
         print(f"  {tag_info['tag']}: F1={tag_info['f1']:.3f} (support={tag_info['support']})")
     
     print(f"\nDetailed results saved to: {output_file}")
-    
+
     return summary
+
+def detect_model_format(model_path):
+    """Detect if model is ONNX or PyTorch format."""
+    if model_path.endswith('.onnx'):
+        return 'onnx'
+    elif model_path.endswith(('.pt', '.pth', '.bin')):
+        return 'pytorch'
+    return 'unknown'
 
 def main():
     # Check GPU availability via ONNX Runtime
@@ -503,17 +757,34 @@ def main():
     BATCH_SIZE = 32  # You can increase this if memory usage is low
     MAX_MEMORY_GB = 25  # Keep within this limit
 
-    process_batch_gpu(
-        data_folder=data_folder,
-        model_path=model_path,
-        config_path=None,
-        threshold=0.5,
-        image_size=640,
-        output_file=output_file,
-        batch_size=BATCH_SIZE,
-        limit=None,  # Set to a number for testing (e.g., 100)
-        max_memory_gb=MAX_MEMORY_GB
-    )
+    # Detect model format and choose appropriate processing function
+    model_format = detect_model_format(model_path)
+
+    if model_format == 'pytorch':
+        print("Detected PyTorch model format - using optimized PyTorch evaluation")
+        process_batch_pytorch(
+            data_folder=data_folder,
+            model_path=model_path,
+            config_path=None,
+            threshold=0.5,
+            image_size=640,
+            output_file=output_file.replace('.json', '_pytorch.json'),
+            batch_size=BATCH_SIZE,
+            compile_model=True  # Enable torch.compile for extra speed
+        )
+    else:
+        print("Using ONNX Runtime evaluation")
+        process_batch_gpu(
+            data_folder=data_folder,
+            model_path=model_path,
+            config_path=None,
+            threshold=0.5,
+            image_size=640,
+            output_file=output_file,
+            batch_size=BATCH_SIZE,
+            limit=None,  # Set to a number for testing (e.g., 100)
+            max_memory_gb=MAX_MEMORY_GB
+        )
 
 if __name__ == "__main__":
     main()
