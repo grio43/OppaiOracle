@@ -362,7 +362,9 @@ class ThreadSafeMetricsTracker:
                     'counters': dict(self.counters),
                     'timer_stats': {k: self.get_timer_stats(k) for k in self.timers}
                 }
-                
+                # Add queue metrics if available
+                data['queue_metrics'] = self.get_queue_metrics()
+
                 with open(filepath, 'w') as f:
                     json.dump(data, f, indent=2, default=str)
                     
@@ -370,6 +372,26 @@ class ThreadSafeMetricsTracker:
             except Exception as e:
                 logger.error(f"Failed to save metrics: {e}")
 
+    def get_queue_metrics(self) -> Dict[str, Any]:
+        """Get logging queue metrics if available."""
+        metrics = {}
+        try:
+            # Try to get metrics from the logging queue if it's a BoundedLevelAwareQueue
+            import logging
+            root_logger = logging.getLogger()
+            for handler in root_logger.handlers:
+                if hasattr(handler, 'queue') and hasattr(handler.queue, 'get_drop_stats'):
+                    drop_stats = handler.queue.get_drop_stats()
+                    metrics['log_queue_drops'] = drop_stats
+                    metrics['log_queue_size'] = len(handler.queue.queue)
+                    break
+        except Exception as e:
+            logger.debug(f"Could not get queue metrics: {e}")
+        
+        # Add host pinned memory metrics if available
+        metrics['host_pinned_bytes'] = self.counters.get('host_pinned_bytes', 0)
+        
+        return metrics
 
 class SystemMonitor:
     """Monitors system resources with proper cleanup"""
@@ -1195,7 +1217,19 @@ class TrainingMonitor:
             'best_val_metric': self.best_val_metric,
             'metrics': {}
         }
+
+        # Add queue metrics
+        queue_metrics = self.metrics.get_queue_metrics()
+        if queue_metrics:
+            summary['queue_metrics'] = queue_metrics
         
+        # Add prefetch controller metrics if available
+        try:
+            if hasattr(self, 'prefetch_controller'):
+                summary['prefetch_metrics'] = self.prefetch_controller.get_metrics()
+        except:
+            pass
+
         # Add metric statistics
         for metric_name in ['loss', 'learning_rate', 'val_loss']:
             stats = self.metrics.get_metric_stats(metric_name)

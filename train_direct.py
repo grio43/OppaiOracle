@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 import sys
-import multiprocessing as mp
+import queue
 import random
 import torch.distributed as dist
 
@@ -20,6 +20,8 @@ import numpy as np
 
 # Import the orientation handler
 from orientation_handler import OrientationHandler
+# Import the bounded queue
+from HDF5_loader import BoundedLevelAwareQueue
 
 # Import base modules with error handling
 try:
@@ -150,9 +152,9 @@ def train_with_orientation_tracking():
 
     # Set up logger early so it's available for all messages
     import logging
-    from logging.handlers import QueueListener
+    from logging.handlers import QueueListener, RotatingFileHandler
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    log_queue = mp.Queue()
+    log_queue = BoundedLevelAwareQueue(maxsize=5000)
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(formatter)
     sh.setLevel(logging.INFO)
@@ -245,7 +247,14 @@ def train_with_orientation_tracking():
 
     _listener = None
     if is_primary:
-        fh = logging.FileHandler('training_with_orientation.log')
+        # Use rotating file handler with compression
+        from HDF5_loader import CompressingRotatingFileHandler
+        fh = CompressingRotatingFileHandler(
+            'training_with_orientation.log',
+            maxBytes=128 * 1024 * 1024,  # 128MB
+            backupCount=5,
+            compress=True
+        )
         fh.setFormatter(formatter)
         fh.setLevel(logging.INFO)
         _listener = QueueListener(log_queue, fh, respect_handler_level=True)
@@ -504,6 +513,18 @@ def train_with_orientation_tracking():
             logger.info("QueueListener stopped successfully")
         except Exception as e:
             logger.warning(f"Error stopping QueueListener: {e}")
+
+    # Log queue drop statistics
+    try:
+        if hasattr(log_queue, 'get_drop_stats'):
+            drop_stats = log_queue.get_drop_stats()
+            total_drops = sum(drop_stats.values())
+            if total_drops > 0:
+                logger.warning(f"Logging queue dropped {total_drops} messages: {drop_stats}")
+    except Exception as e:
+        logger.debug(f"Could not get queue drop stats: {e}")
+
+    logger.info("Training complete!")
 
 
 def validate_orientation_mappings():
