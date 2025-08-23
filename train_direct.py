@@ -525,19 +525,19 @@ def train_with_orientation_tracking():
         except Exception as e:
             logger.warning(f"Error stopping QueueListener: {e}")
 
-    # Log queue drop statistics
-    # Note: mp.Queue doesn't have get_drop_stats method
-    # This was specific to BoundedLevelAwareQueue
-    """
-    try:
-        if hasattr(log_queue, 'get_drop_stats'):
+    # Log queue drop statistics if supported by the queue implementation
+    # mp.Queue does not provide this, but keeping the check maintains
+    # compatibility with queues that do expose drop statistics
+    if hasattr(log_queue, 'get_drop_stats'):
+        try:
             drop_stats = log_queue.get_drop_stats()
             total_drops = sum(drop_stats.values())
             if total_drops > 0:
-                logger.warning(f"Logging queue dropped {total_drops} messages: {drop_stats}")
-    except Exception as e:
-        logger.debug(f"Could not get queue drop stats: {e}")
-    """
+                logger.warning(
+                    f"Logging queue dropped {total_drops} messages: {drop_stats}"
+                )
+        except Exception as e:
+            logger.debug(f"Could not get queue drop stats: {e}")
 
     logger.info("Training complete!")
 
