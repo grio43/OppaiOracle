@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover
 
 # Import our modules
 from Evaluation_Metrics import MetricComputer, MetricConfig
-from Inference_Engine import load_vocabulary_for_training
+from vocabulary import TagVocabulary, load_vocabulary_for_training
 from HDF5_loader import create_dataloaders, SimplifiedDataConfig
 from training_utils import DistributedTrainingHelper
 from model_architecture import create_model, VisionTransformerConfig
@@ -131,7 +131,20 @@ class ValidationRunner:
         self._setup_logging()
         
         # Load vocabulary
-        self.vocab = load_vocabulary_for_training(Path(config.vocab_path))
+        vocab_path = Path(config.vocab_path)
+        if vocab_path.exists():
+            if vocab_path.suffix == '.json':
+                self.vocab = TagVocabulary(vocab_path)
+            else:
+                self.vocab = load_vocabulary_for_training(vocab_path)
+        else:
+            for path in [Path("vocabulary.json"), Path("vocabulary/vocabulary.json")]:
+                if path.exists():
+                    self.vocab = TagVocabulary(path)
+                    break
+            else:
+                raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
+
         logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
         self.num_tags = len(self.vocab.tag_to_index)
         
