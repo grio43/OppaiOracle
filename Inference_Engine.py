@@ -57,7 +57,8 @@ logger = logging.getLogger(__name__)
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+# Use the specific path for your setup
+DEFAULT_VOCAB_PATH = Path("/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json")
 
 
 @dataclass
@@ -189,62 +190,64 @@ class ModelWrapper:
     def load_model(self):
         """Load the trained model"""
         try:
-            # Priority order for vocabulary loading:
-            # 1. Explicit vocab_path from config
-            # 2. Next to model checkpoint
-            # 3. Next to model config
-            # 4. Current working directory
-            # 5. vocabulary/ subdirectory
-
-            vocab_search_paths = []
-
-            # 1. Explicit path
+            # Priority 1: Explicit vocab_path from config
             if self.config.vocab_path:
-                vocab_search_paths.append(Path(self.config.vocab_path))
+                vocab_path = Path(self.config.vocab_path)
+            else:
+                # Use the hardcoded path if not specified
+                vocab_path = DEFAULT_VOCAB_PATH
 
-            # 2. Next to model checkpoint
-            if self.config.model_path:
-                vocab_search_paths.append(Path(self.config.model_path).parent / "vocabulary.json")
+            # Check if the vocabulary file exists
+            if not vocab_path.exists():
+                # Try alternative locations as fallback
+                vocab_search_paths = []
 
-            # 3. Next to config file
-            if self.config.config_path:
-                vocab_search_paths.append(Path(self.config.config_path).parent / "vocabulary.json")
+                # Next to model checkpoint
+                if self.config.model_path:
+                    vocab_search_paths.append(Path(self.config.model_path).parent / "vocabulary.json")
 
-            # 4. Project root
-            vocab_search_paths.append(PROJECT_ROOT / "vocabulary.json")
+                # Next to config file
+                if self.config.config_path:
+                    vocab_search_paths.append(Path(self.config.config_path).parent / "vocabulary.json")
 
-            # 5. Current directory
-            vocab_search_paths.append(Path("vocabulary.json"))
+                # Check alternative paths
+                vocab_found = False
+                for alt_path in vocab_search_paths:
+                    if alt_path.exists():
+                        vocab_path = alt_path
+                        vocab_found = True
+                        logger.info(f"Found vocabulary at alternative location: {vocab_path}")
+                        break
 
-            # 6. vocabulary subdirectory
-            vocab_search_paths.append(PROJECT_ROOT / "vocabulary/vocabulary.json")
-
-            vocab_path = None
-            for path in vocab_search_paths:
-                if path.exists():
-                    vocab_path = path
-                    logger.info(f"Loading vocabulary from {vocab_path}")
-                    self.vocabulary = TagVocabulary(vocab_path)
-                    self.tag_names = [
-                        self.vocabulary.get_tag_from_index(i)
-                        for i in range(len(self.vocabulary.tag_to_index))
-                    ]
-
-                    # Validate for placeholder tags
-                    placeholder_count = sum(
-                        1 for tag in self.tag_names if tag.startswith("tag_") and tag[4:].isdigit()
+                if not vocab_found:
+                    # List all attempted paths for debugging
+                    all_paths = [self.config.vocab_path or DEFAULT_VOCAB_PATH] + vocab_search_paths
+                    paths_str = "\n  ".join(str(p) for p in all_paths)
+                    raise FileNotFoundError(
+                        f"Vocabulary file not found! Searched in:\n  {paths_str}\n"
+                        f"Please ensure vocabulary.json exists at one of these locations."
                     )
-                    if placeholder_count > 100:  # Threshold for detection
-                        logger.warning(
-                            f"Found {placeholder_count} placeholder tags in vocabulary - this may indicate a problem!"
-                        )
-                    else:
-                        logger.info(f"Loaded {len(self.tag_names)} valid tag names from vocabulary")
-                    break
 
-            if vocab_path is None:
-                logger.error(f"Vocabulary file not found! Searched in: {vocab_search_paths}")
-                raise FileNotFoundError("Could not find vocabulary.json in any expected location")
+            # Load the vocabulary
+            logger.info(f"Loading vocabulary from {vocab_path}")
+            self.vocabulary = TagVocabulary(vocab_path)
+            self.tag_names = [
+                self.vocabulary.get_tag_from_index(i)
+                for i in range(len(self.vocabulary.tag_to_index))
+            ]
+
+            # Check for placeholder tags - fail if found
+            placeholder_count = sum(
+                1 for tag in self.tag_names if tag.startswith("tag_") and tag[4:].isdigit()
+            )
+            if placeholder_count > 0:
+                raise ValueError(
+                    f"Vocabulary contains {placeholder_count} placeholder tags (tag_XXX). "
+                    f"This indicates the vocabulary file is corrupted or was not properly generated. "
+                    f"Please regenerate the vocabulary from your dataset."
+                )
+
+            logger.info(f"Successfully loaded {len(self.tag_names)} valid tag names from vocabulary")
 
             # Load model config
             if os.path.exists(self.config.config_path):
@@ -792,7 +795,8 @@ if __name__ == "__main__":
     # Note: image_size should match the training configuration (640 for ViT, not 448)
     config = InferenceConfig(
         model_path="./checkpoints/best_model.pt",  # Standardize to .pt
-        vocab_path=None,  # Will auto-detect from checkpoint directory
+        # Explicitly set the vocabulary path
+        vocab_path="/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json",
         config_path="./checkpoints/model_config.json",
         batch_size=32,
         threshold=0.5,
