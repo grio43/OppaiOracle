@@ -174,8 +174,8 @@ def train_with_orientation_tracking():
         "warmup_steps": 10_000,
         "weight_decay": 0.01,
         "label_smoothing": 0.05,
-        "data_dir": Path("/media/andrewk/qnap-public/docker/workspace/shard_00022/"),
-        "json_dir": Path("/media/andrewk/qnap-public/docker/workspace/shard_00022/"),
+        "data_dir": Path("/media/andrewk/qnap-public/workspace/shard_00022/"),
+        "json_dir": Path("/media/andrewk/qnap-public/workspace/shard_00022/"),
         "vocab_path": Path("vocabulary.json"),
         "num_workers": 4,  # Store in config for dataset initialization
         "device": "cuda" if torch.cuda.is_available() else "cpu",
