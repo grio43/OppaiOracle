@@ -27,7 +27,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
-import cv2
+
+# Make cv2 optional - not needed for basic inference
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    CV2_AVAILABLE = False
+    warnings.warn("OpenCV (cv2) not available. Some image loading features may be limited.")
 
 # Import monitoring system from Monitor_log
 try:
