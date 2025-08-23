@@ -158,27 +158,33 @@ class CompressingRotatingFileHandler(RotatingFileHandler):
 
 
 def setup_worker_logging(worker_id: int, log_queue: object):
-    """Setup per-worker rotating log files."""
-    worker_log_dir = Path("/logs/workers")
-    worker_log_dir.mkdir(parents=True, exist_ok=True)
-    
-    log_file = worker_log_dir / f"worker_{worker_id}.log"
-    handler = CompressingRotatingFileHandler(
-        log_file,
-        maxBytes=64 * 1024 * 1024,  # 64MB
-        backupCount=5,
-        compress=True
-    )
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-    
-    # Queue handler for main process
+    """Setup worker logging via queue only - no per-worker files."""
+    # Get worker-specific logger to avoid polluting root logger
+    worker_logger_name = f'oppai.worker.{worker_id}'
+    worker_logger = logging.getLogger(worker_logger_name)
+    worker_logger.propagate = False  # Don't propagate to root
+    worker_logger.setLevel(logging.INFO)
+
+    # Check if handlers already exist (idempotency)
+    existing_queue_handlers = [h for h in worker_logger.handlers if isinstance(h, QueueHandler)]
+    if existing_queue_handlers:
+        # Already configured, skip
+        return
+
+    # Only add queue handler - main process handles file writing
     queue_handler = QueueHandler(log_queue)
     queue_handler.setLevel(logging.INFO)
-    
-    logger = logging.getLogger()
-    logger.addHandler(handler)
-    logger.addHandler(queue_handler)
+    worker_logger.addHandler(queue_handler)
+
+    # Also configure the module logger to use the queue
+    module_logger = logging.getLogger(__name__)
+    # Remove any existing handlers to avoid duplicates
+    module_logger.handlers = [h for h in module_logger.handlers 
+                              if not isinstance(h, (QueueHandler, CompressingRotatingFileHandler))]
+    module_logger.addHandler(queue_handler)
+    module_logger.setLevel(logging.INFO)
+
+    logger.debug(f"Worker {worker_id} logging configured (queue-only)")
 
 def letterbox_resize(
     image: torch.Tensor,
@@ -336,7 +342,7 @@ class SimplifiedDataConfig:
     
     # LMDB L2 cache settings (from plan)
     l2_cache_enabled: bool = True
-    l2_cache_path: Path = Path("/data/cache/lmdb")
+    l2_cache_path: Path = Path(os.environ.get('OPPAI_L2_CACHE', './cache/lmdb'))
     l2_max_size_gb: float = 48.0
     l2_map_growth_gb: float = 4.0
     l2_max_readers: int = 2048
@@ -1157,7 +1163,8 @@ class SimplifiedDataset(Dataset):
             self.validation_index = None
             if split == 'train':
                 try:
-                    validation_index_path = Path("/data/validation/index.sqlite")
+                    validation_index_base = Path(os.environ.get('OPPAI_VALIDATION_DIR', './validation'))
+                    validation_index_path = validation_index_base / "index.sqlite"
                     self.validation_index = ValidationIndex(validation_index_path)
                     self.background_validator = BackgroundValidator(self.validation_index, config.data_dir)
                     self.background_validator.start()
@@ -1994,33 +2001,25 @@ def create_dataloaders(
 ) -> Tuple[DataLoader, DataLoader, TagVocabulary]:
     """Construct training and validation dataloaders with enhanced memory control."""
     
+    # Ensure cache and log directories exist in main process before workers spawn
+    cache_dir = Path(os.environ.get('OPPAI_L2_CACHE', './cache/lmdb'))
+    validation_dir = Path(os.environ.get('OPPAI_VALIDATION_DIR', './validation'))
+
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        validation_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"Failed to create directories: {e}")
+        # Fall back to temp directory if needed
+        import tempfile
+        fallback_dir = Path(tempfile.gettempdir()) / 'oppai_cache'
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        os.environ['OPPAI_L2_CACHE'] = str(fallback_dir / 'lmdb')
+        os.environ['OPPAI_VALIDATION_DIR'] = str(fallback_dir / 'validation')
+    
     # Set up bounded logging queue if needed
     if log_queue is None:
         log_queue = mp.Queue(maxsize=5000)  # Bounded queue
-        
-        # Configure worker logging with rotation
-        def setup_worker_logging(worker_id):
-            """Setup per-worker rotating log files"""
-            worker_log_dir = Path("/logs/workers")
-            worker_log_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Create rotating file handler
-            log_file = worker_log_dir / f"worker_{worker_id}.log"
-            handler = RotatingFileHandler(
-                log_file,
-                maxBytes=64 * 1024 * 1024,  # 64MB
-                backupCount=5,
-                encoding='utf-8'
-            )
-            handler.setLevel(logging.INFO)
-            
-            # Attach queue handler for main process
-            queue_handler = QueueHandler(log_queue)
-            queue_handler.setLevel(logging.INFO)
-            
-            logger = logging.getLogger()
-            logger.addHandler(handler)
-            logger.addHandler(queue_handler)
     
     # Default pin memory config
     if pin_memory_config is None:
