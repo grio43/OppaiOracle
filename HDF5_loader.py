@@ -24,6 +24,7 @@ import lmdb
 from pathlib import Path
 import hashlib
 import json
+import warnings
 import threading
 import logging
 from datetime import datetime, timedelta
@@ -398,16 +399,27 @@ def _make_worker_init_fn(base_seed: int, log_queue: Optional[object]):
         if log_queue is not None:
             setup_worker_logging(worker_id, log_queue)
 
-        # Important: Close any inherited LMDB environments in worker
+        # Important: Close any inherited LMDB environments in worker (run once)
         # This prevents issues with shared file descriptors
-        import gc
-        for obj in gc.get_objects():
-            if hasattr(obj, '__class__') and obj.__class__.__name__ == 'LMDBCache':
-                if hasattr(obj, 'env') and obj.env is not None:
-                    try:
-                        obj.env.close()
-                    except Exception:
-                        pass
+        # Use a flag to ensure this only runs once per process
+        if not hasattr(_init_fn, '_lmdb_cleaned'):
+            _init_fn._lmdb_cleaned = set()
+        
+        current_pid = os.getpid()
+        if current_pid not in _init_fn._lmdb_cleaned:
+            _init_fn._lmdb_cleaned.add(current_pid)
+            
+            # Suppress deprecation warnings during the GC scan
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=DeprecationWarning)
+                import gc
+                for obj in gc.get_objects():
+                    if hasattr(obj, '__class__') and obj.__class__.__name__ == 'LMDBCache':
+                        if hasattr(obj, 'env') and obj.env is not None:
+                            try:
+                                obj.env.close()
+                            except Exception:
+                                pass
 
     return _init_fn
 

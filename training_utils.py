@@ -48,7 +48,7 @@ class TrainingState:
     loss_history: List[float] = field(default_factory=list)
     
     # Metric tracking
-    metrics_history: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    metrics_history: Dict[str, List[float]] = field(default_factory=dict)
     learning_rates: List[float] = field(default_factory=list)
     
     # Early stopping
@@ -70,11 +70,15 @@ class TrainingState:
     def update_metrics(self, metrics: Dict[str, float]):
         """Update metrics history"""
         for key, value in metrics.items():
+            if key not in self.metrics_history:
+                self.metrics_history[key] = []
             self.metrics_history[key].append(value)
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for saving"""
-        return asdict(self)
+        # Convert to regular dict to avoid serialization issues
+        data = asdict(self)
+        return data
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'TrainingState':
