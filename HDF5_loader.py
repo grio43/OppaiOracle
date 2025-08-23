@@ -26,6 +26,7 @@ import hashlib
 import json
 import threading
 import logging
+from datetime import datetime, timedelta
 import random
 import psutil
 import os
@@ -108,6 +109,14 @@ class BoundedLevelAwareQueue:
                     raise queue.Empty
                 self.not_empty.wait(remaining)
             return self.queue.pop(0)
+
+    def put_nowait(self, record):
+        """Non-blocking put for QueueHandler compatibility."""
+        return self.put(record, block=False)
+    
+    def get_nowait(self):
+        """Non-blocking get for consistency."""
+        return self.get(block=False)
     
     def get_drop_stats(self):
         """Get drop statistics."""

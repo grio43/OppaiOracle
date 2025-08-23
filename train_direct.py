@@ -289,11 +289,18 @@ def train_with_orientation_tracking():
             config["random_flip_prob"] = 0  # Disable flips
     
     
-    if config["num_workers"] > 0 and config["random_flip_prob"] > 0:
-        logger.warning(
-            f"WARNING: Orientation statistics will be incomplete with num_workers={config['num_workers']}. "
-            f"Each worker tracks stats independently. For accurate stats, use num_workers=0."
-        )
+    # Show orientation statistics warning only once
+    orientation_stats_warning_shown = False
+    if config["num_workers"] > 0 and config["random_flip_prob"] > 0 and not orientation_stats_warning_shown:
+        logger.info("\n" + "="*60)
+        logger.info("IMPORTANT: Orientation Statistics Limitation")
+        logger.info("="*60)
+        logger.info(f"With num_workers={config['num_workers']}, orientation statistics will be incomplete.")
+        logger.info("Each worker tracks stats independently and they are not aggregated.")
+        logger.info("For accurate orientation statistics, use num_workers=0.")
+        logger.info("This does not affect training quality, only statistics reporting.")
+        logger.info("="*60 + "\n")
+        orientation_stats_warning_shown = True
     
     device = torch.device(config["device"])
     
