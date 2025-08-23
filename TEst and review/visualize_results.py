@@ -277,7 +277,7 @@ def generate_performance_report(results_data, output_dir):
     print('\n'.join(report_lines))
 
 def main():
-    results_path = "/media/andrewk/qnap-public/workspace/results/evaluation_results.json"
+    results_path = "/media/andrewk/qnap-public/workspace/results/evaluation_results_gpu_results.jsonl"
     output_dir = Path("/media/andrewk/qnap-public/workspace/results")
     output_dir.mkdir(exist_ok=True)
 
