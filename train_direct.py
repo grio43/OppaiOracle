@@ -154,6 +154,8 @@ def train_with_orientation_tracking():
     
     # All required modules are imported at module load time; ImportErrors are raised immediately.
 
+    import tempfile
+
     # Set up logger early so it's available for all messages
     import logging
     from logging.handlers import QueueListener, RotatingFileHandler
@@ -248,6 +250,24 @@ def train_with_orientation_tracking():
     except Exception:
         pass
 
+    # Set up log directory (use environment variable or fallback to local)
+    log_dir = Path(os.environ.get('OPPAI_LOG_DIR', './logs'))
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if not log_dir.is_dir():
+            raise NotADirectoryError(f"{log_dir} exists but is not a directory")
+    except Exception as e:
+        logger.warning(f"Cannot use log directory {log_dir}: {e}")
+        # Fall back to temp directory
+        fallback_log_dir = Path(tempfile.gettempdir()) / 'oppai_logs'
+        fallback_log_dir.mkdir(parents=True, exist_ok=True)
+        log_dir = fallback_log_dir
+        logger.info(f"Using fallback log directory: {log_dir}")
+
+    # Set environment variable for child processes
+    os.environ['OPPAI_LOG_DIR'] = str(log_dir)
+    logger.info(f"Log directory: {log_dir}")
+
     # Set up file logging for primary process
 
     is_primary = True
@@ -261,7 +281,7 @@ def train_with_orientation_tracking():
         # Use rotating file handler with compression
         from HDF5_loader import CompressingRotatingFileHandler
         fh = CompressingRotatingFileHandler(
-            'training_with_orientation.log',
+            log_dir / 'training_with_orientation.log',
             maxBytes=128 * 1024 * 1024,  # 128MB
             backupCount=5,
             compress=True
