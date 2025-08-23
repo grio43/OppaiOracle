@@ -456,7 +456,8 @@ class LMDBCache:
                 # and avoid the warning about undefined behaviour when tensors are
                 # created from non‑writable NumPy arrays.
                 buffer = np.frombuffer(data, dtype=np.uint8).copy()
-                tensor = torch.from_numpy(buffer).view(-1)  # Will reshape later
+                # Return as 1D tensor - caller will reshape based on metadata
+                tensor = torch.from_numpy(buffer)
                 return tensor
             else:
                 self.misses += 1
@@ -1388,14 +1389,30 @@ class SimplifiedDataset(Dataset):
             cached = self.l2_cache.get(cache_key)
             if cached is not None:
                 self.cache_stats['l2_hits'] += 1
-                # Deserialize and add to L1
+                # Deserialize and reshape from flattened tensor
                 was_composited = False  # TODO: store this metadata
-                tensor = cached.float() / 255.0  # Assuming uint8 storage
-                
-                # Add to L1 with memory-aware eviction
-                self._add_to_l1_cache(image_path, (tensor.clone(), was_composited))
-                
-                return tensor, was_composited
+
+                # The cached tensor is flattened, need to reshape to (C, H, W)
+                # We know it's stored as uint8 and the target shape
+                if cached.dim() == 1:
+                    # Calculate expected shape
+                    C, H, W = 3, self.config.image_size, self.config.image_size
+                    expected_elements = C * H * W
+                    if cached.numel() >= expected_elements:
+                        # Reshape to image dimensions
+                        cached = cached[:expected_elements].view(C, H, W)
+                    else:
+                        # Size mismatch, load from disk instead
+                        logger.warning(f"Cached tensor size mismatch for {image_path}, loading from disk")
+                        cached = None
+
+                if cached is not None:
+                    tensor = cached.float() / 255.0  # Convert uint8 to float
+
+                    # Add to L1 with memory-aware eviction
+                    self._add_to_l1_cache(image_path, (tensor.clone(), was_composited))
+
+                    return tensor, was_composited
         
         # Lazy validation before loading from disk
         if self.validation_index is not None:
@@ -1641,25 +1658,45 @@ class SimplifiedDataset(Dataset):
                 tags = swapped_tags
                 if self.orientation_monitor:
                     self.orientation_monitor.check_health(self.orientation_handler)
-            # Perform letterbox resize to preserve aspect ratio
-            
+
+            # Ensure image tensor is properly shaped before any transforms
+            if image.dim() != 3:
+                logger.warning(f"Image tensor has unexpected dimensions: {image.shape} for {image_path}")
+                # Try to reshape if it's flattened
+                if image.dim() == 1:
+                    try:
+                        image = image.view(3, self.config.image_size, self.config.image_size)
+                    except RuntimeError:
+                        # Can't reshape, create a blank image
+                        logger.error(f"Cannot reshape tensor for {image_path}, using blank image")
+                        image = torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32)
+
             # Apply RandomResizedCrop BEFORE letterbox if configured (mutually exclusive)
             # This way we either use RandomResizedCrop OR letterbox, not both
-            if (self.augmentation is not None and 
-                self.split == 'train' and 
+            if (self.augmentation is not None and
+                self.split == 'train' and
                 self.config.random_crop_scale != (1.0, 1.0)):
-                # Apply random crop directly on the tensor
-                image = T.RandomResizedCrop(
-                    self.config.image_size,
-                    scale=self.config.random_crop_scale,
-                    ratio=(0.9, 1.1),
-                    interpolation=T.InterpolationMode.BICUBIC
-                )(image)
-                # Skip letterbox since we already resized
-
-                lb_info = {'scale': 1.0, 'pad': (0, 0, 0, 0)}
+                try:
+                    # Apply random crop directly on the tensor
+                    image = T.RandomResizedCrop(
+                        self.config.image_size,
+                        scale=self.config.random_crop_scale,
+                        ratio=(0.9, 1.1),
+                        interpolation=T.InterpolationMode.BICUBIC
+                    )(image)
+                    # Skip letterbox since we already resized
+                    lb_info = {'scale': 1.0, 'pad': (0, 0, 0, 0)}
+                except Exception as e:
+                    logger.warning(f"RandomResizedCrop failed for {image_path}: {e}, using letterbox instead")
+                    # Fall back to letterbox
+                    image, lb_info = letterbox_resize(
+                        image,
+                        target_size=self.config.image_size,
+                        pad_color=self.config.pad_color,
+                        patch_size=self.config.patch_size,
+                    )
             else:
-                # Perform letterbox resize to preserve aspect ratio            
+                # Perform letterbox resize to preserve aspect ratio
                 image, lb_info = letterbox_resize(
                     image,
                     target_size=self.config.image_size,
@@ -1670,8 +1707,15 @@ class SimplifiedDataset(Dataset):
             # Apply additional augmentation (colour jitter, gamma) if enabled
             # Wrap in try/except to handle augmentation failures gracefully
             if self.augmentation is not None:
-                image = self.augmentation(image)
+                try:
+                    image = self.augmentation(image)
+                except Exception as e:
+                    logger.warning(f"Augmentation failed for {image_path}: {e}, skipping augmentation")
+                    # Continue without augmentation
+
             # Normalise
+            if image.dtype != torch.float32:
+                image = image.float()
             image = self.normalize(image)
             # Encode tags and rating
             tag_labels = self.vocab.encode_tags(tags)
@@ -1726,9 +1770,20 @@ class SimplifiedDataset(Dataset):
                     return self.__getitem__((idx + 1) % len(self.annotations))                
                 return self._create_error_sample(idx, image_path, "io_error")
         except Exception as e:
-            # Unexpected errors should not be silenced
+            # Unexpected errors - handle based on skip_error_samples config
             logger.error(f"Unexpected error in __getitem__ for index {idx}, path {image_path}: {e}")
-            raise RuntimeError(f"Unexpected error processing sample {idx}") from e
+
+            # Track this as a failed image
+            self._failed_images.add(image_path)
+
+            if self.config.skip_error_samples:
+                # Skip to next sample instead of crashing
+                next_idx = (idx + 1) % len(self.annotations)
+                logger.info(f"Skipping sample with unexpected error, moving to index {next_idx}")
+                return self.__getitem__(next_idx)
+            else:
+                # Return error sample instead of raising
+                return self._create_error_sample(idx, image_path, "unexpected_error")
 
     def _create_error_sample(self, idx: int, image_path: str, error_type: str) -> Dict[str, Any]:
         """Create an error sample with appropriate defaults.
