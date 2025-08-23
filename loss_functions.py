@@ -72,25 +72,39 @@ class AsymmetricFocalLoss(nn.Module):
             if targets.size(1) == logits.size(1):
                 logits = logits[:, 1:]
                 targets = targets[:, 1:]
+
         # Apply label smoothing if specified
         if self.label_smoothing > 0:
             targets = targets * (1 - self.label_smoothing) + self.label_smoothing / 2
+
         # Calculate probabilities
         probs = torch.sigmoid(logits)
+
         # Clip probabilities to prevent log(0)
         probs = torch.clamp(probs, min=self.clip, max=1.0 - self.clip)
+
         # Calculate focal weights
         pos_weights = targets * torch.pow(1 - probs, self.gamma_pos)
         neg_weights = (1 - targets) * torch.pow(probs, self.gamma_neg)
+
         # Binary cross entropy
         bce = -(targets * torch.log(probs) + (1 - targets) * torch.log(1 - probs))
+
+        # Check for NaN/Inf in intermediate calculations
+        if torch.isnan(bce).any() or torch.isinf(bce).any():
+            # Log warning and return a safe loss value
+            logger.warning("NaN/Inf detected in BCE calculation, returning zero loss for this batch")
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
         # Apply focal weights with unified alpha
         focal_loss = self.alpha * (pos_weights * bce + neg_weights * bce)
+
         # Apply sample weights if provided (for frequency-based sampling)
         if sample_weights is not None:
             if sample_weights.dim() == 1:
                 sample_weights = sample_weights.unsqueeze(1)
             focal_loss = focal_loss * sample_weights
+
         # Reduction
         if self.reduction == 'mean':
             return focal_loss.mean()
