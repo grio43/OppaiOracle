@@ -174,7 +174,7 @@ def train_with_orientation_tracking():
         "data_dir": Path("/media/andrewk/qnap-public/docker/workspace/shard_00022/"),
         "json_dir": Path("/media/andrewk/qnap-public/docker/workspace/shard_00022/"),
         "vocab_path": Path("vocabulary.json"),
-        "num_workers": 4,
+        "num_workers": 4,  # Store in config for dataset initialization
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "amp": True,
         # Orientation-specific settings
@@ -318,7 +318,8 @@ def train_with_orientation_tracking():
             # Convert string back to Path if needed
             "orientation_map_path": Path(config.get("orientation_map_path")) if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) else config.get("orientation_map_path"),
             "skip_unmapped": config.get("skip_unmapped", True),
-            "strict_orientation_validation": config.get("strict_orientation", True)
+            "strict_orientation_validation": config.get("strict_orientation", True),
+            "num_workers": config["num_workers"]  # Pass to dataset for LMDB initialization
         },
         seed=seed,
         log_queue=log_queue,
