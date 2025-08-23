@@ -374,22 +374,12 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
         if vocab_file.exists():
             return TagVocabulary.from_file(vocab_file)
 
-    # Create dummy vocabulary for demo
-    logger.warning(f"Vocabulary file not found at {vocab_path}, using dummy vocabulary")
-    dummy_tags = [f"tag_{i}" for i in range(1000)]
-
-    vocab = TagVocabulary()
-    vocab.tag_to_index = {vocab.pad_token: 0, vocab.unk_token: 1}
-    vocab.index_to_tag = {0: vocab.pad_token, 1: vocab.unk_token}
-    vocab.unk_index = 1
-
-    #for idx, tag in enumerate(dummy_tags, start=2):
-    #    vocab.tag_to_index[tag] = idx
-    #    vocab.index_to_tag[idx] = tag
-
-    vocab.tags = dummy_tags
-
-    return vocab
+    # Fail loudly if vocabulary not found - no dummy fallback
+    raise FileNotFoundError(
+        f"Vocabulary file not found at {vocab_path}. "
+        f"Tried: vocabulary.json and tags.txt. "
+        f"Please ensure vocabulary.json exists at the specified location."
+    )
 
 def create_dataset_config(vocab: TagVocabulary) -> Dict:
     """Create a configuration dictionary for dataset initialization.
