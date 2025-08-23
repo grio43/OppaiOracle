@@ -56,6 +56,10 @@ from model_architecture import create_model, VisionTransformerConfig
 
 logger = logging.getLogger(__name__)
 
+# Project paths
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+
 
 @dataclass
 class ValidationConfig:
@@ -65,7 +69,7 @@ class ValidationConfig:
     checkpoint_path: Optional[str] = None
     data_dir: str = "data/images"
     json_dir: str = "data/annotations"
-    vocab_path: str = "vocabulary.json"
+    vocab_path: str = str(DEFAULT_VOCAB_PATH)
     output_dir: str = "./validation_results"
     
     # Validation modes
@@ -138,7 +142,7 @@ class ValidationRunner:
             else:
                 self.vocab = load_vocabulary_for_training(vocab_path)
         else:
-            for path in [Path("vocabulary.json"), Path("vocabulary/vocabulary.json")]:
+            for path in [DEFAULT_VOCAB_PATH, PROJECT_ROOT / "vocabulary/vocabulary.json"]:
                 if path.exists():
                     self.vocab = TagVocabulary(path)
                     break
@@ -995,7 +999,7 @@ def main():
     # Data arguments
     parser.add_argument('--data-dir', type=str, default='data/images')
     parser.add_argument('--json-dir', type=str, default='data/annotations')
-    parser.add_argument('--vocab-path', type=str, default='vocabulary.json')
+    parser.add_argument('--vocab-path', type=str, default=str(DEFAULT_VOCAB_PATH))
     
     # Validation arguments
     parser.add_argument('--mode', type=str, default='full', 

@@ -33,6 +33,10 @@ import torch.backends.cudnn as cudnn
 
 logger = logging.getLogger(__name__)
 
+# Project paths
+PROJECT_ROOT = Path(__file__).resolve().parent
+VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+
 
 @dataclass
 class TrainingState:
@@ -532,7 +536,7 @@ class CheckpointManager:
         if hasattr(model_to_check, 'config'):
             checkpoint['vocabulary_info'] = {
                 'num_tags': getattr(model_to_check.config, 'num_tags', None),
-                'vocab_path': 'vocabulary.json',
+                'vocab_path': str(VOCAB_PATH),
                 'has_vocabulary': True
             }
 
