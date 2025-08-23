@@ -28,6 +28,9 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
 
+# Vocabulary utilities
+from vocabulary import TagVocabulary, load_vocabulary_for_training
+
 # Make cv2 optional - not needed for basic inference
 try:
     import cv2
@@ -174,20 +177,40 @@ class ModelWrapper:
         self.device = torch.device(config.device)
         self.model = None
         self.tag_names = []
-        self.normalization_params = None  
+        self.vocabulary = None  # Loaded vocabulary
+        self.normalization_params = None
         self.use_fp16 = config.use_fp16 and config.device == "cuda"
-        
+
     def load_model(self):
         """Load the trained model"""
         try:
+            # Try to load vocabulary first
+            vocab_path = Path(self.config.config_path).parent / "vocabulary.json"
+            if not vocab_path.exists():
+                vocab_path = Path("vocabulary.json")
+                if not vocab_path.exists():
+                    vocab_path = Path("vocabulary/vocabulary.json")
+
+            if vocab_path.exists():
+                logger.info(f"Loading vocabulary from {vocab_path}")
+                self.vocabulary = TagVocabulary(vocab_path)
+                self.tag_names = [
+                    self.vocabulary.get_tag_from_index(i)
+                    for i in range(len(self.vocabulary.tag_to_index))
+                ]
+                logger.info(f"Loaded {len(self.tag_names)} tag names from vocabulary")
+            else:
+                logger.error(f"Vocabulary file not found! Searched in: {vocab_path}")
+
             # Load model config
             if os.path.exists(self.config.config_path):
                 with open(self.config.config_path, 'r') as f:
                     model_config = json.load(f)
-                    self.tag_names = model_config.get('tag_names', [])
+                    if not self.tag_names:
+                        self.tag_names = model_config.get('tag_names', [])
             else:
                 logger.warning(f"Config file not found at {self.config.config_path}")
-                model_config = {}                    
+                model_config = {}
             
             # Load checkpoint
             checkpoint = torch.load(self.config.model_path, map_location=self.device)
