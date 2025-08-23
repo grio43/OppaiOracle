@@ -173,13 +173,14 @@ def train_with_orientation_tracking():
     
     # Enhanced configuration with orientation handling
     config = {
-        "learning_rate": 4e-4,
+        "learning_rate": 1e-4,  # Reduced for stability
         "batch_size": 32,
         "gradient_accumulation": 2,
         "num_epochs": 8,
         "warmup_steps": 10_000,
         "weight_decay": 0.01,
         "label_smoothing": 0.05,
+        "max_grad_norm": 1.0,  # Add gradient clipping
         "data_dir": Path("/media/andrewk/qnap-public/workspace/shard_00022/"),
         "json_dir": Path("/media/andrewk/qnap-public/workspace/shard_00022/"),
         "vocab_path": Path("vocabulary.json"),
@@ -369,13 +370,18 @@ def train_with_orientation_tracking():
     # AMP setup (prefer BF16 on modern NVIDIA GPUs like Blackwell when available)
     is_cuda = config["device"].startswith("cuda") and torch.cuda.is_available()
     device_type = "cuda" if is_cuda else "cpu"
-    # DTYPE: BF16 on CUDA if supported; BF16 on CPU; otherwise FP16
+    # DTYPE: BF16 on CUDA if supported; FP32 on CPU (safer); otherwise FP16
     if is_cuda and torch.cuda.is_bf16_supported():
         amp_dtype = torch.bfloat16
     elif device_type == "cpu":
-        amp_dtype = torch.bfloat16
+        # Use FP32 on CPU for stability in production
+        amp_dtype = torch.float32
+        config["amp"] = False  # Disable AMP on CPU
+        logger.info("Disabling AMP on CPU for stability")
     else:
         amp_dtype = torch.float16
+
+    logger.info(f"Using dtype: {amp_dtype} for autocast")
     # GradScaler is only needed for FP16 on CUDA
     scaler = GradScaler(device='cuda') if (config["amp"] and is_cuda and amp_dtype == torch.float16) else None
 
@@ -425,6 +431,14 @@ def train_with_orientation_tracking():
             tag_labels = batch['tag_labels'].to(device)
             rating_labels = batch['rating_labels'].to(device)
             
+            # Validate inputs for NaN/Inf
+            if torch.isnan(images).any() or torch.isinf(images).any():
+                logger.error(f"NaN/Inf detected in input images at step {step}")
+                continue
+            if torch.isnan(tag_labels).any() or torch.isinf(tag_labels).any():
+                logger.error(f"NaN/Inf detected in tag labels at step {step}")
+                continue
+            
             # Forward pass with mixed precision
             if config["amp"]:
                 with autocast(device_type=device_type, enabled=True, dtype=amp_dtype):
@@ -461,12 +475,18 @@ def train_with_orientation_tracking():
             
             # Gradient accumulation
             if (step + 1) % config["gradient_accumulation"] == 0:
+                # Add gradient clipping before optimizer step
+                if config.get("max_grad_norm", 0) > 0:
+                    if config["amp"] and scaler is not None:
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config["max_grad_norm"])
+                
                 if config["amp"] and scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     optimizer.step()
-                optimizer.zero_grad()       
+                optimizer.zero_grad()
             
             global_step += 1
         

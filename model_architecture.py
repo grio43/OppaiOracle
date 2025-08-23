@@ -199,10 +199,11 @@ class SimplifiedTagger(nn.Module):
                 if attn_kpm is not None:
                     # checkpoint requires tensor args; pass mask explicitly
                     x = torch.utils.checkpoint.checkpoint(
-                        lambda _x, _m: block(_x, key_padding_mask=_m), x, attn_kpm
+                        lambda _x, _m: block(_x, key_padding_mask=_m), x, attn_kpm,
+                        use_reentrant=False
                     )
                 else:
-                    x = torch.utils.checkpoint.checkpoint(block, x)
+                    x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
             else:
                 x = block(x, key_padding_mask=attn_kpm)
         # Final norm
