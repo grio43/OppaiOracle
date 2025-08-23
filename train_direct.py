@@ -13,6 +13,7 @@ import multiprocessing as mp
 import sys
 import random
 import torch.distributed as dist
+from dataclasses import dataclass
 
 import torch
 from torch.amp import GradScaler, autocast
@@ -41,6 +42,11 @@ Please ensure model_architecture.py exists in the current directory with create_
 Import error: {e}"""
     )
     raise ImportError(error_msg)
+
+# Import training utilities for checkpointing
+from training_utils import CheckpointManager, TrainingState
+
+# Add after other imports
 
 try:
     from loss_functions import MultiTaskLoss, AsymmetricFocalLoss
@@ -188,9 +194,10 @@ def train_with_orientation_tracking():
         "orientation_safety_mode": "conservative",  # New: safe by default
         "log_orientation_stats": True,
         # Model configuration
+        "checkpoint_dir": Path("checkpoints"),  # Add checkpoint directory
         "model_config": {
             "hidden_size": 768,
-            "intermediate_size": 3072,  
+            "intermediate_size": 3072,
             "num_hidden_layers": 12,
             "num_attention_heads": 12,
             "patch_size": 16,
@@ -372,6 +379,21 @@ def train_with_orientation_tracking():
     # GradScaler is only needed for FP16 on CUDA
     scaler = GradScaler(device='cuda') if (config["amp"] and is_cuda and amp_dtype == torch.float16) else None
 
+    # Initialize checkpoint manager and training state
+    checkpoint_manager = CheckpointManager(
+        checkpoint_dir=config["checkpoint_dir"],
+        max_checkpoints=5,
+        keep_best=True,
+        save_frequency=1
+    )
+    
+    training_state = TrainingState()
+    best_val_loss = float('inf')
+
+    # Enable anomaly detection for debugging NaN issues (disable in production)
+    if config.get("debug_mode", False):
+        torch.autograd.set_detect_anomaly(True)
+
     # Helper function to safely get orientation stats
     def get_dataset_orientation_stats():
         """Get orientation stats from the dataset if available."""
@@ -475,7 +497,40 @@ def train_with_orientation_tracking():
                 val_loss += loss.item()
         
         avg_val_loss = val_loss / max(1, len(val_loader))
-        logger.info(f"Epoch {epoch + 1}/{config['num_epochs']}: Avg val loss = {avg_val_loss:.4f}")
+        
+        # Check for NaN and handle gracefully
+        if torch.isnan(torch.tensor(avg_val_loss)) or torch.isinf(torch.tensor(avg_val_loss)):
+            logger.error(f"NaN or Inf detected in validation loss at epoch {epoch + 1}!")
+            logger.error("Skipping checkpoint save for this epoch. Consider debugging with anomaly detection.")
+            avg_val_loss = float('inf')  # Prevent best model update
+        else:
+            logger.info(f"Epoch {epoch + 1}/{config['num_epochs']}: Avg val loss = {avg_val_loss:.4f}")
+
+        # Update training state
+        training_state.epoch = epoch + 1
+        training_state.global_step = global_step
+        training_state.train_loss = avg_train_loss
+        training_state.val_loss = avg_val_loss
+
+        # Check if this is the best model
+        is_best = avg_val_loss < best_val_loss
+        if is_best:
+            best_val_loss = avg_val_loss
+            training_state.best_metric = best_val_loss
+            training_state.best_epoch = epoch + 1
+
+        # Save checkpoint
+        checkpoint_manager.save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=None,
+            epoch=epoch + 1,
+            step=global_step,
+            metrics={"train_loss": avg_train_loss, "val_loss": avg_val_loss},
+            training_state=training_state,
+            is_best=is_best,
+            config=config
+        )
 
         # Log orientation statistics at end of epoch
         if config["random_flip_prob"] > 0:
@@ -491,7 +546,7 @@ def train_with_orientation_tracking():
                     logger.info(
                         "Note: These stats are from the main process only. "
                         "Actual flip counts across all workers will be higher."
-                    )        
+                    )
     # Generate and save flip safety report if requested
     if config.get("generate_flip_report", False):
         try:

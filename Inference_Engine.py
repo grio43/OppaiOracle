@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 class InferenceConfig:
     """Configuration for inference engine"""
     # Model settings
-    model_path: str = "./checkpoints/best_model.pth"
+    model_path: str = "./checkpoints/best_model.pt"  # Standardize to .pt
     config_path: str = "./checkpoints/model_config.json"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -707,7 +707,7 @@ if __name__ == "__main__":
     # Configure inference
     # Note: image_size should match the training configuration (640 for ViT, not 448)
     config = InferenceConfig(
-        model_path="./checkpoints/best_model.pth",
+        model_path="./checkpoints/best_model.pt",  # Standardize to .pt
         config_path="./checkpoints/model_config.json",
         batch_size=32,
         threshold=0.5,
@@ -731,7 +731,7 @@ if __name__ == "__main__":
         'tag_names': vocab.tag_names,
         # ... other checkpoint data
     }
-    torch.save(checkpoint, 'best_model.pth')
+    torch.save(checkpoint, 'best_model.pt')  # Standardize to .pt
     """
 
     # Example of saving model config during training (should be done in training script)
