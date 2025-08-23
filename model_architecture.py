@@ -24,7 +24,7 @@ class VisionTransformerConfig:
     num_hidden_layers: int = 24
     num_attention_heads: int = 16
     intermediate_size: int = 5120
-    num_tags: int = 100000
+    num_tags: int = 100000  # This should be overridden with actual vocab size
     num_ratings: int = 5
     dropout: float = 0.1
     attention_dropout: float = 0.1

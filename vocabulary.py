@@ -334,44 +334,57 @@ class TagVocabulary:
 
 
 def load_vocabulary_for_training(vocab_dir: Path) -> TagVocabulary:
-    """Load vocabulary from directory (for backward compatibility).
-    
-    First tries to load from vocabulary.json, then tags.txt, 
-    otherwise creates a dummy vocabulary.
-    
+    """Load vocabulary from directory or file (for backward compatibility).
+
+    First tries to load from vocabulary.json, then tags.txt, otherwise
+    creates a dummy vocabulary.
+
     Args:
-        vocab_dir: Directory containing vocabulary files
-        
+        vocab_dir: Directory containing vocabulary files OR direct path to vocabulary file
+
     Returns:
         TagVocabulary instance
     """
-    # Try JSON format first
-    vocab_json = vocab_dir / "vocabulary.json"
-    if vocab_json.exists():
-        vocab = TagVocabulary()
-        vocab.load_vocabulary(vocab_json)
-        return vocab
-    
-    # Try text format
-    vocab_file = vocab_dir / "tags.txt"
-    if vocab_file.exists():
-        return TagVocabulary.from_file(vocab_file)
-    
+    vocab_path = Path(vocab_dir)
+
+    # Check if direct file path
+    if vocab_path.is_file():
+        if vocab_path.suffix == '.json':
+            vocab = TagVocabulary()
+            vocab.load_vocabulary(vocab_path)
+            return vocab
+        elif vocab_path.suffix == '.txt':
+            return TagVocabulary.from_file(vocab_path)
+
+    # Otherwise treat as directory
+    if vocab_path.is_dir():
+        # Try JSON format first
+        vocab_json = vocab_path / "vocabulary.json"
+        if vocab_json.exists():
+            vocab = TagVocabulary()
+            vocab.load_vocabulary(vocab_json)
+            return vocab
+
+        # Try text format
+        vocab_file = vocab_path / "tags.txt"
+        if vocab_file.exists():
+            return TagVocabulary.from_file(vocab_file)
+
     # Create dummy vocabulary for demo
-    logger.warning(f"Vocabulary file not found in {vocab_dir}, using dummy vocabulary")
+    logger.warning(f"Vocabulary file not found at {vocab_path}, using dummy vocabulary")
     dummy_tags = [f"tag_{i}" for i in range(1000)]
-    
+
     vocab = TagVocabulary()
     vocab.tag_to_index = {vocab.pad_token: 0, vocab.unk_token: 1}
     vocab.index_to_tag = {0: vocab.pad_token, 1: vocab.unk_token}
     vocab.unk_index = 1
-    
+
     #for idx, tag in enumerate(dummy_tags, start=2):
     #    vocab.tag_to_index[tag] = idx
     #    vocab.index_to_tag[idx] = tag
-    
+
     vocab.tags = dummy_tags
-    
+
     return vocab
 
 def create_dataset_config(vocab: TagVocabulary) -> Dict:

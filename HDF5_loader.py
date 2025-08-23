@@ -291,7 +291,7 @@ class SimplifiedDataConfig:
     patch_size: int = 16
 
     # Vocabulary settings
-    top_k_tags: int = 100_000
+    top_k_tags: Optional[int] = None  # None means use all tags in vocabulary
     min_tag_frequency: int = 1  # include all tags that appear at least once
 
     # Augmentation settings
@@ -2053,17 +2053,24 @@ def create_dataloaders(
         rank=rank,
         world_size=world_size,
         frequency_weighted_sampling=frequency_sampling,
+        top_k_tags=None,  # Use all tags in vocabulary
     )
+
     # Apply any user‑provided overrides
     if config_updates:
         for k, v in config_updates.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
+
     vocab = TagVocabulary(vocab_path, min_frequency=cfg.min_tag_frequency)
     if not vocab_path.exists():
         # Build vocabulary from all available annotations
         vocab.build_from_annotations(json_files_sorted, cfg.top_k_tags)
         vocab.save_vocabulary(vocab_path)
+
+    # Set top_k_tags based on actual vocabulary size if not specified
+    if cfg.top_k_tags is None:
+        cfg.top_k_tags = len(vocab.tag_to_index)
     # Create datasets
     train_dataset = SimplifiedDataset(cfg, train_files, split='train', vocab=vocab)
     val_dataset = SimplifiedDataset(cfg, val_files, split='val', vocab=vocab)
