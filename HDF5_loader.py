@@ -58,6 +58,10 @@ from vocabulary import TagVocabulary
 
 logger = logging.getLogger(__name__)
 
+# Project paths
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+
 class BoundedLevelAwareQueue:
     """Bounded queue with level-aware dropping policy for logging."""
     
@@ -2016,7 +2020,7 @@ class SimplifiedDataset(Dataset):
 def create_dataloaders(
     data_dir: Path,
     json_dir: Path,
-    vocab_path: Path,
+    vocab_path: Path = DEFAULT_VOCAB_PATH,
     batch_size: int = 32,
     num_workers: int = 8,
     distributed: bool = False,

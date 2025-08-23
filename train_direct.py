@@ -23,6 +23,10 @@ from torch.amp import GradScaler, autocast
 import numpy as np
 from Monitor_log import MonitorConfig, TrainingMonitor
 
+# Project paths
+PROJECT_ROOT = Path(__file__).resolve().parent
+VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+
 # Import the orientation handler
 from orientation_handler import OrientationHandler
 
@@ -189,7 +193,7 @@ def train_with_orientation_tracking():
         "max_grad_norm": 1.0,  # Add gradient clipping
         "data_dir": Path("/media/andrewk/qnap-public/workspace/shard_00022/"),
         "json_dir": Path("/media/andrewk/qnap-public/workspace/shard_00022/"),
-        "vocab_path": Path("vocabulary.json"),
+        "vocab_path": VOCAB_PATH,
         "num_workers": 4,  # Store in config for dataset initialization
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "checkpoint_dir": Path("checkpoints"),  # Add checkpoint directory
@@ -626,7 +630,7 @@ def train_with_orientation_tracking():
         checkpoint_metadata = {
             "vocabulary_info": {
                 "num_tags": num_tags,
-                "vocab_path": "vocabulary.json",  # Relative to checkpoint dir
+                "vocab_path": str(VOCAB_PATH),
                 "has_vocabulary": True
             },
             "normalization_params": {
