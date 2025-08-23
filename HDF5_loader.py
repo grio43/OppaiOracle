@@ -394,10 +394,21 @@ def _make_worker_init_fn(base_seed: int, log_queue: Optional[object]):
         np.random.seed(seed)
         torch.manual_seed(seed)
 
- # Setup worker logging with rotation
+        # Setup worker logging with rotation
         if log_queue is not None:
             setup_worker_logging(worker_id, log_queue)
-    
+
+        # Important: Close any inherited LMDB environments in worker
+        # This prevents issues with shared file descriptors
+        import gc
+        for obj in gc.get_objects():
+            if hasattr(obj, '__class__') and obj.__class__.__name__ == 'LMDBCache':
+                if hasattr(obj, 'env') and obj.env is not None:
+                    try:
+                        obj.env.close()
+                    except Exception:
+                        pass
+
     return _init_fn
 
 
@@ -419,21 +430,12 @@ class LMDBCache:
         self.current_map_size = min(self.map_growth_bytes, self.max_size_bytes)
         self.readonly = readonly
         self.max_readers = max_readers
-        
-        # Open LMDB environment
-        self.env = lmdb.open(
-            str(self.path),
-            map_size=self.current_map_size,
-            readonly=readonly,
-            lock=not readonly,
-            max_dbs=1,
-            writemap=True,  # Use write-mapped mode for better performance
-            metasync=False,  # Don't sync metadata for each transaction
-            sync=False,  # Don't sync data for each transaction (rely on OS)
-            map_async=True,  # Allow async writes
-            max_readers=self.max_readers,
-        )
-        
+
+        # Open LMDB environment lazily and track process
+        self._env = None
+        self._pid = None
+        self._open_env()
+
         # Track cache statistics
         self.hits = 0
         self.misses = 0
@@ -443,78 +445,147 @@ class LMDBCache:
         self._lock = threading.Lock()
         self.grace_margin = 0.05  # 5% grace margin
         self.max_value_bytes = int(32 * 1024 * 1024)  # 32MB max per value
-        
+
+    def _open_env(self):
+        """Open or reopen LMDB environment for current process"""
+        self.env = lmdb.open(
+            str(self.path),
+            map_size=self.current_map_size,
+            readonly=self.readonly,
+            lock=not self.readonly,
+            max_dbs=1,
+            writemap=True,  # Use write-mapped mode for better performance
+            metasync=False,  # Don't sync metadata for each transaction
+            sync=False,  # Don't sync data for each transaction (rely on OS)
+            map_async=True,  # Allow async writes
+            max_readers=self.max_readers,
+        )
+        self._pid = os.getpid()
+
+    def _ensure_env(self):
+        """Ensure LMDB environment is open for current process"""
+        current_pid = os.getpid()
+        if self._pid != current_pid:
+            if hasattr(self, 'env') and self.env is not None:
+                try:
+                    self.env.close()
+                except Exception:
+                    pass
+            self._open_env()
+            logger.debug(f"LMDB environment reopened for process {current_pid}")
+
     def get(self, key: str) -> Optional[torch.Tensor]:
         """Get item from cache"""
-        with self.env.begin(buffers=True) as txn:
+        self._ensure_env()
+        txn = None
+        try:
+            txn = self.env.begin(buffers=True)
             data = txn.get(key.encode())
+            txn.abort()  # explicitly close read transaction
+            txn = None
             if data is not None:
                 self.hits += 1
-                # Deserialize tensor.  ``np.frombuffer`` returns a read‑only array
+                # Deserialize tensor.  ``np.frombuffer`` returns a read-only array
                 # which subsequently triggers a PyTorch warning when wrapping it
-                # with ``torch.from_numpy``.  Copy the buffer to ensure writability
+                # with ``torch.from_numpy``. Copy the buffer to ensure writability
                 # and avoid the warning about undefined behaviour when tensors are
-                # created from non‑writable NumPy arrays.
+                # created from non-writable NumPy arrays.
                 buffer = np.frombuffer(data, dtype=np.uint8).copy()
-                # Return as 1D tensor - caller will reshape based on metadata
                 tensor = torch.from_numpy(buffer)
                 return tensor
             else:
                 self.misses += 1
                 return None
+        finally:
+            if txn is not None:
+                txn.abort()
     
     def put(self, key: str, value: torch.Tensor, check_memory: bool = True) -> bool:
         """Put item in cache with memory checking"""
         with self._lock:
             if self.readonly:
                 return False
-            
+
+            self._ensure_env()
+
             # Check if key already exists (track duplicates)
-            with self.env.begin(buffers=True) as txn:
-                if txn.get(key.encode()) is not None:
+            txn = None
+            try:
+                txn = self.env.begin(buffers=True)
+                exists = txn.get(key.encode()) is not None
+                txn.abort()
+                txn = None
+                if exists:
                     self.duplicate_keys += 1
                     return True  # Already cached
-            
+            finally:
+                if txn is not None:
+                    txn.abort()
+
             # Serialize tensor with canonical dtype
             if value.dtype != torch.uint8:
-                # Convert to canonical dtype for consistent sizing
                 value = (value * 255).to(torch.uint8) if value.dtype.is_floating_point else value.to(torch.uint8)
-            
+
             value_np = value.cpu().numpy()
             value_bytes = value_np.tobytes()
-            
+
             # Check value size limit
             if len(value_bytes) > self.max_value_bytes:
-                logger.warning(f"Value too large ({len(value_bytes)/1024/1024:.1f}MB > {self.max_value_bytes/1024/1024:.1f}MB), rejecting")
+                logger.warning(
+                    f"Value too large ({len(value_bytes)/1024/1024:.1f}MB > {self.max_value_bytes/1024/1024:.1f}MB), rejecting"
+                )
                 self.rejection_count += 1
                 return False
-            
+
             # Check capacity with grace margin
-            with self.env.begin() as txn:
+            txn = None
+            try:
+                txn = self.env.begin()
                 stat = txn.stat()
-                current_size = stat['psize'] * stat['leaf_pages']
-                
+                txn.abort()
+                txn = None
+            finally:
+                if txn is not None:
+                    txn.abort()
+            current_size = stat['psize'] * stat['leaf_pages']
+
             max_allowed = self.max_size_bytes * (1 - self.grace_margin)
             if current_size + len(value_bytes) > max_allowed:
-                logger.warning(f"Cache approaching capacity limit with grace margin, rejecting insert")
+                logger.warning(
+                    f"Cache approaching capacity limit with grace margin, rejecting insert"
+                )
                 self.rejection_count += 1
                 return False
-            
+
             # Check memory watermarks if requested
             if check_memory and not self._check_memory_available():
                 return False
-        
+
         try:
-            with self.env.begin(write=True) as txn:
+            txn = None
+            try:
+                txn = self.env.begin(write=True)
                 txn.put(key.encode(), value_bytes)
+                txn.commit()
+                txn = None
+            finally:
+                if txn is not None:
+                    txn.abort()
             return True
         except lmdb.MapFullError:
             # Try to grow the map
             if self._grow_map():
                 # Retry after growing
                 try:
-                    with self.env.begin(write=True) as txn:
+                    txn = None
+                    try:
+                        txn = self.env.begin(write=True)
                         txn.put(key.encode(), value_bytes)
+                        txn.commit()
+                        txn = None
+                    finally:
+                        if txn is not None:
+                            txn.abort()
                     return True
                 except lmdb.MapFullError:
                     logger.warning("LMDB cache is full even after growth")
@@ -525,9 +596,10 @@ class LMDBCache:
     
     def _grow_map(self) -> bool:
         """Try to grow the LMDB map size."""
+        self._ensure_env()
         if self.current_map_size >= self.max_size_bytes:
             return False
-        
+
         new_size = min(self.current_map_size + self.map_growth_bytes, self.max_size_bytes)
         try:
             self.env.set_mapsize(new_size)
@@ -559,14 +631,22 @@ class LMDBCache:
     
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics"""
+        self._ensure_env()
         with self._lock:
             total = self.hits + self.misses
             hit_rate = self.hits / max(1, total)
-            
+
             # Get LMDB stats
-            with self.env.begin() as txn:
+            txn = None
+            try:
+                txn = self.env.begin()
                 stat = txn.stat()
-                
+                txn.abort()
+                txn = None
+            finally:
+                if txn is not None:
+                    txn.abort()
+
             return {
                 'hits': self.hits,
                 'misses': self.misses,
@@ -952,13 +1032,26 @@ class SimplifiedDataset(Dataset):
             self.l2_cache = None
             if config.l2_cache_enabled:
                 try:
-                    self.l2_cache = LMDBCache(
-                        path=config.l2_cache_path,
-                        max_size_gb=config.l2_max_size_gb,
-                        max_readers=config.l2_max_readers,
-                        readonly=(split != 'train')  # Only training can write
-                    )
-                    logger.info(f"L2 LMDB cache initialized at {config.l2_cache_path}")
+                    # Don't open LMDB in main process if using workers
+                    # Each worker will open its own environment
+                    if hasattr(config, 'num_workers') and config.num_workers > 0:
+                        # Just store config, workers will create their own
+                        self._l2_cache_config = {
+                            'path': config.l2_cache_path,
+                            'max_size_gb': config.l2_max_size_gb,
+                            'max_readers': config.l2_max_readers,
+                            'readonly': (split != 'train')
+                        }
+                        self.l2_cache = None
+                    else:
+                        # Single process mode - open directly
+                        self.l2_cache = LMDBCache(
+                            path=config.l2_cache_path,
+                            max_size_gb=config.l2_max_size_gb,
+                            max_readers=config.l2_max_readers,
+                            readonly=(split != 'train')  # Only training can write
+                        )
+                        logger.info(f"L2 LMDB cache initialized at {config.l2_cache_path}")
                 except Exception as e:
                     logger.warning(f"Failed to initialize L2 cache: {e}")
                     self.l2_cache = None
@@ -1354,6 +1447,18 @@ class SimplifiedDataset(Dataset):
 
     def _load_image(self, image_path: str) -> Tuple[torch.Tensor, bool]:
         """Load an image using tiered cache (L1 -> L2 -> disk)"""
+
+        # Lazy initialization of L2 cache for workers
+        if self.l2_cache is None and hasattr(self, '_l2_cache_config'):
+            try:
+                self.l2_cache = LMDBCache(**self._l2_cache_config)
+                logger.debug(f"L2 cache initialized in worker process {os.getpid()}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize L2 cache in worker: {e}")
+                self.l2_cache = None
+                if hasattr(self, '_l2_cache_config'):
+                    delattr(self, '_l2_cache_config')
+
         # Generate deduplicated cache key with transform signature
         transform_sig = f"size{self.config.image_size}_norm{hash(self.config.normalize_mean)}"
         cache_key = _compute_cache_key(

@@ -9,8 +9,8 @@ import os
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional
+import multiprocessing as mp
 import sys
-import queue
 import random
 import torch.distributed as dist
 
@@ -20,8 +20,6 @@ import numpy as np
 
 # Import the orientation handler
 from orientation_handler import OrientationHandler
-# Import the bounded queue
-from HDF5_loader import BoundedLevelAwareQueue
 
 # Import base modules with error handling
 try:
@@ -154,7 +152,12 @@ def train_with_orientation_tracking():
     import logging
     from logging.handlers import QueueListener, RotatingFileHandler
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    log_queue = BoundedLevelAwareQueue(maxsize=5000)
+    
+    # Use a proper multiprocessing.Queue for cross-process communication
+    # The BoundedLevelAwareQueue uses threading primitives which cannot be
+    # safely pickled and used in worker processes
+    log_queue = mp.Queue(maxsize=5000)
+    
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(formatter)
     sh.setLevel(logging.INFO)
@@ -174,7 +177,7 @@ def train_with_orientation_tracking():
         "data_dir": Path("/media/andrewk/qnap-public/docker/workspace/shard_00022/"),
         "json_dir": Path("/media/andrewk/qnap-public/docker/workspace/shard_00022/"),
         "vocab_path": Path("vocabulary.json"),
-        "num_workers": 4,
+        "num_workers": 4,  # Store in config for dataset initialization
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "amp": True,
         # Orientation-specific settings
@@ -318,7 +321,8 @@ def train_with_orientation_tracking():
             # Convert string back to Path if needed
             "orientation_map_path": Path(config.get("orientation_map_path")) if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) else config.get("orientation_map_path"),
             "skip_unmapped": config.get("skip_unmapped", True),
-            "strict_orientation_validation": config.get("strict_orientation", True)
+            "strict_orientation_validation": config.get("strict_orientation", True),
+            "num_workers": config["num_workers"]  # Pass to dataset for LMDB initialization
         },
         seed=seed,
         log_queue=log_queue,
@@ -522,6 +526,9 @@ def train_with_orientation_tracking():
             logger.warning(f"Error stopping QueueListener: {e}")
 
     # Log queue drop statistics
+    # Note: mp.Queue doesn't have get_drop_stats method
+    # This was specific to BoundedLevelAwareQueue
+    """
     try:
         if hasattr(log_queue, 'get_drop_stats'):
             drop_stats = log_queue.get_drop_stats()
@@ -530,6 +537,7 @@ def train_with_orientation_tracking():
                 logger.warning(f"Logging queue dropped {total_drops} messages: {drop_stats}")
     except Exception as e:
         logger.debug(f"Could not get queue drop stats: {e}")
+    """
 
     logger.info("Training complete!")
 
