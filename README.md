@@ -18,6 +18,13 @@ flowchart TD
     H5 --> Orient
   end
 
+  %% Dataset Analysis
+  subgraph H[Dataset Analysis]
+    DataA["Dataset_Analysis.py\n• AnalysisConfig\n• dataset insights/report"]
+    H5 -.-> DataA
+    Vocab -.-> DataA
+  end
+
   %% Model
   subgraph C[Model]
     Arch["model_architecture.py\n• VisionTransformerConfig\n• create_model()\n• SimplifiedTagger.forward() -> {tag_logits, rating_logits}"]
@@ -39,8 +46,10 @@ flowchart TD
   subgraph E[Validation & Metrics]
     Val["validation_loop.py\n• ValidationRunner\n• compute metrics/plots"]
     Metrics["metrics.py\n• precision/recall/F1\n• mAP/ROC-AUC/top_k_accuracy"]
+    AdvM["Evaluation_Metrics.py\n• MetricConfig\n• advanced metrics"]
     Train --> Val
     Metrics --> Val
+    AdvM --> Val
   end
 
   %% Monitoring
