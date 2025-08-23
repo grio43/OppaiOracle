@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, sys, time, pathlib
+import json, os, sys, time, pathlib, contextlib
 from collections import defaultdict
 from typing import List, Tuple, Dict, Set
 import numpy as np
@@ -212,29 +212,50 @@ def parse_ground_truth_tags(json_data):
 def calculate_metrics(predicted: Set[str], ground_truth: Set[str]) -> Dict[str, float]:
     """Calculate precision, recall, and F1 score"""
     if not predicted and not ground_truth:
-        return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
-    
+        return {
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 0,
+        }
+
     if not predicted:
-        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
-    
+        return {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": len(ground_truth),
+        }
+
     if not ground_truth:
-        return {"precision": 0.0, "recall": 1.0, "f1": 0.0}
-    
+        return {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": len(predicted),
+            "false_negatives": 0,
+        }
+
     true_positives = len(predicted & ground_truth)
     false_positives = len(predicted - ground_truth)
     false_negatives = len(ground_truth - predicted)
-    
-    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-    
+
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) else 0.0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
     return {
         "precision": precision,
         "recall": recall,
         "f1": f1,
         "true_positives": true_positives,
         "false_positives": false_positives,
-        "false_negatives": false_negatives
+        "false_negatives": false_negatives,
     }
 
 def create_gpu_session(model_path, max_memory_gb=25):
@@ -368,7 +389,7 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
         return None
 
     # Find all JSON files
-    json_files = list(pathlib.Path(data_folder).glob("*.json"))
+    json_files = sorted(pathlib.Path(data_folder).glob("*.json"))
     if limit:
         json_files = json_files[:limit]
 
@@ -404,6 +425,10 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
             return self.samples[idx]
 
     dataset = EvalDataset(json_files)
+
+    def _collate_keep_list(batch):
+        return batch
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -411,50 +436,111 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
         num_workers=4,
         pin_memory=True,
         prefetch_factor=2,
-        persistent_workers=True
+        persistent_workers=True,
+        collate_fn=_collate_keep_list,
     )
 
-    # Results storage
     all_results = []
-    total_inference_time = 0
+    overall_metrics = defaultdict(list)
+    tag_performance = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
+    total_inference_time = 0.0
 
-    # Choose dtype for AMP
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    use_amp = device.type == 'cuda'
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
 
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype):
-        for batch_data in tqdm(dataloader, desc="Processing batches"):
-            # Preprocess batch
-            image_paths = [d['image_path'] for d in batch_data]
-            batch_input, valid_indices, batch_infos = preprocess_batch(
-                image_paths, image_size, mean, std
-            )
+    with torch.no_grad():
+        autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype) if use_amp else contextlib.nullcontext()
+        with autocast_ctx:
+            for batch in tqdm(dataloader, desc="Processing batches"):
+                image_paths = [s['image_path'] for s in batch]
+                gt_sets = [s['ground_truth'] for s in batch]
+                filenames = [s['filename'] for s in batch]
 
-            if batch_input is None:
-                continue
+                batch_input, valid_idx, batch_infos = preprocess_batch(
+                    image_paths, image_size, mean, std
+                )
+                if batch_input is None:
+                    continue
 
-            # Convert to torch tensors
-            images = torch.from_numpy(batch_input).to(device, non_blocking=True)
-            images = images.to(memory_format=torch.channels_last)
+                images = torch.from_numpy(batch_input).to(device, non_blocking=True)
+                images = images.to(memory_format=torch.channels_last)
 
-            # Build padding mask
-            padding_mask = build_padding_mask_from_info(batch_infos, image_size, image_size, device)
-            # Skip mask if no padding
-            if torch.all(padding_mask == 1):
-                padding_mask = None
+                H, W = images.shape[-2:]
+                padding_mask = build_padding_mask_from_info(batch_infos, H, W, device)
+                if torch.all(padding_mask == 1):
+                    padding_mask = None
 
-            # Run inference
-            start_time = time.time()
-            outputs = model(images, padding_mask=padding_mask)
-            torch.cuda.synchronize()  # Wait for GPU to finish
-            inference_time = time.time() - start_time
-            total_inference_time += inference_time
+                start_time = time.time()
+                outputs = model(images, padding_mask=padding_mask)
+                if use_amp:
+                    torch.cuda.synchronize()
+                total_inference_time += time.time() - start_time
 
-            # Process outputs
-            scores = outputs['tag_logits'].sigmoid().cpu().numpy()
-            # ... rest of processing similar to ONNX version
+                if isinstance(outputs, dict) and 'tag_logits' in outputs:
+                    logits = outputs['tag_logits']
+                else:
+                    logits = outputs
+                scores = logits.sigmoid().float().cpu().numpy()
+
+                preds = get_predictions_from_scores(scores, tag_names, threshold)
+
+                for j, src_idx in enumerate(valid_idx):
+                    pred = preds[j]
+                    gt = gt_sets[src_idx]
+                    metrics = calculate_metrics(pred, gt)
+                    for t in (pred & gt):
+                        tag_performance[t]["tp"] += 1
+                    for t in (pred - gt):
+                        tag_performance[t]["fp"] += 1
+                    for t in (gt - pred):
+                        tag_performance[t]["fn"] += 1
+                    all_results.append({
+                        "filename": filenames[src_idx],
+                        "ground_truth_tags": sorted(gt),
+                        "predicted_tags": sorted(pred),
+                        "metrics": metrics,
+                    })
+                    for k, v in metrics.items():
+                        if isinstance(v, (int, float)):
+                            overall_metrics[k].append(v)
+
+    summary = {
+        "total_files": len(dataset),
+        "processed_files": len(all_results),
+        "failed_files": len(dataset) - len(all_results),
+        "average_metrics": {},
+    }
+    for k, v in overall_metrics.items():
+        if v:
+            summary["average_metrics"][k] = float(np.mean(v))
+            summary["average_metrics"][f"{k}_std"] = float(np.std(v))
+
+    tag_f1_scores = []
+    for tag, stats in tag_performance.items():
+        tp, fp, fn = stats["tp"], stats["fp"], stats["fn"]
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        tag_f1_scores.append({
+            "tag": tag,
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "support": tp + fn,
+        })
+    tag_f1_scores.sort(key=lambda x: x["f1"], reverse=True)
+    summary["tag_performance"] = {
+        "best_tags": tag_f1_scores[:10],
+        "worst_tags": tag_f1_scores[-10:] if len(tag_f1_scores) > 10 else [],
+    }
+    summary["total_inference_time"] = total_inference_time
+    summary["images_per_second"] = len(dataset) / total_inference_time if total_inference_time else 0.0
+
+    with open(output_file, "w") as f:
+        json.dump({"summary": summary, "detailed_results": all_results}, f, indent=2)
 
     print(f"Total inference time: {total_inference_time:.2f}s")
-    print(f"Images per second: {len(dataset) / total_inference_time:.2f}")
+    print(f"Images per second: {summary['images_per_second']:.2f}")
 
 def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5, 
                      image_size=640, output_file="evaluation_results.json",
@@ -754,7 +840,7 @@ def main():
     # Adjust batch size based on your model and image size
     # For 640x640 images, 32-64 is usually good for 32GB VRAM
     # Start conservative and increase if memory allows
-    BATCH_SIZE = 250  # You can increase this if memory usage is low
+    BATCH_SIZE = 32  # You can increase this if memory usage is low
     MAX_MEMORY_GB = 25  # Keep within this limit
 
     # Detect model format and choose appropriate processing function
