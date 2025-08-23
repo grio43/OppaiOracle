@@ -223,6 +223,20 @@ class ONNXExporter:
             raise FileNotFoundError(f"Checkpoint not found: {self.config.checkpoint_path}")
         
         try:
+            # Try loading with weights_only=True first (safer)
+            try:
+                # Add pathlib.PosixPath to safe globals for newer PyTorch versions
+                import torch.serialization
+                with torch.serialization.safe_globals([pathlib.PosixPath, pathlib.Path, pathlib.WindowsPath]):
+                    checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu', weights_only=True)
+            except (pickle.UnpicklingError, TypeError) as e:
+                # Fallback to weights_only=False for compatibility
+                # This is safe since we're loading our own trained checkpoint
+                logger.warning(f"Loading with weights_only=True failed: {e}")
+                logger.info("Attempting to load with weights_only=False (trusted checkpoint)")
+                checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu', weights_only=False)
+        except RuntimeError as e:
+            # Handle old PyTorch versions that don't have weights_only parameter
             checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu')
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
