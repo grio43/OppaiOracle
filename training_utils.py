@@ -102,8 +102,10 @@ class DistributedTrainingHelper:
         self.device = None
         
     def setup(self) -> torch.device:
-        """Setup distributed training environment
-        Returns:            torch.device: True or False
+        """Set up distributed training and return device for this process.
+
+        Returns:
+            torch.device: The GPU or CPU assigned to the current process.
         """
         if 'WORLD_SIZE' in os.environ:
             self.is_distributed = True
