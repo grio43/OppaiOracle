@@ -6,6 +6,8 @@ Export trained model to ONNX format for deployment
 
 import os
 import json
+import pathlib
+import pickle
 import logging
 import shutil
 from pathlib import Path
@@ -240,6 +242,30 @@ class ONNXExporter:
             checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu')
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
+        # Detect number of tags from checkpoint
+        num_tags = None
+        
+        # First check state dict for tag_head dimensions
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+        
+        # Look for tag_head.weight or tag_head.bias to determine num_tags
+        for key in state_dict.keys():
+            if 'tag_head.weight' in key:
+                num_tags = state_dict[key].shape[0]
+                logger.info(f"Detected {num_tags} tags from checkpoint")
+                break
+            elif 'tag_head.bias' in key:
+                num_tags = state_dict[key].shape[0]
+                logger.info(f"Detected {num_tags} tags from checkpoint")
+                break
+        
+        if num_tags is None:
+            logger.warning("Could not detect number of tags from checkpoint, using vocabulary size")
             raise
         
         # Extract model config
@@ -256,20 +282,25 @@ class ONNXExporter:
         # Create model
         try:
             if isinstance(model_config, dict):
-                model = create_model(**model_config)
+                model_params = model_config.copy()
+                # Override num_tags if detected from checkpoint
+                if num_tags is not None:
+                    model_params['num_tags'] = num_tags
+                else:
+                    model_params['num_tags'] = len(self.vocab.tag_to_index)
+                model = create_model(**model_params)
             else:
-                model = create_model(**asdict(model_config))
+                model_params = asdict(model_config)
+                # Override num_tags if detected from checkpoint
+                if num_tags is not None:
+                    model_params['num_tags'] = num_tags
+                else:
+                    model_params['num_tags'] = len(self.vocab.tag_to_index)
+                model = create_model(**model_para
         except Exception as e:
             logger.error(f"Failed to create model: {e}")
             raise
         
-        # Load weights
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        elif 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        else:
-            state_dict = checkpoint
         
         # Handle DDP weights
         if any(k.startswith('module.') for k in state_dict.keys()):
