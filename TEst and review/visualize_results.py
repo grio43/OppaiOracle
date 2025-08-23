@@ -1,11 +1,8 @@
  #!/usr/bin/env python3
 import json
-import argparse
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
-import pandas as pd
-import seaborn as sns
 
 def load_results(results_file):
     """Load evaluation results from JSON file"""
@@ -236,34 +233,24 @@ def generate_performance_report(results_data, output_dir):
     print('\n'.join(report_lines))
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize model evaluation results")
-    parser.add_argument("--results", default="evaluation_results.json", 
-                       help="Path to evaluation results JSON file")
-    parser.add_argument("--output_dir", default="./evaluation_plots",
-                       help="Directory to save visualization outputs")
-    parser.add_argument("--top_n", type=int, default=20,
-                       help="Number of top/bottom tags to show")
-    
-    args = parser.parse_args()
-    
-    # Create output directory
-    output_dir = Path(args.output_dir)
+    results_path = "/media/andrewk/qnap-public/workspace/results/evaluation_results.json"
+    output_dir = Path("/media/andrewk/qnap-public/workspace/results")
     output_dir.mkdir(exist_ok=True)
-    
+
     # Load results
-    print(f"Loading results from {args.results}")
-    results_data = load_results(args.results)
-    
+    print(f"Loading results from {results_path}")
+    results_data = load_results(results_path)
+
     # Generate visualizations
     print("\nGenerating visualizations...")
     plot_metrics_distribution(results_data, output_dir)
-    plot_tag_performance(results_data, output_dir, args.top_n)
+    plot_tag_performance(results_data, output_dir, top_n=20)
     plot_tag_counts(results_data, output_dir)
-    
+
     # Generate text report
     print("\nGenerating performance report...")
     generate_performance_report(results_data, output_dir)
-    
+
     print(f"\nAll outputs saved to {output_dir}")
 
 if __name__ == "__main__":
