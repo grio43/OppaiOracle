@@ -631,7 +631,7 @@ class ValidationIndex:
     
     def set_status(self, image_path: str, status: str, error_msg: Optional[str] = None):
         """Set validation status for an image"""
-        from datetime import datetime
+        from datetime import timedelta
 
         # Calculate next retry time with exponential backoff
         next_retry = None
@@ -658,9 +658,8 @@ class ValidationIndex:
                    retry_count = retry_count + 1,
                    next_retry_after = ?,
                    first_failure = COALESCE(first_failure, excluded.first_failure)""",
-                (image_path, status, datetime.now(), error_msg, next_retry, 
+                (image_path, status, datetime.now(), error_msg, next_retry,
                  datetime.now() if status == 'failed' else None, next_retry)
-                (image_path, status, datetime.now(), error_msg, image_path)
             )
             self.conn.commit()
     
@@ -1192,14 +1191,17 @@ class SimplifiedDataset(Dataset):
             orientation_tags.update(self.orientation_handler.reverse_mappings.keys())
         for anno in self.annotations:
             w = 0.0
-            has_orientation_tag = False
+            has_orientation_tag = False 
             for tag in anno['tags']:
                 freq = self.vocab.tag_frequencies.get(tag, 1)
                 # Inverse frequency weighting
                 w += (1.0 / max(freq, 1)) ** self.config.sample_weight_power
             # Average over number of tags to avoid biasing multi‑tag images
             w = w / max(1, len(anno['tags']))
+            weights.append(w)
         weights_arr = np.array(weights, dtype=np.float64)
+        if weights_arr.size == 0:
+            weights_arr = np.ones(len(self.annotations), dtype=np.float64)
         # Normalise weights to sum to one
         weights_arr = weights_arr / weights_arr.sum() if weights_arr.sum() > 0 else weights_arr
         self.sample_weights = weights_arr
