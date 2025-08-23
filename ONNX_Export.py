@@ -296,7 +296,7 @@ class ONNXExporter:
                     model_params['num_tags'] = num_tags
                 else:
                     model_params['num_tags'] = len(self.vocab.tag_to_index)
-                model = create_model(**model_para
+                model = create_model(**model_para)
         except Exception as e:
             logger.error(f"Failed to create model: {e}")
             raise
