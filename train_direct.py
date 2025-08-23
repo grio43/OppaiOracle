@@ -350,7 +350,12 @@ def train_with_orientation_tracking():
             "orientation_map_path": Path(config.get("orientation_map_path")) if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) else config.get("orientation_map_path"),
             "skip_unmapped": config.get("skip_unmapped", True),
             "strict_orientation_validation": config.get("strict_orientation", True),
-            "num_workers": config["num_workers"]  # Pass to dataset for LMDB initialization
+            "num_workers": config["num_workers"],  # Pass to dataset for LMDB initialization
+            # Conservative colour jitter settings for anime
+            "color_jitter_brightness": 0.1,
+            "color_jitter_contrast": 0.1,
+            "color_jitter_saturation": 0.05,
+            "color_jitter_hue": 0.02,
         },
         seed=seed,
         log_queue=log_queue,
