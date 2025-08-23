@@ -1,5 +1,5 @@
- #!/usr/bin/env python3
-import argparse, json, os, sys, time, pathlib
+#!/usr/bin/env python3
+import json, os, sys, time, pathlib
 from collections import defaultdict
 from typing import List, Tuple, Dict, Set
 import numpy as np
@@ -99,6 +99,10 @@ def process_batch(data_folder, model_path, config_path=None, threshold=0.5,
     # Determine output name
     output_names = [o.name for o in sess.get_outputs()]
     use_scores = "scores" if "scores" in output_names else output_names[0]
+
+    # Determine input name
+    input_names = [i.name for i in sess.get_inputs()]
+    input_name = input_names[0] if input_names else "input_image"  # Fallback to "input_image" if needed
     
     # Find all JSON files
     json_files = list(pathlib.Path(data_folder).glob("*.json"))
@@ -137,7 +141,7 @@ def process_batch(data_folder, model_path, config_path=None, threshold=0.5,
             
             # Run inference
             x = preprocess(str(image_path), image_size, mean, std)
-            inputs = {"input_image": x.astype("float32")}
+            inputs = {input_name: x.astype("float32")}
             
             start_time = time.time()
             outs = sess.run([use_scores], inputs)
@@ -253,28 +257,21 @@ def process_batch(data_folder, model_path, config_path=None, threshold=0.5,
     return summary
 
 def main():
-    ap = argparse.ArgumentParser(description="Batch evaluation of model against training data")
-    ap.add_argument("--data_folder", required=True, help="Path to folder containing JSON and image files")
-    ap.add_argument("--model", default="exported_models/model.onnx", help="Path to ONNX model")
-    ap.add_argument("--config", default="./checkpoints/model_config.json", help="Optional model_config.json")
-    ap.add_argument("--threshold", type=float, default=0.5, help="Confidence threshold for predictions")
-    ap.add_argument("--image_size", type=int, default=640, help="Image size for preprocessing")
-    ap.add_argument("--output", default="evaluation_results.json", help="Output file for results")
-    ap.add_argument("--limit", type=int, default=None, help="Limit number of files to process (for testing)")
-    ap.add_argument("--providers", nargs="*", default=None,
-                    help="Override ONNX Runtime providers, e.g. CUDAExecutionProvider")
-    
-    args = ap.parse_args()
-    
+    data_folder = "/media/andrewk/qnap-public/workspace/shard_00022/"
+    model_path = "/media/andrewk/qnap-public/workspace/OppaiOracle/exported/model.onnx"
+    output_dir = "/media/andrewk/qnap-public/workspace/results"
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, "evaluation_results.json")
+
     process_batch(
-        data_folder=args.data_folder,
-        model_path=args.model,
-        config_path=args.config,
-        threshold=args.threshold,
-        image_size=args.image_size,
-        providers=args.providers,
-        output_file=args.output,
-        limit=args.limit
+        data_folder=data_folder,
+        model_path=model_path,
+        config_path=None,
+        threshold=0.5,
+        image_size=640,
+        providers=None,
+        output_file=output_file,
+        limit=None
     )
 
 if __name__ == "__main__":
