@@ -338,6 +338,7 @@ class SimplifiedDataConfig:
     l2_cache_path: Path = Path("/data/cache/lmdb")
     l2_max_size_gb: float = 48.0
     l2_map_growth_gb: float = 4.0
+    l2_max_readers: int = 2048
     l1_per_worker_mb: float = 128.0  # Small L1 cache per worker
     
     # Memory watermarks (from plan)
@@ -402,14 +403,22 @@ def _make_worker_init_fn(base_seed: int, log_queue: Optional[object]):
 
 class LMDBCache:
     """Global file-backed LMDB cache (L2) with memory-mapped access"""
-    
-    def __init__(self, path: Path, max_size_gb: float = 48.0, map_growth_gb: float = 4.0, readonly: bool = False):
+
+    def __init__(
+        self,
+        path: Path,
+        max_size_gb: float = 48.0,
+        map_growth_gb: float = 4.0,
+        readonly: bool = False,
+        max_readers: int = 2048,
+    ):
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self.max_size_bytes = int(max_size_gb * 1024 ** 3)
         self.map_growth_bytes = int(map_growth_gb * 1024 ** 3)
         self.current_map_size = min(self.map_growth_bytes, self.max_size_bytes)
         self.readonly = readonly
+        self.max_readers = max_readers
         
         # Open LMDB environment
         self.env = lmdb.open(
@@ -422,6 +431,7 @@ class LMDBCache:
             metasync=False,  # Don't sync metadata for each transaction
             sync=False,  # Don't sync data for each transaction (rely on OS)
             map_async=True,  # Allow async writes
+            max_readers=self.max_readers,
         )
         
         # Track cache statistics
@@ -944,6 +954,7 @@ class SimplifiedDataset(Dataset):
                     self.l2_cache = LMDBCache(
                         path=config.l2_cache_path,
                         max_size_gb=config.l2_max_size_gb,
+                        max_readers=config.l2_max_readers,
                         readonly=(split != 'train')  # Only training can write
                     )
                     logger.info(f"L2 LMDB cache initialized at {config.l2_cache_path}")
