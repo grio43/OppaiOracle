@@ -341,11 +341,14 @@ def train_with_orientation_tracking():
     num_tags = len(vocab.tag_to_index)
     num_ratings = len(vocab.rating_to_index)
     logger.info(f"Creating model with {num_tags} tags and {num_ratings} ratings")
-    
+
+    # Override the default num_tags with actual vocabulary size
+    model_config = config["model_config"].copy()
+    model_config["num_tags"] = num_tags
+    model_config["num_ratings"] = num_ratings
+
     model = create_model(
-        num_tags=num_tags,
-        num_ratings=num_ratings,
-        **config["model_config"]
+        **model_config
     )
     model.to(device)
     

@@ -90,20 +90,26 @@ class DanbooruDataPreprocessor:
         
         # Load vocabulary (using pickle for speed): changed to json for compatibility
         vocab_pkl = vocab_path / 'vocabulary.json'
+        
+        # Also check if vocab_path itself is the JSON file
+        if not vocab_pkl.exists() and vocab_path.suffix == '.json' and vocab_path.exists():
+            vocab_pkl = vocab_path
+        
         if vocab_pkl.exists():
             #with open(vocab_pkl, 'rb') as f:
                 #vocab_data = pickle.load(f)
             with open(vocab_pkl, 'r', encoding="utf-8") as f:
-                vocab_data = json.load(f)    
+                vocab_data = json.load(f)
                 self.tag_to_index = vocab_data['tag_to_index']
                 self.index_to_tag = vocab_data['index_to_tag']
                 self.tag_counts = vocab_data['tag_frequencies']
                 # self.frequency_buckets = vocab_data['frequency_buckets']
         else:
             raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
-        
+
         self.vocab_size = len(self.tag_to_index)
-        
+        logger.info(f"Loaded vocabulary with {self.vocab_size} tags")
+
         # Rating mapping
         self.rating_to_index = {
             'general': 0,
@@ -120,8 +126,6 @@ class DanbooruDataPreprocessor:
             'files_with_all_oov': 0,
             'total_oov_tags': 0
         }
-        
-        logger.info(f"Loaded vocabulary with {self.vocab_size} tags")
     
     def process_metadata_batch(self, json_files: List[Path]) -> Dict:
         """Process a batch of JSON metadata files - FIXED VERSION"""
