@@ -27,6 +27,10 @@ from utils.metadata_ingestion import parse_tags_field, dedupe_preserve_order
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Project paths
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+
 
 class DanbooruDataPreprocessor:
     """Preprocessor for Danbooru dataset - direct training approach"""
@@ -619,8 +623,8 @@ def main():
     parser.add_argument(
         '--vocab_path',
         type=str,
-        required=True,
-        help='Path to vocabulary directory'
+        default=str(DEFAULT_VOCAB_PATH),
+        help='Path to vocabulary file'
     )
     parser.add_argument(
         '--output_dir',

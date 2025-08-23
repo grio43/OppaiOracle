@@ -14,6 +14,10 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Project paths
+PROJECT_ROOT = Path(__file__).resolve().parent
+VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+
 # ---------------------------------------------------------------------------
 # Ignore tag handling
 #
@@ -333,7 +337,7 @@ class TagVocabulary:
         return vocab
 
 
-def load_vocabulary_for_training(vocab_dir: Path) -> TagVocabulary:
+def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
     """Load vocabulary from directory or file (for backward compatibility).
 
     First tries to load from vocabulary.json, then tags.txt, otherwise
@@ -407,9 +411,9 @@ def create_dataset_config(vocab: TagVocabulary) -> Dict:
 
 def create_vocabulary_from_datasets(dataset_path: Optional[List[Path]] = None):
     """Create vocabulary from datasets (for training).
-    
+
     This function scans the dataset directories for JSON annotation files,
-    builds a vocabulary, and saves it to vocabulary/vocabulary.json.
+    builds a vocabulary, and saves it to the project root ``vocabulary.json``.
     """
     from pathlib import Path
 
@@ -420,13 +424,11 @@ def create_vocabulary_from_datasets(dataset_path: Optional[List[Path]] = None):
 
     vocab = TagVocabulary(min_frequency=5)
     vocab.build_from_annotations([Path(f) for f in json_files], top_k=5000)
-    
-    vocab_dir = Path('vocabulary/')
-    vocab_dir.mkdir(parents=True, exist_ok=True)
-    vocab.save_vocabulary(vocab_dir / 'vocabulary.json')
-    
-    logger.info(f"Created vocabulary with {len(vocab)} tags and saved to {vocab_dir / 'vocabulary.json'}")
-    
+
+    vocab.save_vocabulary(VOCAB_PATH)
+
+    logger.info(f"Created vocabulary with {len(vocab)} tags and saved to {VOCAB_PATH}")
+
     return vocab
 
 
