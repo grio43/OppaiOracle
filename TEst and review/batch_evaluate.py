@@ -364,8 +364,10 @@ def create_pytorch_session(model_path, device='cuda', compile_model=False):
 
 def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0.5,
                          image_size=640, output_file="evaluation_results_torch.json",
-                         batch_size=32, limit=None, compile_model=False):
-    """Process images using PyTorch with full GPU optimizations."""
+                         results_file=None, batch_size=32, limit=None, compile_model=False):
+    """Process images using PyTorch with full GPU optimizations.
+
+    Results are streamed to disk to keep memory usage low."""
 
     # Check CUDA availability
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -395,6 +397,9 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
 
     print(f"Found {len(json_files)} JSON files to process")
     print(f"Batch size: {batch_size}")
+
+    if results_file is None:
+        results_file = output_file.replace('.json', '_results.jsonl')
 
     # Create DataLoader for efficient batching
     from torch.utils.data import DataLoader, Dataset
@@ -440,15 +445,15 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
         collate_fn=_collate_keep_list,
     )
 
-    all_results = []
     overall_metrics = defaultdict(list)
     tag_performance = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
     total_inference_time = 0.0
+    processed_count = 0
 
     use_amp = device.type == 'cuda'
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
 
-    with torch.no_grad():
+    with open(results_file, 'w') as rf, torch.no_grad():
         autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype) if use_amp else contextlib.nullcontext()
         with autocast_ctx:
             for batch in tqdm(dataloader, desc="Processing batches"):
@@ -494,20 +499,24 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
                         tag_performance[t]["fp"] += 1
                     for t in (gt - pred):
                         tag_performance[t]["fn"] += 1
-                    all_results.append({
+                    result = {
                         "filename": filenames[src_idx],
                         "ground_truth_tags": sorted(gt),
                         "predicted_tags": sorted(pred),
                         "metrics": metrics,
-                    })
+                        "num_gt_tags": len(gt),
+                        "num_pred_tags": len(pred),
+                    }
+                    rf.write(json.dumps(result) + "\n")
+                    processed_count += 1
                     for k, v in metrics.items():
                         if isinstance(v, (int, float)):
                             overall_metrics[k].append(v)
 
     summary = {
         "total_files": len(dataset),
-        "processed_files": len(all_results),
-        "failed_files": len(dataset) - len(all_results),
+        "processed_files": processed_count,
+        "failed_files": len(dataset) - processed_count,
         "average_metrics": {},
     }
     for k, v in overall_metrics.items():
@@ -534,18 +543,22 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
         "worst_tags": tag_f1_scores[-10:] if len(tag_f1_scores) > 10 else [],
     }
     summary["total_inference_time"] = total_inference_time
-    summary["images_per_second"] = len(dataset) / total_inference_time if total_inference_time else 0.0
+    summary["images_per_second"] = processed_count / total_inference_time if total_inference_time else 0.0
 
     with open(output_file, "w") as f:
-        json.dump({"summary": summary, "detailed_results": all_results}, f, indent=2)
+        json.dump({"summary": summary, "results_file": os.path.basename(results_file)}, f, indent=2)
 
     print(f"Total inference time: {total_inference_time:.2f}s")
     print(f"Images per second: {summary['images_per_second']:.2f}")
+    print(f"Summary saved to: {output_file}")
+    print(f"Detailed results saved to: {results_file}")
 
-def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5, 
+def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
                      image_size=640, output_file="evaluation_results.json",
-                     batch_size=32, limit=None, max_memory_gb=25):
-    """Process images in batches on GPU for efficient inference"""
+                     results_file=None, batch_size=32, limit=None, max_memory_gb=25):
+    """Process images in batches on GPU for efficient inference.
+
+    Results are written incrementally to disk to minimize RAM usage."""
     
     # Load model configuration
     tag_names, norm = load_tag_names(config_path)
@@ -574,9 +587,11 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
     
     print(f"Found {len(json_files)} JSON files to process")
     print(f"Batch size: {batch_size}")
-    
+
+    if results_file is None:
+        results_file = output_file.replace('.json', '_results.jsonl')
+
     # Results storage
-    all_results = []
     overall_metrics = defaultdict(list)
     tag_performance = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
     failed_files = []
@@ -593,139 +608,134 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
 
     processed_count = 0
 
-    for batch_idx in tqdm(range(0, len(json_files), batch_size),
-                          desc=f"Processing batches",
-                          total=total_batches):
-        
-        batch_files = json_files[batch_idx:batch_idx + batch_size]
-        batch_data = []
-        batch_image_paths = []
-        batch_ground_truths = []
-        
-        # Load batch data
-        for json_path in batch_files:
-            try:
-                with open(json_path, "r") as f:
-                    json_data = json.load(f)
-                
-                image_filename = json_data.get("filename")
-                if not image_filename:
+    with open(results_file, 'w') as rf:
+        for batch_idx in tqdm(range(0, len(json_files), batch_size),
+                              desc=f"Processing batches",
+                              total=total_batches):
+
+            batch_files = json_files[batch_idx:batch_idx + batch_size]
+            batch_data = []
+            batch_image_paths = []
+            batch_ground_truths = []
+
+            # Load batch data
+            for json_path in batch_files:
+                try:
+                    with open(json_path, "r") as f:
+                        json_data = json.load(f)
+
+                    image_filename = json_data.get("filename")
+                    if not image_filename:
+                        failed_files.append(str(json_path))
+                        continue
+
+                    image_path = json_path.parent / image_filename
+                    if not image_path.exists():
+                        failed_files.append(str(json_path))
+                        continue
+
+                    ground_truth = parse_ground_truth_tags(json_data)
+
+                    batch_data.append({
+                        "json_path": json_path,
+                        "image_filename": image_filename,
+                        "json_data": json_data
+                    })
+                    batch_image_paths.append(str(image_path))
+                    batch_ground_truths.append(ground_truth)
+
+                except Exception as e:
+                    print(f"Error loading {json_path}: {e}")
                     failed_files.append(str(json_path))
                     continue
-                
-                image_path = json_path.parent / image_filename
-                if not image_path.exists():
-                    failed_files.append(str(json_path))
-                    continue
-                
-                ground_truth = parse_ground_truth_tags(json_data)
-                
-                batch_data.append({
-                    "json_path": json_path,
-                    "image_filename": image_filename,
-                    "json_data": json_data
-                })
-                batch_image_paths.append(str(image_path))
-                batch_ground_truths.append(ground_truth)
-                
-            except Exception as e:
-                print(f"Error loading {json_path}: {e}")
-                failed_files.append(str(json_path))
+
+            if not batch_image_paths:
                 continue
-        
-        if not batch_image_paths:
-            continue
-        
-        # Preprocess batch
-        batch_input, valid_indices, batch_infos = preprocess_batch(
-            batch_image_paths, image_size, mean, std, gray_background=(114, 114, 114)
-        )
-        if batch_input is None:
-            continue
 
-        # Run batch inference
-        try:
-            inputs = {input_name: batch_input}  # Already float32 from preprocessing
+            # Preprocess batch
+            batch_input, valid_indices, batch_infos = preprocess_batch(
+                batch_image_paths, image_size, mean, std, gray_background=(114, 114, 114)
+            )
+            if batch_input is None:
+                continue
 
-            # Monitor memory periodically
-            if processed_count % 100 == 0:
-                ram_used, ram_avail = get_system_memory_info()
-                gpu_used, gpu_total = get_gpu_memory_info()
-                print(f"\n[After {processed_count} images] RAM: {ram_used:.2f}GB used, GPU: {gpu_used:.2f}/{gpu_total:.2f}GB")
+            # Run batch inference
+            try:
+                inputs = {input_name: batch_input}  # Already float32 from preprocessing
 
-            start_time = time.time()
-            outs = sess.run([use_scores], inputs)
-            batch_inference_time = time.time() - start_time
-            total_inference_time += batch_inference_time
+                # Monitor memory periodically
+                if processed_count % 100 == 0:
+                    ram_used, ram_avail = get_system_memory_info()
+                    gpu_used, gpu_total = get_gpu_memory_info()
+                    print(f"\n[After {processed_count} images] RAM: {ram_used:.2f}GB used, GPU: {gpu_used:.2f}/{gpu_total:.2f}GB")
 
-            scores = outs[0]
-            
-            # Get predictions for the batch
-            batch_predictions = get_predictions_from_scores(scores, tag_names, threshold)
-            
-            # Process results for valid indices
-            for idx_in_valid, orig_idx in enumerate(valid_indices):
-                predicted_tags = batch_predictions[idx_in_valid]
-                ground_truth = batch_ground_truths[orig_idx]
-                data = batch_data[orig_idx]
-                
-                # Calculate metrics
-                metrics = calculate_metrics(predicted_tags, ground_truth)
-                
-                # Update tag-level performance
-                for tag in predicted_tags & ground_truth:
-                    tag_performance[tag]["tp"] += 1
-                for tag in predicted_tags - ground_truth:
-                    tag_performance[tag]["fp"] += 1
-                for tag in ground_truth - predicted_tags:
-                    tag_performance[tag]["fn"] += 1
-                
-                # Store results
-                result = {
-                    "filename": data["image_filename"],
-                    "ground_truth_tags": list(ground_truth),
-                    "predicted_tags": list(predicted_tags),
-                    "metrics": metrics,
-                    "batch_inference_time": batch_inference_time / len(valid_indices),  # Average per image
-                    "num_gt_tags": len(ground_truth),
-                    "num_pred_tags": len(predicted_tags)
-                }
-                all_results.append(result)
-                
-                # Update overall metrics
-                processed_count += 1
+                start_time = time.time()
+                outs = sess.run([use_scores], inputs)
+                batch_inference_time = time.time() - start_time
+                total_inference_time += batch_inference_time
 
-                # Update overall metrics
-                for key, value in metrics.items():
-                    if isinstance(value, (int, float)):
-                        overall_metrics[key].append(value)
+                scores = outs[0]
 
-            # Clear batch data to free memory
-            del batch_input, scores, outs
+                # Get predictions for the batch
+                batch_predictions = get_predictions_from_scores(scores, tag_names, threshold)
 
-            # Periodic garbage collection and result saving
-            if len(all_results) % 500 == 0:
-                # Save intermediate results
-                with open(output_file.replace('.json', f'_partial_{len(all_results)}.json'), 'w') as f:
-                    json.dump({"partial_results": all_results[-500:]}, f)
+                # Process results for valid indices
+                for idx_in_valid, orig_idx in enumerate(valid_indices):
+                    predicted_tags = batch_predictions[idx_in_valid]
+                    ground_truth = batch_ground_truths[orig_idx]
+                    data = batch_data[orig_idx]
+
+                    # Calculate metrics
+                    metrics = calculate_metrics(predicted_tags, ground_truth)
+
+                    # Update tag-level performance
+                    for tag in predicted_tags & ground_truth:
+                        tag_performance[tag]["tp"] += 1
+                    for tag in predicted_tags - ground_truth:
+                        tag_performance[tag]["fp"] += 1
+                    for tag in ground_truth - predicted_tags:
+                        tag_performance[tag]["fn"] += 1
+
+                    # Store results
+                    result = {
+                        "filename": data["image_filename"],
+                        "ground_truth_tags": list(ground_truth),
+                        "predicted_tags": list(predicted_tags),
+                        "metrics": metrics,
+                        "batch_inference_time": batch_inference_time / len(valid_indices),  # Average per image
+                        "num_gt_tags": len(ground_truth),
+                        "num_pred_tags": len(predicted_tags)
+                    }
+                    rf.write(json.dumps(result) + "\n")
+
+                    # Update overall metrics
+                    processed_count += 1
+
+                    for key, value in metrics.items():
+                        if isinstance(value, (int, float)):
+                            overall_metrics[key].append(value)
+
+                # Clear batch data to free memory
+                del batch_input, scores, outs
+
                 gc.collect()  # Force garbage collection
-                        
-        except Exception as e:
-            print(f"Error during batch inference: {e}")
-            for path in batch_image_paths:
-                failed_files.append(path)
-            continue
-    
+
+            except Exception as e:
+                print(f"Error during batch inference: {e}")
+                for path in batch_image_paths:
+                    failed_files.append(path)
+                continue
+
     # Calculate aggregate statistics
     summary = {
         "total_files": len(json_files),
-        "processed_files": len(all_results),
+        "processed_files": processed_count,
         "failed_files": len(failed_files),
         "threshold": threshold,
         "batch_size": batch_size,
         "total_inference_time": total_inference_time,
         "average_batch_time": total_inference_time / total_batches if total_batches > 0 else 0,
-        "images_per_second": len(all_results) / total_inference_time if total_inference_time > 0 else 0,
+        "images_per_second": processed_count / total_inference_time if total_inference_time > 0 else 0,
         "average_metrics": {},
         "tag_performance": {},
         "failed_file_list": failed_files
@@ -760,13 +770,13 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
         "worst_tags": tag_f1_scores[-10:] if len(tag_f1_scores) > 10 else []
     }
     
-    # Save detailed results
+    # Save summary and reference to results file
     with open(output_file, "w") as f:
         json.dump({
             "summary": summary,
-            "detailed_results": all_results
+            "results_file": os.path.basename(results_file)
         }, f, indent=2)
-    
+
     # Print summary
     print("\n" + "="*50)
     print("EVALUATION SUMMARY")
@@ -799,7 +809,8 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
     for tag_info in summary["tag_performance"]["worst_tags"][:5]:
         print(f"  {tag_info['tag']}: F1={tag_info['f1']:.3f} (support={tag_info['support']})")
     
-    print(f"\nDetailed results saved to: {output_file}")
+    print(f"\nSummary saved to: {output_file}")
+    print(f"Detailed results saved to: {results_file}")
 
     return summary
 
