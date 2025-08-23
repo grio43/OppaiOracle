@@ -165,6 +165,7 @@ class ONNXExporter:
         try:
             self.vocab = load_vocabulary_for_training(Path(config.vocab_dir))
             logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
+            self.num_tags = len(self.vocab.tag_to_index)
         except Exception as e:
             logger.error(f"Failed to load vocabulary: {e}")
             raise
@@ -265,8 +266,9 @@ class ONNXExporter:
                 break
         
         if num_tags is None:
-            logger.warning("Could not detect number of tags from checkpoint, using vocabulary size")
-            raise
+            # Use vocabulary size as fallback
+            num_tags = self.num_tags
+            logger.warning(f"Could not detect number of tags from checkpoint, using vocabulary size: {num_tags}")
         
         # Extract model config
         model_config = None
@@ -283,20 +285,14 @@ class ONNXExporter:
         try:
             if isinstance(model_config, dict):
                 model_params = model_config.copy()
-                # Override num_tags if detected from checkpoint
-                if num_tags is not None:
-                    model_params['num_tags'] = num_tags
-                else:
-                    model_params['num_tags'] = len(self.vocab.tag_to_index)
+                model_params['num_tags'] = num_tags
+                logger.info(f"Creating model with {num_tags} tags")
                 model = create_model(**model_params)
             else:
                 model_params = asdict(model_config)
-                # Override num_tags if detected from checkpoint
-                if num_tags is not None:
-                    model_params['num_tags'] = num_tags
-                else:
-                    model_params['num_tags'] = len(self.vocab.tag_to_index)
-                model = create_model(**model_para)
+                model_params['num_tags'] = num_tags
+                logger.info(f"Creating model with {num_tags} tags")
+                model = create_model(**model_params)
         except Exception as e:
             logger.error(f"Failed to create model: {e}")
             raise
