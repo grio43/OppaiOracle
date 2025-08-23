@@ -133,6 +133,7 @@ class ValidationRunner:
         # Load vocabulary
         self.vocab = load_vocabulary_for_training(Path(config.vocab_path))
         logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
+        self.num_tags = len(self.vocab.tag_to_index)
         
         # Load model
         self.model = self._load_model()
@@ -223,8 +224,16 @@ class ValidationRunner:
                # Default config
                 model_config = VisionTransformerConfig()
 
-                # Create model
-            model = create_model(**model_config if isinstance(model_config, dict) else asdict(model_config))
+            # Convert to dict if needed
+            if not isinstance(model_config, dict):
+                model_config = asdict(model_config)
+
+            # Override num_tags with actual vocabulary size
+            model_config['num_tags'] = self.num_tags
+            logger.info(f"Creating model with {self.num_tags} tags (from vocabulary)")
+
+            # Create model
+            model = create_model(**model_config)
             
             # Load weights
             if 'model_state_dict' in checkpoint:

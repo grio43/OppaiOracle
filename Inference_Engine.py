@@ -184,6 +184,7 @@ class ModelWrapper:
             
             # Load checkpoint
             checkpoint = torch.load(self.config.model_path, map_location=self.device)
+            
             # Load normalization parameters from checkpoint if available
             if 'normalization_params' in checkpoint:
                 self.normalization_params = checkpoint['normalization_params']
@@ -207,12 +208,23 @@ class ModelWrapper:
             if 'num_tags' not in vit_config_dict:
                 if self.tag_names:
                     vit_config_dict['num_tags'] = len(self.tag_names)
+                    logger.info(f"Setting num_tags={len(self.tag_names)} from tag_names")
                 elif 'num_classes' in checkpoint:
                     vit_config_dict['num_tags'] = checkpoint['num_classes']
+                    logger.info(f"Setting num_tags={checkpoint['num_classes']} from checkpoint")
+                elif 'model_state_dict' in checkpoint:
+                    # Try to infer from tag_head dimensions
+                    for key, value in checkpoint['model_state_dict'].items():
+                        if 'tag_head.weight' in key:
+                            vit_config_dict['num_tags'] = value.shape[0]
+                            logger.info(f"Inferred num_tags={value.shape[0]} from tag_head.weight")
+                            break
+                        elif 'tag_head.bias' in key:
+                            vit_config_dict['num_tags'] = value.shape[0]
+                            logger.info(f"Inferred num_tags={value.shape[0]} from tag_head.bias")
+                            break
                 else:
-                    # Default fallback
-                    vit_config_dict['num_tags'] = 100000
-                    logger.warning("num_tags not found in config, using default 100000")
+                    raise ValueError("Cannot determine num_tags from checkpoint or config")
             
             # Ensure critical parameters are present with sensible defaults
             vit_config_defaults = {
