@@ -55,12 +55,16 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Project paths
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+
 
 @dataclass
 class InferenceConfig:
     """Configuration for inference engine"""
     # Model settings
-    vocab_path: Optional[str] = None  # Explicit vocabulary path
+    vocab_path: Optional[str] = str(DEFAULT_VOCAB_PATH)  # Explicit vocabulary path
     model_path: str = "./checkpoints/best_model.pt"  # Standardize to .pt
     config_path: str = "./checkpoints/model_config.json"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -206,11 +210,14 @@ class ModelWrapper:
             if self.config.config_path:
                 vocab_search_paths.append(Path(self.config.config_path).parent / "vocabulary.json")
 
-            # 4. Current directory
+            # 4. Project root
+            vocab_search_paths.append(PROJECT_ROOT / "vocabulary.json")
+
+            # 5. Current directory
             vocab_search_paths.append(Path("vocabulary.json"))
 
-            # 5. vocabulary subdirectory
-            vocab_search_paths.append(Path("vocabulary/vocabulary.json"))
+            # 6. vocabulary subdirectory
+            vocab_search_paths.append(PROJECT_ROOT / "vocabulary/vocabulary.json")
 
             vocab_path = None
             for path in vocab_search_paths:
