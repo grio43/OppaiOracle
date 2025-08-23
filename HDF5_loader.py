@@ -1056,9 +1056,12 @@ class SimplifiedDataset(Dataset):
             # Load annotation metadata from the provided JSON files.  This
             # populates ``self.annotations`` with valid entries.
             self._load_annotations(json_files)
-            # Initialize working set sampler if enabled
+            # Initialize working set and sampling attributes
             self.working_set_sampler = None
             self.epoch_indices = None
+            self.sample_weights = None
+            self.working_set_weights = None
+
             # Compute sampling weights if frequency‑weighted sampling is
             # enabled and this is the training split; otherwise, assign
             # ``None`` so that standard shuffling is used.
@@ -1077,9 +1080,11 @@ class SimplifiedDataset(Dataset):
                     )
                     # Get initial epoch indices
                     self.epoch_indices = self.working_set_sampler.get_epoch_indices()
-                    logger.info(f"Working set sampler active with {len(self.epoch_indices)} indices for epoch")
-            else:
-                self.sample_weights = None
+                    # Recompute weights for the working set only
+                    self._calculate_working_set_weights()
+                    logger.info(
+                        f"Working set sampler active with {len(self.epoch_indices)} indices for epoch"
+                    )
 
             effective_size = len(self.epoch_indices) if self.epoch_indices else len(self.annotations)
             logger.info(f"Dataset initialised with {len(self.annotations)} total samples, "
@@ -1218,6 +1223,29 @@ class SimplifiedDataset(Dataset):
             f"Sample weights calculated (min={weights_arr.min():.6f}, max={weights_arr.max():.6f})"
         )
 
+    def _calculate_working_set_weights(self) -> None:
+        """Compute sampling weights for the current working set only."""
+        if self.epoch_indices is None or self.sample_weights is None:
+            return
+
+        working_weights: List[float] = []
+        for idx in self.epoch_indices:
+            if idx < len(self.sample_weights):
+                working_weights.append(self.sample_weights[idx])
+            else:
+                # Fallback uniform weight if index out of range
+                working_weights.append(1.0 / len(self.annotations))
+
+        self.working_set_weights = np.array(working_weights, dtype=np.float64)
+        if self.working_set_weights.size > 0:
+            self.working_set_weights = self.working_set_weights / self.working_set_weights.sum()
+            logger.info(
+                f"Working set weights calculated for {len(self.working_set_weights)} samples "
+                f"(min={self.working_set_weights.min():.6f}, max={self.working_set_weights.max():.6f})"
+            )
+        else:
+            self.working_set_weights = None
+
     def _setup_augmentation(self) -> Optional[T.Compose]:
         """Create an augmentation pipeline for the training split.
 
@@ -1265,12 +1293,18 @@ class SimplifiedDataset(Dataset):
         if self.epoch_indices is not None:
             return len(self.epoch_indices)
         return len(self.annotations)
-    
+
     def _get_actual_index(self, idx: int) -> int:
-        """Map dataset index to actual annotation index"""
+        """Map dataset index to actual annotation index with bounds checking"""
         if self.epoch_indices is not None:
+            if idx >= len(self.epoch_indices):
+                logger.warning(
+                    f"Index {idx} out of bounds for epoch_indices (size {len(self.epoch_indices)}), using modulo"
+                )
+                idx = idx % len(self.epoch_indices)
             return self.epoch_indices[idx]
-        return idx
+        else:
+            return idx
     
     def _log_memory_status(self, context: str = ""):
         """Log current memory status"""
@@ -1478,6 +1512,8 @@ class SimplifiedDataset(Dataset):
         if self.working_set_sampler is not None:
             self.epoch_indices = self.working_set_sampler.get_epoch_indices()
             logger.info(f"New epoch: working set updated to {len(self.epoch_indices)} indices")
+            # Recompute weights for new working set
+            self._calculate_working_set_weights()
 
             # Track unique IDs
             unique_ratio = len(set(self.epoch_indices)) / len(self.epoch_indices)
@@ -1850,10 +1886,20 @@ def create_dataloaders(
             shuffle=True,
         )
     elif frequency_sampling and train_dataset.sample_weights is not None:
+        # Use working set-specific weights if available
+        if getattr(train_dataset, "working_set_weights", None) is not None:
+            weights = train_dataset.working_set_weights
+            num_samples = len(train_dataset.epoch_indices) if train_dataset.epoch_indices is not None else len(train_dataset)
+        else:
+            weights = train_dataset.sample_weights
+            num_samples = len(train_dataset)
         train_sampler = WeightedRandomSampler(
-            weights=train_dataset.sample_weights,
-            num_samples=len(train_dataset),
+            weights=weights,
+            num_samples=num_samples,
             replacement=True,
+        )
+        logger.info(
+            f"Using WeightedRandomSampler with {len(weights)} weights for {num_samples} samples"
         )
     # Determine validation batch size
     val_bs = val_batch_size or batch_size
