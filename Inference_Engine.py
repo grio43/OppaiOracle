@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 class InferenceConfig:
     """Configuration for inference engine"""
     # Model settings
+    vocab_path: Optional[str] = None  # Explicit vocabulary path
     model_path: str = "./checkpoints/best_model.pt"  # Standardize to .pt
     config_path: str = "./checkpoints/model_config.json"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -184,30 +185,64 @@ class ModelWrapper:
     def load_model(self):
         """Load the trained model"""
         try:
-            # Try to load vocabulary first
-            vocab_path = Path(self.config.config_path).parent / "vocabulary.json"
-            if not vocab_path.exists():
-                vocab_path = Path("vocabulary.json")
-                if not vocab_path.exists():
-                    vocab_path = Path("vocabulary/vocabulary.json")
+            # Priority order for vocabulary loading:
+            # 1. Explicit vocab_path from config
+            # 2. Next to model checkpoint
+            # 3. Next to model config
+            # 4. Current working directory
+            # 5. vocabulary/ subdirectory
 
-            if vocab_path.exists():
-                logger.info(f"Loading vocabulary from {vocab_path}")
-                self.vocabulary = TagVocabulary(vocab_path)
-                self.tag_names = [
-                    self.vocabulary.get_tag_from_index(i)
-                    for i in range(len(self.vocabulary.tag_to_index))
-                ]
-                logger.info(f"Loaded {len(self.tag_names)} tag names from vocabulary")
-            else:
-                logger.error(f"Vocabulary file not found! Searched in: {vocab_path}")
+            vocab_search_paths = []
+
+            # 1. Explicit path
+            if self.config.vocab_path:
+                vocab_search_paths.append(Path(self.config.vocab_path))
+
+            # 2. Next to model checkpoint
+            if self.config.model_path:
+                vocab_search_paths.append(Path(self.config.model_path).parent / "vocabulary.json")
+
+            # 3. Next to config file
+            if self.config.config_path:
+                vocab_search_paths.append(Path(self.config.config_path).parent / "vocabulary.json")
+
+            # 4. Current directory
+            vocab_search_paths.append(Path("vocabulary.json"))
+
+            # 5. vocabulary subdirectory
+            vocab_search_paths.append(Path("vocabulary/vocabulary.json"))
+
+            vocab_path = None
+            for path in vocab_search_paths:
+                if path.exists():
+                    vocab_path = path
+                    logger.info(f"Loading vocabulary from {vocab_path}")
+                    self.vocabulary = TagVocabulary(vocab_path)
+                    self.tag_names = [
+                        self.vocabulary.get_tag_from_index(i)
+                        for i in range(len(self.vocabulary.tag_to_index))
+                    ]
+
+                    # Validate for placeholder tags
+                    placeholder_count = sum(
+                        1 for tag in self.tag_names if tag.startswith("tag_") and tag[4:].isdigit()
+                    )
+                    if placeholder_count > 100:  # Threshold for detection
+                        logger.warning(
+                            f"Found {placeholder_count} placeholder tags in vocabulary - this may indicate a problem!"
+                        )
+                    else:
+                        logger.info(f"Loaded {len(self.tag_names)} valid tag names from vocabulary")
+                    break
+
+            if vocab_path is None:
+                logger.error(f"Vocabulary file not found! Searched in: {vocab_search_paths}")
+                raise FileNotFoundError("Could not find vocabulary.json in any expected location")
 
             # Load model config
             if os.path.exists(self.config.config_path):
                 with open(self.config.config_path, 'r') as f:
                     model_config = json.load(f)
-                    if not self.tag_names:
-                        self.tag_names = model_config.get('tag_names', [])
             else:
                 logger.warning(f"Config file not found at {self.config.config_path}")
                 model_config = {}
@@ -750,6 +785,7 @@ if __name__ == "__main__":
     # Note: image_size should match the training configuration (640 for ViT, not 448)
     config = InferenceConfig(
         model_path="./checkpoints/best_model.pt",  # Standardize to .pt
+        vocab_path=None,  # Will auto-detect from checkpoint directory
         config_path="./checkpoints/model_config.json",
         batch_size=32,
         threshold=0.5,

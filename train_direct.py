@@ -17,6 +17,7 @@ from datetime import datetime
 import torch.distributed as dist
 from dataclasses import dataclass
 
+import shutil
 import torch
 from torch.amp import GradScaler, autocast
 import numpy as np
@@ -191,6 +192,7 @@ def train_with_orientation_tracking():
         "vocab_path": Path("vocabulary.json"),
         "num_workers": 4,  # Store in config for dataset initialization
         "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "checkpoint_dir": Path("checkpoints"),  # Add checkpoint directory
         "amp": True,
         # Orientation-specific settings
         "random_flip_prob": 0.2,  # 20% chance of horizontal flip
@@ -204,7 +206,6 @@ def train_with_orientation_tracking():
         "tensorboard_dir": Path("./runs") / f"experiment_{datetime.now():%Y%m%d_%H%M%S}",
         "use_wandb": False,
         # Model configuration
-        "checkpoint_dir": Path("checkpoints"),  # Add checkpoint directory
         "model_config": {
             "hidden_size": 768,
             "intermediate_size": 3072,
@@ -373,6 +374,20 @@ def train_with_orientation_tracking():
     num_tags = len(vocab.tag_to_index)
     num_ratings = len(vocab.rating_to_index)
     logger.info(f"Creating model with {num_tags} tags and {num_ratings} ratings")
+
+    # Copy vocabulary to checkpoint directory for inference
+    checkpoint_dir = config["checkpoint_dir"]
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    vocab_dest = checkpoint_dir / "vocabulary.json"
+
+    # Save vocabulary to checkpoint directory
+    if hasattr(vocab, 'save_vocabulary'):
+        vocab.save_vocabulary(vocab_dest)
+        logger.info(f"Saved vocabulary to {vocab_dest}")
+    elif config["vocab_path"].exists():
+        # Fallback: copy existing vocabulary file
+        shutil.copy2(config["vocab_path"], vocab_dest)
+        logger.info(f"Copied vocabulary to {vocab_dest}")
 
     # Override the default num_tags with actual vocabulary size
     model_config = config["model_config"].copy()
@@ -607,6 +622,19 @@ def train_with_orientation_tracking():
             training_state.best_metric = best_val_loss
             training_state.best_epoch = epoch + 1
 
+        # Prepare checkpoint metadata without placeholder tag_names
+        checkpoint_metadata = {
+            "vocabulary_info": {
+                "num_tags": num_tags,
+                "vocab_path": "vocabulary.json",  # Relative to checkpoint dir
+                "has_vocabulary": True
+            },
+            "normalization_params": {
+                "mean": [0.5, 0.5, 0.5],
+                "std": [0.5, 0.5, 0.5]
+            }
+        }
+
         # Save checkpoint
         checkpoint_manager.save_checkpoint(
             model=model,
@@ -617,7 +645,7 @@ def train_with_orientation_tracking():
             metrics={"train_loss": avg_train_loss, "val_loss": avg_val_loss},
             training_state=training_state,
             is_best=is_best,
-            config=config
+            config={**config, **checkpoint_metadata}  # Include metadata
         )
 
         # Log orientation statistics at end of epoch
