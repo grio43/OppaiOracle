@@ -17,6 +17,7 @@ import torch.distributed as dist
 import torch
 from torch.amp import GradScaler, autocast
 import numpy as np
+from training_utils import CheckpointManager, TrainingState
 
 # Import the orientation handler
 from orientation_handler import OrientationHandler
@@ -358,6 +359,9 @@ def train_with_orientation_tracking():
         lr=config["learning_rate"],
         weight_decay=config["weight_decay"]
     )
+
+    ckpt = CheckpointManager(checkpoint_dir=Path("checkpoints"), max_checkpoints=5, save_best_only=True)
+    best_val = float("inf")
     
     # AMP setup (prefer BF16 on modern NVIDIA GPUs like Blackwell when available)
     is_cuda = config["device"].startswith("cuda") and torch.cuda.is_available()
@@ -477,6 +481,22 @@ def train_with_orientation_tracking():
         avg_val_loss = val_loss / max(1, len(val_loader))
         logger.info(f"Epoch {epoch + 1}/{config['num_epochs']}: Avg val loss = {avg_val_loss:.4f}")
 
+        state = TrainingState(epoch=epoch + 1, global_step=global_step,
+                              train_loss=avg_train_loss, val_loss=avg_val_loss)
+
+        ckpt.save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=None,
+            epoch=epoch + 1,
+            global_step=global_step,
+            metrics={"val_loss": avg_val_loss},
+            training_state=state,
+            is_best=avg_val_loss < best_val,
+            config={"model_config": config["model_config"]}  # so model_config.json gets written
+        )
+        best_val = min(best_val, avg_val_loss)
+
         # Log orientation statistics at end of epoch
         if config["random_flip_prob"] > 0:
             stats = get_dataset_orientation_stats()
@@ -525,19 +545,21 @@ def train_with_orientation_tracking():
         except Exception as e:
             logger.warning(f"Error stopping QueueListener: {e}")
 
-    # Log queue drop statistics
-    # Note: mp.Queue doesn't have get_drop_stats method
-    # This was specific to BoundedLevelAwareQueue
-    """
-    try:
-        if hasattr(log_queue, 'get_drop_stats'):
+    # Log queue drop statistics if supported by the queue implementation
+    # mp.Queue does not provide this, but keeping the check maintains
+    # compatibility with queues that do expose drop statistics
+    if hasattr(log_queue, 'get_drop_stats'):
+        try:
             drop_stats = log_queue.get_drop_stats()
             total_drops = sum(drop_stats.values())
             if total_drops > 0:
-                logger.warning(f"Logging queue dropped {total_drops} messages: {drop_stats}")
-    except Exception as e:
-        logger.debug(f"Could not get queue drop stats: {e}")
-    """
+                logger.warning(
+                    f"Logging queue dropped {total_drops} messages: {drop_stats}"
+                )
+        except Exception as e:
+            logger.debug(f"Could not get queue drop stats: {e}")
+    else:
+        logger.debug("Logging queue does not support drop statistics")
 
     logger.info("Training complete!")
 
