@@ -7,12 +7,22 @@ from pathlib import Path
 
 
 def load_results(results_file: str):
-    """Load evaluation summary and prepare access to detailed results."""
-    with open(results_file, 'r') as f:
-        data = json.load(f)
-    if 'results_file' in data:
-        base = Path(results_file).parent
-        data['results_file'] = str(base / data['results_file'])
+    """Load either the summary JSON or accept a JSONL path directly."""
+    p = Path(results_file)
+    # If a JSONL path is given, treat it as the detailed-results file.
+    if p.suffix.lower() == ".jsonl":
+        return {"summary": {}, "results_file": str(p)}
+
+    # Otherwise assume it's the summary JSON and try to parse it.
+    with open(p, "r") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            # Fallback: if someone passed a JSONL but with .json extension
+            return {"summary": {}, "results_file": str(p)}
+    if "results_file" in data:
+        base = p.parent
+        data["results_file"] = str(base / data["results_file"])
     return data
 
 
@@ -277,21 +287,32 @@ def generate_performance_report(results_data, output_dir):
     print('\n'.join(report_lines))
 
 def main():
-    results_path = "/media/andrewk/qnap-public/workspace/results/evaluation_results_gpu_results.jsonl"
-    output_dir = Path("/media/andrewk/qnap-public/workspace/results")
+    import argparse
+    parser = argparse.ArgumentParser(description="Visualize evaluation results")
+    parser.add_argument(
+        "--results",
+        default="/media/andrewk/qnap-public/workspace/results/evaluation_results_gpu.json",
+        help="Path to the summary JSON (preferred) or the JSONL file."
+    )
+    parser.add_argument(
+        "--outdir",
+        default="/media/andrewk/qnap-public/workspace/results",
+        help="Directory to write plots/report."
+    )
+    args = parser.parse_args()
+
+    results_path = args.results
+    output_dir = Path(args.outdir)
     output_dir.mkdir(exist_ok=True)
 
-    # Load results
     print(f"Loading results from {results_path}")
     results_data = load_results(results_path)
 
-    # Generate visualizations
     print("\nGenerating visualizations...")
     plot_metrics_distribution(results_data, output_dir)
     plot_tag_performance(results_data, output_dir, top_n=20)
     plot_tag_counts(results_data, output_dir)
 
-    # Generate text report
     print("\nGenerating performance report...")
     generate_performance_report(results_data, output_dir)
 
