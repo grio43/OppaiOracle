@@ -6,6 +6,15 @@ import numpy as np
 from PIL import Image
 import onnxruntime as ort
 from tqdm import tqdm
+import torch  # For GPU memory monitoring
+
+def get_gpu_memory_info():
+    """Get current GPU memory usage"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated(0) / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved(0) / 1024**3    # GB
+        return allocated, reserved
+    return 0, 0
 
 def load_tag_names(config_path):
     if config_path and os.path.exists(config_path):
@@ -16,39 +25,54 @@ def load_tag_names(config_path):
         return names, norm
     return None, None
 
-def preprocess(image_path, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)):
-    img = Image.open(image_path).convert("RGB").resize((image_size, image_size))
-    arr = np.array(img).astype("float32")/255.0
-    # HWC -> CHW
-    arr = arr.transpose(2,0,1)
-    # normalize
-    mean = np.array(mean, dtype="float32")[:,None,None]
-    std  = np.array(std,  dtype="float32")[:,None,None]
-    arr = (arr - mean)/std
-    # add batch
-    return np.expand_dims(arr, 0)
+def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)):
+    """Preprocess multiple images into a batch"""
+    batch = []
+    valid_indices = []
+    
+    for idx, image_path in enumerate(image_paths):
+        try:
+            img = Image.open(image_path).convert("RGB").resize((image_size, image_size))
+            arr = np.array(img).astype("float32")/255.0
+            # HWC -> CHW
+            arr = arr.transpose(2,0,1)
+            # normalize
+            mean_arr = np.array(mean, dtype="float32")[:,None,None]
+            std_arr = np.array(std, dtype="float32")[:,None,None]
+            arr = (arr - mean_arr)/std_arr
+            batch.append(arr)
+            valid_indices.append(idx)
+        except Exception as e:
+            print(f"Error preprocessing {image_path}: {e}")
+            continue
+    
+    if batch:
+        return np.stack(batch, axis=0), valid_indices
+    return None, []
 
 def get_predictions_from_scores(scores, tag_names, threshold=0.5):
-    """Get predicted tags above threshold"""
-    s = scores[0] if scores.ndim == 2 else scores
-    predicted_tags = set()
+    """Get predicted tags above threshold for batch or single image"""
+    if scores.ndim == 1:
+        scores = scores[np.newaxis, :]  # Add batch dimension if missing
     
-    for i, score in enumerate(s):
-        if score >= threshold:
-            tag = tag_names[i] if tag_names and i < len(tag_names) else f"tag_{i}"
-            predicted_tags.add(tag)
+    batch_predictions = []
+    for score_vec in scores:
+        predicted_tags = set()
+        for i, score in enumerate(score_vec):
+            if score >= threshold:
+                tag = tag_names[i] if tag_names and i < len(tag_names) else f"tag_{i}"
+                predicted_tags.add(tag)
+        batch_predictions.append(predicted_tags)
     
-    return predicted_tags
+    return batch_predictions
 
 def parse_ground_truth_tags(json_data):
     """Parse ground truth tags from JSON"""
     tags_str = json_data.get("tags", "")
-    # Split tags and clean them
     tags = set(tag.strip() for tag in tags_str.split() if tag.strip())
     
-    # Also check for rating if it's a tag
     rating = json_data.get("rating", "")
-    if rating and rating != "safe":  # You might want to include/exclude certain ratings
+    if rating and rating != "safe":
         tags.add(rating)
     
     return tags
@@ -81,10 +105,56 @@ def calculate_metrics(predicted: Set[str], ground_truth: Set[str]) -> Dict[str, 
         "false_negatives": false_negatives
     }
 
-def process_batch(data_folder, model_path, config_path=None, threshold=0.5, 
-                  image_size=640, providers=None, output_file="evaluation_results.json",
-                  limit=None):
-    """Process all images in the folder and evaluate against ground truth"""
+def create_gpu_session(model_path, max_memory_gb=25):
+    """Create ONNX Runtime session with GPU configuration"""
+    providers = []
+    
+    # Configure CUDA provider with memory limits
+    cuda_options = {
+        'device_id': 0,
+        'arena_extend_strategy': 'kSameAsRequested',
+        'gpu_mem_limit': int(max_memory_gb * 1024 * 1024 * 1024),  # Convert GB to bytes
+        'cudnn_conv_algo_search': 'HEURISTIC',
+        'do_copy_in_default_stream': True,
+    }
+    
+    # Try CUDA first, then TensorRT if available
+    if 'CUDAExecutionProvider' in ort.get_available_providers():
+        providers.append(('CUDAExecutionProvider', cuda_options))
+        print(f"Using CUDA provider with {max_memory_gb}GB memory limit")
+    
+    if 'TensorrtExecutionProvider' in ort.get_available_providers():
+        trt_options = {
+            'device_id': 0,
+            'trt_max_workspace_size': int(8 * 1024 * 1024 * 1024),  # 8GB for TRT workspace
+            'trt_fp16_enable': True,  # Enable FP16 for better performance
+        }
+        providers.append(('TensorrtExecutionProvider', trt_options))
+        print("TensorRT provider available and configured")
+    
+    # Fallback to CPU if no GPU providers available
+    providers.append('CPUExecutionProvider')
+    
+    # Create session options for better performance
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+    sess_options.inter_op_num_threads = 4
+    sess_options.intra_op_num_threads = 4
+    
+    # Create session
+    session = ort.InferenceSession(model_path, sess_options=sess_options, providers=providers)
+    
+    # Print which provider is actually being used
+    actual_provider = session.get_providers()[0]
+    print(f"Session created with provider: {actual_provider}")
+    
+    return session
+
+def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5, 
+                     image_size=640, output_file="evaluation_results.json",
+                     batch_size=32, limit=None, max_memory_gb=25):
+    """Process images in batches on GPU for efficient inference"""
     
     # Load model configuration
     tag_names, norm = load_tag_names(config_path)
@@ -92,17 +162,19 @@ def process_batch(data_folder, model_path, config_path=None, threshold=0.5,
     if norm and "mean" in norm and "std" in norm:
         mean, std = tuple(norm["mean"]), tuple(norm["std"])
     
-    # Initialize ONNX session
-    providers = providers or ort.get_available_providers()
-    sess = ort.InferenceSession(model_path, providers=providers)
+    # Initialize GPU session
+    sess = create_gpu_session(model_path, max_memory_gb)
     
-    # Determine output name
+    # Get input/output names
     output_names = [o.name for o in sess.get_outputs()]
     use_scores = "scores" if "scores" in output_names else output_names[0]
-
-    # Determine input name
+    
     input_names = [i.name for i in sess.get_inputs()]
-    input_name = input_names[0] if input_names else "input_image"  # Fallback to "input_image" if needed
+    input_name = input_names[0] if input_names else "input_image"
+    
+    # Print session info
+    print(f"Model input: {input_name}, shape: {sess.get_inputs()[0].shape}")
+    print(f"Model output: {use_scores}, shape: {sess.get_outputs()[0].shape}")
     
     # Find all JSON files
     json_files = list(pathlib.Path(data_folder).glob("*.json"))
@@ -110,6 +182,7 @@ def process_batch(data_folder, model_path, config_path=None, threshold=0.5,
         json_files = json_files[:limit]
     
     print(f"Found {len(json_files)} JSON files to process")
+    print(f"Batch size: {batch_size}")
     
     # Results storage
     all_results = []
@@ -117,72 +190,121 @@ def process_batch(data_folder, model_path, config_path=None, threshold=0.5,
     tag_performance = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
     failed_files = []
     
-    # Process each file
-    for json_path in tqdm(json_files, desc="Processing images"):
-        try:
-            # Load JSON data
-            with open(json_path, "r") as f:
-                json_data = json.load(f)
-            
-            # Get image path
-            image_filename = json_data.get("filename")
-            if not image_filename:
-                print(f"Warning: No filename in {json_path}")
-                continue
-            
-            image_path = json_path.parent / image_filename
-            if not image_path.exists():
-                print(f"Warning: Image not found: {image_path}")
+    # Process in batches
+    total_batches = (len(json_files) + batch_size - 1) // batch_size
+    total_inference_time = 0
+    
+    for batch_idx in tqdm(range(0, len(json_files), batch_size), 
+                          desc=f"Processing batches", 
+                          total=total_batches):
+        
+        batch_files = json_files[batch_idx:batch_idx + batch_size]
+        batch_data = []
+        batch_image_paths = []
+        batch_ground_truths = []
+        
+        # Load batch data
+        for json_path in batch_files:
+            try:
+                with open(json_path, "r") as f:
+                    json_data = json.load(f)
+                
+                image_filename = json_data.get("filename")
+                if not image_filename:
+                    failed_files.append(str(json_path))
+                    continue
+                
+                image_path = json_path.parent / image_filename
+                if not image_path.exists():
+                    failed_files.append(str(json_path))
+                    continue
+                
+                ground_truth = parse_ground_truth_tags(json_data)
+                
+                batch_data.append({
+                    "json_path": json_path,
+                    "image_filename": image_filename,
+                    "json_data": json_data
+                })
+                batch_image_paths.append(str(image_path))
+                batch_ground_truths.append(ground_truth)
+                
+            except Exception as e:
+                print(f"Error loading {json_path}: {e}")
                 failed_files.append(str(json_path))
                 continue
+        
+        if not batch_image_paths:
+            continue
+        
+        # Preprocess batch
+        batch_input, valid_indices = preprocess_batch(batch_image_paths, image_size, mean, std)
+        if batch_input is None:
+            continue
+        
+        # Run batch inference
+        try:
+            inputs = {input_name: batch_input.astype("float32")}
             
-            # Get ground truth tags
-            ground_truth = parse_ground_truth_tags(json_data)
-            
-            # Run inference
-            x = preprocess(str(image_path), image_size, mean, std)
-            inputs = {input_name: x.astype("float32")}
+            # Monitor GPU memory before inference
+            if batch_idx == 0:  # First batch
+                alloc_before, reserved_before = get_gpu_memory_info()
+                print(f"GPU memory before inference: {alloc_before:.2f}GB allocated, {reserved_before:.2f}GB reserved")
             
             start_time = time.time()
             outs = sess.run([use_scores], inputs)
-            inference_time = time.time() - start_time
+            batch_inference_time = time.time() - start_time
+            total_inference_time += batch_inference_time
+            
+            # Monitor GPU memory after first inference
+            if batch_idx == 0:
+                alloc_after, reserved_after = get_gpu_memory_info()
+                print(f"GPU memory after inference: {alloc_after:.2f}GB allocated, {reserved_after:.2f}GB reserved")
+                print(f"Memory increase: {alloc_after - alloc_before:.2f}GB")
             
             scores = outs[0]
             
-            # Get predictions
-            predicted_tags = get_predictions_from_scores(scores, tag_names, threshold)
+            # Get predictions for the batch
+            batch_predictions = get_predictions_from_scores(scores, tag_names, threshold)
             
-            # Calculate metrics
-            metrics = calculate_metrics(predicted_tags, ground_truth)
-            
-            # Update tag-level performance
-            for tag in predicted_tags & ground_truth:
-                tag_performance[tag]["tp"] += 1
-            for tag in predicted_tags - ground_truth:
-                tag_performance[tag]["fp"] += 1
-            for tag in ground_truth - predicted_tags:
-                tag_performance[tag]["fn"] += 1
-            
-            # Store results
-            result = {
-                "filename": image_filename,
-                "ground_truth_tags": list(ground_truth),
-                "predicted_tags": list(predicted_tags),
-                "metrics": metrics,
-                "inference_time": inference_time,
-                "num_gt_tags": len(ground_truth),
-                "num_pred_tags": len(predicted_tags)
-            }
-            all_results.append(result)
-            
-            # Update overall metrics
-            for key, value in metrics.items():
-                if isinstance(value, (int, float)):
-                    overall_metrics[key].append(value)
-            
+            # Process results for valid indices
+            for idx_in_valid, orig_idx in enumerate(valid_indices):
+                predicted_tags = batch_predictions[idx_in_valid]
+                ground_truth = batch_ground_truths[orig_idx]
+                data = batch_data[orig_idx]
+                
+                # Calculate metrics
+                metrics = calculate_metrics(predicted_tags, ground_truth)
+                
+                # Update tag-level performance
+                for tag in predicted_tags & ground_truth:
+                    tag_performance[tag]["tp"] += 1
+                for tag in predicted_tags - ground_truth:
+                    tag_performance[tag]["fp"] += 1
+                for tag in ground_truth - predicted_tags:
+                    tag_performance[tag]["fn"] += 1
+                
+                # Store results
+                result = {
+                    "filename": data["image_filename"],
+                    "ground_truth_tags": list(ground_truth),
+                    "predicted_tags": list(predicted_tags),
+                    "metrics": metrics,
+                    "batch_inference_time": batch_inference_time / len(valid_indices),  # Average per image
+                    "num_gt_tags": len(ground_truth),
+                    "num_pred_tags": len(predicted_tags)
+                }
+                all_results.append(result)
+                
+                # Update overall metrics
+                for key, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        overall_metrics[key].append(value)
+                        
         except Exception as e:
-            print(f"Error processing {json_path}: {e}")
-            failed_files.append(str(json_path))
+            print(f"Error during batch inference: {e}")
+            for path in batch_image_paths:
+                failed_files.append(path)
             continue
     
     # Calculate aggregate statistics
@@ -191,6 +313,10 @@ def process_batch(data_folder, model_path, config_path=None, threshold=0.5,
         "processed_files": len(all_results),
         "failed_files": len(failed_files),
         "threshold": threshold,
+        "batch_size": batch_size,
+        "total_inference_time": total_inference_time,
+        "average_batch_time": total_inference_time / total_batches if total_batches > 0 else 0,
+        "images_per_second": len(all_results) / total_inference_time if total_inference_time > 0 else 0,
         "average_metrics": {},
         "tag_performance": {},
         "failed_file_list": failed_files
@@ -215,7 +341,7 @@ def process_batch(data_folder, model_path, config_path=None, threshold=0.5,
             "f1": f1,
             "precision": precision,
             "recall": recall,
-            "support": tp + fn  # Number of ground truth occurrences
+            "support": tp + fn
         })
     
     # Sort tags by F1 score
@@ -238,11 +364,21 @@ def process_batch(data_folder, model_path, config_path=None, threshold=0.5,
     print("="*50)
     print(f"Processed: {summary['processed_files']}/{summary['total_files']} files")
     print(f"Failed: {summary['failed_files']} files")
+    print(f"Batch size: {batch_size}")
     print(f"Threshold: {threshold}")
+    print(f"Total inference time: {total_inference_time:.2f}s")
+    print(f"Images per second: {summary['images_per_second']:.2f}")
+    
+    # Final GPU memory check
+    alloc_final, reserved_final = get_gpu_memory_info()
+    print(f"\nFinal GPU memory: {alloc_final:.2f}GB allocated, {reserved_final:.2f}GB reserved")
+    
     print("\nAverage Metrics:")
     for metric, value in summary["average_metrics"].items():
         if not metric.endswith("_std"):
-            print(f"  {metric}: {value:.4f}")
+            std_key = f"{metric}_std"
+            std_val = summary["average_metrics"].get(std_key, 0)
+            print(f"  {metric}: {value:.4f} (±{std_val:.4f})")
     
     print("\nTop 5 Best Performing Tags:")
     for tag_info in summary["tag_performance"]["best_tags"][:5]:
@@ -257,21 +393,35 @@ def process_batch(data_folder, model_path, config_path=None, threshold=0.5,
     return summary
 
 def main():
+    # Check GPU availability
+    if torch.cuda.is_available():
+        print(f"GPU detected: {torch.cuda.get_device_name(0)}")
+        print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}GB")
+    else:
+        print("WARNING: No GPU detected, will use CPU (much slower)")
+    
     data_folder = "/media/andrewk/qnap-public/workspace/shard_00022/"
     model_path = "/media/andrewk/qnap-public/workspace/OppaiOracle/exported/model.onnx"
     output_dir = "/media/andrewk/qnap-public/workspace/results"
     os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, "evaluation_results.json")
+    output_file = os.path.join(output_dir, "evaluation_results_gpu.json")
 
-    process_batch(
+    # Adjust batch size based on your model and image size
+    # For 640x640 images, 32-64 is usually good for 32GB VRAM
+    # Start conservative and increase if memory allows
+    BATCH_SIZE = 32  # You can increase this if memory usage is low
+    MAX_MEMORY_GB = 25  # Keep within this limit
+
+    process_batch_gpu(
         data_folder=data_folder,
         model_path=model_path,
         config_path=None,
         threshold=0.5,
         image_size=640,
-        providers=None,
         output_file=output_file,
-        limit=None
+        batch_size=BATCH_SIZE,
+        limit=None,  # Set to a number for testing (e.g., 100)
+        max_memory_gb=MAX_MEMORY_GB
     )
 
 if __name__ == "__main__":
