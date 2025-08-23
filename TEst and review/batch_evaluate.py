@@ -6,15 +6,37 @@ import numpy as np
 from PIL import Image
 import onnxruntime as ort
 from tqdm import tqdm
-import torch  # For GPU memory monitoring
+import gc
+import psutil  # For system memory monitoring
+
+def get_system_memory_info():
+    """Get current system memory usage"""
+    mem = psutil.virtual_memory()
+    return mem.used / 1024**3, mem.available / 1024**3  # GB
 
 def get_gpu_memory_info():
-    """Get current GPU memory usage"""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated(0) / 1024**3  # GB
-        reserved = torch.cuda.memory_reserved(0) / 1024**3    # GB
-        return allocated, reserved
-    return 0, 0
+    """Get GPU memory info using nvidia-ml-py if available, otherwise nvidia-smi"""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        used = info.used / 1024**3  # GB
+        total = info.total / 1024**3  # GB
+        return used, total
+    except:
+        # Fallback: parse nvidia-smi output
+        import subprocess
+        try:
+            result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total', 
+                                   '--format=csv,nounits,noheader'], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                used, total = map(float, result.stdout.strip().split(','))
+                return used/1024, total/1024  # Convert MB to GB
+        except:
+            pass
+        return 0, 0
 
 def load_tag_names(config_path):
     if config_path and os.path.exists(config_path):
@@ -25,21 +47,48 @@ def load_tag_names(config_path):
         return names, norm
     return None, None
 
-def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)):
-    """Preprocess multiple images into a batch"""
+def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5), 
+                    gray_background=(114, 114, 114)):
+    """Preprocess multiple images into a batch with proper transparency handling and padding"""
     batch = []
     valid_indices = []
     
     for idx, image_path in enumerate(image_paths):
         try:
-            img = Image.open(image_path).convert("RGB").resize((image_size, image_size))
-            arr = np.array(img).astype("float32")/255.0
+            img = Image.open(image_path)
+            
+            # Handle transparency by compositing on gray background
+            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                # Create gray background
+                background = Image.new('RGB', img.size, gray_background)
+                # Convert image to RGBA if not already
+                if img.mode != 'RGBA':
+                    img = img.convert('RGBA')
+                # Composite image over gray background
+                background.paste(img, mask=img.split()[3])  # Use alpha channel as mask
+                img = background
+            else:
+                img = img.convert('RGB')
+            
+            # Resize with padding to maintain aspect ratio
+            img.thumbnail((image_size, image_size), Image.Resampling.LANCZOS)
+            
+            # Create new image with padding if needed
+            if img.size != (image_size, image_size):
+                padded = Image.new('RGB', (image_size, image_size), gray_background)
+                # Center the image
+                x = (image_size - img.width) // 2
+                y = (image_size - img.height) // 2
+                padded.paste(img, (x, y))
+                img = padded
+            
+            arr = np.array(img, dtype=np.float32) / 255.0
             # HWC -> CHW
-            arr = arr.transpose(2,0,1)
+            arr = arr.transpose(2, 0, 1)
             # normalize
-            mean_arr = np.array(mean, dtype="float32")[:,None,None]
-            std_arr = np.array(std, dtype="float32")[:,None,None]
-            arr = (arr - mean_arr)/std_arr
+            mean_arr = np.array(mean, dtype=np.float32)[:, None, None]
+            std_arr = np.array(std, dtype=np.float32)[:, None, None]
+            arr = (arr - mean_arr) / std_arr
             batch.append(arr)
             valid_indices.append(idx)
         except Exception as e:
@@ -47,7 +96,7 @@ def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0
             continue
     
     if batch:
-        return np.stack(batch, axis=0), valid_indices
+        return np.stack(batch, axis=0).astype(np.float32), valid_indices
     return None, []
 
 def get_predictions_from_scores(scores, tag_names, threshold=0.5):
@@ -108,14 +157,16 @@ def calculate_metrics(predicted: Set[str], ground_truth: Set[str]) -> Dict[str, 
 def create_gpu_session(model_path, max_memory_gb=25):
     """Create ONNX Runtime session with GPU configuration"""
     providers = []
-    
+
     # Configure CUDA provider with memory limits
     cuda_options = {
         'device_id': 0,
         'arena_extend_strategy': 'kSameAsRequested',
-        'gpu_mem_limit': int(max_memory_gb * 1024 * 1024 * 1024),  # Convert GB to bytes
+        'gpu_mem_limit': int(max_memory_gb * 1024 * 1024 * 1024),
         'cudnn_conv_algo_search': 'HEURISTIC',
         'do_copy_in_default_stream': True,
+        'cudnn_conv_use_max_workspace': True,
+        'enable_cuda_graph': False,  # Disable CUDA graphs to reduce memory fragmentation
     }
     
     # Try CUDA first, then TensorRT if available
@@ -138,7 +189,8 @@ def create_gpu_session(model_path, max_memory_gb=25):
     # Create session options for better performance
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL  # Use sequential for more predictable memory
+    sess_options.enable_mem_pattern = False  # Disable memory pattern optimization to reduce RAM usage
     sess_options.inter_op_num_threads = 4
     sess_options.intra_op_num_threads = 4
     
@@ -148,7 +200,15 @@ def create_gpu_session(model_path, max_memory_gb=25):
     # Print which provider is actually being used
     actual_provider = session.get_providers()[0]
     print(f"Session created with provider: {actual_provider}")
-    
+
+    # Warmup run to initialize GPU memory pools
+    try:
+        dummy_input = np.random.randn(1, 3, 640, 640).astype(np.float32)
+        _ = session.run(None, {session.get_inputs()[0].name: dummy_input})
+        print("Warmup run completed")
+    except Exception as e:
+        print(f"Warmup failed (non-critical): {e}")
+
     return session
 
 def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5, 
@@ -193,9 +253,17 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
     # Process in batches
     total_batches = (len(json_files) + batch_size - 1) // batch_size
     total_inference_time = 0
-    
-    for batch_idx in tqdm(range(0, len(json_files), batch_size), 
-                          desc=f"Processing batches", 
+
+    # Monitor initial memory
+    ram_used_init, ram_avail_init = get_system_memory_info()
+    gpu_used_init, gpu_total_init = get_gpu_memory_info()
+    print(f"Initial RAM: {ram_used_init:.2f}GB used, {ram_avail_init:.2f}GB available")
+    print(f"Initial GPU: {gpu_used_init:.2f}GB used / {gpu_total_init:.2f}GB total")
+
+    processed_count = 0
+
+    for batch_idx in tqdm(range(0, len(json_files), batch_size),
+                          desc=f"Processing batches",
                           total=total_batches):
         
         batch_files = json_files[batch_idx:batch_idx + batch_size]
@@ -238,30 +306,26 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
             continue
         
         # Preprocess batch
-        batch_input, valid_indices = preprocess_batch(batch_image_paths, image_size, mean, std)
+        batch_input, valid_indices = preprocess_batch(batch_image_paths, image_size, mean, std,
+                                                      gray_background=(114, 114, 114))
         if batch_input is None:
             continue
-        
+
         # Run batch inference
         try:
-            inputs = {input_name: batch_input.astype("float32")}
-            
-            # Monitor GPU memory before inference
-            if batch_idx == 0:  # First batch
-                alloc_before, reserved_before = get_gpu_memory_info()
-                print(f"GPU memory before inference: {alloc_before:.2f}GB allocated, {reserved_before:.2f}GB reserved")
-            
+            inputs = {input_name: batch_input}  # Already float32 from preprocessing
+
+            # Monitor memory periodically
+            if processed_count % 100 == 0:
+                ram_used, ram_avail = get_system_memory_info()
+                gpu_used, gpu_total = get_gpu_memory_info()
+                print(f"\n[After {processed_count} images] RAM: {ram_used:.2f}GB used, GPU: {gpu_used:.2f}/{gpu_total:.2f}GB")
+
             start_time = time.time()
             outs = sess.run([use_scores], inputs)
             batch_inference_time = time.time() - start_time
             total_inference_time += batch_inference_time
-            
-            # Monitor GPU memory after first inference
-            if batch_idx == 0:
-                alloc_after, reserved_after = get_gpu_memory_info()
-                print(f"GPU memory after inference: {alloc_after:.2f}GB allocated, {reserved_after:.2f}GB reserved")
-                print(f"Memory increase: {alloc_after - alloc_before:.2f}GB")
-            
+
             scores = outs[0]
             
             # Get predictions for the batch
@@ -297,9 +361,22 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
                 all_results.append(result)
                 
                 # Update overall metrics
+                processed_count += 1
+
+                # Update overall metrics
                 for key, value in metrics.items():
                     if isinstance(value, (int, float)):
                         overall_metrics[key].append(value)
+
+            # Clear batch data to free memory
+            del batch_input, scores, outs
+
+            # Periodic garbage collection and result saving
+            if len(all_results) % 500 == 0:
+                # Save intermediate results
+                with open(output_file.replace('.json', f'_partial_{len(all_results)}.json'), 'w') as f:
+                    json.dump({"partial_results": all_results[-500:]}, f)
+                gc.collect()  # Force garbage collection
                         
         except Exception as e:
             print(f"Error during batch inference: {e}")
@@ -369,9 +446,11 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
     print(f"Total inference time: {total_inference_time:.2f}s")
     print(f"Images per second: {summary['images_per_second']:.2f}")
     
-    # Final GPU memory check
-    alloc_final, reserved_final = get_gpu_memory_info()
-    print(f"\nFinal GPU memory: {alloc_final:.2f}GB allocated, {reserved_final:.2f}GB reserved")
+    # Final memory check
+    ram_used_final, ram_avail_final = get_system_memory_info()
+    gpu_used_final, gpu_total_final = get_gpu_memory_info()
+    print(f"\nFinal RAM: {ram_used_final:.2f}GB used (Δ{ram_used_final-ram_used_init:+.2f}GB)")
+    print(f"Final GPU: {gpu_used_final:.2f}/{gpu_total_final:.2f}GB used (Δ{gpu_used_final-gpu_used_init:+.2f}GB)")
     
     print("\nAverage Metrics:")
     for metric, value in summary["average_metrics"].items():
@@ -393,13 +472,25 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
     return summary
 
 def main():
-    # Check GPU availability
-    if torch.cuda.is_available():
-        print(f"GPU detected: {torch.cuda.get_device_name(0)}")
-        print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}GB")
+    # Check GPU availability via ONNX Runtime
+    providers = ort.get_available_providers()
+    print(f"Available ONNX Runtime providers: {providers}")
+
+    if 'CUDAExecutionProvider' in providers:
+        print("CUDA provider available - GPU acceleration enabled")
+        gpu_used, gpu_total = get_gpu_memory_info()
+        if gpu_total > 0:
+            print(f"GPU Memory: {gpu_used:.2f}/{gpu_total:.2f}GB")
+    elif 'TensorrtExecutionProvider' in providers:
+        print("TensorRT provider available - GPU acceleration enabled")
     else:
-        print("WARNING: No GPU detected, will use CPU (much slower)")
-    
+        print("WARNING: No GPU providers available, will use CPU (much slower)")
+
+    # Check system memory
+    ram_used, ram_avail = get_system_memory_info()
+    print(f"System RAM: {ram_used:.2f}GB used, {ram_avail:.2f}GB available")
+    print()
+
     data_folder = "/media/andrewk/qnap-public/workspace/shard_00022/"
     model_path = "/media/andrewk/qnap-public/workspace/OppaiOracle/exported/model.onnx"
     output_dir = "/media/andrewk/qnap-public/workspace/results"
