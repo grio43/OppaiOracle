@@ -440,8 +440,12 @@ class LMDBCache:
             data = txn.get(key.encode())
             if data is not None:
                 self.hits += 1
-                # Deserialize tensor
-                buffer = np.frombuffer(data, dtype=np.uint8)
+                # Deserialize tensor.  ``np.frombuffer`` returns a read‑only array
+                # which subsequently triggers a PyTorch warning when wrapping it
+                # with ``torch.from_numpy``.  Copy the buffer to ensure writability
+                # and avoid the warning about undefined behaviour when tensors are
+                # created from non‑writable NumPy arrays.
+                buffer = np.frombuffer(data, dtype=np.uint8).copy()
                 tensor = torch.from_numpy(buffer).view(-1)  # Will reshape later
                 return tensor
             else:
@@ -1296,15 +1300,22 @@ class SimplifiedDataset(Dataset):
 
     def _get_actual_index(self, idx: int) -> int:
         """Map dataset index to actual annotation index with bounds checking"""
-        if self.epoch_indices is not None:
-            if idx >= len(self.epoch_indices):
+        if self.epoch_indices:
+            size = len(self.epoch_indices)
+            if idx >= size or idx < -size:
                 logger.warning(
-                    f"Index {idx} out of bounds for epoch_indices (size {len(self.epoch_indices)}), using modulo"
+                    f"Index {idx} out of bounds for epoch_indices (size {size}), using modulo"
                 )
-                idx = idx % len(self.epoch_indices)
+                idx %= size
             return self.epoch_indices[idx]
-        else:
-            return idx
+
+        total = len(self.annotations)
+        if idx >= total or idx < -total:
+            logger.warning(
+                f"Index {idx} out of bounds for annotations (size {total}), using modulo"
+            )
+            idx %= total
+        return idx
     
     def _log_memory_status(self, context: str = ""):
         """Log current memory status"""
