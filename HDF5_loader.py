@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import copy
 import multiprocessing as mp
+import queue
 import sqlite3
 import lmdb
 from pathlib import Path
@@ -32,12 +33,19 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler
 import torchvision.transforms as T
-from logging.handlers import RotatingFileHandler, QueueHandler
+from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 import torchvision.transforms.functional as TF
 from PIL import Image
 
 from collections import OrderedDict
-from logging.handlers import QueueHandler
+
+# Optional compression support
+try:
+    import lz4.frame
+    LZ4_AVAILABLE = True
+except ImportError:
+    LZ4_AVAILABLE = False
+
 
 from orientation_handler import OrientationHandler, OrientationMonitor  # type: ignore
 # Import TagVocabulary from the vocabulary module rather than a relative package path.
@@ -46,6 +54,119 @@ from vocabulary import TagVocabulary
 
 logger = logging.getLogger(__name__)
 
+class BoundedLevelAwareQueue:
+    """Bounded queue with level-aware dropping policy for logging."""
+    
+    def __init__(self, maxsize=5000):
+        self.maxsize = maxsize
+        self.queue = []
+        self.lock = threading.Lock()
+        self.not_empty = threading.Condition(self.lock)
+        self.drop_counts = {'DEBUG': 0, 'INFO': 0, 'WARNING': 0, 'ERROR': 0, 'CRITICAL': 0}
+        
+    def put(self, record, block=False, timeout=None):
+        """Put record with level-aware dropping."""
+        with self.lock:
+            if len(self.queue) >= self.maxsize:
+                # Drop policy: prefer dropping DEBUG/INFO over WARNING/ERROR/CRITICAL
+                if hasattr(record, 'levelname'):
+                    if record.levelname in ('DEBUG', 'INFO'):
+                        # Drop this low-priority message
+                        self.drop_counts[record.levelname] += 1
+                        return
+                    else:
+                        # Try to drop a DEBUG/INFO message to make room
+                        for i, item in enumerate(self.queue):
+                            if hasattr(item, 'levelname') and item.levelname in ('DEBUG', 'INFO'):
+                                self.queue.pop(i)
+                                self.drop_counts[item.levelname] += 1
+                                break
+                        else:
+                            # No DEBUG/INFO to drop, drop oldest
+                            if self.queue:
+                                dropped = self.queue.pop(0)
+                                if hasattr(dropped, 'levelname'):
+                                    self.drop_counts[dropped.levelname] += 1
+            
+            self.queue.append(record)
+            self.not_empty.notify()
+    
+    def get(self, block=True, timeout=None):
+        """Get record from queue."""
+        with self.lock:
+            if not block:
+                if not self.queue:
+                    raise queue.Empty
+                return self.queue.pop(0)
+            
+            deadline = None if timeout is None else time.time() + timeout
+            while not self.queue:
+                remaining = None if deadline is None else deadline - time.time()
+                if remaining is not None and remaining <= 0:
+                    raise queue.Empty
+                self.not_empty.wait(remaining)
+            return self.queue.pop(0)
+    
+    def get_drop_stats(self):
+        """Get drop statistics."""
+        with self.lock:
+            return self.drop_counts.copy()
+
+
+class CompressingRotatingFileHandler(RotatingFileHandler):
+    """Rotating file handler with optional compression."""
+    
+    def __init__(self, *args, compress=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.compress = compress and LZ4_AVAILABLE
+        
+    def doRollover(self):
+        """Override to add compression after rotation."""
+        super().doRollover()
+        
+        if self.compress and self.backupCount > 0:
+            # Compress the most recent backup
+            for i in range(self.backupCount, 0, -1):
+                sfn = self.rotation_filename("%s.%d" % (self.baseFilename, i))
+                if os.path.exists(sfn) and not sfn.endswith('.lz4'):
+                    self._compress_file(sfn)
+    
+    def _compress_file(self, filepath):
+        """Compress a file using lz4."""
+        try:
+            import lz4.frame
+            compressed_path = filepath + '.lz4'
+            with open(filepath, 'rb') as f_in:
+                with lz4.frame.open(compressed_path, 'wb') as f_out:
+                    f_out.write(f_in.read())
+            os.remove(filepath)
+            logger.debug(f"Compressed {filepath} -> {compressed_path}")
+        except Exception as e:
+            logger.warning(f"Failed to compress {filepath}: {e}")
+
+
+def setup_worker_logging(worker_id: int, log_queue: object):
+    """Setup per-worker rotating log files."""
+    worker_log_dir = Path("/logs/workers")
+    worker_log_dir.mkdir(parents=True, exist_ok=True)
+    
+    log_file = worker_log_dir / f"worker_{worker_id}.log"
+    handler = CompressingRotatingFileHandler(
+        log_file,
+        maxBytes=64 * 1024 * 1024,  # 64MB
+        backupCount=5,
+        compress=True
+    )
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    
+    # Queue handler for main process
+    queue_handler = QueueHandler(log_queue)
+    queue_handler.setLevel(logging.INFO)
+    
+    logger = logging.getLogger()
+    logger.addHandler(handler)
+    logger.addHandler(queue_handler)
 
 def letterbox_resize(
     image: torch.Tensor,
@@ -188,12 +309,12 @@ class SimplifiedDataConfig:
     # Sampling settings
     frequency_weighted_sampling: bool = True
     sample_weight_power: float = 0.5
-    orientation_oversample_factor: float = 2.0
 
     # Multi‑GPU settings
     distributed: bool = False
     rank: int = 0
     world_size: int = 1
+    log_queue_maxsize: int = 5000    
 
     # Cache settings
     cache_size_gb: float = 8.0
@@ -261,39 +382,28 @@ def _make_worker_init_fn(base_seed: int, log_queue: Optional[object]):
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        # Remove any FileHandlers in workers (avoid cross-process file writes)
-        root = logging.getLogger()
-        for h in list(root.handlers):
-            try:
-                from logging import FileHandler
-                if isinstance(h, FileHandler):
-                    root.removeHandler(h)
-            except Exception:
-                pass
-
-        # Attach QueueHandler if queue supplied
+ # Setup worker logging with rotation
         if log_queue is not None:
-            try:
-                qh = QueueHandler(log_queue)
-                qh.setLevel(logging.INFO)
-                root.addHandler(qh)
-            except Exception:
-                pass
+            setup_worker_logging(worker_id, log_queue)
+    
     return _init_fn
+
 
 class LMDBCache:
     """Global file-backed LMDB cache (L2) with memory-mapped access"""
     
-    def __init__(self, path: Path, max_size_gb: float = 48.0, readonly: bool = False):
+    def __init__(self, path: Path, max_size_gb: float = 48.0, map_growth_gb: float = 4.0, readonly: bool = False):
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self.max_size_bytes = int(max_size_gb * 1024 ** 3)
+        self.map_growth_bytes = int(map_growth_gb * 1024 ** 3)
+        self.current_map_size = min(self.map_growth_bytes, self.max_size_bytes)
         self.readonly = readonly
         
         # Open LMDB environment
         self.env = lmdb.open(
             str(self.path),
-            map_size=self.max_size_bytes,
+            map_size=self.current_map_size,
             readonly=readonly,
             lock=not readonly,
             max_dbs=1,
@@ -373,7 +483,33 @@ class LMDBCache:
                 txn.put(key.encode(), value_bytes)
             return True
         except lmdb.MapFullError:
-            logger.warning("LMDB cache is full, skipping insert")
+            # Try to grow the map
+            if self._grow_map():
+                # Retry after growing
+                try:
+                    with self.env.begin(write=True) as txn:
+                        txn.put(key.encode(), value_bytes)
+                    return True
+                except lmdb.MapFullError:
+                    logger.warning("LMDB cache is full even after growth")
+                    return False
+            else:
+                logger.warning("LMDB cache is full and cannot grow further")
+                return False
+    
+    def _grow_map(self) -> bool:
+        """Try to grow the LMDB map size."""
+        if self.current_map_size >= self.max_size_bytes:
+            return False
+        
+        new_size = min(self.current_map_size + self.map_growth_bytes, self.max_size_bytes)
+        try:
+            self.env.set_mapsize(new_size)
+            self.current_map_size = new_size
+            logger.info(f"LMDB map grown to {new_size / (1024**3):.1f} GB")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to grow LMDB map: {e}")
             return False
     
     def _check_memory_available(self) -> bool:
@@ -423,11 +559,14 @@ class LMDBCache:
 
 
 class ValidationIndex:
-    """SQLite-based validation index for lazy validation"""
+    """SQLite-based validation index for lazy validation with retry/backoff/TTL"""
     
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_retries = 3
+        self.ttl_days = 7
+        self.backoff_base = 60  # seconds        
         
         # Create/open database
         self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
@@ -441,7 +580,9 @@ class ValidationIndex:
                     status TEXT,
                     last_checked TIMESTAMP,
                     error_message TEXT,
-                    retry_count INTEGER DEFAULT 0
+                    retry_count INTEGER DEFAULT 0,
+                    next_retry_after TIMESTAMP,
+                    first_failure TIMESTAMP
                 )
             """)
             self.conn.commit()
@@ -455,16 +596,68 @@ class ValidationIndex:
             )
             result = cursor.fetchone()
             return result[0] if result else None
+        
+    def should_retry(self, image_path: str) -> bool:
+        """Check if image should be retried based on backoff/TTL."""
+        with self.lock:
+            cursor = self.conn.execute(
+                """SELECT retry_count, next_retry_after, first_failure 
+                   FROM validation_status WHERE image_path = ?""",
+                (image_path,)
+            )
+            result = cursor.fetchone()
+            if not result:
+                return True
+            
+            retry_count, next_retry_after, first_failure = result
+            
+            # Check TTL
+            if first_failure:
+                from datetime import datetime, timedelta
+                first_fail_dt = datetime.fromisoformat(first_failure)
+                if datetime.now() - first_fail_dt > timedelta(days=self.ttl_days):
+                    # Expired, skip permanently
+                    return False
+            
+            # Check backoff
+            if next_retry_after:
+                next_retry_dt = datetime.fromisoformat(next_retry_after)
+                if datetime.now() < next_retry_dt:
+                    return False
+            
+            return retry_count < self.max_retries
     
     def set_status(self, image_path: str, status: str, error_msg: Optional[str] = None):
         """Set validation status for an image"""
         from datetime import datetime
+
+        # Calculate next retry time with exponential backoff
+        next_retry = None
+        if status == 'failed':
+            with self.lock:
+                cursor = self.conn.execute(
+                    "SELECT retry_count FROM validation_status WHERE image_path = ?",
+                    (image_path,)
+                )
+                result = cursor.fetchone()
+                retry_count = result[0] if result else 0
+                backoff_seconds = self.backoff_base * (2 ** retry_count)
+                next_retry = datetime.now() + timedelta(seconds=backoff_seconds)
+
         with self.lock:
             self.conn.execute(
-                """INSERT OR REPLACE INTO validation_status 
-                   (image_path, status, last_checked, error_message, retry_count)
-                   VALUES (?, ?, ?, ?, 
-                           COALESCE((SELECT retry_count FROM validation_status WHERE image_path = ?), 0) + 1)""",
+                """INSERT INTO validation_status 
+                   (image_path, status, last_checked, error_message, retry_count, next_retry_after, first_failure)
+                   VALUES (?, ?, ?, ?, 1, ?, ?)
+                   ON CONFLICT(image_path) DO UPDATE SET
+                   status = excluded.status,
+                   last_checked = excluded.last_checked,
+                   error_message = excluded.error_message,
+                   retry_count = retry_count + 1,
+                   next_retry_after = ?,
+                   first_failure = COALESCE(first_failure, excluded.first_failure)""",
+                (image_path, status, datetime.now(), error_msg, next_retry, 
+                 datetime.now() if status == 'failed' else None, next_retry)
                 (image_path, status, datetime.now(), error_msg, image_path)
             )
             self.conn.commit()
@@ -474,6 +667,118 @@ class ValidationIndex:
         if hasattr(self, 'conn'):
             self.conn.close()
 
+class BackgroundValidator(threading.Thread):
+    """Background thread for opportunistic validation."""
+    
+    def __init__(self, validation_index: ValidationIndex, data_dir: Path):
+        super().__init__(daemon=True, name="BackgroundValidator")
+        self.validation_index = validation_index
+        self.data_dir = data_dir
+        self.running = False
+        self.stop_event = threading.Event()
+        
+    def run(self):
+        """Run background validation loop."""
+        self.running = True
+        while self.running and not self.stop_event.is_set():
+            # Get a batch of unvalidated or retry-eligible images
+            # (Implementation would query the validation index for candidates)
+            
+            # Sleep between validation attempts
+            self.stop_event.wait(timeout=30)
+    
+    def stop(self):
+        """Stop the background validator."""
+        self.running = False
+        self.stop_event.set()
+
+
+class AdaptivePrefetchController:
+    """Controls prefetch factor and pinned memory based on memory pressure."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.original_prefetch = config.get('prefetch_factor', 2)
+        self.max_inflight_per_worker = config.get('max_inflight_per_worker', 2)
+        self.global_max_inflight = config.get('global_max_inflight', 16)
+        self.cooldown_counter = 0
+        self.emergency_unpin_threshold = 5.0  # Critical memory %
+        self.reduce_prefetch_threshold = 12.0  # Low memory %
+        self.restore_threshold = 25.0  # High memory %
+        self.current_inflight = 0
+        self.lock = threading.Lock()
+        self.pinned_bytes = 0
+        
+    def check_and_adapt(self, loader: DataLoader) -> Dict[str, Any]:
+        """Adapt prefetch and pinning based on memory pressure."""
+        mem = psutil.virtual_memory()
+        free_pct = (mem.available / mem.total) * 100
+        
+        actions = {'pin_memory': loader.pin_memory, 'prefetch_factor': loader.prefetch_factor}
+        
+        with self.lock:
+            if free_pct < self.emergency_unpin_threshold:
+                # Emergency unpin
+                if loader.pin_memory:
+                    logger.warning(f"Critical memory ({free_pct:.1f}%), disabling pinned memory")
+                    loader.pin_memory = False
+                    actions['pin_memory'] = False
+                    self.cooldown_counter = 300
+                    self.pinned_bytes = 0
+                    
+            elif free_pct < self.reduce_prefetch_threshold:
+                # Reduce prefetch
+                if loader.prefetch_factor > 1:
+                    logger.info(f"Low memory ({free_pct:.1f}%), reducing prefetch")
+                    loader.prefetch_factor = 1
+                    actions['prefetch_factor'] = 1
+                    
+            elif free_pct > self.restore_threshold and self.cooldown_counter == 0:
+                # Restore settings
+                if loader.prefetch_factor < self.original_prefetch:
+                    loader.prefetch_factor = min(
+                        self.original_prefetch,
+                        self._calculate_safe_prefetch()
+                    )
+                    actions['prefetch_factor'] = loader.prefetch_factor
+                    
+                if not loader.pin_memory and self.config.get('enabled', True):
+                    loader.pin_memory = True
+                    actions['pin_memory'] = True
+            
+            if self.cooldown_counter > 0:
+                self.cooldown_counter -= 1
+                
+        return actions
+    
+    def _calculate_safe_prefetch(self) -> int:
+        """Calculate safe prefetch factor based on in-flight limits."""
+        with self.lock:
+            # Respect per-worker and global limits
+            return min(
+                self.original_prefetch,
+                self.max_inflight_per_worker,
+                max(1, self.global_max_inflight // max(1, self.current_inflight))
+            )
+    
+    def update_inflight(self, num_workers: int):
+        """Update current in-flight worker count."""
+        with self.lock:
+            self.current_inflight = num_workers
+    
+    def track_pinned_bytes(self, batch_size: int, element_size: int):
+        """Track pinned memory usage."""
+        with self.lock:
+            self.pinned_bytes = batch_size * element_size
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get prefetch controller metrics."""
+        with self.lock:
+            return {
+                'pinned_bytes': self.pinned_bytes,
+                'current_inflight': self.current_inflight,
+                'cooldown_remaining': self.cooldown_counter
+            }
 
 class WorkingSetSampler:
     """Two-stage working set sampler with bounded trickle-in"""
@@ -726,6 +1031,8 @@ class SimplifiedDataset(Dataset):
                 try:
                     validation_index_path = Path("/data/validation/index.sqlite")
                     self.validation_index = ValidationIndex(validation_index_path)
+                    self.background_validator = BackgroundValidator(self.validation_index, config.data_dir)
+                    self.background_validator.start()
                     logger.info(f"Validation index initialized at {validation_index_path}")
                 except Exception as e:
                     logger.warning(f"Failed to initialize validation index: {e}")
@@ -888,8 +1195,6 @@ class SimplifiedDataset(Dataset):
                 freq = self.vocab.tag_frequencies.get(tag, 1)
                 # Inverse frequency weighting
                 w += (1.0 / max(freq, 1)) ** self.config.sample_weight_power
-                if tag in orientation_tags:
-                    has_orientation_tag = True
             # Average over number of tags to avoid biasing multi‑tag images
             w = w / max(1, len(anno['tags']))
         weights_arr = np.array(weights, dtype=np.float64)
@@ -1027,9 +1332,11 @@ class SimplifiedDataset(Dataset):
         if self.validation_index is not None:
             status = self.validation_index.get_status(image_path)
             if status == 'failed':
-                # Return black image for known bad images
-                logger.debug(f"Skipping known bad image: {image_path}")
-                return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32), False
+                # Check if we should retry
+                if not self.validation_index.should_retry(image_path):
+                    # Skip permanently failed image
+                    logger.debug(f"Skipping permanently failed image: {image_path}")
+                    return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32), False
         # Load from disk
         self.cache_stats['disk_loads'] += 1
         
@@ -1423,6 +1730,11 @@ class SimplifiedDataset(Dataset):
             'worker_local': True  # Flag to indicate these are worker-local stats
         }
 
+    def __del__(self):
+        """Cleanup when dataset is destroyed."""
+        if hasattr(self, 'background_validator'):
+            self.background_validator.stop()
+
 def create_dataloaders(
     data_dir: Path,
     json_dir: Path,
@@ -1480,38 +1792,8 @@ def create_dataloaders(
             'adaptive': True,
         }
     
-    # Adaptive prefetch controller
-    class PrefetchController:
-        """Controls prefetch factor based on memory pressure"""
-        def __init__(self, config):
-            self.config = config
-            self.original_prefetch = config['prefetch_factor']
-            self.cooldown_counter = 0
-            
-        def check_and_adapt(self, loader):
-            """Adapt prefetch based on memory pressure"""
-            mem = psutil.virtual_memory()
-            free_pct = (mem.available / mem.total) * 100
-            
-            if free_pct < 5 and self.config['enabled']:
-                # Emergency unpin
-                logger.warning(f"Critical memory ({free_pct:.1f}%), disabling pinned memory")
-                loader.pin_memory = False
-                self.cooldown_counter = 300
-            elif free_pct < 15 and loader.prefetch_factor > 1:
-                # Reduce prefetch
-                logger.info(f"Low memory ({free_pct:.1f}%), reducing prefetch")
-                loader.prefetch_factor = 1
-            elif free_pct > 20 and self.cooldown_counter == 0:
-                # Restore settings
-                loader.prefetch_factor = self.original_prefetch
-                if self.config['enabled']:
-                    loader.pin_memory = True
-            
-            if self.cooldown_counter > 0:
-                self.cooldown_counter -= 1
-    
-    prefetch_controller = PrefetchController(pin_memory_config)
+    # Create adaptive prefetch controller
+    prefetch_controller = AdaptivePrefetchController(pin_memory_config)
     
     json_files = list(json_dir.glob("*.json"))
     if not json_files:
@@ -1597,8 +1879,15 @@ def create_dataloaders(
         worker_init_fn=worker_init_fn,
         generator=generator,
     )
-    # Attach prefetch controller to loaders
+
+    # Attach prefetch controller and update worker count
     train_loader._prefetch_controller = prefetch_controller
+    prefetch_controller.update_inflight(num_workers)
+    
+    # Track pinned memory usage
+    if pin_memory_config['enabled']:
+        element_size = batch_size * 3 * 640 * 640 * 4  # Assuming float32
+        prefetch_controller.track_pinned_bytes(batch_size, element_size)
 
     return train_loader, val_loader, vocab
 
