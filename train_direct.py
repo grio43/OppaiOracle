@@ -7,17 +7,20 @@ Demonstrates integration of the orientation handler with fail-fast behavior and 
 import logging
 import os
 import json
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional
 import multiprocessing as mp
 import sys
 import random
+from datetime import datetime
 import torch.distributed as dist
 from dataclasses import dataclass
 
 import torch
 from torch.amp import GradScaler, autocast
 import numpy as np
+from Monitor_log import MonitorConfig, TrainingMonitor
 
 # Import the orientation handler
 from orientation_handler import OrientationHandler
@@ -196,6 +199,10 @@ def train_with_orientation_tracking():
         "skip_unmapped": True,  # Changed: DO skip unmapped for safety
         "orientation_safety_mode": "conservative",  # New: safe by default
         "log_orientation_stats": True,
+        # Monitoring settings
+        "use_tensorboard": True,
+        "tensorboard_dir": Path("./runs") / f"experiment_{datetime.now():%Y%m%d_%H%M%S}",
+        "use_wandb": False,
         # Model configuration
         "checkpoint_dir": Path("checkpoints"),  # Add checkpoint directory
         "model_config": {
@@ -394,6 +401,17 @@ def train_with_orientation_tracking():
         lr=config["learning_rate"],
         weight_decay=config["weight_decay"]
     )
+
+    # Monitoring setup
+    monitor_config = MonitorConfig(
+        log_dir=str(log_dir),
+        use_tensorboard=config.get("use_tensorboard", True),
+        tensorboard_dir=str(config.get("tensorboard_dir", Path("./runs"))),
+        use_wandb=config.get("use_wandb", False),
+        wandb_project="anime-tagger",
+        wandb_run_name=f"train_{datetime.now():%Y%m%d_%H%M%S}"
+    )
+    monitor = TrainingMonitor(monitor_config)
     
     # AMP setup (prefer BF16 on modern NVIDIA GPUs like Blackwell when available)
     is_cuda = config["device"].startswith("cuda") and torch.cuda.is_available()
@@ -453,6 +471,7 @@ def train_with_orientation_tracking():
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
+        epoch_start = time.time()
         
         for step, batch in enumerate(train_loader):
             images = batch['images'].to(device)
@@ -500,7 +519,19 @@ def train_with_orientation_tracking():
                 loss.backward()
             
             running_loss += loss.item()
-            
+
+            if global_step % 10 == 0:
+                monitor.log_step(
+                    step=global_step,
+                    loss=loss.item(),
+                    metrics={
+                        'tag_loss': losses.get('tag_loss', 0.0),
+                        'rating_loss': losses.get('rating_loss', 0.0),
+                    },
+                    learning_rate=optimizer.param_groups[0]['lr'],
+                    batch_size=images.size(0)
+                )
+
             # Gradient accumulation
             if (step + 1) % config["gradient_accumulation"] == 0:
                 # Add gradient clipping before optimizer step
@@ -545,7 +576,7 @@ def train_with_orientation_tracking():
                 val_loss += loss.item()
         
         avg_val_loss = val_loss / max(1, len(val_loader))
-        
+
         # Check for NaN and handle gracefully
         if torch.isnan(torch.tensor(avg_val_loss)) or torch.isinf(torch.tensor(avg_val_loss)):
             logger.error(f"NaN or Inf detected in validation loss at epoch {epoch + 1}!")
@@ -553,6 +584,15 @@ def train_with_orientation_tracking():
             avg_val_loss = float('inf')  # Prevent best model update
         else:
             logger.info(f"Epoch {epoch + 1}/{config['num_epochs']}: Avg val loss = {avg_val_loss:.4f}")
+
+        monitor.log_validation(global_step, {'loss': avg_val_loss})
+        epoch_duration = time.time() - epoch_start
+        monitor.log_epoch(
+            epoch=epoch + 1,
+            train_metrics={'loss': avg_train_loss},
+            val_metrics={'loss': avg_val_loss},
+            duration=epoch_duration,
+        )
 
         # Update training state
         training_state.epoch = epoch + 1
@@ -619,7 +659,9 @@ def train_with_orientation_tracking():
         logger.info("="*60)
     
     logger.info("\nTraining complete with orientation-aware augmentation!")
-    
+
+    monitor.close()
+
     # Cleanup: Stop the QueueListener if it was started
     if _listener is not None:
         try:
