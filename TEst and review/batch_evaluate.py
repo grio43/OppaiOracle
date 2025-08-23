@@ -40,13 +40,81 @@ def get_gpu_memory_info():
         return 0, 0
 
 def load_tag_names(config_path):
+    """Load tag names and normalization parameters for evaluation.
+
+    The original implementation only looked for a JSON config containing
+    a ``tag_names`` entry.  In practice many training runs store the tag
+    vocabulary separately (e.g. in ``vocabulary.json``) and the config
+    may not include the names at all.  When that happens the evaluation
+    code falls back to generating placeholder ``tag_*`` names which is
+    what the user reported.
+
+    This helper now attempts a few fallbacks:
+
+    1. If ``config_path`` is provided and contains ``tag_names`` it is used
+       directly.
+    2. Otherwise we look for a ``vocabulary.json`` file alongside the
+       config or in common locations and build the list of tag names from
+       its ``index_to_tag`` mapping.
+
+    Args:
+        config_path: Optional path to a JSON config file.
+
+    Returns:
+        Tuple[List[str] | None, Dict | None]: tag names and normalization
+            parameters if found.
+    """
+    norm = None
+    names = None
+
+    # ------------------------------------------------------------------
+    # First try the provided config file
     if config_path and os.path.exists(config_path):
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        names = cfg.get("tag_names", None)
-        norm = cfg.get("normalization_params", None)
-        return names, norm
-    return None, None
+        names = cfg.get("tag_names")
+        norm = cfg.get("normalization_params")
+        if names:
+            return names, norm
+        # If tag names weren't embedded, search relative to the config
+        search_dirs = [pathlib.Path(config_path).parent]
+    else:
+        # Search starting from current working directory
+        search_dirs = [pathlib.Path(".")]
+
+    # ------------------------------------------------------------------
+    # Look for a vocabulary file in common locations
+    vocab_candidates = []
+    for base in search_dirs:
+        vocab_candidates.append(base / "vocabulary.json")
+    # Additional common fallback locations
+    vocab_candidates.append(pathlib.Path("vocabulary.json"))
+    vocab_candidates.append(pathlib.Path("vocabulary") / "vocabulary.json")
+
+    for vocab_path in vocab_candidates:
+        if vocab_path.exists():
+            try:
+                with open(vocab_path, "r", encoding="utf-8") as vf:
+                    vocab_data = json.load(vf)
+                idx_to_tag = vocab_data.get("index_to_tag")
+                if isinstance(idx_to_tag, dict):
+                    # Sort by numerical index as keys may be strings
+                    names = [
+                        tag for _, tag in sorted(
+                            ((int(k), v) for k, v in idx_to_tag.items()),
+                            key=lambda kv: kv[0]
+                        )
+                    ]
+                elif isinstance(idx_to_tag, list):
+                    names = idx_to_tag
+                if names:
+                    return names, norm
+            except Exception:
+                # If we fail to load this candidate continue to next
+                continue
+
+    # If nothing was found, return None so callers know tag names are missing
+    return None, norm
 
 def letterbox_resize_numpy(image, target_size=640, pad_color=(114, 114, 114), patch_size=16):
     """
