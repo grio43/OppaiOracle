@@ -1,60 +1,62 @@
+# OppaiOracle
+
+```mermaid
 flowchart TD
-    subgraph Config["Configuration & Setup"]
-        CFG["Configuration_System.py"]
-        REQS["requirements.txt"]
-        CONFIGS["configs/ (YAMLs/JSONs)"]
-        IGNORES["Tags_ignore.txt"]
-    end
+  %% Configuration & Vocabulary
+  subgraph A[Configuration & Vocabulary]
+    Config["Configuration_System.py\n• load_config()"]
+    Vocab["vocabulary.py\n• TagVocabulary\n• load_vocabulary_for_training()"]
+    Config --> Vocab
+  end
 
-    subgraph Data["Data Ingestion & Preparation"]
-        LOADER["HDF5_loader.py\ letterbox_resize(),\ create_dataloaders()"]
-        ORIENT["orientation_handler.py\ OrientationHandler"]
-        METADATA["utils/metadata_ingestion.py\ parse_tags_field(), dedupe_preserve_order()"]
-        VOCAB["vocabulary.py\ TagVocabulary:contentReference[oaicite:11]{index=11}"]
-        PREP["tag_vocabulary.py\ DanbooruDataPreprocessor"]
-        ANALYZE["Dataset_Analysis.py"]
-    end
+  %% Data Ingestion & Preparation
+  subgraph B[Data Ingestion & Preparation]
+    H5["HDF5_loader.py\n• SimplifiedDataConfig\n• create_dataloaders()\n• letterbox_resize()\n• BoundedLevelAwareQueue"]
+    Orient["orientation_handler.py\n• OrientationHandler\n• OrientationMonitor"]
+    Vocab --> H5
+    Config --> H5
+    H5 --> Orient
+  end
 
-    subgraph Model["Model & Loss/Metric"]
-        ARCH["model_architecture.py\ SimplifiedTagger,\ VisionTransformerConfig:contentReference[oaicite:12]{index=12}"]
-        LOSS["loss_functions.py\ AsymmetricFocalLoss,\ MultiTaskLoss"]
-        METRICS["metrics.py\ compute_precision_recall_f1():contentReference[oaicite:13]{index=13}"]
-        ADV_METRICS["Evaluation_Metrics.py\ MetricComputer,\ MetricConfig:contentReference[oaicite:14]{index=14}"]
-    end
+  %% Model
+  subgraph C[Model]
+    Arch["model_architecture.py\n• VisionTransformerConfig\n• create_model()\n• SimplifiedTagger.forward() -> {tag_logits, rating_logits}"]
+    Losses["loss_functions.py\n• AsymmetricFocalLoss\n• MultiTaskLoss (α, β)"]
+  end
 
-    subgraph Train["Training & Validation"]
-        TRAIN["train_direct.py\ setup_orientation_aware_training(),\ train_with_orientation_tracking()"]
-        VAL["validation_loop.py\ ValidationRunner"]
-        UTILS["training_utils.py\ TrainingState,\ DistributedTrainingHelper:contentReference[oaicite:15]{index=15}"]
-    end
+  %% Training
+  subgraph D[Training]
+    Train["train_direct.py\n• setup_orientation_aware_training()\n• train_with_orientation_tracking()"]
+    TUtils["training_utils.py\n• TrainingState\n• setup_optimizer()\n• save_checkpoint()/load_checkpoint()"]
+    Arch --> Train
+    Losses --> Train
+    H5 --> Train
+    Orient --> Train
+    TUtils --> Train
+  end
 
-    subgraph Monitor["Monitoring & Logging"]
-        MON["Monitor_log.py\ MonitorConfig,\ TrainingMonitor,\ AlertSystem:contentReference[oaicite:16]{index=16}"]
-    end
+  %% Validation & Metrics
+  subgraph E[Validation & Metrics]
+    Val["validation_loop.py\n• ValidationRunner\n• compute metrics/plots"]
+    Metrics["metrics.py\n• precision/recall/F1\n• mAP/ROC-AUC/top_k_accuracy"]
+    Train --> Val
+    Metrics --> Val
+  end
 
-    subgraph Inference["Inference & Export"]
-        INFER["Inference_Engine.py\ InferenceConfig,\ ImagePreprocessor,\ ModelWrapper:contentReference[oaicite:17]{index=17}"]
-        ONNX["ONNX_Export.py\ ONNXExporter:contentReference[oaicite:18]{index=18}"]
-    end
+  %% Monitoring
+  subgraph F[Monitoring]
+    Mon["Monitor_log.py\n• MonitorConfig\n• TrainingMonitor\n• AlertSystem"]
+    Train --> Mon
+    Val --> Mon
+  end
 
-    %% Edges
-    CFG --> LOADER
-    CONFIGS --> LOADER
-    IGNORES --> VOCAB
-    LOADER --> ORIENT --> METADATA
-    METADATA --> PREP
-    PREP --> VOCAB
-    VOCAB --> ARCH
-    ARCH --> TRAIN
-    LOSS --> TRAIN
-    METRICS --> VAL
-    ADV_METRICS --> VAL
-    UTILS --> TRAIN
-    UTILS --> VAL
-    TRAIN --> VAL
-    MON --- TRAIN
-    MON --- VAL
-    MON --- INFER
-    TRAIN --> INFER
-    VAL --> INFER
-    INFER --> ONNX
+  %% Inference & Export
+  subgraph G[Inference & Export]
+    Infer["Inference_Engine.py\n• InferenceConfig\n• ImagePreprocessor\n• ModelWrapper\n• InferenceEngine.predict()"]
+    Export["ONNX_Export.py\n• ONNXExportConfig\n• ModelWrapper (ONNX)\n• ONNXExporter.export()"]
+    Arch --> Infer
+    Vocab --> Infer
+    Val --> Infer
+    Infer --> Export
+  end
+```
