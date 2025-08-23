@@ -312,10 +312,11 @@ class SimplifiedDataConfig:
     random_crop_scale: Tuple[float, float] = (0.95, 1.0)
     # Colour jitter parameters
     color_jitter: bool = True
-    color_jitter_brightness: float = 0.4
-    color_jitter_contrast: float = 0.4
-    color_jitter_saturation: float = 0.4
-    color_jitter_hue: float = 0.1
+    # Conservative defaults tuned for anime colour fidelity
+    color_jitter_brightness: float = 0.1
+    color_jitter_contrast: float = 0.1
+    color_jitter_saturation: float = 0.05
+    color_jitter_hue: float = 0.02
     # Optional path to orientation mapping (JSON or YAML).  If provided, the
     # mapping is loaded on dataset initialisation.
     orientation_map_path: Optional[Path] = None
@@ -1374,11 +1375,10 @@ class SimplifiedDataset(Dataset):
     def _setup_augmentation(self) -> Optional[T.Compose]:
         """Create an augmentation pipeline for the training split.
 
-        The pipeline excludes horizontal flips, which are handled explicitly in
-        :meth:`__getitem__` to enable orientation‑aware tag remapping.  Colour
-        jitter parameters are configurable via :class:`SimplifiedDataConfig`.
-        A random gamma transform with a wide range is appended to better
-        handle exposure variations.
+        Carefully tuned for anime images to preserve colour accuracy while
+        providing useful variation.  The pipeline excludes horizontal flips,
+        which are handled explicitly in :meth:`__getitem__` to enable
+        orientation‑aware tag remapping.
         """
         transforms: List[Any] = []
         # Note: RandomResizedCrop will override letterbox resize, so only use one or the other
@@ -1396,7 +1396,7 @@ class SimplifiedDataset(Dataset):
                 )
             )
             """
-        # Colour jitter
+        # Colour jitter with conservative values
         if self.config.color_jitter:
             transforms.append(
                 T.ColorJitter(
@@ -1406,11 +1406,20 @@ class SimplifiedDataset(Dataset):
                     hue=self.config.color_jitter_hue,
                 )
             )
-        # Random gamma correction
+
+        # Random gamma correction with clamping
         def gamma_transform(img: torch.Tensor) -> torch.Tensor:
-            gamma = float(np.random.uniform(0.7, 1.3))
-            return TF.adjust_gamma(img, gamma=gamma)
+            # Reduced range: 0.9 to 1.1 for anime images
+            gamma = float(np.random.uniform(0.9, 1.1))
+            result = TF.adjust_gamma(img, gamma=gamma)
+            # Clamp to avoid out-of-range values
+            return torch.clamp(result, 0.0, 1.0)
+
         transforms.append(T.Lambda(gamma_transform))
+
+        # Final safety clamp to ensure valid range
+        transforms.append(T.Lambda(lambda x: torch.clamp(x, 0.0, 1.0)))
+
         return T.Compose(transforms) if transforms else None
 
     def __len__(self) -> int:
@@ -1830,8 +1839,30 @@ class SimplifiedDataset(Dataset):
             if self.augmentation is not None:
                 try:
                     image = self.augmentation(image)
+
+                    # Ensure augmented values are valid
+                    if torch.isnan(image).any() or torch.isinf(image).any():
+                        logger.warning(
+                            f"NaN/Inf detected after augmentation for {image_path}, skipping augmentation"
+                        )
+                        # Reload clean image and apply letterbox
+                        image, _ = self._load_image(image_path)
+                        image, lb_info = letterbox_resize(
+                            image,
+                            target_size=self.config.image_size,
+                            pad_color=self.config.pad_color,
+                            patch_size=self.config.patch_size,
+                        )
+                    elif (image < 0).any() or (image > 1).any():
+                        logger.debug(
+                            f"Values outside [0,1] detected, clamping for {image_path}"
+                        )
+                        image = torch.clamp(image, 0.0, 1.0)
+
                 except Exception as e:
-                    logger.warning(f"Augmentation failed for {image_path}: {e}, skipping augmentation")
+                    logger.warning(
+                        f"Augmentation failed for {image_path}: {e}, skipping augmentation"
+                    )
                     # Continue without augmentation
 
             # Normalise
