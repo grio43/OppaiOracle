@@ -754,7 +754,7 @@ def main():
     # Adjust batch size based on your model and image size
     # For 640x640 images, 32-64 is usually good for 32GB VRAM
     # Start conservative and increase if memory allows
-    BATCH_SIZE = 32  # You can increase this if memory usage is low
+    BATCH_SIZE = 250  # You can increase this if memory usage is low
     MAX_MEMORY_GB = 25  # Keep within this limit
 
     # Detect model format and choose appropriate processing function
