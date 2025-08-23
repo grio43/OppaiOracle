@@ -522,7 +522,20 @@ class CheckpointManager:
         
         if config is not None:
             checkpoint['config'] = config
-        
+
+        # Save vocabulary info (but not full tag_names to avoid placeholders)
+        if hasattr(model, 'module'):
+            model_to_check = model.module
+        else:
+            model_to_check = model
+
+        if hasattr(model_to_check, 'config'):
+            checkpoint['vocabulary_info'] = {
+                'num_tags': getattr(model_to_check.config, 'num_tags', None),
+                'vocab_path': 'vocabulary.json',
+                'has_vocabulary': True
+            }
+
         # Save regular checkpoint
         checkpoint_path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{step}.pt"
         torch.save(checkpoint, checkpoint_path)
