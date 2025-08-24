@@ -9,7 +9,13 @@ export_variants:  # Which variants to export
   - quantized    # Quantized for size/speed
 
 # ONNX-Specific Settings
-opset_version: 16  # ONNX opset version (16 is widely supported)
+# Use opset 18+ for modern transformer models with LayerNormalization support
+# Opset timeline:
+# - 16 (2021): Basic support, no LayerNormalization
+# - 17 (2022): Added LayerNormalization, GroupNormalization improvements
+# - 18 (2023): Additional optimizations for transformers
+# - 19 (2024): Latest improvements
+opset_version: 18  # Minimum for transformer optimizations with LayerNorm
 export_params: true  # Export model parameters
 do_constant_folding: true  # Optimize constants during export
 input_names:
