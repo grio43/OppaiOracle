@@ -20,6 +20,9 @@ from collections import defaultdict, deque
 import threading
 import queue
 
+import gzip
+import base64
+import hashlib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -190,52 +193,68 @@ class ModelWrapper:
     def load_model(self):
         """Load the trained model"""
         try:
-            # Priority 1: Explicit vocab_path from config
-            if self.config.vocab_path:
-                vocab_path = Path(self.config.vocab_path)
+            # Load checkpoint first
+            checkpoint = torch.load(self.config.model_path, map_location=self.device)
+
+            # Priority 1: Check for embedded vocabulary in checkpoint
+            if 'vocab_b64_gzip' in checkpoint:
+                logger.info("Found embedded vocabulary in checkpoint")
+                try:
+                    # Decode embedded vocabulary
+                    vocab_b64 = checkpoint['vocab_b64_gzip']
+                    vocab_compressed = base64.b64decode(vocab_b64)
+                    vocab_bytes = gzip.decompress(vocab_compressed)
+                    vocab_json = vocab_bytes.decode('utf-8')
+                    vocab_data = json.loads(vocab_json)
+
+                    # Verify integrity
+                    if 'vocab_sha256' in checkpoint:
+                        expected_sha = checkpoint['vocab_sha256']
+                        actual_sha = hashlib.sha256(vocab_bytes).hexdigest()
+                        if expected_sha != actual_sha:
+                            logger.warning(f"Vocabulary SHA mismatch: expected {expected_sha}, got {actual_sha}")
+
+                    # Create vocabulary from embedded data
+                    from vocabulary import TagVocabulary
+                    self.vocabulary = TagVocabulary()
+                    self.vocabulary.tag_to_index = vocab_data['tag_to_index']
+                    self.vocabulary.index_to_tag = {int(k): v for k, v in vocab_data['index_to_tag'].items()}
+                    self.vocabulary.tag_frequencies = vocab_data.get('tag_frequencies', {})
+
+                    self.tag_names = [
+                        self.vocabulary.get_tag_from_index(i)
+                        for i in range(len(self.vocabulary.tag_to_index))
+                    ]
+                    logger.info(f"Successfully loaded {len(self.tag_names)} tags from embedded vocabulary")
+
+                except Exception as e:
+                    logger.error(f"Failed to load embedded vocabulary: {e}")
+                    # Fall back to external vocabulary file
+                    self._load_external_vocabulary()
             else:
-                # Use the hardcoded path if not specified
-                vocab_path = DEFAULT_VOCAB_PATH
+                # No embedded vocabulary, load from file
+                logger.info("No embedded vocabulary found, loading from external file")
+                self._load_external_vocabulary()
 
-            # Check if the vocabulary file exists
-            if not vocab_path.exists():
-                # Try alternative locations as fallback
-                vocab_search_paths = []
+            # Validate vocabulary contains real tags, not placeholders
+            self._verify_vocabulary()
 
-                # Next to model checkpoint
-                if self.config.model_path:
-                    vocab_search_paths.append(Path(self.config.model_path).parent / "vocabulary.json")
-
-                # Next to config file
-                if self.config.config_path:
-                    vocab_search_paths.append(Path(self.config.config_path).parent / "vocabulary.json")
-
-                # Check alternative paths
-                vocab_found = False
-                for alt_path in vocab_search_paths:
-                    if alt_path.exists():
-                        vocab_path = alt_path
-                        vocab_found = True
-                        logger.info(f"Found vocabulary at alternative location: {vocab_path}")
-                        break
-
-                if not vocab_found:
-                    # List all attempted paths for debugging
-                    all_paths = [self.config.vocab_path or DEFAULT_VOCAB_PATH] + vocab_search_paths
-                    paths_str = "\n  ".join(str(p) for p in all_paths)
-                    raise FileNotFoundError(
-                        f"Vocabulary file not found! Searched in:\n  {paths_str}\n"
-                        f"Please ensure vocabulary.json exists at one of these locations."
-                    )
-
-            # Load the vocabulary
-            logger.info(f"Loading vocabulary from {vocab_path}")
-            self.vocabulary = TagVocabulary(vocab_path)
-            self.tag_names = [
-                self.vocabulary.get_tag_from_index(i)
-                for i in range(len(self.vocabulary.tag_to_index))
-            ]
-            logger.info(f"Successfully loaded {len(self.tag_names)} valid tag names from vocabulary")
+            # Load preprocessing parameters from checkpoint
+            if 'preprocessing_params' in checkpoint:
+                self.normalization_params = checkpoint['preprocessing_params']
+                # Update config with embedded parameters
+                self.config.normalize_mean = self.normalization_params.get('normalize_mean', [0.5, 0.5, 0.5])
+                self.config.normalize_std = self.normalization_params.get('normalize_std', [0.5, 0.5, 0.5])
+                self.config.image_size = self.normalization_params.get('image_size', 640)
+                logger.info(f"Loaded preprocessing params from checkpoint: {self.normalization_params}")
+            elif 'normalization_params' in checkpoint:
+                # Legacy format
+                self.normalization_params = checkpoint['normalization_params']
+                self.config.normalize_mean = self.normalization_params['mean']
+                self.config.normalize_std = self.normalization_params['std']
+                logger.info(f"Loaded normalization params from checkpoint (legacy format)")
+            else:
+                logger.warning("Preprocessing params not found in checkpoint. Using config defaults.")
 
             # Load model config
             if os.path.exists(self.config.config_path):
@@ -244,21 +263,6 @@ class ModelWrapper:
             else:
                 logger.warning(f"Config file not found at {self.config.config_path}")
                 model_config = {}
-            
-            # Load checkpoint
-            checkpoint = torch.load(self.config.model_path, map_location=self.device)
-            
-            # Load normalization parameters from checkpoint if available
-            if 'normalization_params' in checkpoint:
-                self.normalization_params = checkpoint['normalization_params']
-                # Update config with training normalization parameters
-                self.config.normalize_mean = self.normalization_params['mean']
-                self.config.normalize_std = self.normalization_params['std']
-                logger.info(f"Loaded normalization params from checkpoint: "
-                          f"mean={self.config.normalize_mean}, std={self.config.normalize_std}")
-            else:
-                logger.warning("Normalization params not found in checkpoint. "
-                             "Using config defaults (should match training values)")            
             
             # Extract model configuration from checkpoint or use defaults
             vit_config_dict = checkpoint.get('model_config', {})
@@ -344,7 +348,48 @@ class ModelWrapper:
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             return False
-    
+
+    def _load_external_vocabulary(self):
+        """Load vocabulary from external file (fallback)"""
+        if self.config.vocab_path:
+            vocab_path = Path(self.config.vocab_path)
+        else:
+            vocab_path = DEFAULT_VOCAB_PATH
+
+        if not vocab_path.exists():
+            search_paths = []
+            if self.config.model_path:
+                search_paths.append(Path(self.config.model_path).parent / "vocabulary.json")
+            if self.config.config_path:
+                search_paths.append(Path(self.config.config_path).parent / "vocabulary.json")
+
+            for alt_path in search_paths:
+                if alt_path.exists():
+                    vocab_path = alt_path
+                    logger.info(f"Found vocabulary at: {vocab_path}")
+                    break
+            else:
+                raise FileNotFoundError("Vocabulary file not found! Please use a checkpoint with embedded vocabulary.")
+
+        logger.info(f"Loading external vocabulary from {vocab_path}")
+        self.vocabulary = TagVocabulary(vocab_path)
+        self.tag_names = [
+            self.vocabulary.get_tag_from_index(i)
+            for i in range(len(self.vocabulary.tag_to_index))
+        ]
+
+    def _verify_vocabulary(self):
+        """Verify vocabulary contains real tags, not placeholders"""
+        placeholder_count = sum(
+            1 for tag in self.tag_names
+            if tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit()
+        )
+        if placeholder_count > 10:
+            raise ValueError(
+                f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags!\n"
+                f"This checkpoint/vocabulary is corrupted. Cannot perform inference."
+            )
+
     @torch.no_grad()
     def predict(self, images: torch.Tensor) -> torch.Tensor:
         """Run inference on batch of images"""
