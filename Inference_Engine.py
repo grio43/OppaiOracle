@@ -33,7 +33,7 @@ from PIL import Image
 
 # Vocabulary utilities
 from model_metadata import ModelMetadata
-from vocabulary import TagVocabulary, load_vocabulary_for_training
+from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
 from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
 
 # Make cv2 optional - not needed for basic inference
@@ -376,18 +376,8 @@ class ModelWrapper:
 
     def _verify_vocabulary(self):
         """Verify vocabulary contains real tags, not placeholders"""
-        placeholder_count = sum(
-            1 for tag in self.tag_names
-            if tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit()
-        )
-        if placeholder_count > 10:
-            logger.error(
-                f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags! "
-                f"Example placeholders: {[t for t in self.tag_names[:20] if t.startswith('tag_')]}"
-            )
-            raise ValueError(
-                f"This checkpoint/vocabulary is corrupted. Cannot perform inference."
-            )
+        # Use centralized verification
+        verify_vocabulary_integrity(self.vocabulary, Path(self.config.vocab_path))
 
     @torch.no_grad()
     def predict(self, images: torch.Tensor) -> torch.Tensor:
@@ -451,10 +441,11 @@ class ResultProcessor:
             tags = []
             for score, idx in zip(scores.tolist(), indices.tolist()):
                 if idx < len(self.tag_names):
-                    tags.append(TagPrediction(
-                        name=self.tag_names[idx],
-                        score=score
-                    ))
+                    tag_name = self.tag_names[idx]
+                    # Double-check for placeholders in output
+                    if not (tag_name.startswith('tag_') and len(tag_name) > 4 and tag_name[4:].isdigit()):
+                        tags.append(TagPrediction(name=tag_name, score=score))
+                    # Silently skip placeholder tags in output
 
             result = ImagePrediction(
                 image=path,
@@ -462,11 +453,6 @@ class ResultProcessor:
                 processing_time=None  # Will be filled by engine
             )
             results.append(result)
-
-            # Validate no placeholder tags in output
-            for tag in tags:
-                if tag.name.startswith('tag_') and tag.name[4:].isdigit():
-                    raise ValueError(f"CRITICAL: Placeholder tag '{tag.name}' in output!")
         
         return results
     

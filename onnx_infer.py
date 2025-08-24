@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 import onnxruntime as ort
 
-from vocabulary import TagVocabulary
+from vocabulary import TagVocabulary, verify_vocabulary_integrity
 
 
 def _load_metadata(session: ort.InferenceSession):
@@ -34,16 +34,8 @@ def _load_metadata(session: ort.InferenceSession):
         raise RuntimeError('Vocabulary checksum mismatch')
     vocab = TagVocabulary.from_json(vocab_bytes.decode('utf-8'))
 
-    # Verify vocabulary integrity
-    placeholder_count = sum(
-        1 for tag in vocab.tag_to_index.keys()
-        if tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit()
-    )
-    if placeholder_count > 10:
-        raise RuntimeError(
-            f"Embedded vocabulary contains {placeholder_count} placeholder tags. "
-            f"Model vocabulary is corrupted!"
-        )
+    # Verify vocabulary integrity using centralized function
+    verify_vocabulary_integrity(vocab, Path("embedded_vocabulary"))
     mean = json.loads(meta.get('normalize_mean', '[0.5, 0.5, 0.5]'))
     std = json.loads(meta.get('normalize_std', '[0.5, 0.5, 0.5]'))
     image_size = int(meta.get('image_size', 448))
@@ -79,6 +71,8 @@ def main():
                 "Please specify vocabulary with --vocab vocabulary.json"
             )
         vocab = TagVocabulary(Path(args.vocab))
+        # Verify external vocabulary
+        verify_vocabulary_integrity(vocab, Path(args.vocab))
         mean = [0.5, 0.5, 0.5]
         std = [0.5, 0.5, 0.5]
         image_size = 448
@@ -99,7 +93,11 @@ def main():
             score = float(scores[idx])
             if score < args.threshold:
                 continue
-            tags.append({'name': vocab.get_tag_from_index(int(idx)), 'score': score})
+            tag_name = vocab.get_tag_from_index(int(idx))
+            # Skip placeholder tags in output
+            if tag_name.startswith('tag_') and len(tag_name) > 4 and tag_name[4:].isdigit():
+                continue
+            tags.append({'name': tag_name, 'score': score})
         results.append({
             'image': path,
             'tags': tags,

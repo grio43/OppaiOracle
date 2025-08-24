@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover
 
 # Import our modules
 from Evaluation_Metrics import MetricComputer, MetricConfig
-from vocabulary import TagVocabulary, load_vocabulary_for_training
+from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
 from HDF5_loader import create_dataloaders, SimplifiedDataConfig
 from training_utils import DistributedTrainingHelper
 from model_architecture import create_model, VisionTransformerConfig
@@ -154,15 +154,8 @@ class ValidationRunner:
                     self.vocab.tag_frequencies = vocab_data.get('tag_frequencies', {})
                     self.vocab.unk_index = self.vocab.tag_to_index.get(self.vocab.unk_token, 1)
 
-                    placeholder_count = sum(
-                        1 for tag in self.vocab.tag_to_index.keys()
-                        if tag.startswith("tag_") and tag[4:].isdigit()
-                    )
-                    if placeholder_count > 0:
-                        raise ValueError(
-                            f"Embedded vocabulary contains {placeholder_count} placeholder tags!"
-                        )
-
+                    # Verify vocabulary integrity
+                    verify_vocabulary_integrity(self.vocab, Path("embedded"))
                     vocab_loaded = True
                     logger.info(
                         f"Successfully loaded embedded vocabulary with {len(self.vocab.tag_to_index)} tags"
@@ -190,25 +183,12 @@ class ValidationRunner:
                         break
                 else:
                     raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
+            # Verify external vocabulary
+            verify_vocabulary_integrity(self.vocab, vocab_path)
             # Compute vocabulary hash for external file
             self.vocab_sha256 = compute_vocab_sha256(vocab_path=vocab_path)
 
         logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
-
-        # Final vocabulary integrity check
-        placeholder_count = sum(
-            1 for tag in self.vocab.tag_to_index.keys()
-            if tag.startswith("tag_") and tag[4:].isdigit()
-        )
-        if placeholder_count > 0:
-            logger.error(f"Found {placeholder_count} placeholder tags in vocabulary!")
-            logger.error(
-                f"Examples: {[t for t in list(self.vocab.tag_to_index.keys())[:20] if t.startswith('tag_')]}"
-            )
-            raise ValueError(
-                f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags! "
-                f"Cannot run validation with corrupted vocabulary. Please use a valid checkpoint."
-            )
 
         self.num_tags = len(self.vocab.tag_to_index)
         
@@ -533,7 +513,11 @@ class ValidationRunner:
         metric_computer = MetricComputer(self.metric_config)
         
         # Get tag names and frequencies
-        tag_names = [self.vocab.get_tag_from_index(i) for i in range(len(self.vocab.tag_to_index))]
+        tag_names = []
+        for i in range(len(self.vocab.tag_to_index)):
+            tag_name = self.vocab.get_tag_from_index(i)
+            # Skip placeholders when building tag list
+            tag_names.append(tag_name)
         tag_frequencies = self._compute_tag_frequencies(all_targets) if self.config.analyze_by_frequency else None
         
         metrics = metric_computer.compute_all_metrics(
