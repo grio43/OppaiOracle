@@ -16,6 +16,18 @@ import numpy as np
 from typing import Dict, List, Tuple
 
 # Terminal UI version using rich
+def extract_tags_from_result(result):
+    """Extract tags from result, supporting both new and legacy formats."""
+    # Try new schema first
+    if 'tags' in result and isinstance(result['tags'], list):
+        # New schema: tags is a list of {name, score} dicts
+        return {tag['name'] for tag in result['tags']}
+    # Fall back to legacy schema
+    elif 'predicted_tags' in result:
+        return set(result.get('predicted_tags', []))
+    else:
+        return set()
+
 def run_terminal_viewer(jsonl_file: str, refresh_interval: float = 1.0):
     """Terminal-based live viewer using rich library"""
     try:
@@ -131,7 +143,8 @@ def run_terminal_viewer(jsonl_file: str, refresh_interval: float = 1.0):
                     self.stats['zero_f1_count'] += 1
                 
                 # Update tag performance
-                predicted = set(result.get('predicted_tags', []))
+                predicted = extract_tags_from_result(result)
+                # Support both formats for ground truth
                 ground_truth = set(result.get('ground_truth_tags', []))
                 
                 for tag in predicted & ground_truth:
@@ -646,7 +659,8 @@ def run_web_viewer(jsonl_file: str, port: int = 5000):
             })
             
             # Update tag performance
-            predicted = set(result.get('predicted_tags', []))
+            predicted = extract_tags_from_result(result)
+            # Support both formats for ground truth
             ground_truth = set(result.get('ground_truth_tags', []))
             
             for tag in predicted & ground_truth:

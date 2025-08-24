@@ -10,6 +10,23 @@ from tqdm import tqdm
 import gc
 import psutil  # For system memory monitoring
 
+def verify_vocabulary_integrity(tag_names):
+    """Verify vocabulary contains real tags, not placeholders."""
+    if not tag_names:
+        raise ValueError("No tag names provided - vocabulary is empty or missing")
+
+    placeholder_count = sum(
+        1 for tag in tag_names
+        if tag and tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit()
+    )
+
+    if placeholder_count > 10:  # Allow a few for special tokens
+        raise ValueError(
+            f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags!\n"
+            f"This indicates a corrupted vocabulary. Cannot perform evaluation.\n"
+            f"Please use a checkpoint with embedded vocabulary or provide a valid vocabulary file."
+        )
+
 def get_system_memory_info():
     """Get current system memory usage"""
     mem = psutil.virtual_memory()
@@ -182,20 +199,33 @@ def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0
         return np.stack(batch, axis=0).astype(np.float32), valid_indices, batch_infos
     return None, [], []
 
-def get_predictions_from_scores(scores, tag_names, threshold=0.5):
+def get_predictions_from_scores(scores, tag_names, threshold=0.5, vocabulary=None):
     """Get predicted tags above threshold for batch or single image"""
     if scores.ndim == 1:
         scores = scores[np.newaxis, :]  # Add batch dimension if missing
-    
+
+    # Verify we have valid tag names
+    if not tag_names:
+        raise ValueError("No tag names available for decoding predictions")
+
     batch_predictions = []
     for score_vec in scores:
         predicted_tags = set()
         for i, score in enumerate(score_vec):
             if score >= threshold:
-                tag = tag_names[i] if tag_names and i < len(tag_names) else f"tag_{i}"
+                if i < len(tag_names):
+                    tag = tag_names[i]
+                    # Fail if we encounter placeholder tags
+                    if tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit():
+                        raise ValueError(
+                            f"Encountered placeholder tag '{tag}' at index {i}. "
+                            f"Vocabulary is corrupted - aborting evaluation."
+                        )
+                else:
+                    raise IndexError(f"Tag index {i} out of range (vocab size: {len(tag_names)})")
                 predicted_tags.add(tag)
         batch_predictions.append(predicted_tags)
-    
+
     return batch_predictions
 
 def parse_ground_truth_tags(json_data):
@@ -384,6 +414,9 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
     if norm and "mean" in norm and "std" in norm:
         mean, std = tuple(norm["mean"]), tuple(norm["std"])
 
+    # Verify vocabulary integrity
+    verify_vocabulary_integrity(tag_names)
+
     # Create PyTorch model
     model = create_pytorch_session(model_path, device, compile_model)
     if model is None:
@@ -565,7 +598,10 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
     mean, std = (0.5,0.5,0.5), (0.5,0.5,0.5)
     if norm and "mean" in norm and "std" in norm:
         mean, std = tuple(norm["mean"]), tuple(norm["std"])
-    
+
+    # Verify vocabulary integrity
+    verify_vocabulary_integrity(tag_names)
+
     # Initialize GPU session
     sess = create_gpu_session(model_path, max_memory_gb)
     
@@ -699,10 +735,16 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
                     # Store results
                     result = {
                         "filename": data["image_filename"],
+                        "image": data["image_filename"],  # Add standard field
+                        "tags": [
+                            {"name": tag, "score": 1.0}  # Binary predictions
+                            for tag in predicted_tags
+                        ],
+                        "processing_time": int(batch_inference_time * 1000 / len(valid_indices)),  # ms per image
+                        # Legacy fields for compatibility
                         "ground_truth_tags": list(ground_truth),
                         "predicted_tags": list(predicted_tags),
                         "metrics": metrics,
-                        "batch_inference_time": batch_inference_time / len(valid_indices),  # Average per image
                         "num_gt_tags": len(ground_truth),
                         "num_pred_tags": len(predicted_tags)
                     }
