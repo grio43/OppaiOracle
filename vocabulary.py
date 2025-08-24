@@ -271,7 +271,7 @@ class TagVocabulary:
             filepath: Path to save vocabulary file
         """
         self.save_vocabulary(filepath)
-    
+
     def load_vocabulary(self, vocab_path: Path) -> None:
         """Load vocabulary from a JSON file.
         
@@ -304,7 +304,42 @@ class TagVocabulary:
         # Filter out missing tags (None values) in case ignored tags are absent
         self.ignored_tag_indices = [i for i in self.ignored_tag_indices if i is not None]
 
+        _verify_vocabulary_integrity(self, vocab_path)
         logger.info(f"Loaded vocabulary with {len(self.tag_to_index)} tags from {vocab_path}")
+
+    def to_json(self) -> str:
+        """Serialize vocabulary to JSON string."""
+        return json.dumps({
+            'tag_to_index': self.tag_to_index,
+            'index_to_tag': self.index_to_tag,
+            'tag_frequencies': self.tag_frequencies,
+        }, ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, json_str: str) -> 'TagVocabulary':
+        """Create vocabulary from a JSON string."""
+        data = json.loads(json_str)
+        vocab = cls()
+        vocab.tag_to_index = {k: int(v) for k, v in data['tag_to_index'].items()}
+        vocab.index_to_tag = {int(k): v for k, v in data['index_to_tag'].items()}
+        vocab.tag_frequencies = data.get('tag_frequencies', {})
+
+        # Ensure special tokens
+        for token in (vocab.pad_token, vocab.unk_token):
+            if token not in vocab.tag_to_index:
+                idx = len(vocab.tag_to_index)
+                vocab.tag_to_index[token] = idx
+                vocab.index_to_tag[idx] = token
+
+        vocab.unk_index = vocab.tag_to_index.get(vocab.unk_token, 1)
+        vocab.tags = [t for t in vocab.tag_to_index.keys() if t not in (vocab.pad_token, vocab.unk_token)]
+        vocab.ignored_tag_indices = [
+            vocab.tag_to_index.get(t) for t in vocab.ignored_tags if t in vocab.tag_to_index
+        ]
+        vocab.ignored_tag_indices = [i for i in vocab.ignored_tag_indices if i is not None]
+
+        _verify_vocabulary_integrity(vocab, Path('embedded'))
+        return vocab
     
     @classmethod
     def from_file(cls, filepath: Path) -> 'TagVocabulary':
@@ -397,11 +432,11 @@ def _verify_vocabulary_integrity(vocab: TagVocabulary, source_path: Path) -> Non
         if tag.startswith("tag_") and tag[4:].isdigit()
     )
 
-    if placeholder_count > 100:  # Allow a few for backward compat, but not many
+    if placeholder_count > 0:
         raise ValueError(
             f"CRITICAL: Vocabulary at {source_path} contains {placeholder_count} placeholder tags.\n"
             f"This vocabulary file is corrupted and contains 'tag_XXX' instead of real tags.\n"
-            f"The model would learn meaningless labels if trained with this vocabulary.\n"
+            f"The model would learn meaningless labels if used in training or inference.\n"
             f"Please regenerate the vocabulary from your dataset annotations."
         )
 
