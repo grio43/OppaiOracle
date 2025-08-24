@@ -557,20 +557,43 @@ class CheckpointManager:
                 f"Vocabulary file not found at {vocab_path} - checkpoint will not be self-contained!"
             )
 
-        # Embed preprocessing parameters
-        if config:
+        # Embed preprocessing parameters - require explicit config
+        if config is None:
+            raise RuntimeError(
+                "Configuration must be provided to save_checkpoint to embed preprocessing parameters. "
+                "Please pass a config dict with the following required keys: "
+                "normalize_mean, normalize_std, image_size, patch_size. "
+                "This ensures checkpoints contain the exact preprocessing used during training."
+            )
+
+        # Validate required preprocessing parameters are present
+        required_params = ['normalize_mean', 'normalize_std', 'image_size', 'patch_size']
+        missing_params = [p for p in required_params if p not in config]
+        if missing_params:
+            raise RuntimeError(
+                f"Missing required preprocessing parameters in config: {', '.join(missing_params)}. "
+                f"All of {required_params} must be explicitly provided to ensure correct preprocessing."
+            )
+
+        # Validate and extract preprocessing parameters
+        try:
+            normalize_mean = tuple(config['normalize_mean'])
+            normalize_std = tuple(config['normalize_std'])
+            if len(normalize_mean) != 3 or len(normalize_std) != 3:
+                raise ValueError("normalize_mean and normalize_std must have exactly 3 values")
+
+            image_size = int(config['image_size'])
+            patch_size = int(config['patch_size'])
+
             checkpoint = ModelMetadata.embed_preprocessing_params(
                 checkpoint,
-                normalize_mean=tuple(config.get('normalize_mean', [0.5, 0.5, 0.5])),
-                normalize_std=tuple(config.get('normalize_std', [0.5, 0.5, 0.5])),
-                image_size=config.get('image_size', 640),
-                patch_size=config.get('patch_size', 16),
+                normalize_mean=normalize_mean,
+                normalize_std=normalize_std,
+                image_size=image_size,
+                patch_size=patch_size,
             )
-        else:
-            checkpoint = ModelMetadata.embed_preprocessing_params(
-                checkpoint, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), 640, 16
-            )
-            logger.info("Embedded default preprocessing params")
+        except (TypeError, ValueError) as e:
+            raise RuntimeError(f"Invalid preprocessing parameters in config: {e}")
 
         # Backwards compatibility info
         if hasattr(model_to_check, 'config'):
