@@ -353,21 +353,21 @@ class DataConfig(BaseConfig):
     pad_color: Tuple[int, int, int] = (114, 114, 114)
     
     # Data loading
-    batch_size: int = 32
-    num_workers: int = 8
+    batch_size: int = 60
+    num_workers: int = 12
     pin_memory: bool = True
     prefetch_factor: int = 2
     persistent_workers: bool = True
     drop_last: bool = False
     
     # Caching
-    cache_size_gb: float = 4.0
+    cache_size_gb: float = 25.0
     preload_files: int = 2
     use_memory_cache: bool = True
     
     # Augmentation
     augmentation_enabled: bool = True
-    random_flip_prob: float = 0.5
+    random_flip_prob: float = 0.35
     color_jitter: bool = True
     color_jitter_brightness: float = 0.4
     color_jitter_contrast: float = 0.4
