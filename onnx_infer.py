@@ -154,7 +154,13 @@ def main():
         start = time.time()
         inp = _preprocess(path, image_size, mean, std)
         outputs = session.run(None, {input_name: inp})
-        scores = outputs[-1][0]  # assume last output are scores
+
+        # Handle both old (predictions, scores) and new (scores only) model formats
+        if len(outputs) == 1:
+            scores = outputs[0][0]  # New format: scores only
+        else:
+            scores = outputs[-1][0]  # Old format: assume last output are scores
+
         idxs = np.argsort(scores)[::-1][:args.top_k]
         tags = []
         for idx in idxs:
