@@ -29,8 +29,8 @@ amp_dtype: float16  # Options: float16, bfloat16
 max_grad_norm: 1.0  # Maximum gradient norm for clipping
 
 # Checkpointing Strategy
-save_steps: 5000  # Save checkpoint every N steps
-save_total_limit: 5  # Keep only the last N checkpoints
+save_steps: 10000  # Save checkpoint every N steps
+save_total_limit: 3  # Keep only the last N checkpoints
 save_best_only: false  # Save all checkpoints, not just the best
 eval_steps: 1000  # Run validation every N steps
 logging_steps: 100  # Log metrics every N steps
@@ -44,7 +44,7 @@ label_smoothing: 0.1  # Label smoothing factor
 use_class_weights: true  # Use frequency-based class weights
 
 # Knowledge Distillation from Dual Teachers
-use_distillation: true
+use_distillation: false
 distillation_alpha: 0.7  # Weight for distillation loss vs ground truth
 distillation_temperature: 3.0  # Temperature for soft targets
 anime_teacher_weight: 0.7  # Weight for anime teacher (70k tags model)
