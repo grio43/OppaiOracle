@@ -16,6 +16,7 @@ from dataclasses import dataclass, asdict, field
 from collections import defaultdict
 import base64
 import gzip
+import hashlib
 import time
 import warnings
 import sys
@@ -193,6 +194,14 @@ class ONNXExporter:
 
                 if vocab_path.is_dir():
                     vocab_path = vocab_path / "vocabulary.json"
+                
+                # Validate vocabulary path before attempting to use it
+                if not vocab_path.exists():
+                    # Try canonical fallback path
+                    canonical_path = Path(os.path.dirname(__file__)) / "vocabulary.json"
+                    if canonical_path.exists():
+                        logger.info(f"Using canonical vocabulary path: {canonical_path}")
+                        vocab_path = canonical_path
 
                 if not vocab_path.exists():
                     logger.warning(f"Vocabulary not found at {vocab_path}, trying canonical path")
@@ -502,6 +511,13 @@ class ONNXExporter:
                 device=self.device
             )
             
+            # Ensure model is in FP32 for export (handles BF16 training case)
+            if self.model.dtype != torch.float32:
+                logger.info(f"Converting model from {self.model.dtype} to float32 for export")
+                self.model = self.model.float()
+                # Also ensure dummy input matches
+                dummy_input = dummy_input.float()
+
             # Export
             logger.info(f"Exporting to {output_path}")
             
@@ -654,8 +670,7 @@ class ONNXExporter:
                 opt_level=2,
                 use_gpu=torch.cuda.is_available(),
                 only_onnxruntime=False,  # Apply both ONNX and ORT optimizations
-                # float16 parameter removed - not supported in current API
-                input_int32=False
+                # Note: float16 and input_int32 parameters removed - not supported in current API
             )
             
             # Save the optimized model
@@ -831,10 +846,6 @@ class ONNXExporter:
                     if vocab_b64 and vocab_sha:
                         # Validate the embedded vocabulary data
                         try:
-                            import base64
-                            import gzip
-                            import hashlib
-
                             # Verify the embedded data is valid and checksum matches
                             vocab_bytes = gzip.decompress(base64.b64decode(vocab_b64))
                             computed_sha = hashlib.sha256(vocab_bytes).hexdigest()
