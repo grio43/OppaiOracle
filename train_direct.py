@@ -564,17 +564,27 @@ def train_with_orientation_tracking():
     
     # Log augmentation hparams at start
     if monitor.writer:
-        hparams = {
+        # Separate numeric and string hparams
+        numeric_hparams = {
             'hparams/random_flip_prob': config["random_flip_prob"],
             'hparams/random_crop_scale_min': config.get("random_crop_scale", (0.95, 1.0))[0],
             'hparams/random_crop_scale_max': config.get("random_crop_scale", (0.95, 1.0))[1],
             'hparams/color_jitter_brightness': dataloader_config_updates.get("color_jitter_brightness", 0.1),
             'hparams/color_jitter_contrast': dataloader_config_updates.get("color_jitter_contrast", 0.1),
             'hparams/color_jitter_saturation': dataloader_config_updates.get("color_jitter_saturation", 0.05),
+        }
+
+        string_hparams = {
             'hparams/orientation_safety_mode': config.get("orientation_safety_mode", "conservative"),
         }
-        for key, value in hparams.items():
+
+        # Log numeric values with add_scalar
+        for key, value in numeric_hparams.items():
             monitor.writer.add_scalar(key, value, 0)
+
+        # Log string values with add_text
+        for key, value in string_hparams.items():
+            monitor.writer.add_text(key, value, 0)
 
     for epoch in range(config["num_epochs"]):
         model.train()
