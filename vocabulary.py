@@ -327,7 +327,14 @@ class TagVocabulary:
 
     @classmethod
     def from_json(cls, json_str: str) -> 'TagVocabulary':
-        """Create vocabulary from a JSON string."""
+        """Create vocabulary from a JSON string.
+        
+        Raises:
+            ValueError: If json_str is empty or contains only whitespace
+            json.JSONDecodeError: If json_str is not valid JSON
+        """
+        if not json_str or not json_str.strip():
+            raise ValueError("Cannot create vocabulary from empty or whitespace-only JSON string")
         data = json.loads(json_str)
         vocab = cls()
         vocab.tag_to_index = {k: int(v) for k, v in data['tag_to_index'].items()}
