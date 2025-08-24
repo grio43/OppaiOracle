@@ -683,6 +683,12 @@ def train_with_orientation_tracking():
                 "vocab_path": str(VOCAB_PATH),
                 "has_vocabulary": True
             },
+            # Preprocessing params for self-contained checkpoint
+            "normalize_mean": [0.5, 0.5, 0.5],
+            "normalize_std": [0.5, 0.5, 0.5],
+            "image_size": config.get("image_size", 640),
+            "patch_size": config.get("patch_size", 16),
+            # Include original config
             "normalization_params": {
                 "mean": [0.5, 0.5, 0.5],
                 "std": [0.5, 0.5, 0.5]
