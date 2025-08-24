@@ -32,6 +32,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
+import torchvision
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
@@ -112,7 +113,11 @@ class MonitorConfig:
     # Data pipeline monitoring
     monitor_data_pipeline: bool = True
     data_pipeline_stats_interval: int = 100  # batches
-    
+    augmentation_stats_interval: int = 100  # batches
+    log_augmentation_histograms: bool = True
+    log_augmentation_images: bool = False
+    augmentation_image_interval: int = 500  # batches
+
     # Remote monitoring
     enable_prometheus: bool = False
     prometheus_port: int = 8080
@@ -752,6 +757,15 @@ class TrainingMonitor:
             'augmentation_times': deque(maxlen=1000)
         }
 
+        # Augmentation stats aggregator
+        self.aug_stats_aggregated = {
+            'flip': defaultdict(int),
+            'jitter': defaultdict(list),
+            'crop': defaultdict(list),
+            'resize': defaultdict(list)
+        }
+        self.last_aug_log_step = 0
+
         # Start system monitoring
         if config.track_system_metrics:
             self.system_monitor.start()
@@ -1070,6 +1084,130 @@ class TrainingMonitor:
             
             logger.debug(f"Data pipeline stats - Load: {avg_load_time:.3f}s, "
                         f"Batch: {avg_batch_size:.1f}, Aug: {avg_aug_time:.3f}s")
+    
+    def log_augmentations(self, step: int, stats: Any):
+        """Log augmentation statistics to TensorBoard.
+        
+        Args:
+            step: Current training step
+            stats: AugmentationStats object or dict with augmentation statistics
+        """
+        # Only log at intervals to avoid overwhelming TensorBoard
+        if step - self.last_aug_log_step < self.config.augmentation_stats_interval:
+            return
+            
+        self.last_aug_log_step = step
+        
+        # Extract stats (handle both object and dict)
+        if hasattr(stats, '__dict__'):
+            stats = stats.__dict__
+        
+        # Log flip statistics
+        flip_total = stats.get('flip_total', 0)
+        if flip_total > 0:
+            flip_rate = stats.get('flip_safe', 0) / flip_total
+            self._log_to_backends(step, {
+                'data/flip/total': flip_total,
+                'data/flip/safe': stats.get('flip_safe', 0),
+                'data/flip/skipped_text': stats.get('flip_skipped_text', 0),
+                'data/flip/skipped_unmapped': stats.get('flip_skipped_unmapped', 0),
+                'data/flip/blocked_safety': stats.get('flip_blocked_safety', 0),
+                'data/flip/rate': flip_rate,
+            })
+        
+        # Log color jitter statistics
+        jitter_applied = stats.get('jitter_applied', 0)
+        image_count = stats.get('image_count', 1)
+        if jitter_applied > 0:
+            jitter_rate = jitter_applied / image_count
+            self._log_to_backends(step, {
+                'data/color_jitter/applied_rate': jitter_rate,
+            })
+            
+            # Log histograms if enabled
+            if self.config.log_augmentation_histograms and self.writer:
+                brightness_factors = stats.get('jitter_brightness_factors', [])
+                if brightness_factors:
+                    self.writer.add_histogram('data/color_jitter/brightness_factor', 
+                                             np.array(brightness_factors), step)
+                    
+                contrast_factors = stats.get('jitter_contrast_factors', [])
+                if contrast_factors:
+                    self.writer.add_histogram('data/color_jitter/contrast_factor',
+                                             np.array(contrast_factors), step)
+        
+        # Log crop statistics
+        crop_applied = stats.get('crop_applied', 0)
+        if crop_applied > 0:
+            crop_rate = crop_applied / image_count
+            self._log_to_backends(step, {
+                'data/crop/applied_rate': crop_rate,
+            })
+            
+            if self.config.log_augmentation_histograms and self.writer:
+                crop_scales = stats.get('crop_scales', [])
+                if crop_scales:
+                    self.writer.add_histogram('data/crop/scale', np.array(crop_scales), step)
+                    
+                crop_aspects = stats.get('crop_aspects', [])
+                if crop_aspects:
+                    self.writer.add_histogram('data/crop/aspect_ratio', np.array(crop_aspects), step)
+        
+        # Log resize/letterbox statistics
+        resize_scales = stats.get('resize_scales', [])
+        if resize_scales and self.config.log_augmentation_histograms and self.writer:
+            self.writer.add_histogram('data/resize/scale_r', np.array(resize_scales), step)
+            
+        resize_pad_pixels = stats.get('resize_pad_pixels', [])
+        if resize_pad_pixels and self.config.log_augmentation_histograms and self.writer:
+            self.writer.add_histogram('data/resize/pad_total_px', np.array(resize_pad_pixels), step)
+        
+        # Log timing metrics
+        self._log_to_backends(step, {
+            'data/aug/batch_time_ms': 0,  # Would need to track this
+            'data/aug/images_per_sec': image_count / max(1, self.config.augmentation_stats_interval),
+        })
+    
+    def log_augmentation_images(self, step: int, original_images: torch.Tensor, 
+                               augmented_images: torch.Tensor, num_images: int = 4):
+        """Log before/after augmentation image grids.
+        
+        Args:
+            step: Current training step  
+            original_images: Batch of original images
+            augmented_images: Batch of augmented images
+            num_images: Number of images to log
+        """
+        if not self.config.log_augmentation_images:
+            return
+            
+        if step % self.config.augmentation_image_interval != 0:
+            return
+            
+        try:
+            # Select subset of images
+            num_images = min(num_images, len(original_images))
+            indices = torch.randperm(len(original_images))[:num_images]
+            
+            if self.writer:
+                # Create grid of original images
+                orig_grid = torchvision.utils.make_grid(
+                    original_images[indices].cpu(),
+                    nrow=num_images,
+                    normalize=True
+                )
+                self.writer.add_image('data/preview/original', orig_grid, step)
+                
+                # Create grid of augmented images
+                aug_grid = torchvision.utils.make_grid(
+                    augmented_images[indices].cpu(),
+                    nrow=num_images,
+                    normalize=True
+                )
+                self.writer.add_image('data/preview/augmented', aug_grid, step)
+                
+        except Exception as e:
+            logger.error(f"Failed to log augmentation images: {e}")
     
     def _check_training_health(self, step: int, loss: float, step_time: float):
         """Check training health and send alerts if needed"""
