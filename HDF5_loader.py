@@ -450,9 +450,11 @@ class LMDBCache:
         self.path.mkdir(parents=True, exist_ok=True)
         self.max_size_bytes = int(max_size_gb * 1024 ** 3)
         self.map_growth_bytes = int(map_growth_gb * 1024 ** 3)
-        self.current_map_size = min(self.map_growth_bytes, self.max_size_bytes)
+        # Pre-allocate full size to avoid MDB_MAP_RESIZED errors
+        self.current_map_size = self.max_size_bytes
         self.readonly = readonly
         self.max_readers = max_readers
+        self.resize_attempted = False  # Track if we've already tried resizing
 
         # Open LMDB environment lazily and track process
         self._env = None
@@ -470,20 +472,33 @@ class LMDBCache:
         self.max_value_bytes = int(32 * 1024 * 1024)  # 32MB max per value
 
     def _open_env(self):
-        """Open or reopen LMDB environment for current process"""
+        """Open or reopen LMDB environment for current process with full size pre-allocated"""
+        # Check actual database size if it exists
+        data_file = self.path / "data.mdb"
+        if data_file.exists():
+            actual_size = data_file.stat().st_size
+            if actual_size > self.current_map_size:
+                logger.warning(
+                    f"LMDB database size ({actual_size / (1024**3):.1f}GB) exceeds configured map size "
+                    f"({self.current_map_size / (1024**3):.1f}GB), adjusting"
+                )
+                self.current_map_size = int(actual_size * 1.5)
+
         self.env = lmdb.open(
             str(self.path),
-            map_size=self.current_map_size,
+            map_size=self.current_map_size,  # Now pre-allocated to max
             readonly=self.readonly,
             lock=not self.readonly,
             max_dbs=1,
-            writemap=True,  # Use write-mapped mode for better performance
+            writemap=not self.readonly,  # Only use writemap for writers
+            readahead=False,  # Disable readahead for better memory control
             metasync=False,  # Don't sync metadata for each transaction
             sync=False,  # Don't sync data for each transaction (rely on OS)
             map_async=True,  # Allow async writes
             max_readers=self.max_readers,
         )
         self._pid = os.getpid()
+        logger.debug(f"LMDB environment opened with map_size={self.current_map_size / (1024**3):.1f}GB for process {self._pid}")
 
     def _ensure_env(self):
         """Ensure LMDB environment is open for current process"""
@@ -497,6 +512,27 @@ class LMDBCache:
             self._open_env()
             logger.debug(f"LMDB environment reopened for process {current_pid}")
 
+    def _handle_map_resized(self):
+        """Handle MDB_MAP_RESIZED error by reopening with larger size"""
+        if self.resize_attempted:
+            # Already tried once, don't retry indefinitely
+            return False
+
+        self.resize_attempted = True
+        logger.warning("MDB_MAP_RESIZED encountered, reopening environment with larger map size")
+
+        # Close current environment
+        if hasattr(self, 'env') and self.env is not None:
+            try:
+                self.env.close()
+            except Exception:
+                pass
+
+        # Reopen with increased size
+        self.current_map_size = self.max_size_bytes
+        self._open_env()
+        return True
+
     def get(self, key: str) -> Optional[torch.Tensor]:
         """Get item from cache"""
         self._ensure_env()
@@ -506,6 +542,21 @@ class LMDBCache:
             data = txn.get(key.encode())
             txn.abort()  # explicitly close read transaction
             txn = None
+        except lmdb.MapResizedError:
+            if txn is not None:
+                txn.abort()
+            if self._handle_map_resized():
+                # Retry once after resize
+                return self.get(key)
+            return None
+        except Exception as e:
+            logger.debug(f"LMDB get error for key {key}: {e}")
+            return None
+        finally:
+            if txn is not None:
+                txn.abort()
+
+        try:
             if data is not None:
                 self.hits += 1
                 # Deserialize tensor.  ``np.frombuffer`` returns a read-only array
@@ -519,9 +570,9 @@ class LMDBCache:
             else:
                 self.misses += 1
                 return None
-        finally:
-            if txn is not None:
-                txn.abort()
+        except Exception as e:
+            logger.error(f"Error deserializing cached tensor: {e}")
+            return None
     
     def put(self, key: str, value: torch.Tensor, check_memory: bool = True) -> bool:
         """Put item in cache with memory checking"""
@@ -593,6 +644,14 @@ class LMDBCache:
                 if txn is not None:
                     txn.abort()
             return True
+        except lmdb.MapResizedError:
+            if txn is not None:
+                txn.abort()
+            if self._handle_map_resized():
+                # Retry once after resize
+                return self.put(key, value, check_memory)
+            logger.warning("LMDB put failed due to map resize")
+            return False
         except lmdb.MapFullError:
             # Try to grow the map
             if self._grow_map():
@@ -1164,6 +1223,15 @@ class SimplifiedDataset(Dataset):
             # Track permanently failed images
             self._failed_images: set[str] = set()
 
+            # Initialize known-good sample pool for fallback
+            self._known_good_indices: List[int] = []
+            self._known_good_lock = threading.Lock()
+            self._populate_known_good_pool()
+
+            # Max retry attempts - scale with dataset size
+            self._max_retry_attempts = min(16, max(8, len(self.annotations) // 1000))
+            logger.info(f"Max retry attempts set to {self._max_retry_attempts} for {len(self.annotations)} samples")
+
             # Initialize validation index for lazy validation
             self.validation_index = None
             if split == 'train':
@@ -1222,6 +1290,30 @@ class SimplifiedDataset(Dataset):
 
             # Monitor memory at initialization
             self._log_memory_status("Dataset initialization")
+
+    def _populate_known_good_pool(self, sample_size: int = 100):
+        """Populate a pool of known-good sample indices for fallback"""
+        if len(self.annotations) == 0:
+            return
+
+        sample_size = min(sample_size, len(self.annotations))
+        test_indices = np.random.choice(len(self.annotations), size=sample_size, replace=False)
+
+        good_indices = []
+        for idx in test_indices:
+            image_path = self.annotations[idx]['image_path']
+            try:
+                # Quick validation - just try to open
+                with Image.open(image_path) as img:
+                    _ = img.size
+                good_indices.append(idx)
+            except Exception:
+                continue
+
+        with self._known_good_lock:
+            self._known_good_indices = good_indices
+
+        logger.info(f"Known-good pool populated with {len(good_indices)}/{sample_size} valid samples")
 
     def _load_annotations(self, json_files: List[Path]) -> None:
         """Parse annotation files and populate ``self.annotations``.
@@ -1716,222 +1808,234 @@ class SimplifiedDataset(Dataset):
         Applies a random horizontal flip with orientation‑aware tag remapping
         for the training split.  Letterbox resizing is performed to
         preserve aspect ratio.  Augmentation and normalisation are then
-        applied.
+        applied."""
 
-        Args:
-            idx: Index of item to fetch
+        # Iterative retry logic with visited tracking
+        visited_indices = set()
+        attempts = 0
+        original_idx = idx
 
-        Returns:
-            Dictionary containing image, labels, and metadata
+        while attempts < self._max_retry_attempts:
+            attempts += 1
 
-        Raises:
-            IndexError: If index is out of bounds
-            RuntimeError: If critical error occurs during processing
-        """
-        # Map index through working set if active
-        actual_idx = self._get_actual_index(idx)
-        
-        if actual_idx < 0 or actual_idx >= len(self.annotations):
-            raise IndexError(f"Index {actual_idx} out of range for dataset with {len(self.annotations)} samples")
-        
-        # Use actual_idx instead of idx when accessing annotations
-        anno = self.annotations[actual_idx]
-        image_path = anno['image_path']
+            # Avoid infinite loops by checking visited indices
+            if idx in visited_indices:
+                # Try to get a known-good sample
+                with self._known_good_lock:
+                    if self._known_good_indices:
+                        idx = random.choice(self._known_good_indices)
+                        if idx in visited_indices:
+                            # Even our good samples have been tried, give up
+                            break
+                    else:
+                        # No good samples available, increment and continue
+                        idx = (idx + 1) % len(self.annotations)
 
-        # Skip if this is a known failed image and skip_error_samples is enabled
-        if self.config.skip_error_samples and image_path in self._failed_images:
-            # Return next valid sample (with wraparound)
-            next_idx = (idx + 1) % len(self.annotations)
-            logger.debug(f"Skipping known failed image at index {idx}, using index {next_idx}")
-            return self.__getitem__(next_idx)
+            visited_indices.add(idx)
 
-        # Track error count for this specific image (thread‑safe).
-        with self._error_counts_lock:
-            error_count = self._error_counts.get(image_path, 0)
-        max_retries = 3
-        try:
-            # Load image tensor and get composite flag
-            image, was_composited = self._load_image(image_path)
-            # Copy tags so we can mutate without altering the original
-            tags = list(anno['tags'])
+            # Map index through working set if active
+            actual_idx = self._get_actual_index(idx)
 
-            # Update tags if image was composited from transparency
-            if was_composited:
-                # Remove transparent_background if present
-                tags = [t for t in tags if t != 'transparent_background']
-                # Add gray_background if not already present
-                if 'gray_background' not in tags:
-                    tags.append('gray_background')
+            if actual_idx < 0 or actual_idx >= len(self.annotations):
+                # Invalid index, try next
+                idx = (idx + 1) % len(self.annotations)
+                continue
 
-            was_flipped = False  # Track if image was flipped
-            # Random horizontal flip with orientation-aware tag swapping
-            if (
-                self.orientation_handler is not None
-                and self.split == 'train'
-                and np.random.rand() < self.config.random_flip_prob
-            ):
-                swapped_tags, should_flip = self.orientation_handler.handle_complex_tags(tags)
-                if should_flip:
-                    image = TF.hflip(image)
-                    was_flipped = True
-                    self._orientation_stats['flips'] += 1
-                else:
-                    self._orientation_stats['skipped'] += 1
-                self._orientation_stats['processed'] += 1
-                tags = swapped_tags
-                if self.orientation_monitor:
-                    self.orientation_monitor.check_health(self.orientation_handler)
+            # Use actual_idx instead of idx when accessing annotations
+            anno = self.annotations[actual_idx]
+            image_path = anno['image_path']
 
-            # Ensure image tensor is properly shaped before any transforms
-            if image.dim() != 3:
-                logger.warning(f"Image tensor has unexpected dimensions: {image.shape} for {image_path}")
-                # Try to reshape if it's flattened
-                if image.dim() == 1:
+            # Skip if this is a known failed image
+            if image_path in self._failed_images:
+                idx = (idx + 1) % len(self.annotations)
+                continue
+
+            # Track error count for this specific image
+            with self._error_counts_lock:
+                error_count = self._error_counts.get(image_path, 0)
+
+            try:
+                # Load image tensor and get composite flag
+                image, was_composited = self._load_image(image_path)
+
+                # Validate image tensor
+                if image is None or torch.isnan(image).any() or torch.isinf(image).any():
+                    raise ValueError(f"Invalid image tensor for {image_path}")
+
+                # Copy tags so we can mutate without altering the original
+                tags = list(anno['tags'])
+
+                # Update tags if image was composited from transparency
+                if was_composited:
+                    # Remove transparent_background if present
+                    tags = [t for t in tags if t != 'transparent_background']
+                    # Add gray_background if not already present
+                    if 'gray_background' not in tags:
+                        tags.append('gray_background')
+
+                was_flipped = False  # Track if image was flipped
+                # Random horizontal flip with orientation-aware tag swapping
+                if (
+                    self.orientation_handler is not None
+                    and self.split == 'train'
+                    and np.random.rand() < self.config.random_flip_prob
+                ):
+                    swapped_tags, should_flip = self.orientation_handler.handle_complex_tags(tags)
+                    if should_flip:
+                        image = TF.hflip(image)
+                        was_flipped = True
+                        self._orientation_stats['flips'] += 1
+                    else:
+                        self._orientation_stats['skipped'] += 1
+                    self._orientation_stats['processed'] += 1
+                    tags = swapped_tags
+                    if self.orientation_monitor:
+                        self.orientation_monitor.check_health(self.orientation_handler)
+
+                # Ensure image tensor is properly shaped before any transforms
+                if image.dim() != 3:
+                    logger.warning(f"Image tensor has unexpected dimensions: {image.shape} for {image_path}")
+                    # Try to reshape if it's flattened
+                    if image.dim() == 1:
+                        try:
+                            image = image.view(3, self.config.image_size, self.config.image_size)
+                        except RuntimeError:
+                            # Can't reshape, treat as error
+                            raise ValueError(f"Cannot reshape tensor for {image_path}")
+                    else:
+                        raise ValueError(f"Invalid tensor dimensions for {image_path}")
+
+                # Apply color augmentations BEFORE letterbox/padding
+                # This ensures padding areas remain consistent
+                if self.augmentation is not None and self.split == 'train':
                     try:
-                        image = image.view(3, self.config.image_size, self.config.image_size)
-                    except RuntimeError:
-                        # Can't reshape, create a blank image
-                        logger.error(f"Cannot reshape tensor for {image_path}, using blank image")
-                        image = torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32)
+                        image = self.augmentation(image)
 
-            # Apply color augmentations BEFORE letterbox/padding
-            # This ensures padding areas remain consistent
-            if self.augmentation is not None and self.split == 'train':
-                try:
-                    image = self.augmentation(image)
-
-                    # Ensure augmented values are valid
-                    if torch.isnan(image).any() or torch.isinf(image).any():
+                        # Ensure augmented values are valid
+                        if torch.isnan(image).any() or torch.isinf(image).any():
+                            logger.warning(
+                                f"NaN/Inf detected after augmentation for {image_path}, skipping augmentation"
+                            )
+                            # Reload clean image
+                            image, _ = self._load_image(image_path)
+                            # Re-apply flip if it was done
+                            if was_flipped:
+                                image = TF.hflip(image)
+                        elif (image < 0).any() or (image > 1).any():
+                            logger.debug(
+                                f"Values outside [0,1] detected, clamping for {image_path}"
+                            )
+                            image = torch.clamp(image, 0.0, 1.0)
+                    except Exception as e:
                         logger.warning(
-                            f"NaN/Inf detected after augmentation for {image_path}, skipping augmentation"
+                            f"Augmentation failed for {image_path}: {e}, skipping augmentation"
                         )
-                        # Reload clean image
-                        image, _ = self._load_image(image_path)
-                        # Re-apply flip if it was done
-                        if was_flipped:
-                            image = TF.hflip(image)
-                    elif (image < 0).any() or (image > 1).any():
-                        logger.debug(
-                            f"Values outside [0,1] detected, clamping for {image_path}"
-                        )
-                        image = torch.clamp(image, 0.0, 1.0)
-                except Exception as e:
-                    logger.warning(
-                        f"Augmentation failed for {image_path}: {e}, skipping augmentation"
-                    )
 
-            # Apply RandomResizedCrop BEFORE letterbox if configured (mutually exclusive)
-            # This way we either use RandomResizedCrop OR letterbox, not both
-            if (self.augmentation is not None and
-                self.split == 'train' and
-                self.config.random_crop_scale != (1.0, 1.0)):
-                try:
-                    # Apply random crop directly on the tensor
-                    image = T.RandomResizedCrop(
-                        self.config.image_size,
-                        scale=self.config.random_crop_scale,
-                        ratio=(0.9, 1.1),
-                        interpolation=T.InterpolationMode.BICUBIC
-                    )(image)
-                    # Skip letterbox since we already resized
-                    lb_info = {'scale': 1.0, 'pad': (0, 0, 0, 0)}
-                except Exception as e:
-                    logger.warning(f"RandomResizedCrop failed for {image_path}: {e}, using letterbox instead")
-                    # Fall back to letterbox
+                # Apply RandomResizedCrop BEFORE letterbox if configured
+                if (self.augmentation is not None and
+                    self.split == 'train' and
+                    self.config.random_crop_scale != (1.0, 1.0)):
+                    try:
+                        image = T.RandomResizedCrop(
+                            self.config.image_size,
+                            scale=self.config.random_crop_scale,
+                            ratio=(0.9, 1.1),
+                            interpolation=T.InterpolationMode.BICUBIC
+                        )(image)
+                        lb_info = {'scale': 1.0, 'pad': (0, 0, 0, 0)}
+                    except Exception as e:
+                        logger.warning(f"RandomResizedCrop failed for {image_path}: {e}, using letterbox instead")
+                        image, lb_info = letterbox_resize(
+                            image,
+                            target_size=self.config.image_size,
+                            pad_color=self.config.pad_color,
+                            patch_size=self.config.patch_size,
+                        )
+                else:
+                    # Perform letterbox resize to preserve aspect ratio
                     image, lb_info = letterbox_resize(
                         image,
                         target_size=self.config.image_size,
                         pad_color=self.config.pad_color,
                         patch_size=self.config.patch_size,
                     )
-            else:
-                # Perform letterbox resize to preserve aspect ratio
-                image, lb_info = letterbox_resize(
-                    image,
-                    target_size=self.config.image_size,
-                    pad_color=self.config.pad_color,
-                    patch_size=self.config.patch_size,
-                )
 
-            # Normalise
-            if image.dtype != torch.float32:
-                image = image.float()
-            image = self.normalize(image)
-            # Encode tags and rating
-            tag_labels = self.vocab.encode_tags(tags)
-            rating_label = self.vocab.rating_to_index.get(anno['rating'], self.vocab.rating_to_index['unknown'])
-            # Reset error count on successful load.
-            with self._error_counts_lock:
-                if image_path in self._error_counts:
-                    del self._error_counts[image_path]
-            # Package the sample as a dictionary.  Labels are nested
-            # under a single ``labels`` key to avoid duplication.  Tag
-            # labels are returned as a multi‑hot vector and rating as an
-            # integer index.  Include scaling and padding information in
-            # metadata for downstream use.
-            return {
-                'image': image,
-                'labels': {
-                    'tags': tag_labels,
-                    'rating': rating_label,
-                },
-                'metadata': {
-                    'index': actual_idx,  # Use actual_idx for the true dataset index
-                    'path': anno['image_path'],
-                    'num_tags': len(tags),  # Updated count
-                    'tags': tags,  # Updated tags
-                    'rating': anno['rating'],
-                    'scale': lb_info['scale'],
-                    'pad': lb_info['pad'],
-                    'was_composited': was_composited,  # Add to metadata for debugging
-                    'was_flipped': was_flipped,  # Track if flip was applied
-                },
-            }
-        except (IOError, OSError) as e:
-            # File I/O errors – may be temporary.  Increment the retry count
-            # under the lock.  If the maximum number of retries is
-            # exceeded, propagate a runtime error to abort training.
-            with self._error_counts_lock:
-                self._error_counts[image_path] = error_count + 1               
-                if error_count >= max_retries:
+                # Normalise
+                if image.dtype != torch.float32:
+                    image = image.float()
+                image = self.normalize(image)
+
+                # Encode tags and rating
+                tag_labels = self.vocab.encode_tags(tags)
+                rating_label = self.vocab.rating_to_index.get(anno['rating'], self.vocab.rating_to_index['unknown'])
+
+                # Success! Reset error count and add to known-good pool
+                with self._error_counts_lock:
+                    if image_path in self._error_counts:
+                        del self._error_counts[image_path]
+
+                # Add successful index to known-good pool (with probability to avoid bias)
+                if random.random() < 0.1:  # 10% chance
+                    with self._known_good_lock:
+                        if actual_idx not in self._known_good_indices:
+                            self._known_good_indices.append(actual_idx)
+                            # Keep pool size bounded
+                            if len(self._known_good_indices) > 200:
+                                self._known_good_indices.pop(0)
+
+                # Package the sample as a dictionary
+                return {
+                    'image': image,
+                    'labels': {
+                        'tags': tag_labels,
+                        'rating': rating_label,
+                    },
+                    'metadata': {
+                        'index': actual_idx,
+                        'path': anno['image_path'],
+                        'num_tags': len(tags),
+                        'tags': tags,
+                        'rating': anno['rating'],
+                        'scale': lb_info['scale'],
+                        'pad': lb_info['pad'],
+                        'was_composited': was_composited,
+                        'was_flipped': was_flipped,
+                    },
+                }
+
+            except (IOError, OSError, ValueError) as e:
+                # Track error and mark as failed if exceeded retries
+                with self._error_counts_lock:
+                    self._error_counts[image_path] = error_count + 1
+                    if error_count >= 3:
+                        self._failed_images.add(image_path)
+
+                # Log only first occurrence per image
+                if error_count == 0:
+                    logger.warning(f"Error loading {image_path}: {e}")
+
+                # Try next index
+                idx = (idx + 1) % len(self.annotations)
+                continue
+
+            except Exception as e:
+                # Unexpected error - log once and mark as failed
+                if image_path not in self._failed_images:
+                    logger.error(f"Unexpected error loading {image_path}: {e}")
                     self._failed_images.add(image_path)
 
-            if error_count >= max_retries:
-                logger.error(f"Failed to load {image_path} after {max_retries} attempts: {e}")
-                if self.config.skip_error_samples:
-                    # Skip to next sample instead of crashing
-                    next_idx = (idx + 1) % len(self.annotations)
-                    logger.info(f"Skipping permanently failed image, moving to index {next_idx}")
-                    return self.__getitem__(next_idx)
-                else:
-                    raise RuntimeError(f"Persistent failure loading {image_path}: {e}") from e
-            else:
-                logger.warning(f"Error loading {image_path} (attempt {error_count + 1}/{max_retries}): {e}")
-                if self.config.skip_error_samples:
-                    return self.__getitem__((idx + 1) % len(self.annotations))                
-                return self._create_error_sample(idx, image_path, "io_error")
-        except Exception as e:
-            # Unexpected errors - handle based on skip_error_samples config
-            logger.error(f"Unexpected error in __getitem__ for index {idx}, path {image_path}: {e}")
+                # Try next index
+                idx = (idx + 1) % len(self.annotations)
+                continue
 
-            # Track this as a failed image
-            self._failed_images.add(image_path)
-
-            if self.config.skip_error_samples:
-                # Skip to next sample instead of crashing
-                next_idx = (idx + 1) % len(self.annotations)
-                logger.info(f"Skipping sample with unexpected error, moving to index {next_idx}")
-                return self.__getitem__(next_idx)
-            else:
-                # Return error sample instead of raising
-                return self._create_error_sample(idx, image_path, "unexpected_error")
-
+        # Exhausted all attempts - return error sample
+        logger.warning(f"Failed to load sample after {attempts} attempts, returning error sample for index {original_idx}")
+        return self._create_error_sample(original_idx, "exhausted_retries", "max_retries_exceeded")
     def _create_error_sample(self, idx: int, image_path: str, error_type: str) -> Dict[str, Any]:
         """Create an error sample with appropriate defaults.
 
         This should only be used for recoverable errors like temporary I/O issues.
         """
-        logger.debug(f"Creating error sample for {image_path}, type: {error_type}")
         # Use letterbox padding on a zero image so downstream patchify has correct shape.
         blank = torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32)
         padded, lb_info = letterbox_resize(
@@ -1957,6 +2061,7 @@ class SimplifiedDataset(Dataset):
                 'tags': [],
                 'rating': 'unknown',
                 'error_type': error_type,
+                'is_error_sample': True,  # Flag for collate_fn
                 'scale': lb_info['scale'],
                 'pad': lb_info['pad'],
                 'was_composited': False,
@@ -2170,20 +2275,26 @@ def create_dataloaders(
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Custom collate function to assemble a batch of samples."""
-    images = torch.stack([item['image'] for item in batch])
+    # Filter out error samples if configured
+    valid_batch = [item for item in batch if not item.get('metadata', {}).get('is_error_sample', False)]
+    if not valid_batch:
+        # All samples were errors, use original batch
+        valid_batch = batch
+
+    images = torch.stack([item['image'] for item in valid_batch])
     # Extract nested labels.  Tag labels are stacked into a 2D tensor and
     # rating labels are collected into a 1D tensor.
-    tag_labels = torch.stack([item['labels']['tags'] for item in batch])
-    rating_labels = torch.tensor([item['labels']['rating'] for item in batch], dtype=torch.long)
+    tag_labels = torch.stack([item['labels']['tags'] for item in valid_batch])
+    rating_labels = torch.tensor([item['labels']['rating'] for item in valid_batch], dtype=torch.long)
     # Collate metadata lists and keep padding info for downstream usage.
     metadata = {
-        'indices': [item['metadata']['index'] for item in batch],
-        'paths': [item['metadata']['path'] for item in batch],
-        'num_tags': torch.tensor([item['metadata']['num_tags'] for item in batch]),
-        'tags': [item['metadata']['tags'] for item in batch],
-        'ratings': [item['metadata']['rating'] for item in batch],
-        'scales': [item['metadata'].get('scale') for item in batch],
-        'pads': [item['metadata'].get('pad') for item in batch],
+        'indices': [item['metadata']['index'] for item in valid_batch],
+        'paths': [item['metadata']['path'] for item in valid_batch],
+        'num_tags': torch.tensor([item['metadata']['num_tags'] for item in valid_batch]),
+        'tags': [item['metadata']['tags'] for item in valid_batch],
+        'ratings': [item['metadata']['rating'] for item in valid_batch],
+        'scales': [item['metadata'].get('scale') for item in valid_batch],
+        'pads': [item['metadata'].get('pad') for item in valid_batch],
     }
     # Derive a per-pixel padding mask (True=content, False=padding) so downstream
     # modules (e.g., ViT attention) can ignore padded regions.
@@ -2202,9 +2313,11 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         if right > 0:
             padding_mask[i, :, W - right:] = False
     return {
-        'images': images,
-        'tag_labels': tag_labels,
-        'rating_labels': rating_labels,
-        'padding_mask': padding_mask,  # (B, H, W), bool
+        'image': images,
+        'labels': {
+            'tags': tag_labels,
+            'rating': rating_labels,
+        },
         'metadata': metadata,
+        'padding_mask': padding_mask,
     }
