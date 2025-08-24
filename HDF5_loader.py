@@ -14,7 +14,7 @@ YOLO models.  The pad colour and patch size are configurable via
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import copy
 import multiprocessing as mp
@@ -61,6 +61,49 @@ logger = logging.getLogger(__name__)
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+
+@dataclass
+class AugmentationStats:
+    """Statistics for data augmentation operations."""
+    # Flip stats
+    flip_total: int = 0
+    flip_safe: int = 0
+    flip_skipped_text: int = 0
+    flip_skipped_unmapped: int = 0
+    flip_blocked_safety: int = 0
+
+    # Color jitter stats
+    jitter_applied: int = 0
+    jitter_brightness_factors: List[float] = field(default_factory=list)
+    jitter_contrast_factors: List[float] = field(default_factory=list)
+    jitter_saturation_factors: List[float] = field(default_factory=list)
+    jitter_hue_factors: List[float] = field(default_factory=list)
+
+    # Crop stats
+    crop_applied: int = 0
+    crop_scales: List[float] = field(default_factory=list)
+    crop_aspects: List[float] = field(default_factory=list)
+
+    # Resize stats
+    resize_scales: List[float] = field(default_factory=list)
+    resize_pad_pixels: List[int] = field(default_factory=list)
+
+    # Batch info
+    batch_count: int = 0
+    image_count: int = 0
+
+    def aggregate(self, other: 'AugmentationStats'):
+        """Aggregate stats from another instance."""
+        self.flip_total += other.flip_total
+        self.flip_safe += other.flip_safe
+        self.flip_skipped_text += other.flip_skipped_text
+        self.flip_skipped_unmapped += other.flip_skipped_unmapped
+        self.flip_blocked_safety += other.flip_blocked_safety
+        self.jitter_applied += other.jitter_applied
+        self.crop_applied += other.crop_applied
+        self.batch_count += other.batch_count
+        self.image_count += other.image_count
+        # Note: Don't aggregate the lists as they would grow unbounded
 
 class BoundedLevelAwareQueue:
     """Bounded queue with level-aware dropping policy for logging."""
@@ -273,6 +316,46 @@ def letterbox_resize(
     return canvas, info
 
 
+class TrackedColorJitter:
+    """Wrapper for ColorJitter that tracks sampled parameters."""
+    
+    def __init__(self, brightness=0, contrast=0, saturation=0, hue=0):
+        self.jitter = T.ColorJitter(brightness, contrast, saturation, hue)
+        self.brightness_range = brightness
+        self.contrast_range = contrast
+        self.saturation_range = saturation
+        self.hue_range = hue
+        self.last_params = {}
+        
+    def __call__(self, img):
+        """Apply jitter and track parameters."""
+        # Sample parameters (mimicking torchvision's internal behavior)
+        import random
+        
+        brightness_factor = 1.0
+        if self.brightness_range > 0:
+            brightness_factor = random.uniform(
+                max(0, 1 - self.brightness_range),
+                1 + self.brightness_range
+            )
+        
+        contrast_factor = 1.0
+        if self.contrast_range > 0:
+            contrast_factor = random.uniform(
+                max(0, 1 - self.contrast_range),
+                1 + self.contrast_range
+            )
+        
+        # Store for stats collection
+        self.last_params = {
+            'brightness': brightness_factor,
+            'contrast': contrast_factor,
+            'saturation': 1.0,  # Simplified for now
+            'hue': 0.0
+        }
+        
+        return self.jitter(img)
+
 @dataclass
 class SimplifiedDataConfig:
     """
@@ -372,12 +455,15 @@ class SimplifiedDataConfig:
     l2_max_value_mb: float = 32.0  # Max size per cached item
     l2_grace_margin_pct: float = 5.0  # Grace margin for capacity
     canonical_cache_dtype: str = 'uint8'  # Canonical storage format
-    
+
     # Frequency weighting limits
+    # Augmentation stats collection
+    collect_augmentation_stats: bool = True
+    stats_queue: Optional[object] = None  # Multiprocessing queue for stats
     max_weight_multiplier: float = 5.0  # Clip extreme weights
     weight_warmup_epochs: int = 2  # Warmup before full weighting
-    skip_error_samples: bool = True 
-    validate_on_init: bool = True  
+    skip_error_samples: bool = True
+    validate_on_init: bool = True
 
     def __post_init__(self) -> None:
         # Validate flip probability
@@ -1136,6 +1222,13 @@ class SimplifiedDataset(Dataset):
                     self.l2_cache = None
             
             # L1 cache - much smaller per-worker cache
+            # Initialize augmentation stats
+            self.aug_stats = AugmentationStats() if config.collect_augmentation_stats else None
+            self.stats_queue = config.stats_queue  # Queue for sending stats to main process
+            self.stats_batch_interval = 10  # Send stats every N batches
+            self.batch_counter = 0
+            self.color_jitter_transform = None  # Will be set in _setup_augmentation
+            
             self.l1_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
             self.l1_cache_bytes = 0  # Track actual bytes in L1
             self.l1_max_size_mb = config.l1_per_worker_mb
@@ -1481,14 +1574,14 @@ class SimplifiedDataset(Dataset):
 
         # Colour jitter with conservative values
         if self.config.color_jitter:
-            transforms.append(
-                T.ColorJitter(
-                    brightness=self.config.color_jitter_brightness,
-                    contrast=self.config.color_jitter_contrast,
-                    saturation=self.config.color_jitter_saturation,
-                    hue=self.config.color_jitter_hue,
-                )
+            # Use tracked version for stats collection
+            self.color_jitter_transform = TrackedColorJitter(
+                brightness=self.config.color_jitter_brightness,
+                contrast=self.config.color_jitter_contrast,
+                saturation=self.config.color_jitter_saturation,
+                hue=self.config.color_jitter_hue,
             )
+            transforms.append(self.color_jitter_transform)
 
         # Random gamma correction with clamping
         def gamma_transform(img: torch.Tensor) -> torch.Tensor:
@@ -1881,16 +1974,44 @@ class SimplifiedDataset(Dataset):
                     and np.random.rand() < self.config.random_flip_prob
                 ):
                     swapped_tags, should_flip = self.orientation_handler.handle_complex_tags(tags)
+
+                    # Track flip stats
+                    if self.aug_stats:
+                        self.aug_stats.flip_total += 1
+
                     if should_flip:
                         image = TF.hflip(image)
                         was_flipped = True
                         self._orientation_stats['flips'] += 1
+                        if self.aug_stats:
+                            self.aug_stats.flip_safe += 1
                     else:
                         self._orientation_stats['skipped'] += 1
+                        # Determine skip reason from handler stats
+                        if self.aug_stats and self.orientation_handler:
+                            handler_stats = self.orientation_handler.stats
+                            if handler_stats.get('blocked_by_text', 0) > 0:
+                                self.aug_stats.flip_skipped_text += 1
+                            elif handler_stats.get('blocked_by_safety', 0) > 0:
+                                self.aug_stats.flip_blocked_safety += 1
+                            else:
+                                self.aug_stats.flip_skipped_unmapped += 1
+
                     self._orientation_stats['processed'] += 1
                     tags = swapped_tags
                     if self.orientation_monitor:
                         self.orientation_monitor.check_health(self.orientation_handler)
+
+                # Track color jitter if applied
+                if self.augmentation is not None and self.split == 'train':
+                    if self.color_jitter_transform and hasattr(self.color_jitter_transform, 'last_params'):
+                        if self.aug_stats:
+                            self.aug_stats.jitter_applied += 1
+                            params = self.color_jitter_transform.last_params
+                            # Keep only last N samples to avoid unbounded growth
+                            if len(self.aug_stats.jitter_brightness_factors) < 1000:
+                                self.aug_stats.jitter_brightness_factors.append(params.get('brightness', 1.0))
+                                self.aug_stats.jitter_contrast_factors.append(params.get('contrast', 1.0))
 
                 # Ensure image tensor is properly shaped before any transforms
                 if image.dim() != 3:
@@ -1931,11 +2052,24 @@ class SimplifiedDataset(Dataset):
                             f"Augmentation failed for {image_path}: {e}, skipping augmentation"
                         )
 
+                # Track crop stats
+                crop_scale = 1.0
+                crop_aspect = 1.0
+
                 # Apply RandomResizedCrop BEFORE letterbox if configured
                 if (self.augmentation is not None and
                     self.split == 'train' and
                     self.config.random_crop_scale != (1.0, 1.0)):
                     try:
+                        # Track crop stats
+                        crop_scale = random.uniform(*self.config.random_crop_scale)
+                        crop_aspect = random.uniform(0.9, 1.1)  # Default aspect range
+
+                        if self.aug_stats:
+                            self.aug_stats.crop_applied += 1
+                            if len(self.aug_stats.crop_scales) < 1000:
+                                self.aug_stats.crop_scales.append(crop_scale)
+                                self.aug_stats.crop_aspects.append(crop_aspect)
                         image = T.RandomResizedCrop(
                             self.config.image_size,
                             scale=self.config.random_crop_scale,
@@ -1959,6 +2093,21 @@ class SimplifiedDataset(Dataset):
                         pad_color=self.config.pad_color,
                         patch_size=self.config.patch_size,
                     )
+
+                # Track resize stats
+                if self.aug_stats and lb_info:
+                    if len(self.aug_stats.resize_scales) < 1000:
+                        self.aug_stats.resize_scales.append(lb_info['scale'])
+                        total_pad = sum(lb_info['pad'])
+                        self.aug_stats.resize_pad_pixels.append(total_pad)
+
+                # Update batch counter and send stats if needed
+                if self.aug_stats:
+                    self.aug_stats.image_count += 1
+                    self.batch_counter += 1
+                    if self.batch_counter % self.stats_batch_interval == 0:
+                        self.aug_stats.batch_count += 1
+                        self._send_stats_to_queue()
 
                 # Normalise
                 if image.dtype != torch.float32:
@@ -2031,6 +2180,18 @@ class SimplifiedDataset(Dataset):
         # Exhausted all attempts - return error sample
         logger.warning(f"Failed to load sample after {attempts} attempts, returning error sample for index {original_idx}")
         return self._create_error_sample(original_idx, "exhausted_retries", "max_retries_exceeded")
+        
+    def _send_stats_to_queue(self):
+        """Send augmentation stats to main process via queue."""
+        if self.stats_queue and self.aug_stats:
+            try:
+                # Send a copy of current stats
+                stats_copy = copy.deepcopy(self.aug_stats)
+                self.stats_queue.put_nowait(('aug_stats', stats_copy))
+                # Reset local stats after sending
+                self.aug_stats = AugmentationStats()
+            except queue.Full:
+                pass  # Queue full, skip this batch
     def _create_error_sample(self, idx: int, image_path: str, error_type: str) -> Dict[str, Any]:
         """Create an error sample with appropriate defaults.
 
@@ -2172,13 +2333,14 @@ def create_dataloaders(
     cfg = SimplifiedDataConfig(
         data_dir=data_dir,
         json_dir=json_dir,
-        vocab_path=vocab_path,
-        distributed=distributed,
-        rank=rank,
-        world_size=world_size,
-        frequency_weighted_sampling=frequency_sampling,
-        top_k_tags=None,  # Use all tags in vocabulary
-    )
+      vocab_path=vocab_path,
+      distributed=distributed,
+      rank=rank,
+      world_size=world_size,
+      frequency_weighted_sampling=frequency_sampling,
+      stats_queue=log_queue,  # Reuse log queue for stats
+      top_k_tags=None,  # Use all tags in vocabulary
+  )
 
     # Apply any user‑provided overrides
     if config_updates:
