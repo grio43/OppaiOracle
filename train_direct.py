@@ -25,7 +25,8 @@ from Monitor_log import MonitorConfig, TrainingMonitor
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+# Use the specific vocabulary path
+VOCAB_PATH = Path("/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json")
 
 # Import the orientation handler
 from orientation_handler import OrientationHandler
@@ -379,6 +380,43 @@ def train_with_orientation_tracking():
     num_ratings = len(vocab.rating_to_index)
     logger.info(f"Creating model with {num_tags} tags and {num_ratings} ratings")
 
+    # CRITICAL: Verify vocabulary is valid before training
+    logger.info("Verifying vocabulary integrity...")
+
+    # Check for placeholder tags
+    placeholder_tags = []
+    real_tags_sample = []
+    for tag, idx in vocab.tag_to_index.items():
+        if tag.startswith("tag_") and tag[4:].isdigit():
+            placeholder_tags.append(tag)
+        elif tag not in ["<PAD>", "<UNK>"]:
+            real_tags_sample.append(tag)
+            if len(real_tags_sample) >= 10:  # Just sample first 10 real tags
+                break
+
+    if len(placeholder_tags) > 0:
+        raise ValueError(
+            f"CRITICAL: Vocabulary contains {len(placeholder_tags)} placeholder tags!\n"
+            f"Examples of placeholders found: {placeholder_tags[:10]}\n"
+            f"This means the vocabulary file at {VOCAB_PATH} is corrupted.\n"
+            f"Training would produce a model that outputs meaningless 'tag_XXX' labels.\n"
+            f"Please rebuild the vocabulary from your dataset annotations."
+        )
+
+    if len(real_tags_sample) < 5:
+        raise ValueError(
+            f"CRITICAL: Vocabulary contains fewer than 5 real tags!\n"
+            f"Found tags: {real_tags_sample}\n"
+            f"This vocabulary is too small or corrupted.\n"
+            f"Please rebuild the vocabulary from your dataset annotations."
+        )
+
+    logger.info(f"\u2713 Vocabulary verification passed!")
+    logger.info(f"  - Total tags: {num_tags}")
+    logger.info(f"  - No placeholder tags found")
+    logger.info(f"  - Sample real tags: {real_tags_sample[:5]}")
+    logger.info(f"  - Vocabulary path: {VOCAB_PATH}")
+
     # Copy vocabulary to checkpoint directory for inference
     checkpoint_dir = config["checkpoint_dir"]
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -390,6 +428,18 @@ def train_with_orientation_tracking():
         logger.info(f"Saved vocabulary to {vocab_dest}")
     elif config["vocab_path"].exists():
         # Fallback: copy existing vocabulary file
+        # But first verify it's valid JSON with proper structure
+        try:
+            with open(config["vocab_path"], 'r') as f:
+                vocab_check = json.load(f)
+                if 'tag_to_index' not in vocab_check or 'index_to_tag' not in vocab_check:
+                    raise ValueError("Invalid vocabulary structure")
+        except Exception as e:
+            raise ValueError(
+                f"CRITICAL: Cannot verify vocabulary file at {config['vocab_path']}.\n"
+                f"Error: {e}\n"
+                f"Training aborted to prevent creating a broken model."
+            )
         shutil.copy2(config["vocab_path"], vocab_dest)
         logger.info(f"Copied vocabulary to {vocab_dest}")
 
