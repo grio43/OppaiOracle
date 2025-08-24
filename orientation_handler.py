@@ -202,8 +202,11 @@ class OrientationHandler:
                     if any(skip in tag for skip in ['copyright', 'bright', 'upright', 
                                                      'straight', 'light', 'fight']):
                         continue
-                    # Skip style descriptors that don't need flipping
-                    if any(skip in tag for skip in ['asymmetric', 'single_']):
+                    # Skip style descriptors that don't need flipping (asymmetric/single tags are handled as-is)
+                    if any(skip in tag for skip in ['asymmetric', 'asymmetrical', 'single_']):
+                        continue
+                    # Skip symmetric tags that don't require mapping
+                    if tag in self.symmetric_tags:
                         continue
                     orientation_tags.append(tag)
             
@@ -272,7 +275,7 @@ class OrientationHandler:
             if any(keyword in tag for keyword in orientation_keywords):
                 # Skip tags that contain left/right but are actually style descriptors
                 # that don't change with orientation
-                if any(skip in tag for skip in ['asymmetric', 'single_']):
+                if any(skip in tag for skip in ['asymmetric', 'asymmetrical', 'single_']):
                     continue
                 matched = False
                 for regex_data in self.regex_patterns:
@@ -324,8 +327,9 @@ class OrientationHandler:
                 except Exception as e:
                     logger.error(f"Regex substitution failed for tag '{tag}': {e}")
 
-        # No mapping found - check if it's an orientation tag we should track
-        if any(keyword in tag for keyword in ['left', 'right', 'asymmetric']):
+        # No mapping found - check if it's an orientation tag we should track  
+        # Note: 'asymmetric'/'asymmetrical' tags are NOT tracked as unmapped since they don't need swapping
+        if any(keyword in tag for keyword in ['left', 'right']) and not any(skip in tag for skip in ['asymmetric', 'asymmetrical']):
             with self._stats_lock:
                 self.stats['unmapped_tags'].add(tag)
                 self.stats['unmapped_tag_frequency'][tag] = self.stats['unmapped_tag_frequency'].get(tag, 0) + 1
@@ -450,7 +454,7 @@ class OrientationHandler:
         # CHANGED: Only validate tags that actually need orientation mapping
         # Skip asymmetric and single_ as they don't need mapping
         orientation_indicators = ['left', 'right', 'facing', 'looking', 'pointing']
-        skip_indicators = ['asymmetric', 'single_', 'copyright', 'bright', 'upright']
+        skip_indicators = ['asymmetric', 'asymmetrical', 'single_', 'copyright', 'bright', 'upright']
         
         for tag in all_tags:
             # Check if this might be an orientation tag
@@ -489,17 +493,18 @@ class OrientationHandler:
             Dictionary of validation issues found
         """
         issues = {
-            'asymmetric_mappings': [],
+            # Note: 'bidirectional_mapping_issues' checks A->B->A consistency, not style asymmetry
+            'bidirectional_mapping_issues': [],  # Renamed from 'asymmetric_mappings' for clarity
             'circular_mappings': [],
             'duplicate_mappings': [],
             'regex_conflicts': []
         }
         
-        # Check for asymmetric mappings (A->B but B doesn't map back to A)
+        # Check for bidirectional mapping consistency (A->B but B doesn't map back to A)
         for tag1, tag2 in self.explicit_mappings.items():
             if tag2 in self.explicit_mappings:
                 if self.explicit_mappings[tag2] != tag1:
-                    issues['asymmetric_mappings'].append(f"{tag1} -> {tag2} -> {self.explicit_mappings[tag2]}")
+                    issues['bidirectional_mapping_issues'].append(f"{tag1} -> {tag2} -> {self.explicit_mappings[tag2]}")
         
         # Check for circular mappings
         visited = set()
@@ -594,11 +599,9 @@ class OrientationHandler:
                 suggestions[tag] = suggested
             # Try pattern-based suggestions
             elif tag.startswith('single_'):
-                # Single items typically don't have a direct swap
+                # Single items don't need swapping (they're already handled correctly)
                 suggestions[tag] = tag  # Map to itself (symmetric)
-            elif 'asymmetric' in tag:
-                # Asymmetric items are typically self-referential
-                suggestions[tag] = tag  # Map to itself (symmetric)
+            # Note: asymmetric/asymmetrical tags are NOT included here since they're not tracked as unmapped
         
         return suggestions
     
@@ -789,8 +792,9 @@ def test_orientation_handler():
             (["hair_over_left_eye", "standing"], ["hair_over_right_eye", "standing"]),
             (["facing_left", "text"], None),  # Should skip due to text
             (["left_hand", "right_foot"], ["right_hand", "left_foot"]),
-            (["asymmetrical_hair"], None),  # Should skip due to unmapped
-            (["looking_at_viewer", "sitting"], ["looking_at_viewer", "sitting"])  # Symmetric
+            (["asymmetrical_hair", "standing"], ["asymmetrical_hair", "standing"]),  # Asymmetric tags don't block flips
+            (["looking_at_viewer", "sitting"], ["looking_at_viewer", "sitting"]),  # Symmetric
+            (["asymmetric_wings", "facing_left"], ["asymmetric_wings", "facing_right"])  # Asymmetric + orientation works
         ]
         
         print("Testing orientation handler...")
