@@ -61,6 +61,13 @@ def main():
     parser.add_argument('--threshold', type=float, default=0.0)
     parser.add_argument('--output', type=str, help='Output JSON file')
     parser.add_argument('--vocab', type=str, help='External vocabulary file (if not embedded)')
+    # Preprocessing parameters (required when metadata is missing)
+    parser.add_argument('--mean', type=float, nargs=3, metavar=('R', 'G', 'B'),
+                        help='Normalization mean values for RGB channels (required if not in model metadata)')
+    parser.add_argument('--std', type=float, nargs=3, metavar=('R', 'G', 'B'),
+                        help='Normalization std values for RGB channels (required if not in model metadata)')
+    parser.add_argument('--image-size', type=int, help='Input image size (required if not in model metadata)')
+    parser.add_argument('--patch-size', type=int, help='Model patch size (required if not in model metadata)')
     args = parser.parse_args()
 
     session = ort.InferenceSession(args.model)
@@ -77,10 +84,34 @@ def main():
         vocab = TagVocabulary(Path(args.vocab))
         # Verify external vocabulary
         verify_vocabulary_integrity(vocab, Path(args.vocab))
-        mean = [0.5, 0.5, 0.5]
-        std = [0.5, 0.5, 0.5]
-        image_size = 448
-        patch_size = 32
+        
+        # Check for required preprocessing parameters
+        missing_params = []
+        if args.mean is None:
+            missing_params.append("--mean")
+        if args.std is None:
+            missing_params.append("--std")
+        if args.image_size is None:
+            missing_params.append("--image-size")
+        if args.patch_size is None:
+            missing_params.append("--patch-size")
+
+        if missing_params:
+            raise RuntimeError(
+                f"Model lacks preprocessing metadata and required parameters are missing: {', '.join(missing_params)}\n"
+                f"When model metadata is not available, you must explicitly provide:\n"
+                f"  --mean R G B        (e.g., --mean 0.5 0.5 0.5)\n"
+                f"  --std R G B         (e.g., --std 0.5 0.5 0.5)\n"
+                f"  --image-size SIZE   (e.g., --image-size 640)\n"
+                f"  --patch-size SIZE   (e.g., --patch-size 16)\n"
+                f"These values must match those used during training to ensure correct predictions."
+            )
+
+        # Use explicitly provided parameters
+        mean = list(args.mean)
+        std = list(args.std)
+        image_size = args.image_size
+        patch_size = args.patch_size
         meta = result[-1]  # Get the meta from the result
         vocab_embedded = False
     else:
