@@ -592,6 +592,19 @@ def train_with_orientation_tracking():
         optimizer.zero_grad()
         epoch_start = time.time()
         
+        # CRITICAL: Set epoch for proper shuffling in samplers
+        if hasattr(train_loader, 'sampler') and train_loader.sampler is not None:
+            if hasattr(train_loader.sampler, 'set_epoch'):
+                train_loader.sampler.set_epoch(epoch)
+                logger.info(f"Set epoch {epoch} for sampler {type(train_loader.sampler).__name__}")
+            else:
+                logger.debug(f"Sampler {type(train_loader.sampler).__name__} does not support set_epoch")
+        
+        # Also update dataset epoch if it has working set sampler
+        if hasattr(train_loader.dataset, 'new_epoch'):
+            train_loader.dataset.new_epoch()
+            logger.debug(f"Called new_epoch on dataset for epoch {epoch}")
+        
         # Process any pending augmentation stats from workers
         if stats_queue:
             while not stats_queue.empty():
