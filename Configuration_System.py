@@ -694,7 +694,9 @@ class ExportConfig(BaseConfig):
     export_format: str = "onnx"  # onnx, torchscript, tflite, coreml
     
     # ONNX settings
-    opset_version: int = 16
+    # Use opset 18 or higher for transformer models with LayerNormalization
+    # Opset 17 introduced LayerNormalization; opset 18 adds transformer optimizations
+    opset_version: int = 18
     export_params: bool = True
     do_constant_folding: bool = True
     
