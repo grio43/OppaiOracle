@@ -5,6 +5,7 @@ import json
 import base64
 import gzip
 import hashlib
+import logging
 import time
 import sys
 from pathlib import Path
@@ -15,6 +16,13 @@ import onnxruntime as ort
 
 from vocabulary import TagVocabulary, verify_vocabulary_integrity
 from schemas import RunMetadata, TagPrediction, ImagePrediction, PredictionOutput
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 def _load_metadata(session: ort.InferenceSession):
@@ -101,7 +109,13 @@ def main():
     parser.add_argument('--patch-size', type=int, help='Model patch size (required if not in model metadata)')
     args = parser.parse_args()
 
-    session = ort.InferenceSession(args.model)
+    # Explicitly specify providers for better control
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    session = ort.InferenceSession(
+        args.model,
+        providers=providers
+    )
+    logger.info(f"Using providers: {session.get_providers()}")
     result = _load_metadata(session)
     vocab_embedded = True
 
