@@ -361,7 +361,7 @@ class DataConfig(BaseConfig):
     drop_last: bool = False
     
     # Caching
-    cache_size_gb: float = 25.0
+    cache_size_gb: float = 105.0
     preload_files: int = 2
     use_memory_cache: bool = True
     
