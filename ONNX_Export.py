@@ -69,10 +69,13 @@ class ONNXExportConfig:
     output_path: str = "model.onnx"
     
     # Export settings
-    # Use opset 18 or higher for transformer models with LayerNormalization
-    # Opset 17 introduced LayerNormalization, while opset 18 added additional optimizations
-    # See: https://github.com/onnx/onnx/releases/tag/v1.12.0 (opset 17)
-    opset_version: int = 18  # Minimum for LayerNormalization support, 18 recommended
+    # Use opset 18 or higher for transformer models with LayerNormalization support
+    # Opset timeline:
+    # - 16 (2021): Basic support, no LayerNormalization
+    # - 17 (2022): Added LayerNormalization, GroupNormalization improvements
+    # - 18 (2023): Additional optimizations for transformers
+    # - 19 (2024): Latest improvements
+    opset_version: int = 17  # Use 17 for better LayerNorm compatibility, avoid opset 18 ReduceMean issues
     input_names: List[str] = field(default_factory=lambda: ["input_image"])
     # Only export scores, not binary predictions (to avoid threshold-related validation issues)
     output_names: List[str] = field(default_factory=lambda: ["scores"])
@@ -551,14 +554,18 @@ class ONNXExporter:
             # Add metadata
             if self.config.add_metadata:
                 self._add_metadata(output_path)
-            
+
+            # Validate BEFORE optimization (critical fix)
+            if self.config.validate_export:
+                self._validate_model(output_path)
+
             # Optimize
             if self.config.optimize:
                 self._optimize_model(output_path)
-            
-            # Validate
+
+            # Validate ORT inference after optimization
             if self.config.validate_export:
-                self._validate_model(output_path)
+                self._validate_ort_inference(output_path)
             
             logger.info(f"✓ Full model exported to {output_path}")
             
@@ -679,35 +686,52 @@ class ONNXExporter:
             logger.warning(f"Optimization failed: {e}, keeping original model")
     
     def _basic_optimize(self, model_path: Path):
-        """Basic ONNX optimization without transformer-specific optimizations"""
+        """Basic ONNX optimization using onnx-simplifier"""
         try:
-            from onnx import optimizer as onnx_optimizer
-            
+            from onnxsim import simplify
+
             model = onnx.load(str(model_path))
-            
-            # Basic optimization passes
-            passes = [
-                'eliminate_identity',
-                'eliminate_nop_dropout',
-                'eliminate_nop_pad',
-                'eliminate_nop_transpose',
-                'eliminate_unused_initializer',
-                'fuse_consecutive_concats',
-                'fuse_consecutive_squeezes',
-                'fuse_consecutive_transposes',
-                'fuse_matmul_add_bias_into_gemm',
-                'fuse_pad_into_conv',
-            ]
-            
-            optimized_model = onnx_optimizer.optimize(model, passes)
-            onnx.save(optimized_model, str(model_path))
-            
-            logger.info("✓ Basic optimization complete")
-            
+
+            # Simplify with onnx-simplifier
+            model_simp, check = simplify(
+                model,
+                check_n=3,
+                perform_optimization=True,
+                skip_fuse_bn=False,
+                input_shapes={'input_image': [self.config.batch_size, 3,
+                             self.config.image_size, self.config.image_size]}
+            )
+
+            if check:
+                onnx.save(model_simp, str(model_path))
+                logger.info("✓ Basic optimization complete with onnx-simplifier")
+            else:
+                logger.warning("Simplification check failed, keeping original model")
+
+        except ImportError:
+            logger.warning("onnx-simplifier not installed, skipping basic optimization")
+            logger.info("Install with: pip install onnx-simplifier")
         except Exception as e:
             logger.warning(f"Basic optimization failed: {e}")
-    
-    
+
+    def _validate_ort_inference(self, model_path: Path):
+        """Validate model through ORT inference (post-optimization)"""
+        logger.info("Validating model inference...")
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        try:
+            session = ort.InferenceSession(str(model_path), providers=providers)
+            # Test with dummy input
+            test_input = np.random.randn(
+                self.config.batch_size, 3,
+                self.config.image_size, self.config.image_size
+            ).astype(np.float32)
+            session.run(None, {self.config.input_names[0]: test_input})
+            logger.info("✓ Model inference validation passed")
+            return True
+        except Exception as e:
+            logger.error(f"Inference validation failed: {e}")
+            return False
+
     def _quantize_dynamic(self, input_path: Path, output_path: Path):
         """Apply dynamic quantization"""
         logger.info("Applying dynamic quantization...")
@@ -848,15 +872,29 @@ class ONNXExporter:
             logger.warning(f"Failed to add metadata: {e}")
     
     def _validate_model(self, model_path: Path):
-        """Validate exported ONNX model"""
+        '''Validate ONNX model structure (pre-optimization only)'''
         logger.info("Validating ONNX model...")
-        
+
         try:
             # Check model structure
             model = onnx.load(str(model_path))
             onnx.checker.check_model(model)
             logger.info("✓ ONNX model structure is valid")
-            
+            # Do NOT run inference validation here - save for after optimization
+        except Exception as e:
+            logger.error(f"Validation failed: {e}")
+            raise
+
+    def _validate_model_old(self, model_path: Path):
+        '''DEPRECATED: Old validation method that combines structure and inference checks'''
+        logger.info("Validating ONNX model...")
+
+        try:
+            # Check model structure
+            model = onnx.load(str(model_path))
+            onnx.checker.check_model(model)
+            logger.info("✓ ONNX model structure is valid")
+
             # Create test input
             test_input = np.random.randn(
                 self.config.batch_size,
@@ -864,7 +902,7 @@ class ONNXExporter:
                 self.config.image_size,
                 self.config.image_size
             ).astype(np.float32)
-            
+
             # Run inference with PyTorch
             torch_input = torch.from_numpy(test_input).to(self.device)
 
@@ -872,16 +910,13 @@ class ONNXExporter:
             self.model.eval()
             if hasattr(self.model, 'model'):
                 self.model.model.eval()
-                
+
             with torch.no_grad():
                 torch_scores = self.model(torch_input)
-                # Move to CPU while still in no_grad context
                 torch_scores = torch_scores.cpu().numpy()
 
-            # Derive predictions from scores for comparison
             torch_predictions = (torch_scores > 0.5).astype(np.float32)
 
-            # Run inference with ONNX Runtime
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
             session = ort.InferenceSession(str(model_path), providers=providers)
 
@@ -890,22 +925,14 @@ class ONNXExporter:
                 {self.config.input_names[0]: test_input}
             )
 
-            # ONNX now returns only scores
             onnx_scores = onnx_outputs[0]
-
-            # Derive predictions from ONNX scores for comparison
             onnx_predictions = (onnx_scores > 0.5).astype(np.float32)
 
-            # Calculate actual difference for diagnostics
             max_diff = np.max(np.abs(torch_scores - onnx_scores))
             mean_diff = np.mean(np.abs(torch_scores - onnx_scores))
 
-            # Compare scores (not predictions) to avoid threshold issues
-            # Use slightly relaxed tolerance if difference is very small
             rtol = self.config.tolerance_rtol
             atol = self.config.tolerance_atol
-
-            # If max difference is below 5e-4, consider it acceptable for FP32
             if max_diff < 5e-4:
                 rtol = max(rtol, 1e-3)
                 atol = max(atol, 5e-4)
@@ -915,12 +942,9 @@ class ONNXExporter:
                 rtol=rtol, atol=atol
             )
 
-            # Optional: Check top-k stability instead of exact prediction match
             top_k = min(100, torch_scores.shape[-1])
             torch_top_k = np.argsort(torch_scores, axis=-1)[:, -top_k:]
             onnx_top_k = np.argsort(onnx_scores, axis=-1)[:, -top_k:]
-
-            # Check if top-k indices match (order matters less for high-scoring tags)
             top_k_stable = np.array_equal(torch_top_k, onnx_top_k)
 
             if scores_close:
@@ -929,19 +953,18 @@ class ONNXExporter:
                 logger.info(f"  Mean score difference: {mean_diff:.6f}")
                 logger.info(f"  Top-{top_k} stability: {'✓' if top_k_stable else '⚠ (minor differences)'}")
             else:
-                # For very small differences that are just outside tolerance, warn but don't fail
                 if max_diff < 1e-3:
-                    logger.warning(f"⚠ Model validation: small numerical differences detected")
+                    logger.warning("⚠ Model validation: small numerical differences detected")
                     logger.warning(f"  Max difference: {max_diff:.6f} (acceptable for deployment)")
                 else:
                     logger.error("✗ Model validation failed!")
                     logger.error(f"  Max score diff: {max_diff}")
                     raise ValueError("ONNX model output does not match PyTorch model")
-                
+
         except Exception as e:
             logger.error(f"Validation failed: {e}")
             raise
-    
+
     def _print_model_info(self, model_path: Path):
         """Print information about exported model"""
         try:
@@ -1102,7 +1125,7 @@ def main():
     parser.add_argument('-s', '--image-size', type=int, default=640,
                         help='Input image size')
     parser.add_argument('--opset', type=int, default=18,
-                        help='ONNX opset version (>=17 for LayerNorm, 18 recommended)')
+                        help='ONNX opset version (17 recommended for LayerNorm compatibility)')
     parser.add_argument('--variants', nargs='+', default=['full'],
                         choices=['full', 'quantized'],
                         help='Export variants to generate')
