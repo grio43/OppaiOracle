@@ -405,10 +405,11 @@ class ModelWrapper:
 
 class ResultProcessor:
     """Process and format inference results"""
-    
-    def __init__(self, config: InferenceConfig, tag_names: List[str]):
+
+    def __init__(self, config: InferenceConfig, tag_names: List[str], model_wrapper: ModelWrapper):
         self.config = config
         self.tag_names = tag_names
+        self.model_wrapper = model_wrapper
         
     def process_predictions(
         self,
@@ -441,11 +442,9 @@ class ResultProcessor:
             tags = []
             for score, idx in zip(scores.tolist(), indices.tolist()):
                 if idx < len(self.tag_names):
-                    tag_name = self.tag_names[idx]
-                    # Double-check for placeholders in output
-                    if not (tag_name.startswith('tag_') and len(tag_name) > 4 and tag_name[4:].isdigit()):
-                        tags.append(TagPrediction(name=tag_name, score=score))
-                    # Silently skip placeholder tags in output
+                    # This will raise ValueError if placeholder detected
+                    tag_name = self.model_wrapper.vocabulary.get_tag_from_index(idx)
+                    tags.append(TagPrediction(name=tag_name, score=score))
 
             result = ImagePrediction(
                 image=path,
@@ -561,7 +560,8 @@ class InferenceEngine:
         # Setup result processor
         self.result_processor = ResultProcessor(
             self.config,
-            self.model_wrapper.tag_names
+            self.model_wrapper.tag_names,
+            self.model_wrapper
         )
 
         # Update preprocessor with loaded normalization params if available
@@ -664,7 +664,6 @@ class InferenceEngine:
             if uncached_images:
                 # Preprocess batch
                 processed = self.preprocessor.preprocess_batch(uncached_images)
-                
                 # Predict
                 predictions = self.model_wrapper.predict(processed)
                 

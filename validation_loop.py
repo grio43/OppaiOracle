@@ -515,8 +515,12 @@ class ValidationRunner:
         # Get tag names and frequencies
         tag_names = []
         for i in range(len(self.vocab.tag_to_index)):
-            tag_name = self.vocab.get_tag_from_index(i)
-            # Skip placeholders when building tag list
+            # This will raise ValueError if placeholder detected
+            try:
+                tag_name = self.vocab.get_tag_from_index(i)
+            except ValueError as e:
+                logger.error(f"Vocabulary corruption detected: {e}")
+                raise
             tag_names.append(tag_name)
         tag_frequencies = self._compute_tag_frequencies(all_targets) if self.config.analyze_by_frequency else None
         
@@ -974,7 +978,11 @@ class ValidationRunner:
             # Create tag predictions
             tags = []
             for score, idx in zip(scores.tolist(), indices.tolist()):
-                tag_name = self.vocab.get_tag_from_index(idx)
+                try:
+                    tag_name = self.vocab.get_tag_from_index(idx)
+                except ValueError as e:
+                    logger.error(f"Vocabulary corruption detected during prediction save: {e}")
+                    raise
                 tags.append(TagPrediction(name=tag_name, score=score))
 
             # Get image identifier
