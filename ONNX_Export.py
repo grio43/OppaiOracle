@@ -17,6 +17,9 @@ from collections import defaultdict
 import time
 import warnings
 import sys
+import base64
+import gzip
+import hashlib
 
 import numpy as np
 import torch
@@ -72,6 +75,9 @@ class ONNXExportConfig:
     # Model configuration
     batch_size: int = 1
     image_size: int = 640
+    patch_size: int = 16
+    normalize_mean: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
+    normalize_std: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
     export_params: bool = True
     do_constant_folding: bool = True
     
@@ -728,6 +734,12 @@ class ONNXExporter:
             # Clear existing metadata
             del model.metadata_props[:]
             
+            # Serialize vocabulary
+            vocab_json = self.vocab.to_json()
+            vocab_bytes = vocab_json.encode('utf-8')
+            vocab_sha = hashlib.sha256(vocab_bytes).hexdigest()
+            vocab_b64 = base64.b64encode(gzip.compress(vocab_bytes)).decode('utf-8')
+
             # Add metadata
             metadata = {
                 'model_description': self.config.model_description,
@@ -736,6 +748,12 @@ class ONNXExporter:
                 'export_date': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'num_tags': str(len(self.vocab.tag_to_index)),
                 'image_size': str(self.config.image_size),
+                'patch_size': str(self.config.patch_size),
+                'normalize_mean': json.dumps(self.config.normalize_mean),
+                'normalize_std': json.dumps(self.config.normalize_std),
+                'vocab_format_version': '1',
+                'vocab_sha256': vocab_sha,
+                'vocab_b64_gzip': vocab_b64,
                 'framework': 'PyTorch',
                 'framework_version': torch.__version__,
                 'onnx_version': onnx.__version__,
