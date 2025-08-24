@@ -47,6 +47,7 @@ class RunMetadata:
     patch_size: int
     model_path: Optional[str] = None
     num_tags: Optional[int] = None
+    vocab_embedded: bool = True  # Whether vocab came from model metadata
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
