@@ -15,8 +15,7 @@ do_constant_folding: true  # Optimize constants during export
 input_names:
   - input_image
 output_names:
-  - predictions
-  - scores
+  - scores  # Only export scores, not binary predictions (avoids threshold validation issues)
 
 # Dynamic Batching Configuration
 dynamic_batch_size: true  # Allow variable batch sizes
@@ -25,14 +24,18 @@ max_batch_size: 128
 dynamic_axes:  # Define dynamic dimensions
   input_image:
     0: batch_size
-  predictions:
-    0: batch_size
   scores:
     0: batch_size
 
 # Model Architecture Settings
 batch_size: 1  # Default batch size for export
 image_size: 640  # Input image size (must match training)
+
+# Preprocessing Parameters
+# These should match training values - defaults here are ImageNet normalization
+# Will be overridden by values from checkpoint if available
+normalize_mean: [0.485, 0.456, 0.406]  # RGB channel means
+normalize_std: [0.229, 0.224, 0.225]   # RGB channel stds
 
 # Optimization Settings
 optimize: true  # Apply optimization passes
