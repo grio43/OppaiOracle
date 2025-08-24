@@ -444,30 +444,47 @@ class SystemMonitor:
         with self._lock:
             if not self.running:
                 return
-            
+            # 1. Signal shutdown first to interrupt any blocking operations
+            self._shutdown_event.set()
+
+            # 2. Mark as not running
             self.running = False
             thread_to_join = self.thread
+            self.thread = None
 
-        # Shutdown executor first to cancel any ongoing metric collection
-        if hasattr(self, '_executor'):
-            self._executor.shutdown(wait=False)
-            
-        # Signal shutdown to interrupt any blocking operations
-        self._shutdown_event.set()            
-            
+        # 3. Wait for thread to exit (outside lock to avoid deadlock)
         if thread_to_join and thread_to_join.is_alive():
             thread_to_join.join(timeout=2) 
             if thread_to_join.is_alive():
                 logger.warning("System monitor thread did not stop gracefully within timeout")
-            
+
+        # 4. NOW shutdown executor after thread has exited
+        if hasattr(self, '_executor'):
+            try:
+                self._executor.shutdown(wait=True, timeout=1)
+            except Exception as e:
+                logger.debug(f"Error shutting down executor: {e}")
+
         logger.info("System monitoring stopped")
     
     def _monitor_loop(self):
         """Main monitoring loop with error handling"""
         while self.running:
             try:
+                # Check shutdown before submitting to executor
+                if self._shutdown_event.is_set():
+                    break
+
                 # Use executor with timeout for metric collection
-                future = self._executor.submit(self._collect_metrics_safe)
+                try:
+                    future = self._executor.submit(self._collect_metrics_safe)
+                except RuntimeError as e:
+                    # Executor was shut down, exit gracefully
+                    if "cannot schedule new futures after shutdown" in str(e):
+                        logger.debug("Executor shut down, exiting monitor loop")
+                        break
+                    raise
+
                 try:
                     metrics = future.result(timeout=self.config.system_metrics_interval * 0.8)
                 except concurrent.futures.TimeoutError:
