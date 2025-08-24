@@ -1382,24 +1382,11 @@ class SimplifiedDataset(Dataset):
         Carefully tuned for anime images to preserve colour accuracy while
         providing useful variation.  The pipeline excludes horizontal flips,
         which are handled explicitly in :meth:`__getitem__` to enable
-        orientation‑aware tag remapping.
+        orientation‑aware tag remapping. Also excludes spatial transforms
+        which should be applied before letterbox padding.
         """
         transforms: List[Any] = []
-        # Note: RandomResizedCrop will override letterbox resize, so only use one or the other
-        # If you want to use RandomResizedCrop, it should be done BEFORE letterbox in __getitem__
-        # or letterbox should be skipped entirely when this augmentation is active.
-        # For now, we'll comment it out to preserve letterbox behavior
-        """
-        if self.config.random_crop_scale != (1.0, 1.0):
-            transforms.append(
-                T.RandomResizedCrop(
-                    self.config.image_size,
-                    scale=self.config.random_crop_scale,
-                    ratio=(0.9, 1.1),
-                    interpolation=T.InterpolationMode.BICUBIC,  # LANCZOS not supported on tensors
-                )
-            )
-            """
+
         # Colour jitter with conservative values
         if self.config.color_jitter:
             transforms.append(
@@ -1807,6 +1794,32 @@ class SimplifiedDataset(Dataset):
                         logger.error(f"Cannot reshape tensor for {image_path}, using blank image")
                         image = torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32)
 
+            # Apply color augmentations BEFORE letterbox/padding
+            # This ensures padding areas remain consistent
+            if self.augmentation is not None and self.split == 'train':
+                try:
+                    image = self.augmentation(image)
+
+                    # Ensure augmented values are valid
+                    if torch.isnan(image).any() or torch.isinf(image).any():
+                        logger.warning(
+                            f"NaN/Inf detected after augmentation for {image_path}, skipping augmentation"
+                        )
+                        # Reload clean image
+                        image, _ = self._load_image(image_path)
+                        # Re-apply flip if it was done
+                        if was_flipped:
+                            image = TF.hflip(image)
+                    elif (image < 0).any() or (image > 1).any():
+                        logger.debug(
+                            f"Values outside [0,1] detected, clamping for {image_path}"
+                        )
+                        image = torch.clamp(image, 0.0, 1.0)
+                except Exception as e:
+                    logger.warning(
+                        f"Augmentation failed for {image_path}: {e}, skipping augmentation"
+                    )
+
             # Apply RandomResizedCrop BEFORE letterbox if configured (mutually exclusive)
             # This way we either use RandomResizedCrop OR letterbox, not both
             if (self.augmentation is not None and
@@ -1839,37 +1852,6 @@ class SimplifiedDataset(Dataset):
                     pad_color=self.config.pad_color,
                     patch_size=self.config.patch_size,
                 )
-            
-            # Apply additional augmentation (colour jitter, gamma) if enabled
-            # Wrap in try/except to handle augmentation failures gracefully
-            if self.augmentation is not None:
-                try:
-                    image = self.augmentation(image)
-
-                    # Ensure augmented values are valid
-                    if torch.isnan(image).any() or torch.isinf(image).any():
-                        logger.warning(
-                            f"NaN/Inf detected after augmentation for {image_path}, skipping augmentation"
-                        )
-                        # Reload clean image and apply letterbox
-                        image, _ = self._load_image(image_path)
-                        image, lb_info = letterbox_resize(
-                            image,
-                            target_size=self.config.image_size,
-                            pad_color=self.config.pad_color,
-                            patch_size=self.config.patch_size,
-                        )
-                    elif (image < 0).any() or (image > 1).any():
-                        logger.debug(
-                            f"Values outside [0,1] detected, clamping for {image_path}"
-                        )
-                        image = torch.clamp(image, 0.0, 1.0)
-
-                except Exception as e:
-                    logger.warning(
-                        f"Augmentation failed for {image_path}: {e}, skipping augmentation"
-                    )
-                    # Continue without augmentation
 
             # Normalise
             if image.dtype != torch.float32:
