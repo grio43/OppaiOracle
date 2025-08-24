@@ -2281,7 +2281,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         # All samples were errors, use original batch
         valid_batch = batch
 
-    images = torch.stack([item['image'] for item in valid_batch])
+    images_tensor = torch.stack([item['image'] for item in valid_batch])
     # Extract nested labels.  Tag labels are stacked into a 2D tensor and
     # rating labels are collected into a 1D tensor.
     tag_labels = torch.stack([item['labels']['tags'] for item in valid_batch])
@@ -2298,7 +2298,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
     # Derive a per-pixel padding mask (True=content, False=padding) so downstream
     # modules (e.g., ViT attention) can ignore padded regions.
-    B, C, H, W = images.shape
+    B, C, H, W = images_tensor.shape
     padding_mask = torch.ones((B, H, W), dtype=torch.bool)
     for i, pad in enumerate(metadata['pads']):
         if pad is None:
@@ -2312,12 +2312,12 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             padding_mask[i, :, :left] = False
         if right > 0:
             padding_mask[i, :, W - right:] = False
+    
+    # Return with 'images' (plural) to match training loop expectations
     return {
-        'image': images,
-        'labels': {
-            'tags': tag_labels,
-            'rating': rating_labels,
-        },
-        'metadata': metadata,
+        'images': images_tensor,           # Changed from 'image' to 'images'
+        'tag_labels': tag_labels,          # Flattened structure to match training expectations
+        'rating_labels': rating_labels,    # Flattened structure to match training expectations
         'padding_mask': padding_mask,
+        'metadata': metadata,
     }
