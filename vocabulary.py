@@ -356,9 +356,13 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
         if vocab_path.suffix == '.json':
             vocab = TagVocabulary()
             vocab.load_vocabulary(vocab_path)
+            # Verify the loaded vocabulary is valid
+            _verify_vocabulary_integrity(vocab, vocab_path)
             return vocab
         elif vocab_path.suffix == '.txt':
-            return TagVocabulary.from_file(vocab_path)
+            vocab = TagVocabulary.from_file(vocab_path)
+            _verify_vocabulary_integrity(vocab, vocab_path)
+            return vocab
 
     # Otherwise treat as directory
     if vocab_path.is_dir():
@@ -367,12 +371,16 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
         if vocab_json.exists():
             vocab = TagVocabulary()
             vocab.load_vocabulary(vocab_json)
+            # Verify the loaded vocabulary is valid
+            _verify_vocabulary_integrity(vocab, vocab_json)
             return vocab
 
         # Try text format
         vocab_file = vocab_path / "tags.txt"
         if vocab_file.exists():
-            return TagVocabulary.from_file(vocab_file)
+            vocab = TagVocabulary.from_file(vocab_file)
+            _verify_vocabulary_integrity(vocab, vocab_file)
+            return vocab
 
     # Fail loudly if vocabulary not found - no dummy fallback
     raise FileNotFoundError(
@@ -380,6 +388,22 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
         f"Tried: vocabulary.json and tags.txt. "
         f"Please ensure vocabulary.json exists at the specified location."
     )
+
+
+def _verify_vocabulary_integrity(vocab: TagVocabulary, source_path: Path) -> None:
+    """Verify that a loaded vocabulary contains real tags, not placeholders."""
+    placeholder_count = sum(
+        1 for tag in vocab.tag_to_index.keys()
+        if tag.startswith("tag_") and tag[4:].isdigit()
+    )
+
+    if placeholder_count > 100:  # Allow a few for backward compat, but not many
+        raise ValueError(
+            f"CRITICAL: Vocabulary at {source_path} contains {placeholder_count} placeholder tags.\n"
+            f"This vocabulary file is corrupted and contains 'tag_XXX' instead of real tags.\n"
+            f"The model would learn meaningless labels if trained with this vocabulary.\n"
+            f"Please regenerate the vocabulary from your dataset annotations."
+        )
 
 def create_dataset_config(vocab: TagVocabulary) -> Dict:
     """Create a configuration dictionary for dataset initialization.
