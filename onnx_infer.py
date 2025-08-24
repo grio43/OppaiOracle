@@ -99,10 +99,8 @@ def main():
             score = float(scores[idx])
             if score < args.threshold:
                 continue
+            # This will raise ValueError if placeholder detected
             tag_name = vocab.get_tag_from_index(int(idx))
-            # Skip placeholder tags in output
-            if tag_name.startswith('tag_') and len(tag_name) > 4 and tag_name[4:].isdigit():
-                continue
             tags.append(TagPrediction(name=tag_name, score=score))
 
         results.append(ImagePrediction(
