@@ -74,7 +74,7 @@ def setup_orientation_aware_training(
     json_dir: Path,
     vocab_path: Path,
     orientation_map_path: Optional[Path] = None,
-    random_flip_prob: float = 0.2,
+    random_flip_prob: float = 0.35,
     strict_orientation: bool = True,
     safety_mode: str = "conservative",
     skip_unmapped: bool = False
