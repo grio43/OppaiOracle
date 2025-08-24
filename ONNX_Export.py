@@ -466,16 +466,13 @@ class ONNXExporter:
         logger.info(f"Export variants: {self.config.export_variants}")
         
         results = {}
-        
+
         # Export variants
         for variant in self.config.export_variants:
-            logger.info(f"\nExporting variant: {variant}")
-            
+            logger.info(f"\nExporting variant: {variant}")            
             try:
                 if variant == "full":
                     results[variant] = self._export_full_model()
-                elif variant == "mobile":
-                    results[variant] = self._export_mobile_model()
                 elif variant == "quantized":
                     results[variant] = self._export_quantized_model()
                 else:
@@ -511,12 +508,23 @@ class ONNXExporter:
                 device=self.device
             )
             
-            # Ensure model is in FP32 for export (handles BF16 training case)
-            if self.model.dtype != torch.float32:
-                logger.info(f"Converting model from {self.model.dtype} to float32 for export")
+            # Get actual dtype from model parameters (ModelWrapper doesn't have .dtype attribute)
+            current_dtype = torch.float32  # Default assumption
+            try:
+                # Get dtype from first parameter
+                for param in self.model.parameters():
+                    current_dtype = param.dtype
+                    break
+            except Exception as e:
+                logger.warning(f"Could not determine model dtype: {e}, assuming float32")
+
+            # Ensure model is in FP32 for export (critical for BF16/FP16 trained models)
+            if current_dtype != torch.float32:
+                logger.info(f"Converting model from {current_dtype} to float32 for export")
                 self.model = self.model.float()
-                # Also ensure dummy input matches
-                dummy_input = dummy_input.float()
+
+            # Always ensure dummy input is float32
+            dummy_input = dummy_input.float()
 
             # Export
             logger.info(f"Exporting to {output_path}")
@@ -560,54 +568,6 @@ class ONNXExporter:
             logger.error(f"Failed to export full model: {e}")
             return None
     
-    def _export_mobile_model(self) -> Optional[Path]:
-        """Export optimized model for mobile deployment"""
-        base_path = Path(self.config.output_path)
-        mobile_path = base_path.parent / f"{base_path.stem}_mobile.onnx"
-        
-        try:
-            # Use smaller batch size for mobile
-            original_batch_size = self.config.batch_size
-            self.config.batch_size = 1
-            
-            # Create temp path
-            temp_path = base_path.parent / "temp_mobile.onnx"
-            
-            # Export
-            dummy_input = torch.randn(
-                1, 3, self.config.image_size, self.config.image_size,
-                device=self.device
-            )
-            
-            torch.onnx.export(
-                self.model,
-                dummy_input,
-                str(temp_path),
-                export_params=True,
-                opset_version=self.config.opset_version,
-                do_constant_folding=True,
-                input_names=self.config.input_names,
-                output_names=self.config.output_names,
-                dynamic_axes=None,  # Fixed batch size for mobile
-                verbose=False
-            )
-            
-            # Optimize for mobile
-            self._optimize_for_mobile(temp_path, mobile_path)
-            
-            # Clean up
-            if temp_path.exists():
-                temp_path.unlink()
-            
-            self.config.batch_size = original_batch_size
-            
-            logger.info(f"✓ Mobile model exported to {mobile_path}")
-            return mobile_path
-            
-        except Exception as e:
-            logger.error(f"Failed to export mobile model: {e}")
-            self.config.batch_size = original_batch_size
-            return None
     
     def _export_quantized_model(self) -> Optional[Path]:
         """Export quantized model"""
@@ -716,50 +676,6 @@ class ONNXExporter:
         except Exception as e:
             logger.warning(f"Basic optimization failed: {e}")
     
-    def _optimize_for_mobile(self, input_path: Path, output_path: Path):
-        """Optimize model specifically for mobile deployment"""
-        try:
-            from onnx import optimizer as onnx_optimizer
-            
-            # Load model
-            model = onnx.load(str(input_path))
-            
-            # Run ONNX optimizer passes suitable for mobile
-            passes = [
-                'eliminate_identity',
-                'eliminate_nop_dropout',
-                'eliminate_nop_monotone_argmax',
-                'eliminate_nop_pad',
-                'eliminate_nop_transpose',
-                'eliminate_unused_initializer',
-                'eliminate_deadend',
-                'fuse_consecutive_concats',
-                'fuse_consecutive_squeezes',
-                'fuse_consecutive_transposes',
-                'fuse_matmul_add_bias_into_gemm',
-                'simplify_lexsort',
-                'nop'
-            ]
-            
-            optimized_model = onnx_optimizer.optimize(model, passes)
-            
-            # Update model with shape inference
-            optimized_model = shape_inference.infer_shapes(optimized_model)
-            
-            # Save
-            onnx.save(optimized_model, str(output_path))
-            
-            # Try mobile-specific optimizer if available
-            try:
-                from onnxruntime.tools.mobile_optimizer import optimize_model
-                optimize_model(str(output_path), str(output_path))
-                logger.info("✓ Applied mobile-specific optimizations")
-            except ImportError:
-                logger.info("✓ Applied general optimizations (mobile optimizer not available)")
-                
-        except Exception as e:
-            logger.warning(f"Mobile optimization failed: {e}, using original model")
-            shutil.copy(str(input_path), str(output_path))
     
     def _quantize_dynamic(self, input_path: Path, output_path: Path):
         """Apply dynamic quantization"""
@@ -1157,7 +1073,7 @@ def main():
     parser.add_argument('--opset', type=int, default=16,
                         help='ONNX opset version')
     parser.add_argument('--variants', nargs='+', default=['full'],
-                        choices=['full', 'mobile', 'quantized'],
+                        choices=['full', 'quantized'],
                         help='Export variants to generate')
     parser.add_argument('--optimize', action='store_true', default=True,
                         help='Optimize exported model')
