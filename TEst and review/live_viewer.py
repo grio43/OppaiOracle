@@ -20,13 +20,12 @@ import sys
 from pathlib import Path as PathLib
 sys.path.append(str(PathLib(__file__).parent.parent))
 from vocabulary import verify_vocabulary_integrity
+from schemas import validate_schema
 
 # Terminal UI version using rich
 def extract_tags_from_result(result):
-    """Extract tags from result, supporting both new and legacy formats."""
-    # Try new schema first
+    """Extract tags from standardized result format."""
     if 'tags' in result and isinstance(result['tags'], list):
-        # New schema: tags is a list of {name, score} dicts
         tags = set()
         for tag in result['tags']:
             name = tag['name']
@@ -35,16 +34,8 @@ def extract_tags_from_result(result):
                 raise ValueError(f"Placeholder tag '{name}' detected in results. Vocabulary is corrupted.")
             tags.add(name)
         return tags
-    # Fall back to legacy schema
-    elif 'predicted_tags' in result:
-        tags = set()
-        for tag in result.get('predicted_tags', []):
-            # Fail fast on placeholder tags
-            if tag.startswith('tag_') and len(tag) > 4 and tag[4:].isdigit():
-                raise ValueError(f"Placeholder tag '{tag}' detected in results. Vocabulary is corrupted.")
-            tags.add(tag)
-        return tags
     else:
+        # For live viewer, return empty set if missing (partial data)
         return set()
 
 def run_terminal_viewer(jsonl_file: str, refresh_interval: float = 1.0):
@@ -163,9 +154,12 @@ def run_terminal_viewer(jsonl_file: str, refresh_interval: float = 1.0):
                 
                 # Update tag performance
                 predicted = extract_tags_from_result(result)
-                # Support both formats for ground truth
+                # Ground truth is in extended format only
                 ground_truth = set(result.get('ground_truth_tags', []))
-                
+                if not ground_truth:
+                    # Skip if no ground truth available
+                    continue
+
                 for tag in predicted & ground_truth:
                     self.tag_performance[tag]['tp'] += 1
                 for tag in predicted - ground_truth:

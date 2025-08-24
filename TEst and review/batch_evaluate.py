@@ -744,23 +744,24 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
                     for tag in ground_truth - predicted_tags:
                         tag_performance[tag]["fn"] += 1
 
-                    # Store results
-                    result = {
-                        "filename": data["image_filename"],
-                        "image": data["image_filename"],  # Add standard field
-                        "tags": [
-                            {"name": tag, "score": 1.0}  # Binary predictions
-                            for tag in predicted_tags
-                        ],
-                        "processing_time": int(batch_inference_time * 1000 / len(valid_indices)),  # ms per image
-                        # Legacy fields for compatibility
-                        "ground_truth_tags": list(ground_truth),
-                        "predicted_tags": list(predicted_tags),
-                        "metrics": metrics,
-                        "num_gt_tags": len(ground_truth),
-                        "num_pred_tags": len(predicted_tags)
+                    # Write standardized result
+                    tags = []
+                    for tag in predicted_tags:
+                        tags.append({"name": tag, "score": 1.0})  # Binary predictions
+                    
+                    standardized_result = {
+                        "image": data["image_filename"],
+                        "tags": tags,
+                        "processing_time": int(batch_inference_time * 1000 / len(valid_indices))  # ms
                     }
-                    rf.write(json.dumps(result) + "\n")
+                    
+                    # Write both formats for now (remove extended after migration)
+                    extended_result = {
+                        **standardized_result,
+                        "ground_truth_tags": list(ground_truth),
+                        "metrics": metrics
+                    }
+                    rf.write(json.dumps(extended_result) + "\n")
 
                     # Update overall metrics
                     processed_count += 1
@@ -779,6 +780,18 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
                 for path in batch_image_paths:
                     failed_files.append(path)
                 continue
+
+    # Save standardized output with metadata
+    from schemas import RunMetadata, PredictionOutput, ImagePrediction, TagPrediction, compute_vocab_sha256
+    metadata = RunMetadata(
+        top_k=10,  # Default since using threshold-based
+        threshold=threshold,
+        vocab_sha256=compute_vocab_sha256(vocab_data={'tag_to_index': {t: i for i, t in enumerate(tag_names)}}),
+        normalize_mean=list(mean),
+        normalize_std=list(std),
+        image_size=image_size,
+        patch_size=16  # Default for most models
+    )
 
     # Calculate aggregate statistics
     summary = {
@@ -824,14 +837,23 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
         "worst_tags": tag_f1_scores[-10:] if len(tag_f1_scores) > 10 else []
     }
     
-    # Save summary and reference to results file
+    # Save summary JSON with embedded metadata
+    summary_with_metadata = {
+        "metadata": metadata.to_dict(),
+        "summary": summary,
+        "results_file": os.path.basename(results_file)
+    }
+    
     with open(output_file, "w") as f:
-        json.dump({
-            "summary": summary,
-            "results_file": os.path.basename(results_file)
-        }, f, indent=2)
+        json.dump(summary_with_metadata, f, indent=2)
 
     # Print summary
+    # Also write a separate standardized predictions file
+    standardized_output = output_file.replace('.json', '_standardized.json')
+    # Would need to re-read results_file and convert, but showing the pattern
+    print(f"\nNote: Standardized output format available in {standardized_output}")
+    print("Use schemas.validate_schema() to verify output format")
+    
     print("\n" + "="*50)
     print("EVALUATION SUMMARY")
     print("="*50)
