@@ -35,7 +35,7 @@ import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler, Sampler
 import torchvision.transforms as T
 from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 import torchvision.transforms.functional as TF
@@ -1140,6 +1140,50 @@ class WorkingSetSampler:
         
         self.epoch_count += 1
         return epoch_indices
+
+
+class EpochAwareWeightedSampler(Sampler):
+    """Weighted sampler that properly reshuffles each epoch.
+
+    This sampler ensures different sampling patterns each epoch while
+    maintaining reproducibility through epoch-specific seeding.
+    """
+
+    def __init__(self, weights, num_samples, replacement=True, base_seed=None):
+        """Initialize the epoch-aware weighted sampler.
+
+        Args:
+            weights: Sampling weights for each sample
+            num_samples: Number of samples to draw
+            replacement: Whether to sample with replacement
+            base_seed: Base seed for reproducibility
+        """
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.num_samples = num_samples
+        self.replacement = replacement
+        self.base_seed = base_seed if base_seed is not None else int(torch.empty((), dtype=torch.int64).random_().item())
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        """Set epoch for deterministic shuffling."""
+        self.epoch = epoch
+
+    def __iter__(self):
+        # Create epoch-specific generator for reproducible shuffling
+        generator = torch.Generator()
+        generator.manual_seed(self.base_seed + self.epoch)
+
+        # Sample with epoch-specific randomness
+        indices = torch.multinomial(
+            self.weights,
+            self.num_samples,
+            self.replacement,
+            generator=generator
+        )
+        return iter(indices.tolist())
+
+    def __len__(self):
+        return self.num_samples
 
 def _compute_cache_key(
     image_path: str,
@@ -2386,6 +2430,10 @@ def create_dataloaders(
     # Create datasets
     train_dataset = SimplifiedDataset(cfg, train_files, split='train', vocab=vocab)
     val_dataset = SimplifiedDataset(cfg, val_files, split='val', vocab=vocab)
+
+    # Determine base seed for reproducible sampling and workers
+    base_seed = int(seed if seed is not None else torch.initial_seed() % (2**31 - 1))
+
     # Choose sampler
     train_sampler: Optional[Any] = None
     if distributed:
@@ -2403,19 +2451,20 @@ def create_dataloaders(
         else:
             weights = train_dataset.sample_weights
             num_samples = len(train_dataset)
-        train_sampler = WeightedRandomSampler(
+        # Use epoch-aware sampler for proper shuffling between epochs
+        train_sampler = EpochAwareWeightedSampler(
             weights=weights,
             num_samples=num_samples,
             replacement=True,
+            base_seed=base_seed
         )
         logger.info(
-            f"Using WeightedRandomSampler with {len(weights)} weights for {num_samples} samples"
+            f"Using EpochAwareWeightedSampler with {len(weights)} weights for {num_samples} samples"
         )
     # Determine validation batch size
     val_bs = val_batch_size or batch_size
 
     # Deterministic generator and per-worker init
-    base_seed = int(seed if seed is not None else torch.initial_seed() % (2**31 - 1))
     generator = torch.Generator()
     generator.manual_seed(base_seed)
     worker_init_fn = _make_worker_init_fn(base_seed, log_queue)
