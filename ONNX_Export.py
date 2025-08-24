@@ -44,7 +44,7 @@ except ImportError:
 
 # Import our modules
 from model_architecture import create_model, VisionTransformerConfig
-from vocabulary import load_vocabulary_for_training
+from vocabulary import load_vocabulary_for_training, TagVocabulary
 
 
 # Configure logging
@@ -60,7 +60,7 @@ class ONNXExportConfig:
     """Configuration for ONNX export"""
     # Model paths
     checkpoint_path: str
-    vocab_dir: str
+    vocab_dir: str = "/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json"
     output_path: str = "model.onnx"
     
     # Export settings
@@ -163,13 +163,65 @@ class ONNXExporter:
         
         # Load vocabulary
         try:
-            self.vocab = load_vocabulary_for_training(Path(config.vocab_dir))
+            # Try to load vocabulary from the specified path
+            vocab_path = Path(config.vocab_dir)
+            
+            # If it's a directory, look for vocabulary.json inside it
+            if vocab_path.is_dir():
+                vocab_path = vocab_path / "vocabulary.json"
+            
+            # Use the canonical path if not found
+            if not vocab_path.exists():
+                logger.warning(f"Vocabulary not found at {vocab_path}, trying canonical path")
+                vocab_path = Path("/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json")
+            
+            if not vocab_path.exists():
+                raise FileNotFoundError(
+                    f"Vocabulary file not found at {vocab_path}. "
+                    f"Cannot export model without valid vocabulary."
+                )
+            
+            logger.info(f"Loading vocabulary from {vocab_path}")
+            self.vocab = TagVocabulary(vocab_path)
             logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
             self.num_tags = len(self.vocab.tag_to_index)
+
+            # CRITICAL: Verify vocabulary before export
+            self._verify_vocabulary()
+
         except Exception as e:
             logger.error(f"Failed to load vocabulary: {e}")
             raise
+
+    def _verify_vocabulary(self):
+        """Verify that vocabulary contains real tags, not placeholders"""
+        logger.info("Verifying vocabulary integrity before export...")
         
+        placeholder_tags = []
+        real_tags_sample = []
+        
+        for tag, idx in self.vocab.tag_to_index.items():
+            if tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit():
+                placeholder_tags.append(tag)
+            elif tag not in ["<PAD>", "<UNK>"]:
+                real_tags_sample.append(tag)
+                if len(real_tags_sample) >= 20:  # Sample more tags for verification
+                    break
+        
+        # Check for placeholder tags
+        if len(placeholder_tags) > 100:  # More than 100 placeholders is definitely wrong
+            raise ValueError(
+                f"CRITICAL: Vocabulary contains {len(placeholder_tags)} placeholder tags!\n"
+                f"Examples: {placeholder_tags[:10]}\n"
+                f"This vocabulary is corrupted with 'tag_XXX' placeholders instead of real tags.\n"
+                f"The exported ONNX model would be unusable.\n"
+                f"Please use the correct vocabulary.json from training."
+            )
+        
+        logger.info(f"✓ Vocabulary verification passed")
+        logger.info(f"  Sample real tags: {real_tags_sample[:5]}")
+        
+
         # Load model
         self.model = self._load_model()
         self.model_config = self._extract_model_config()
@@ -296,7 +348,21 @@ class ONNXExporter:
         except Exception as e:
             logger.error(f"Failed to create model: {e}")
             raise
-        
+
+        # Additional check: Verify the model's tag_head matches vocabulary
+        if hasattr(model, 'tag_head'):
+            tag_head_out_features = model.tag_head.out_features
+            if tag_head_out_features != num_tags:
+                logger.warning(
+                    f"Model tag_head output size ({tag_head_out_features}) doesn't match "
+                    f"vocabulary size ({num_tags}). This may cause issues."
+                )
+                # Try to fix by recreating the tag_head
+                if hasattr(model, 'config'):
+                    model.config.num_tags = num_tags
+                    model.tag_head = nn.Linear(model.tag_head.in_features, num_tags)
+                    logger.info(f"Recreated tag_head with {num_tags} outputs")
+
         
         # Handle DDP weights
         if any(k.startswith('module.') for k in state_dict.keys()):
@@ -321,6 +387,17 @@ class ONNXExporter:
     def export(self):
         """Export model to ONNX format"""
         logger.info("Starting ONNX export...")
+
+        # Final vocabulary check before export
+        if not hasattr(self, 'vocab') or self.vocab is None:
+            raise RuntimeError("Vocabulary not loaded, cannot export")
+        
+        if len(self.vocab.tag_to_index) < 100:
+            raise ValueError(
+                f"Vocabulary too small ({len(self.vocab.tag_to_index)} tags). "
+                f"This appears to be an invalid vocabulary."
+            )
+
         logger.info(f"Export variants: {self.config.export_variants}")
         
         results = {}
@@ -903,7 +980,7 @@ def main():
     
     parser = argparse.ArgumentParser(description='Export Anime Tagger model to ONNX')
     parser.add_argument('checkpoint', type=str, help='Path to model checkpoint')
-    parser.add_argument('vocab_dir', type=str, help='Path to vocabulary directory')
+    parser.add_argument('vocab_dir', type=str, nargs='?', default="/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json", help='Path to vocabulary directory or file')
     parser.add_argument('-o', '--output', type=str, default='model.onnx',
                         help='Output ONNX model path')
     parser.add_argument('-b', '--batch-size', type=int, default=1,
@@ -930,7 +1007,16 @@ def main():
                         help='Number of benchmark iterations')
     
     args = parser.parse_args()
+
+    # Verify checkpoint exists
+    if not Path(args.checkpoint).exists():
+        logger.error(f"Checkpoint not found: {args.checkpoint}")
+        sys.exit(1)
     
+    # Log vocabulary path being used
+    logger.info(f"Using vocabulary: {args.vocab_dir}")
+    logger.info(f"Checkpoint: {args.checkpoint}")
+
     # Create config
     config = ONNXExportConfig(
         checkpoint_path=args.checkpoint,
