@@ -1183,8 +1183,19 @@ class SimplifiedDataset(Dataset):
             split: str,
             vocab: TagVocabulary,
         ) -> None:
-            # Create a deep copy of config to avoid mutation by downstream components
-            config = copy.deepcopy(config)
+            # Extract unpicklable objects before copying
+            stats_queue = config.stats_queue if hasattr(config, 'stats_queue') else None
+
+            # Create a shallow copy of config to avoid mutation by downstream components
+            # Deep copy fails with multiprocessing.Queue objects
+            if isinstance(config, SimplifiedDataConfig):
+                # For dataclass, create a new instance with same values
+                config = SimplifiedDataConfig(**{f.name: getattr(config, f.name)
+                                                for f in config.__dataclass_fields__.values()})
+            else:
+                config = copy.copy(config)
+
+            config.stats_queue = stats_queue  # Restore the queue reference
 
             assert split in {'train', 'val', 'test'}, f"Unknown split '{split}'"
             self.config = config
@@ -1225,7 +1236,7 @@ class SimplifiedDataset(Dataset):
             # Initialize augmentation stats
             self.aug_stats = AugmentationStats() if config.collect_augmentation_stats else None
             self.stats_queue = config.stats_queue  # Queue for sending stats to main process
-            self.stats_batch_interval = 10  # Send stats every N batches
+            self.stats_batch_interval = 10  # Send stats every N batches  
             self.batch_counter = 0
             self.color_jitter_transform = None  # Will be set in _setup_augmentation
             
@@ -2001,6 +2012,21 @@ class SimplifiedDataset(Dataset):
                     tags = swapped_tags
                     if self.orientation_monitor:
                         self.orientation_monitor.check_health(self.orientation_handler)
+
+                    # Send orientation stats to queue periodically (similar to aug stats)
+                    if (self.stats_queue and 
+                        self._orientation_stats['processed'] % self.stats_batch_interval == 0):
+                        try:
+                            stats_copy = {
+                                'flips': self._orientation_stats.get('flips', 0),
+                                'skipped': self._orientation_stats.get('skipped', 0),
+                                'processed': self._orientation_stats.get('processed', 0)
+                            }
+                            self.stats_queue.put_nowait(('orientation_stats', stats_copy))
+                            # Reset local counters after sending
+                            self._orientation_stats = {'flips': 0, 'skipped': 0, 'processed': 0}
+                        except queue.Full:
+                            pass  # Queue full, skip this batch
 
                 # Track color jitter if applied
                 if self.augmentation is not None and self.split == 'train':
