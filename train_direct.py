@@ -790,18 +790,19 @@ def train_with_orientation_tracking():
             }
         }
 
-        # Save checkpoint
-        checkpoint_manager.save_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            scheduler=None,
-            epoch=epoch + 1,
-            step=global_step,
-            metrics={"train_loss": avg_train_loss, "val_loss": avg_val_loss},
-            training_state=training_state,
-            is_best=is_best,
-            config={**config, **checkpoint_metadata}  # Include metadata
-        )
+        # Save checkpoint on primary process only
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            checkpoint_manager.save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scheduler=None,
+                epoch=epoch + 1,
+                step=global_step,
+                metrics={"train_loss": avg_train_loss, "val_loss": avg_val_loss},
+                training_state=training_state,
+                is_best=is_best,
+                config={**config, **checkpoint_metadata}  # Include metadata
+            )
 
         # Log orientation statistics at end of epoch
         if config["random_flip_prob"] > 0 and aggregated_orientation_stats['processed'] > 0:
