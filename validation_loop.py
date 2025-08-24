@@ -53,6 +53,7 @@ from HDF5_loader import create_dataloaders, SimplifiedDataConfig
 from training_utils import DistributedTrainingHelper
 from model_architecture import create_model, VisionTransformerConfig
 from model_metadata import ModelMetadata
+from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
 
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,8 @@ class ValidationRunner:
         # Setup output directory
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.vocab_sha256 = "unknown"
+        self.patch_size = 16  # Default
         
         # Setup plotting directory
         self.plot_dir = Path(config.plot_dir)
@@ -164,6 +167,8 @@ class ValidationRunner:
                     logger.info(
                         f"Successfully loaded embedded vocabulary with {len(self.vocab.tag_to_index)} tags"
                     )
+                    # Compute vocabulary hash
+                    self.vocab_sha256 = compute_vocab_sha256(vocab_data=vocab_data)
                 except Exception as e:
                     logger.error(f"Failed to use embedded vocabulary: {e}")
                     vocab_loaded = False
@@ -181,9 +186,12 @@ class ValidationRunner:
                 for path in [DEFAULT_VOCAB_PATH, PROJECT_ROOT / "vocabulary/vocabulary.json"]:
                     if path.exists():
                         self.vocab = TagVocabulary(path)
+                        vocab_path = path
                         break
                 else:
                     raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
+            # Compute vocabulary hash for external file
+            self.vocab_sha256 = compute_vocab_sha256(vocab_path=vocab_path)
 
         logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
 
@@ -323,6 +331,14 @@ class ValidationRunner:
                     logger.info(f"Found preprocessing params in checkpoint: {preprocessing}")
                     # Store for later use
                     self.preprocessing_params = preprocessing
+                    self.patch_size = preprocessing.get('patch_size', 16)
+                else:
+                    self.preprocessing_params = {
+                        'normalize_mean': [0.5, 0.5, 0.5],
+                        'normalize_std': [0.5, 0.5, 0.5],
+                        'image_size': 640,
+                        'patch_size': 16
+                    }
             elif 'normalization_params' in checkpoint:
                 # Legacy format
                 norm = checkpoint['normalization_params']
@@ -453,6 +469,7 @@ class ValidationRunner:
         all_predictions = []
         all_targets = []
         all_metadata = []
+        all_processing_times = []  # Track per-image times
         
         # Measure inference time
         inference_times = []
@@ -475,7 +492,9 @@ class ValidationRunner:
                 if self.config.measure_inference_time and torch.cuda.is_available():
                     torch.cuda.synchronize()
                     inference_time = time.time() - start_time
-                    inference_times.append(inference_time / images.shape[0])  # Per image
+                    per_image_time = (inference_time / images.shape[0]) * 1000  # Convert to ms
+                    inference_times.append(per_image_time / 1000)  # Keep in seconds for backward compat
+                    all_processing_times.extend([per_image_time] * images.shape[0])
                 
                 # Handle hierarchical output
                 if logits.dim() == 3:
@@ -538,7 +557,9 @@ class ValidationRunner:
         
         # Save predictions if requested
         if self.config.save_predictions:
-            self._save_predictions(all_predictions, all_targets, all_metadata)
+            self._save_predictions_standardized(
+                all_predictions, all_targets, all_metadata, all_processing_times
+            )
         
         # Per-image results
         if self.config.save_per_image_results:
@@ -933,6 +954,64 @@ class ValidationRunner:
         safe_name = tag_name.replace('/', '_').replace(' ', '_')
         plt.savefig(tag_dir / f'pr_curve_{safe_name}.png')
         plt.close()
+
+    def _save_predictions_standardized(self, predictions: torch.Tensor, targets: torch.Tensor, 
+                                      metadata: List, processing_times: List):
+        """Save predictions in standardized format."""
+        logger.info("Saving predictions in standardized format...")
+
+        # Create metadata
+        run_metadata = RunMetadata(
+            top_k=self.config.prediction_threshold,  # Using threshold as proxy for top_k
+            threshold=self.config.prediction_threshold,
+            vocab_sha256=self.vocab_sha256,
+            normalize_mean=list(self.preprocessing_params.get('normalize_mean', [0.5, 0.5, 0.5])),
+            normalize_std=list(self.preprocessing_params.get('normalize_std', [0.5, 0.5, 0.5])),
+            image_size=self.preprocessing_params.get('image_size', 640),
+            patch_size=self.patch_size,
+            model_path=str(self.config.checkpoint_path or self.config.model_path),
+            num_tags=self.num_tags
+        )
+
+        # Create image predictions
+        results = []
+        for i in range(len(predictions)):
+            # Get predictions for this image
+            pred = predictions[i]
+
+            # Get top predictions above threshold
+            scores, indices = torch.topk(pred, min(20, len(pred)))  # Top 20 by default
+
+            # Filter by threshold
+            mask = scores >= self.config.prediction_threshold
+            scores = scores[mask]
+            indices = indices[mask]
+
+            # Create tag predictions
+            tags = []
+            for score, idx in zip(scores.tolist(), indices.tolist()):
+                tag_name = self.vocab.get_tag_from_index(idx)
+                tags.append(TagPrediction(name=tag_name, score=score))
+
+            # Get image identifier
+            image_id = metadata[i].get('path', metadata[i].get('image_id', f'image_{i}')) if i < len(metadata) else f'image_{i}'
+
+            # Get processing time if available
+            proc_time = processing_times[i] if i < len(processing_times) else None
+
+            result = ImagePrediction(
+                image=image_id,
+                tags=tags,
+                processing_time=proc_time
+            )
+            results.append(result)
+
+        # Save as standardized JSON
+        output = PredictionOutput(metadata=run_metadata, results=results)
+        save_path = self.output_dir / 'predictions_standardized.json'
+        output.save(save_path)
+
+        logger.info(f"Saved standardized predictions to {save_path}")
     
     def _save_predictions(self, predictions: torch.Tensor, targets: torch.Tensor, metadata: List):
         """Save raw predictions to file"""
