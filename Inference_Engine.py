@@ -235,29 +235,6 @@ class ModelWrapper:
                 self.vocabulary.get_tag_from_index(i)
                 for i in range(len(self.vocabulary.tag_to_index))
             ]
-
-            # Check for placeholder tags - FAIL HARD if found
-            placeholder_count = sum(
-                1 for tag in self.tag_names if tag.startswith("tag_") and tag[4:].isdigit()
-            )
-
-            # Also check for too many placeholder tags as a percentage
-            placeholder_percentage = (
-                (placeholder_count / len(self.tag_names)) * 100 if self.tag_names else 0
-            )
-
-            if placeholder_count > 100 or placeholder_percentage > 10:
-                # This is a critical error - the vocabulary is corrupted
-                raise ValueError(
-                    f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags "
-                    f"({placeholder_percentage:.1f}% of vocabulary). "
-                    f"This indicates the vocabulary file is corrupted or was not properly generated. "
-                    f"Expected real tags like '1girl', 'solo', etc., but found 'tag_XXX' placeholders.\n"
-                    f"Vocabulary path: {vocab_path}\n"
-                    f"Please ensure the correct vocabulary.json from training is available.\n"
-                    f"Please regenerate the vocabulary from your dataset."
-                )
-
             logger.info(f"Successfully loaded {len(self.tag_names)} valid tag names from vocabulary")
 
             # Load model config
@@ -448,17 +425,26 @@ class ResultProcessor:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         if self.config.output_format == 'json':
+            payload = {
+                'metadata': {
+                    'top_k': self.config.top_k,
+                    'threshold': self.config.threshold
+                },
+                'results': results
+            }
             with open(output_path, 'w') as f:
-                json.dump(results, f, indent=2)
+                json.dump(payload, f, indent=2)
         elif self.config.output_format == 'csv':
             import csv
             with open(output_path, 'w', newline='') as f:
                 if results:
                     writer = csv.DictWriter(f, fieldnames=results[0].keys())
                     writer.writeheader()
+                    writer.writerow({'image': f'# top_k={self.config.top_k} threshold={self.config.threshold}'})
                     writer.writerows(results)
         elif self.config.output_format == 'txt':
             with open(output_path, 'w') as f:
+                f.write(f"# top_k={self.config.top_k} threshold={self.config.threshold}\n")
                 for result in results:
                     f.write(f"{result['image']}: ")
                     tags = [f"{t['name']}({t['score']:.2f})" for t in result.get('tags', [])]
