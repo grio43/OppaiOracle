@@ -27,14 +27,23 @@ def extract_tags_from_result(result):
     # Try new schema first
     if 'tags' in result and isinstance(result['tags'], list):
         # New schema: tags is a list of {name, score} dicts
-        return {tag['name'] for tag in result['tags'] \
-                if not (tag['name'].startswith('tag_') and \
-                       len(tag['name']) > 4 and \
-                       tag['name'][4:].isdigit())}
+        tags = set()
+        for tag in result['tags']:
+            name = tag['name']
+            # Fail fast on placeholder tags
+            if name.startswith('tag_') and len(name) > 4 and name[4:].isdigit():
+                raise ValueError(f"Placeholder tag '{name}' detected in results. Vocabulary is corrupted.")
+            tags.add(name)
+        return tags
     # Fall back to legacy schema
     elif 'predicted_tags' in result:
-        return {tag for tag in result.get('predicted_tags', [])
-                if not (tag.startswith('tag_') and len(tag) > 4 and tag[4:].isdigit())}
+        tags = set()
+        for tag in result.get('predicted_tags', []):
+            # Fail fast on placeholder tags
+            if tag.startswith('tag_') and len(tag) > 4 and tag[4:].isdigit():
+                raise ValueError(f"Placeholder tag '{tag}' detected in results. Vocabulary is corrupted.")
+            tags.add(tag)
+        return tags
     else:
         return set()
 
