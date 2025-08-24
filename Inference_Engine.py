@@ -236,14 +236,25 @@ class ModelWrapper:
                 for i in range(len(self.vocabulary.tag_to_index))
             ]
 
-            # Check for placeholder tags - fail if found
+            # Check for placeholder tags - FAIL HARD if found
             placeholder_count = sum(
                 1 for tag in self.tag_names if tag.startswith("tag_") and tag[4:].isdigit()
             )
-            if placeholder_count > 0:
+
+            # Also check for too many placeholder tags as a percentage
+            placeholder_percentage = (
+                (placeholder_count / len(self.tag_names)) * 100 if self.tag_names else 0
+            )
+
+            if placeholder_count > 100 or placeholder_percentage > 10:
+                # This is a critical error - the vocabulary is corrupted
                 raise ValueError(
-                    f"Vocabulary contains {placeholder_count} placeholder tags (tag_XXX). "
+                    f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags "
+                    f"({placeholder_percentage:.1f}% of vocabulary). "
                     f"This indicates the vocabulary file is corrupted or was not properly generated. "
+                    f"Expected real tags like '1girl', 'solo', etc., but found 'tag_XXX' placeholders.\n"
+                    f"Vocabulary path: {vocab_path}\n"
+                    f"Please ensure the correct vocabulary.json from training is available.\n"
                     f"Please regenerate the vocabulary from your dataset."
                 )
 
