@@ -753,9 +753,30 @@ class ONNXExporter:
             
             # Use ModelMetadata to prepare vocabulary for embedding
             temp_checkpoint: Dict[str, Any] = {}
+            vocab_embedded_successfully = False
             vocab_path = Path(self.config.vocab_dir) / "vocabulary.json" if Path(self.config.vocab_dir).is_dir() else Path(self.config.vocab_dir)
             if vocab_path.exists():
                 temp_checkpoint = ModelMetadata.embed_vocabulary(temp_checkpoint, vocab_path)
+                # Check if embedding was successful by verifying non-empty values
+                vocab_b64 = temp_checkpoint.get('vocab_b64_gzip', '')
+                vocab_sha = temp_checkpoint.get('vocab_sha256', '')
+                if vocab_b64 and vocab_sha:
+                    # Validate the embedded vocabulary data
+                    try:
+                        import base64
+                        import gzip
+                        import hashlib
+
+                        # Verify the embedded data is valid and checksum matches
+                        vocab_bytes = gzip.decompress(base64.b64decode(vocab_b64))
+                        computed_sha = hashlib.sha256(vocab_bytes).hexdigest()
+                        if computed_sha == vocab_sha:
+                            vocab_embedded_successfully = True
+                            logger.info(f"\u2713 Vocabulary successfully embedded (SHA256: {vocab_sha[:8]}...)")
+                        else:
+                            logger.warning(f"Vocabulary checksum mismatch: expected {vocab_sha}, got {computed_sha}")
+                    except Exception as e:
+                        logger.warning(f"Failed to validate embedded vocabulary: {e}")
 
             # Add metadata
             metadata = {
@@ -768,15 +789,19 @@ class ONNXExporter:
                 'patch_size': str(self.config.patch_size),
                 'normalize_mean': json.dumps(self.config.normalize_mean),
                 'normalize_std': json.dumps(self.config.normalize_std),
-                'vocab_format_version': temp_checkpoint.get('vocab_format_version', '1'),
-                'vocab_sha256': temp_checkpoint.get('vocab_sha256', ''),
-                'vocab_b64_gzip': temp_checkpoint.get('vocab_b64_gzip', ''),
                 'framework': 'PyTorch',
                 'framework_version': torch.__version__,
                 'onnx_version': onnx.__version__,
                 'opset_version': str(self.config.opset_version),
                 'device': str(self.device),
             }
+
+            # Only add vocabulary metadata if embedding was successful
+            # This prevents empty strings from being added to metadata
+            if vocab_embedded_successfully:
+                metadata['vocab_format_version'] = temp_checkpoint.get('vocab_format_version', '1')
+                metadata['vocab_sha256'] = temp_checkpoint['vocab_sha256']
+                metadata['vocab_b64_gzip'] = temp_checkpoint['vocab_b64_gzip']
             
             for key, value in metadata.items():
                 meta = model.metadata_props.add()
@@ -785,8 +810,12 @@ class ONNXExporter:
             
             # Save model
             onnx.save(model, str(model_path))
-            logger.info("✓ Metadata added to model")
-            
+
+            if vocab_embedded_successfully:
+                logger.info("✓ Metadata added to model (including embedded vocabulary)")
+            else:
+                logger.info("✓ Metadata added to model (external vocabulary required for inference)")
+
         except Exception as e:
             logger.warning(f"Failed to add metadata: {e}")
     
