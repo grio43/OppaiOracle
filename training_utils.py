@@ -36,6 +36,15 @@ import torch.backends.cudnn as cudnn
 
 logger = logging.getLogger(__name__)
 
+# Import ModelMetadata at module level to avoid import issues
+try:
+    from model_metadata import ModelMetadata
+    MODEL_METADATA_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"ModelMetadata module not available: {e}")
+    logger.warning("Checkpoints will not include embedded vocabulary")
+    MODEL_METADATA_AVAILABLE = False
+
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
 VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
@@ -510,8 +519,7 @@ class CheckpointManager:
         config: Optional[Dict] = None
     ) -> Path:
         """Save a checkpoint"""
-
-        from model_metadata import ModelMetadata
+        global MODEL_METADATA_AVAILABLE
 
         # Prepare checkpoint data
         checkpoint = {
@@ -541,26 +549,50 @@ class CheckpointManager:
         # Load and embed vocabulary if available
         vocab_path = Path(config.get('vocab_path', VOCAB_PATH) if config else VOCAB_PATH)
         if vocab_path.exists():
-            # Use ModelMetadata helper to embed vocabulary
-            checkpoint = ModelMetadata.embed_vocabulary(checkpoint, vocab_path)
+            if MODEL_METADATA_AVAILABLE:
+                # Use ModelMetadata helper to embed vocabulary
+                checkpoint = ModelMetadata.embed_vocabulary(checkpoint, vocab_path)
+            else:
+                logger.error(f"Cannot embed vocabulary - ModelMetadata module not available")
         else:
             logger.error(f"Vocabulary file not found at {vocab_path} - checkpoint will not be self-contained!")
+            MODEL_METADATA_AVAILABLE = False  # Prevent trying to use it for preprocessing params
 
         # Embed preprocessing parameters
         if config:
-            # Use ModelMetadata helper to embed preprocessing params
-            checkpoint = ModelMetadata.embed_preprocessing_params(
-                checkpoint,
-                normalize_mean=tuple(config.get('normalize_mean', [0.5, 0.5, 0.5])),
-                normalize_std=tuple(config.get('normalize_std', [0.5, 0.5, 0.5])),
-                image_size=config.get('image_size', 640),
-                patch_size=config.get('patch_size', 16)
-            )
+            if MODEL_METADATA_AVAILABLE:
+                # Use ModelMetadata helper to embed preprocessing params
+                checkpoint = ModelMetadata.embed_preprocessing_params(
+                    checkpoint,
+                    normalize_mean=tuple(config.get('normalize_mean', [0.5, 0.5, 0.5])),
+                    normalize_std=tuple(config.get('normalize_std', [0.5, 0.5, 0.5])),
+                    image_size=config.get('image_size', 640),
+                    patch_size=config.get('patch_size', 16)
+                )
+            else:
+                # Fallback: embed preprocessing params directly
+                checkpoint['preprocessing_params'] = {
+                    'normalize_mean': list(config.get('normalize_mean', [0.5, 0.5, 0.5])),
+                    'normalize_std': list(config.get('normalize_std', [0.5, 0.5, 0.5])),
+                    'image_size': config.get('image_size', 640),
+                    'patch_size': config.get('patch_size', 16),
+                }
+                logger.info("Embedded preprocessing params directly (ModelMetadata not available)")
         else:
-            # Use defaults if no config provided
-            checkpoint = ModelMetadata.embed_preprocessing_params(
-                checkpoint, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), 640, 16)
-            logger.info("Embedded default preprocessing params")
+            if MODEL_METADATA_AVAILABLE:
+                # Use defaults if no config provided
+                checkpoint = ModelMetadata.embed_preprocessing_params(
+                    checkpoint, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), 640, 16)
+                logger.info("Embedded default preprocessing params")
+            else:
+                # Fallback: embed defaults directly
+                checkpoint['preprocessing_params'] = {
+                    'normalize_mean': [0.5, 0.5, 0.5],
+                    'normalize_std': [0.5, 0.5, 0.5],
+                    'image_size': 640,
+                    'patch_size': 16,
+                }
+                logger.info("Embedded default preprocessing params directly")
 
         # Backwards compatibility info
         if hasattr(model_to_check, 'config'):
