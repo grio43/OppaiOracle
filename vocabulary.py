@@ -174,11 +174,21 @@ class TagVocabulary:
         
         Args:
             index: Tag index
-            
+
         Returns:
             Tag string, or <UNK> if index not found
+            
+        Raises:
+            ValueError: If the tag at the index is a placeholder (corrupted vocabulary)
         """
-        return self.index_to_tag.get(index, self.unk_token)
+        tag = self.index_to_tag.get(index, self.unk_token)
+        # Fail fast if we encounter a placeholder tag
+        if tag != self.unk_token and tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit():
+            raise ValueError(
+                f"CRITICAL: Placeholder tag '{tag}' detected at index {index}. "
+                f"The vocabulary is corrupted. Please regenerate from dataset annotations."
+            )
+        return tag
     
     def build_from_annotations(self, json_files: List[Path], top_k: int) -> None:
         """Build a vocabulary from a collection of JSON annotation files.

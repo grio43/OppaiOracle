@@ -203,13 +203,17 @@ def get_predictions_from_scores(scores, tag_names, threshold=0.5, vocabulary=Non
         for i, score in enumerate(score_vec):
             if score >= threshold:
                 if i < len(tag_names):
-                    tag = tag_names[i]
-                    # Skip placeholder tags silently
-                    if tag and tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit():
-                        continue
+                    # Use vocabulary if available for proper validation
+                    if vocabulary:
+                        tag = vocabulary.get_tag_from_index(i)  # Will raise if placeholder
+                    else:
+                        tag = tag_names[i]
+                        # Fail fast on placeholders
+                        if tag and tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit():
+                            raise ValueError(f"Placeholder tag '{tag}' detected. Vocabulary is corrupted.")
+                    predicted_tags.add(tag)
                 else:
                     raise IndexError(f"Tag index {i} out of range (vocab size: {len(tag_names)})")
-                predicted_tags.add(tag)
         batch_predictions.append(predicted_tags)
 
     return batch_predictions
@@ -515,7 +519,11 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
                     logits = outputs
                 scores = logits.sigmoid().float().cpu().numpy()
 
-                preds = get_predictions_from_scores(scores, tag_names, threshold)
+                # Pass vocabulary for proper validation
+                preds = get_predictions_from_scores(
+                    scores, tag_names, threshold, 
+                    vocabulary=temp_vocab if 'temp_vocab' in locals() else None
+                )
 
                 for j, src_idx in enumerate(valid_idx):
                     pred = preds[j]
