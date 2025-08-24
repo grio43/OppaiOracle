@@ -390,7 +390,7 @@ class SimplifiedDataConfig:
     # Augmentation settings
     augmentation_enabled: bool = True
     # Reduce flip probability because many tags encode left/right semantics
-    random_flip_prob: float = 0.2
+    random_flip_prob: float = 0.35
     # Safer default: fail if flips requested but mapping invalid
     strict_orientation_validation: bool = True
     skip_unmapped: bool = True
