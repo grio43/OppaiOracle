@@ -5,15 +5,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 
+# Import vocabulary verification
+import sys
+sys.path.append(str(Path(__file__).parent.parent))
+from vocabulary import verify_vocabulary_integrity
+
 def extract_tags_from_result(result):
     """Extract predicted tags from result, supporting both new and legacy formats."""
     # Try new schema first
     if 'tags' in result and isinstance(result['tags'], list):
         # New schema: tags is a list of {name, score} dicts
-        return [tag['name'] for tag in result['tags']]
+        # Filter out placeholder tags
+        return [tag['name'] for tag in result['tags']
+                if not (tag['name'].startswith('tag_') and 
+                       len(tag['name']) > 4 and 
+                       tag['name'][4:].isdigit())]
     # Fall back to legacy schema
     elif 'predicted_tags' in result:
-        return result.get('predicted_tags', [])
+        # Filter out placeholder tags
+        return [tag for tag in result.get('predicted_tags', [])
+                if not (tag.startswith('tag_') and len(tag) > 4 and tag[4:].isdigit())]
     else:
         return []
 
