@@ -14,7 +14,7 @@ flowchart TD
     TAGJSON --> HL
     ORIMAP --> ORH --> HL
     H5 --> HL
-    LMDB <---> HL
+    LMDB <--> HL
     HL --> BATCH[Batched tensors]
   end
 
@@ -57,7 +57,7 @@ flowchart TD
     ICONF --> PREP
     PREP --> IDS --> PRED --> PROC
     WRAP --> PRED
-    PROC <---> ICACHE
+    PROC <--> ICACHE
   end
 
   %% =========================
