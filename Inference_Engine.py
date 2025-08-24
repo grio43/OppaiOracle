@@ -459,8 +459,13 @@ class ResultProcessor:
             results.append({
                 'image': path,
                 'tags': tags,
-                'processing_time': None  # Will be filled by engine
+                'processing_time': None,  # Will be filled by engine  
             })
+
+            # Validate no placeholder tags in output
+            for tag_dict in tags:
+                if tag_dict['name'].startswith('tag_') and tag_dict['name'][4:].isdigit():
+                    raise ValueError(f"CRITICAL: Placeholder tag '{tag_dict['name']}' in output!")
         
         return results
     
@@ -473,7 +478,10 @@ class ResultProcessor:
             payload = {
                 'metadata': {
                     'top_k': self.config.top_k,
-                    'threshold': self.config.threshold
+                    'threshold': self.config.threshold,
+                    'normalize_mean': list(self.config.normalize_mean),
+                    'normalize_std': list(self.config.normalize_std),
+                    'image_size': self.config.image_size
                 },
                 'results': results
             }

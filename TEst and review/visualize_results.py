@@ -5,6 +5,29 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 
+def extract_tags_from_result(result):
+    """Extract predicted tags from result, supporting both new and legacy formats."""
+    # Try new schema first
+    if 'tags' in result and isinstance(result['tags'], list):
+        # New schema: tags is a list of {name, score} dicts
+        return [tag['name'] for tag in result['tags']]
+    # Fall back to legacy schema
+    elif 'predicted_tags' in result:
+        return result.get('predicted_tags', [])
+    else:
+        return []
+
+def extract_metrics_from_result(result):
+    """Extract metrics from result, supporting both formats."""
+    # Direct metrics field (legacy)
+    if 'metrics' in result:
+        return result['metrics']
+    # Try to compute from tags if available
+    predicted = set(extract_tags_from_result(result))
+    ground_truth = set(result.get('ground_truth_tags', []))
+    # Return basic computed metrics
+    return calculate_basic_metrics(predicted, ground_truth)
+
 
 def load_results(results_file: str):
     """Load either the summary JSON or accept a JSONL path directly."""
@@ -45,7 +68,9 @@ def plot_metrics_distribution(results_data, output_dir):
     """Plot distribution of precision, recall, and F1 scores"""
     precisions, recalls, f1_scores = [], [], []
     for r in detailed_results_iter(results_data):
-        metrics = r['metrics']
+        metrics = extract_metrics_from_result(r)
+        if not metrics:
+            continue
         precisions.append(metrics['precision'])
         recalls.append(metrics['recall'])
         f1_scores.append(metrics['f1'])
@@ -251,12 +276,16 @@ def generate_performance_report(results_data, output_dir):
 
         report_lines.append("TOP 10 BEST PERFORMING IMAGES:")
         for i, result in enumerate(best_results, 1):
-            report_lines.append(f"  {i}. {result['filename']}: F1={result['metrics']['f1']:.3f}")
+            filename = result.get('filename') or result.get('image', f'image_{i}')
+            metrics = extract_metrics_from_result(result)
+            report_lines.append(f"  {i}. {filename}: F1={metrics.get('f1', 0):.3f}")
         report_lines.append("")
 
         report_lines.append("TOP 10 WORST PERFORMING IMAGES:")
         for i, result in enumerate(worst_results, 1):
-            report_lines.append(f"  {i}. {result['filename']}: F1={result['metrics']['f1']:.3f}")
+            filename = result.get('filename') or result.get('image', f'image_{i}')
+            metrics = extract_metrics_from_result(result)
+            report_lines.append(f"  {i}. {filename}: F1={metrics.get('f1', 0):.3f}")
         report_lines.append("")
     
     # Tag performance
@@ -285,6 +314,25 @@ def generate_performance_report(results_data, output_dir):
     
     # Also print to console
     print('\n'.join(report_lines))
+
+def calculate_basic_metrics(predicted, ground_truth):
+    """Calculate basic metrics from predicted and ground truth sets."""
+    if not predicted and not ground_truth:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
+    if not predicted:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    if not ground_truth:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+    tp = len(predicted & ground_truth)
+    fp = len(predicted - ground_truth)
+    fn = len(ground_truth - predicted)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    return {"precision": precision, "recall": recall, "f1": f1}
 
 def main():
     import argparse
