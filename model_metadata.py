@@ -36,6 +36,13 @@ class ModelMetadata:
             return checkpoint
 
         try:
+            # Verify the vocabulary file itself is valid before embedding
+            with open(vocab_path, 'r', encoding='utf-8') as f:
+                test_load = json.load(f)
+                if not test_load.get('tag_to_index') or not test_load.get('index_to_tag'):
+                    logger.error(f"Invalid vocabulary file structure at {vocab_path}")
+                    return checkpoint
+
             with open(vocab_path, 'r', encoding='utf-8') as f:
                 vocab_data = json.load(f)
 
@@ -49,7 +56,14 @@ class ModelMetadata:
                 if tag.startswith("tag_") and tag[4:].isdigit()
             )
             if placeholder_count > 0:
-                raise ValueError(f"Vocabulary contains {placeholder_count} placeholder tags!")
+                logger.error(f"Vocabulary contains {placeholder_count} placeholder tags - not embedding!")
+                logger.error(
+                    f"Examples: {[t for t in list(vocab_data['tag_to_index'].keys())[:10] if t.startswith('tag_')]}"
+                )
+                raise ValueError(
+                    f"Vocabulary contains {placeholder_count} placeholder tags! Will not embed corrupted vocabulary."
+                )
+                return checkpoint
 
             # Compress vocabulary
             vocab_json = json.dumps(vocab_data, ensure_ascii=False)
@@ -94,9 +108,19 @@ class ModelMetadata:
                 actual_sha = hashlib.sha256(vocab_bytes).hexdigest()
                 if expected_sha != actual_sha:
                     logger.warning(f"Vocabulary SHA mismatch!")
+                    return None
 
             vocab_json = vocab_bytes.decode('utf-8')
             vocab_data = json.loads(vocab_json)
+
+            # Verify extracted vocabulary is valid
+            placeholder_count = sum(
+                1 for tag in vocab_data.get('tag_to_index', {}).keys()
+                if tag.startswith("tag_") and tag[4:].isdigit()
+            )
+            if placeholder_count > 0:
+                logger.error(f"Extracted vocabulary contains {placeholder_count} placeholder tags!")
+                return None
 
             return vocab_data
 
