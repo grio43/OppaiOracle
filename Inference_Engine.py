@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
+import hashlib
 import warnings
 import traceback
 from contextlib import contextmanager
@@ -22,7 +23,6 @@ import queue
 
 import gzip
 import base64
-import hashlib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -34,6 +34,7 @@ from PIL import Image
 # Vocabulary utilities
 from model_metadata import ModelMetadata
 from vocabulary import TagVocabulary, load_vocabulary_for_training
+from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
 
 # Make cv2 optional - not needed for basic inference
 try:
@@ -190,6 +191,8 @@ class ModelWrapper:
         self.vocabulary = None  # Loaded vocabulary
         self.normalization_params = None
         self.use_fp16 = config.use_fp16 and config.device == "cuda"
+        self.vocab_sha256 = "unknown"  # Will be computed when vocabulary is loaded
+        self.patch_size = 16  # Default, will be updated from model config
 
     def load_model(self):
         """Load the trained model"""
@@ -212,6 +215,9 @@ class ModelWrapper:
                         for i in range(len(self.vocabulary.tag_to_index))
                     ]
                     logger.info(f"Successfully loaded {len(self.tag_names)} tags from embedded vocabulary")
+                    # Compute vocabulary hash
+                    vocab_json = json.dumps(vocab_data, sort_keys=True)
+                    self.vocab_sha256 = hashlib.sha256(vocab_json.encode()).hexdigest()
                 else:
                     logger.error("Failed to extract embedded vocabulary")
                     # Fall back to external vocabulary file
@@ -296,6 +302,7 @@ class ModelWrapper:
                 'padding_mask_keep_threshold': 0.9,
                 'gradient_checkpointing': False  # Disable for inference
             }
+            self.patch_size = vit_config_dict.get('patch_size', 16)
             
             # Apply defaults for missing values
             for key, default_value in vit_config_defaults.items():
@@ -363,6 +370,9 @@ class ModelWrapper:
             self.vocabulary.get_tag_from_index(i)
             for i in range(len(self.vocabulary.tag_to_index))
         ]
+        # Compute vocabulary hash for external vocabulary
+        vocab_json = json.dumps({'tag_to_index': self.vocabulary.tag_to_index}, sort_keys=True)
+        self.vocab_sha256 = hashlib.sha256(vocab_json.encode()).hexdigest()
 
     def _verify_vocabulary(self):
         """Verify vocabulary contains real tags, not placeholders"""
@@ -415,17 +425,18 @@ class ResultProcessor:
         predictions: torch.Tensor,
         image_paths: List[str],
         valid_flags: List[bool]
-    ) -> List[Dict[str, Any]]:
+    ) -> List[ImagePrediction]:
         """Process raw predictions into formatted results"""
         results = []
-        
+
         for pred, path, valid in zip(predictions, image_paths, valid_flags):
             if not valid:
-                results.append({
-                    'image': path,
-                    'error': 'Failed to process image',
-                    'tags': []
-                })
+                result = ImagePrediction(
+                    image=path,
+                    tags=[],
+                    processing_time=None
+                )
+                results.append(result)
                 continue
             
             # Get top-k predictions
@@ -440,56 +451,55 @@ class ResultProcessor:
             tags = []
             for score, idx in zip(scores.tolist(), indices.tolist()):
                 if idx < len(self.tag_names):
-                    tags.append({
-                        'name': self.tag_names[idx],
-                        'score': round(score, 4)
-                    })
-            
-            results.append({
-                'image': path,
-                'tags': tags,
-                'processing_time': None,  # Will be filled by engine  
-            })
+                    tags.append(TagPrediction(
+                        name=self.tag_names[idx],
+                        score=score
+                    ))
+
+            result = ImagePrediction(
+                image=path,
+                tags=tags,
+                processing_time=None  # Will be filled by engine
+            )
+            results.append(result)
 
             # Validate no placeholder tags in output
-            for tag_dict in tags:
-                if tag_dict['name'].startswith('tag_') and tag_dict['name'][4:].isdigit():
-                    raise ValueError(f"CRITICAL: Placeholder tag '{tag_dict['name']}' in output!")
+            for tag in tags:
+                if tag.name.startswith('tag_') and tag.name[4:].isdigit():
+                    raise ValueError(f"CRITICAL: Placeholder tag '{tag.name}' in output!")
         
         return results
     
-    def save_results(self, results: List[Dict], output_path: str):
+    def save_results(self, results: List[ImagePrediction], output_path: str,
+                     metadata: RunMetadata):
         """Save results to file"""
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         if self.config.output_format == 'json':
-            payload = {
-                'metadata': {
-                    'top_k': self.config.top_k,
-                    'threshold': self.config.threshold,
-                    'normalize_mean': list(self.config.normalize_mean),
-                    'normalize_std': list(self.config.normalize_std),
-                    'image_size': self.config.image_size
-                },
-                'results': results
-            }
-            with open(output_path, 'w') as f:
-                json.dump(payload, f, indent=2)
+            output = PredictionOutput(metadata=metadata, results=results)
+            output.save(output_path)
         elif self.config.output_format == 'csv':
             import csv
             with open(output_path, 'w', newline='') as f:
-                if results:
-                    writer = csv.DictWriter(f, fieldnames=results[0].keys())
-                    writer.writeheader()
-                    writer.writerow({'image': f'# top_k={self.config.top_k} threshold={self.config.threshold}'})
-                    writer.writerows(results)
+                writer = csv.writer(f)
+                writer.writerow(['# Metadata:', json.dumps(metadata.to_dict())])
+                writer.writerow(['image', 'tags', 'scores', 'processing_time'])
+                for result in results:
+                    tag_names = [t.name for t in result.tags]
+                    tag_scores = [str(t.score) for t in result.tags]
+                    writer.writerow([
+                        result.image,
+                        ','.join(tag_names),
+                        ','.join(tag_scores),
+                        result.processing_time or ''
+                    ])
         elif self.config.output_format == 'txt':
             with open(output_path, 'w') as f:
-                f.write(f"# top_k={self.config.top_k} threshold={self.config.threshold}\n")
+                f.write(f"# Metadata: {json.dumps(metadata.to_dict())}\n")
                 for result in results:
-                    f.write(f"{result['image']}: ")
-                    tags = [f"{t['name']}({t['score']:.2f})" for t in result.get('tags', [])]
+                    f.write(f"{result.image}: ")
+                    tags = [f"{t.name}({t.score:.2f})" for t in result.tags]
                     f.write(', '.join(tags) + '\n')
 
 
@@ -589,7 +599,7 @@ class InferenceEngine:
             self.cache = InferenceCache(self.config.cache_size)
             logger.info(f"Cache enabled with size {self.config.cache_size}")
     
-    def predict_single(self, image: Union[str, np.ndarray, Image.Image]) -> Dict[str, Any]:
+    def predict_single(self, image: Union[str, np.ndarray, Image.Image]) -> ImagePrediction:
         """Predict tags for a single image"""
         start_time = time.time()
         
@@ -615,9 +625,9 @@ class InferenceEngine:
                 [image_path],
                 [True]
             )[0]
-            
+
             # Add timing
-            results['processing_time'] = time.time() - start_time
+            results.processing_time = (time.time() - start_time) * 1000  # Convert to ms
             
             # Cache result
             if self.cache and isinstance(image, str):
@@ -625,19 +635,20 @@ class InferenceEngine:
             
             # Log to monitor
             if self.monitor:
-                self.monitor.metrics.add_metric('inference_time', results['processing_time'])
+                self.monitor.metrics.add_metric('inference_time', results.processing_time / 1000)
                 self.monitor.metrics.increment_counter('images_processed')
             
             return results
             
         except Exception as e:
             logger.error(f"Inference failed: {e}")
-            return {
-                'error': str(e),
-                'processing_time': time.time() - start_time
-            }
+            return ImagePrediction(
+                image=image if isinstance(image, str) else "array",
+                tags=[],
+                processing_time=(time.time() - start_time) * 1000
+            )
     
-    def predict_batch(self, images: List[Union[str, np.ndarray, Image.Image]]) -> List[Dict[str, Any]]:
+    def predict_batch(self, images: List[Union[str, np.ndarray, Image.Image]]) -> List[ImagePrediction]:
         """Predict tags for a batch of images"""
         start_time = time.time()
         
@@ -681,7 +692,7 @@ class InferenceEngine:
                 
                 # Add timing and cache
                 for i, (idx, result) in enumerate(zip(uncached_indices, batch_results)):
-                    result['processing_time'] = (time.time() - start_time) / len(images)
+                    result.processing_time = ((time.time() - start_time) / len(images)) * 1000  # ms
                     results[idx] = result
                     
                     # Cache if applicable
@@ -700,10 +711,14 @@ class InferenceEngine:
             
         except Exception as e:
             logger.error(f"Batch inference failed: {e}")
-            return [{
-                'error': str(e),
-                'processing_time': time.time() - start_time
-            }] * len(images)
+            return [
+                ImagePrediction(
+                    image=img if isinstance(img, str) else f"array_{i}",
+                    tags=[],
+                    processing_time=(time.time() - start_time) * 1000 / len(images)
+                )
+                for i, img in enumerate(images)
+            ]
     
     def process_directory(
         self,
@@ -763,15 +778,28 @@ class InferenceEngine:
                     self.monitor.metrics.increment_counter('batches_processed')
                     self.monitor.metrics.increment_counter('images_processed', len(batch_images))
             
+            # Create metadata
+            metadata = RunMetadata(
+                top_k=self.config.top_k,
+                threshold=self.config.threshold,
+                vocab_sha256=self.model_wrapper.vocab_sha256,
+                normalize_mean=list(self.config.normalize_mean),
+                normalize_std=list(self.config.normalize_std),
+                image_size=self.config.image_size,
+                patch_size=self.model_wrapper.patch_size,
+                model_path=self.config.model_path,
+                num_tags=len(self.model_wrapper.tag_names)
+            )
+
             # Save results
-            self.result_processor.save_results(all_results, output_path)
+            self.result_processor.save_results(all_results, output_path, metadata)
             
             # Calculate statistics
             total_time = time.time() - start_time
             stats = {
                 'total_images': len(image_paths),
-                'successful': sum(1 for r in all_results if 'error' not in r),
-                'failed': sum(1 for r in all_results if 'error' in r),
+                'successful': sum(1 for r in all_results if len(r.tags) > 0),
+                'failed': sum(1 for r in all_results if len(r.tags) == 0),
                 'total_time': total_time,
                 'avg_time_per_image': total_time / len(image_paths),
                 'output_file': str(output_path)
