@@ -13,6 +13,7 @@ import logging
 import math
 import shutil
 import threading
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
@@ -494,20 +495,39 @@ class CheckpointManager:
         self.best_metric = float('inf')
         
         # Load existing checkpoints
-        self._scan_checkpoints()
+        self._scan_existing_checkpoints()
+
+    def _is_primary_process(self) -> bool:
+        """Check if this is the primary process for checkpoint operations."""
+        if dist.is_initialized():
+            return dist.get_rank() == 0
+        return True
     
-    def _scan_checkpoints(self):
+    def _scan_existing_checkpoints(self):
         """Scan directory for existing checkpoints"""
-        checkpoint_files = list(self.checkpoint_dir.glob("checkpoint_*.pt"))
-        
-        # Sort by modification time
-        checkpoint_files.sort(key=lambda x: x.stat().st_mtime)
-        self.checkpoints = checkpoint_files
-        
+        if self.checkpoint_dir.exists():
+            checkpoint_files = [
+                p for p in self.checkpoint_dir.glob("checkpoint_*.pt")
+                if p.exists()
+            ]
+            self.checkpoints = checkpoint_files
+            self._sort_checkpoints_safe()
+
         # Find best checkpoint
         best_file = self.checkpoint_dir / "best_model.pt"
         if best_file.exists():
             self.best_checkpoint = best_file
+
+    def _sort_checkpoints_safe(self):
+        """Sort checkpoints by mtime, handling missing files gracefully."""
+        # Filter out non-existent files
+        self.checkpoints = [p for p in self.checkpoints if p.exists()]
+        try:
+            self.checkpoints.sort(key=lambda x: x.stat().st_mtime)
+        except FileNotFoundError:
+            self.checkpoints = [p for p in self.checkpoints if p.exists()]
+            if self.checkpoints:
+                self.checkpoints.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0)
     
     def save_checkpoint(
         self,
@@ -520,8 +540,11 @@ class CheckpointManager:
         training_state: TrainingState,
         is_best: bool = False,
         config: Optional[Dict] = None
-    ) -> Path:
+    ) -> Optional[Path]:
         """Save a checkpoint"""
+
+        if not self._is_primary_process():
+            return None
 
         # Prepare checkpoint data
         checkpoint = {
@@ -607,9 +630,17 @@ class CheckpointManager:
                     'embedded': 'vocab_b64_gzip' in checkpoint
                 }
 
-        # Save regular checkpoint
+        # Save regular checkpoint atomically
         checkpoint_path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{step}.pt"
-        torch.save(checkpoint, checkpoint_path)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        fd, temp_path = tempfile.mkstemp(suffix='.tmp', prefix='checkpoint_', dir=self.checkpoint_dir)
+        try:
+            torch.save(checkpoint, temp_path)
+            os.replace(temp_path, checkpoint_path)
+        finally:
+            os.close(fd)
+
         self.checkpoints.append(checkpoint_path)
         
         logger.info(f"Saved checkpoint to {checkpoint_path}")
@@ -632,19 +663,46 @@ class CheckpointManager:
     
     def _cleanup_old_checkpoints(self):
         """Remove old checkpoints if exceeding limit"""
-        if len(self.checkpoints) > self.max_checkpoints:
-            # Sort by modification time
-            self.checkpoints.sort(key=lambda x: x.stat().st_mtime)
-            
-            # Remove oldest checkpoints
-            to_remove = self.checkpoints[:-self.max_checkpoints]
-            
-            for checkpoint in to_remove:
-                if checkpoint != self.best_checkpoint:
-                    checkpoint.unlink()
-                    logger.info(f"Removed old checkpoint: {checkpoint}")
-            
-            self.checkpoints = self.checkpoints[-self.max_checkpoints:]
+        if not self._is_primary_process():
+            return
+
+        if self.max_checkpoints is None or self.max_checkpoints <= 0:
+            return
+
+        # Refresh and sort checkpoints
+        self._refresh_checkpoint_list()
+        self._sort_checkpoints_safe()
+
+        while len(self.checkpoints) > self.max_checkpoints:
+            oldest = self.checkpoints.pop(0)
+            if oldest == self.best_checkpoint:
+                continue
+            if oldest.exists():
+                try:
+                    oldest.unlink()
+                    logger.info(f"Removed old checkpoint: {oldest}")
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"Warning: Could not delete {oldest}: {e}")
+
+    def _refresh_checkpoint_list(self):
+        """Refresh the checkpoint list to sync with disk state."""
+        disk_checkpoints = set()
+        if self.checkpoint_dir.exists():
+            disk_checkpoints = {
+                p.resolve() for p in self.checkpoint_dir.glob('checkpoint_*.pt')
+                if p.exists()
+            }
+
+        # Keep only existing files from our list
+        self.checkpoints = [p for p in self.checkpoints if p.exists()]
+
+        # Add any new files from disk that we don't know about
+        known_paths = {p.resolve() for p in self.checkpoints}
+        for disk_path in disk_checkpoints:
+            if disk_path not in known_paths:
+                self.checkpoints.append(Path(disk_path))
     
     def load_checkpoint(
         self,
@@ -710,6 +768,32 @@ class CheckpointManager:
         """Get path to latest checkpoint"""
         if self.checkpoints:
             return self.checkpoints[-1]
+        return None
+
+    def load_latest_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """Load the most recent checkpoint."""
+        self._refresh_checkpoint_list()
+        if not self.checkpoints:
+            return None
+
+        existing = [p for p in self.checkpoints if p.exists()]
+        if not existing:
+            return None
+
+        try:
+            latest = max(existing, key=lambda x: x.stat().st_mtime)
+            return torch.load(latest, map_location='cpu')
+        except (FileNotFoundError, ValueError):
+            return None
+
+    def load_best_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """Load the best checkpoint based on metric."""
+        best_path = self.checkpoint_dir / "best_model.pt"
+        if best_path.exists():
+            try:
+                return torch.load(best_path, map_location='cpu')
+            except Exception as e:
+                print(f"Warning: Could not load best checkpoint: {e}")
         return None
 
 
