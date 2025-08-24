@@ -19,25 +19,56 @@ from schemas import RunMetadata, TagPrediction, ImagePrediction, PredictionOutpu
 
 def _load_metadata(session: ort.InferenceSession):
     meta = session.get_modelmeta().custom_metadata_map
-    if 'vocab_b64_gzip' not in meta:
-        # Try to load from external vocabulary file as fallback
+
+    # Check if vocabulary metadata exists and is non-empty
+    vocab_b64_gzip = meta.get('vocab_b64_gzip', '')
+    vocab_sha256 = meta.get('vocab_sha256', '')
+
+    # Treat missing or empty vocabulary metadata as no embedded vocab
+    if not vocab_b64_gzip or not vocab_sha256:
         import warnings
         warnings.warn(
-            "Model is missing embedded vocabulary metadata. "
+            "Model is missing or has empty embedded vocabulary metadata. "
             "Attempting to load from external vocabulary.json file. "
             "For reproducible inference, please use models with embedded vocabulary.",
             RuntimeWarning
         )
         # Return None to signal external vocab needed
         return None, None, None, None, None, meta
-    vocab_bytes = gzip.decompress(base64.b64decode(meta['vocab_b64_gzip']))
-    sha = hashlib.sha256(vocab_bytes).hexdigest()
-    if meta.get('vocab_sha256') and meta['vocab_sha256'] != sha:
-        raise RuntimeError('Vocabulary checksum mismatch')
-    vocab = TagVocabulary.from_json(vocab_bytes.decode('utf-8'))
 
-    # Verify vocabulary integrity using centralized function
-    verify_vocabulary_integrity(vocab, Path("embedded_vocabulary"))
+    # Try to decode and decompress the vocabulary with robust error handling
+    try:
+        # Decode base64
+        vocab_b64_decoded = base64.b64decode(vocab_b64_gzip)
+
+        # Decompress gzip
+        vocab_bytes = gzip.decompress(vocab_b64_decoded)
+
+        # Verify checksum
+        sha = hashlib.sha256(vocab_bytes).hexdigest()
+        if vocab_sha256 != sha:
+            raise RuntimeError(f'Vocabulary checksum mismatch: expected {vocab_sha256}, got {sha}')
+
+        # Decode UTF-8 and parse JSON
+        vocab_json = vocab_bytes.decode('utf-8')
+        if not vocab_json.strip():
+            raise ValueError("Embedded vocabulary JSON is empty")
+
+        vocab = TagVocabulary.from_json(vocab_json)
+
+        # Verify vocabulary integrity using centralized function
+        verify_vocabulary_integrity(vocab, Path("embedded_vocabulary"))
+
+    except Exception as e:
+        import warnings
+        warnings.warn(
+            f"Failed to load embedded vocabulary: {e}. "
+            "Will require external vocabulary file (--vocab) and preprocessing parameters "
+            "(--mean, --std, --image-size, --patch-size) for inference.",
+            RuntimeWarning
+        )
+        return None, None, None, None, None, meta
+
     mean = json.loads(meta.get('normalize_mean', '[0.5, 0.5, 0.5]'))
     std = json.loads(meta.get('normalize_std', '[0.5, 0.5, 0.5]'))
     image_size = int(meta.get('image_size', 448))
