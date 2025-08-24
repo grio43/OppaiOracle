@@ -54,6 +54,7 @@ Import error: {e}"""
 
 # Import training utilities for checkpointing
 from training_utils import CheckpointManager, TrainingState
+from HDF5_loader import AugmentationStats
 
 # Add after other imports
 
@@ -210,6 +211,10 @@ def train_with_orientation_tracking():
         "use_tensorboard": True,
         "tensorboard_dir": Path("./runs") / f"experiment_{datetime.now():%Y%m%d_%H%M%S}",
         "use_wandb": False,
+        # Augmentation monitoring
+        "log_augmentation_stats": True,
+        "augmentation_stats_interval": 100,
+        "log_augmentation_images": True,
         # Model configuration
         "model_config": {
             "hidden_size": 768,
@@ -345,10 +350,28 @@ def train_with_orientation_tracking():
         logger.info("This does not affect training quality, only statistics reporting.")
         logger.info("="*60 + "\n")
         orientation_stats_warning_shown = True
-    
+
+    # Create queue for augmentation stats collection
+    stats_queue = mp.Queue(maxsize=1000) if config.get("log_augmentation_stats", True) else None
+
     device = torch.device(config["device"])
-    
+
     # Create dataloaders with orientation-aware configuration
+    dataloader_config_updates = {
+        "random_flip_prob": config["random_flip_prob"],
+        # Convert string back to Path if needed
+        "orientation_map_path": Path(config.get("orientation_map_path")) if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) else config.get("orientation_map_path"),
+        "skip_unmapped": config.get("skip_unmapped", True),
+        "strict_orientation_validation": config.get("strict_orientation", True),
+        "num_workers": config["num_workers"],  # Pass to dataset for LMDB initialization
+        "collect_augmentation_stats": config.get("log_augmentation_stats", True),
+        "stats_queue": stats_queue,  # Pass stats queue
+        # Conservative colour jitter settings for anime
+        "color_jitter_brightness": 0.1,
+        "color_jitter_contrast": 0.1,
+        "color_jitter_saturation": 0.05,
+        "color_jitter_hue": 0.02,
+    }
     train_loader, val_loader, vocab = create_dataloaders(
         data_dir=config["data_dir"],
         json_dir=config["json_dir"],
@@ -357,19 +380,7 @@ def train_with_orientation_tracking():
         num_workers=config["num_workers"],
         frequency_sampling=True,
         val_batch_size=None,
-        config_updates={
-            "random_flip_prob": config["random_flip_prob"],
-            # Convert string back to Path if needed
-            "orientation_map_path": Path(config.get("orientation_map_path")) if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) else config.get("orientation_map_path"),
-            "skip_unmapped": config.get("skip_unmapped", True),
-            "strict_orientation_validation": config.get("strict_orientation", True),
-            "num_workers": config["num_workers"],  # Pass to dataset for LMDB initialization
-            # Conservative colour jitter settings for anime
-            "color_jitter_brightness": 0.1,
-            "color_jitter_contrast": 0.1,
-            "color_jitter_saturation": 0.05,
-            "color_jitter_hue": 0.02,
-        },
+        config_updates=dataloader_config_updates,
         seed=seed,
         log_queue=log_queue,
         force_val_persistent_workers=False,
@@ -477,6 +488,8 @@ def train_with_orientation_tracking():
         use_tensorboard=config.get("use_tensorboard", True),
         tensorboard_dir=str(config.get("tensorboard_dir", Path("./runs"))),
         use_wandb=config.get("use_wandb", False),
+        augmentation_stats_interval=config.get("augmentation_stats_interval", 100),
+        log_augmentation_images=config.get("log_augmentation_images", False),
         wandb_project="anime-tagger",
         wandb_run_name=f"train_{datetime.now():%Y%m%d_%H%M%S}"
     )
@@ -535,12 +548,37 @@ def train_with_orientation_tracking():
     # Training loop with orientation statistics
     global_step = 0
     orientation_stats_interval = 100  # Log orientation stats every N batches
+    aggregated_aug_stats = AugmentationStats()
     
+    # Log augmentation hparams at start
+    if monitor.writer:
+        hparams = {
+            'hparams/random_flip_prob': config["random_flip_prob"],
+            'hparams/random_crop_scale_min': config.get("random_crop_scale", (0.95, 1.0))[0],
+            'hparams/random_crop_scale_max': config.get("random_crop_scale", (0.95, 1.0))[1],
+            'hparams/color_jitter_brightness': dataloader_config_updates.get("color_jitter_brightness", 0.1),
+            'hparams/color_jitter_contrast': dataloader_config_updates.get("color_jitter_contrast", 0.1),
+            'hparams/color_jitter_saturation': dataloader_config_updates.get("color_jitter_saturation", 0.05),
+            'hparams/orientation_safety_mode': config.get("orientation_safety_mode", "conservative"),
+        }
+        for key, value in hparams.items():
+            monitor.writer.add_scalar(key, value, 0)
+
     for epoch in range(config["num_epochs"]):
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
         epoch_start = time.time()
+        
+        # Process any pending augmentation stats from workers
+        if stats_queue:
+            while not stats_queue.empty():
+                try:
+                    msg_type, stats = stats_queue.get_nowait()
+                    if msg_type == 'aug_stats' and isinstance(stats, AugmentationStats):
+                        aggregated_aug_stats.aggregate(stats)
+                except:
+                    break
         
         for step, batch in enumerate(train_loader):
             images = batch['images'].to(device)
@@ -600,6 +638,20 @@ def train_with_orientation_tracking():
                     learning_rate=optimizer.param_groups[0]['lr'],
                     batch_size=images.size(0)
                 )
+
+            # Log augmentation stats periodically
+            if global_step % config.get("augmentation_stats_interval", 100) == 0:
+                # Process pending stats
+                if stats_queue:
+                    while not stats_queue.empty():
+                        try:
+                            msg_type, stats = stats_queue.get_nowait()
+                            if msg_type == 'aug_stats':
+                                aggregated_aug_stats.aggregate(stats)
+                        except:
+                            break
+                # Log aggregated stats
+                monitor.log_augmentations(global_step, aggregated_aug_stats)
 
             # Gradient accumulation
             if (step + 1) % config["gradient_accumulation"] == 0:
@@ -723,6 +775,28 @@ def train_with_orientation_tracking():
                         "Note: These stats are from the main process only. "
                         "Actual flip counts across all workers will be higher."
                     )
+
+    # Final augmentation stats summary
+    if aggregated_aug_stats.flip_total > 0:
+        logger.info("\n" + "="*60)
+        logger.info("Final Augmentation Statistics:")
+        logger.info("="*60)
+        logger.info(f"Total flips attempted: {aggregated_aug_stats.flip_total}")
+        logger.info(f"Successful flips: {aggregated_aug_stats.flip_safe}")
+        logger.info(f"Skipped (text): {aggregated_aug_stats.flip_skipped_text}")
+        logger.info(f"Skipped (unmapped): {aggregated_aug_stats.flip_skipped_unmapped}")
+        logger.info(f"Blocked (safety): {aggregated_aug_stats.flip_blocked_safety}")
+        flip_rate = aggregated_aug_stats.flip_safe / max(1, aggregated_aug_stats.flip_total)
+        logger.info(f"Overall flip rate: {flip_rate:.1%}")
+        logger.info(f"Color jitter applied: {aggregated_aug_stats.jitter_applied}")
+        logger.info(f"Random crops applied: {aggregated_aug_stats.crop_applied}")
+        logger.info(f"Total images processed: {aggregated_aug_stats.image_count}")
+        logger.info("="*60)
+
+        # Save to JSON for reproducibility
+        with open(checkpoint_dir / "augmentation_stats.json", 'w') as f:
+            json.dump(aggregated_aug_stats.__dict__, f, indent=2, default=list)
+
     # Generate and save flip safety report if requested
     if config.get("generate_flip_report", False):
         try:
