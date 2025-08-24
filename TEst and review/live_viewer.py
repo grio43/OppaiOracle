@@ -15,16 +15,26 @@ import argparse
 import numpy as np
 from typing import Dict, List, Tuple
 
+# Import vocabulary verification
+import sys
+from pathlib import Path as PathLib
+sys.path.append(str(PathLib(__file__).parent.parent))
+from vocabulary import verify_vocabulary_integrity
+
 # Terminal UI version using rich
 def extract_tags_from_result(result):
     """Extract tags from result, supporting both new and legacy formats."""
     # Try new schema first
     if 'tags' in result and isinstance(result['tags'], list):
         # New schema: tags is a list of {name, score} dicts
-        return {tag['name'] for tag in result['tags']}
+        return {tag['name'] for tag in result['tags'] \
+                if not (tag['name'].startswith('tag_') and \
+                       len(tag['name']) > 4 and \
+                       tag['name'][4:].isdigit())}
     # Fall back to legacy schema
     elif 'predicted_tags' in result:
-        return set(result.get('predicted_tags', []))
+        return {tag for tag in result.get('predicted_tags', [])
+                if not (tag.startswith('tag_') and len(tag) > 4 and tag[4:].isdigit())}
     else:
         return set()
 

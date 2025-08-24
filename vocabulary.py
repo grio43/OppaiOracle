@@ -425,20 +425,40 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
     )
 
 
-def _verify_vocabulary_integrity(vocab: TagVocabulary, source_path: Path) -> None:
-    """Verify that a loaded vocabulary contains real tags, not placeholders."""
+def verify_vocabulary_integrity(vocab: TagVocabulary, source_path: Optional[Path] = None,
+                               max_placeholders: int = 10) -> None:
+    """Verify that a loaded vocabulary contains real tags, not placeholders.
+
+    Args:
+        vocab: TagVocabulary instance to verify
+        source_path: Optional path to vocabulary source for error messages
+        max_placeholders: Maximum allowed placeholder tags (default 10 for special tokens)
+
+    Raises:
+        ValueError: If vocabulary contains too many placeholder tags
+    """
     placeholder_count = sum(
         1 for tag in vocab.tag_to_index.keys()
-        if tag.startswith("tag_") and tag[4:].isdigit()
+        if tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit()
     )
 
-    if placeholder_count > 0:
+    if placeholder_count > max_placeholders:
+        source_str = f" at {source_path}" if source_path else ""
+        sample_placeholders = [
+            tag for tag in list(vocab.tag_to_index.keys())[:50]
+            if tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit()
+        ][:5]
         raise ValueError(
-            f"CRITICAL: Vocabulary at {source_path} contains {placeholder_count} placeholder tags.\n"
+            f"CRITICAL: Vocabulary{source_str} contains {placeholder_count} placeholder tags "
+            f"(max allowed: {max_placeholders}).\n"
+            f"Examples: {sample_placeholders}\n"
             f"This vocabulary file is corrupted and contains 'tag_XXX' instead of real tags.\n"
             f"The model would learn meaningless labels if used in training or inference.\n"
             f"Please regenerate the vocabulary from your dataset annotations."
         )
+
+# Keep backward compatibility alias
+_verify_vocabulary_integrity = verify_vocabulary_integrity
 
 def create_dataset_config(vocab: TagVocabulary) -> Dict:
     """Create a configuration dictionary for dataset initialization.

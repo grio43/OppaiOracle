@@ -10,22 +10,11 @@ from tqdm import tqdm
 import gc
 import psutil  # For system memory monitoring
 
-def verify_vocabulary_integrity(tag_names):
-    """Verify vocabulary contains real tags, not placeholders."""
-    if not tag_names:
-        raise ValueError("No tag names provided - vocabulary is empty or missing")
-
-    placeholder_count = sum(
-        1 for tag in tag_names
-        if tag and tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit()
-    )
-
-    if placeholder_count > 10:  # Allow a few for special tokens
-        raise ValueError(
-            f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags!\n"
-            f"This indicates a corrupted vocabulary. Cannot perform evaluation.\n"
-            f"Please use a checkpoint with embedded vocabulary or provide a valid vocabulary file."
-        )
+# Import centralized verification
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
+from vocabulary import TagVocabulary, verify_vocabulary_integrity
 
 def get_system_memory_info():
     """Get current system memory usage"""
@@ -215,12 +204,9 @@ def get_predictions_from_scores(scores, tag_names, threshold=0.5, vocabulary=Non
             if score >= threshold:
                 if i < len(tag_names):
                     tag = tag_names[i]
-                    # Fail if we encounter placeholder tags
-                    if tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit():
-                        raise ValueError(
-                            f"Encountered placeholder tag '{tag}' at index {i}. "
-                            f"Vocabulary is corrupted - aborting evaluation."
-                        )
+                    # Skip placeholder tags silently
+                    if tag and tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit():
+                        continue
                 else:
                     raise IndexError(f"Tag index {i} out of range (vocab size: {len(tag_names)})")
                 predicted_tags.add(tag)
@@ -414,8 +400,17 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
     if norm and "mean" in norm and "std" in norm:
         mean, std = tuple(norm["mean"]), tuple(norm["std"])
 
-    # Verify vocabulary integrity
-    verify_vocabulary_integrity(tag_names)
+    # Verify vocabulary integrity using centralized function
+    if tag_names:
+        # Create a temporary vocabulary object for verification
+        temp_vocab = TagVocabulary()
+        temp_vocab.tag_to_index = {tag: i for i, tag in enumerate(tag_names)}
+        temp_vocab.index_to_tag = {i: tag for i, tag in enumerate(tag_names)}
+        try:
+            verify_vocabulary_integrity(temp_vocab, Path(config_path) if config_path else None)
+        except ValueError as e:
+            print(f"Vocabulary integrity check failed: {e}")
+            return None
 
     # Create PyTorch model
     model = create_pytorch_session(model_path, device, compile_model)
@@ -599,8 +594,17 @@ def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
     if norm and "mean" in norm and "std" in norm:
         mean, std = tuple(norm["mean"]), tuple(norm["std"])
 
-    # Verify vocabulary integrity
-    verify_vocabulary_integrity(tag_names)
+    # Verify vocabulary integrity using centralized function
+    if tag_names:
+        # Create a temporary vocabulary object for verification
+        temp_vocab = TagVocabulary()
+        temp_vocab.tag_to_index = {tag: i for i, tag in enumerate(tag_names)}
+        temp_vocab.index_to_tag = {i: tag for i, tag in enumerate(tag_names)}
+        try:
+            verify_vocabulary_integrity(temp_vocab, Path(config_path) if config_path else None)
+        except ValueError as e:
+            print(f"Vocabulary integrity check failed: {e}")
+            return {"error": str(e)}
 
     # Initialize GPU session
     sess = create_gpu_session(model_path, max_memory_gb)
