@@ -5,16 +5,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 
-# Import vocabulary verification
+# Import vocabulary verification and schema validation
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
 from vocabulary import verify_vocabulary_integrity
+from schemas import validate_schema
 
 def extract_tags_from_result(result):
-    """Extract predicted tags from result, supporting both new and legacy formats."""
-    # Try new schema first
+    """Extract predicted tags from standardized result format."""
     if 'tags' in result and isinstance(result['tags'], list):
-        # New schema: tags is a list of {name, score} dicts
         tags = []
         for tag in result['tags']:
             name = tag['name']
@@ -23,24 +22,15 @@ def extract_tags_from_result(result):
                 raise ValueError(f"Placeholder tag '{name}' detected in results. Vocabulary is corrupted.")
             tags.append(name)
         return tags
-    # Fall back to legacy schema
-    elif 'predicted_tags' in result:
-        tags = []
-        for tag in result.get('predicted_tags', []):
-            # Fail fast on placeholder tags
-            if tag.startswith('tag_') and len(tag) > 4 and tag[4:].isdigit():
-                raise ValueError(f"Placeholder tag '{tag}' detected in results. Vocabulary is corrupted.")
-            tags.append(tag)
-        return tags
     else:
-        return []
+        raise ValueError("Result missing 'tags' field - not in standard format")
 
 def extract_metrics_from_result(result):
-    """Extract metrics from result, supporting both formats."""
+    """Extract metrics from result (extended format only)."""
     # Direct metrics field (legacy)
     if 'metrics' in result:
         return result['metrics']
-    # Try to compute from tags if available
+    # Compute if we have ground truth
     predicted = set(extract_tags_from_result(result))
     ground_truth = set(result.get('ground_truth_tags', []))
     # Return basic computed metrics
@@ -50,18 +40,31 @@ def extract_metrics_from_result(result):
 def load_results(results_file: str):
     """Load either the summary JSON or accept a JSONL path directly."""
     p = Path(results_file)
-    # If a JSONL path is given, treat it as the detailed-results file.
+
+    # Check if it's JSONL with individual results
     if p.suffix.lower() == ".jsonl":
         return {"summary": {}, "results_file": str(p)}
 
-    # Otherwise assume it's the summary JSON and try to parse it.
+    # Load JSON and validate if it's standard format
     with open(p, "r") as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError:
-            # Fallback: if someone passed a JSONL but with .json extension
-            return {"summary": {}, "results_file": str(p)}
-    if "results_file" in data:
+        data = json.load(f)
+
+    # Check if this is a standard format file
+    try:
+        validate_schema(data)
+        print("✓ Loaded standardized format predictions")
+        return data
+    except ValueError as e:
+        # Not standard format, check if it has a reference to results file
+        pass
+
+    # Legacy format with summary and results_file reference
+    if "summary" in data and "results_file" in data:
+        print("Loading legacy format with separate results file")
+        base = p.parent
+        data["results_file"] = str(base / data["results_file"])
+        return data
+    elif "results_file" in data:
         base = p.parent
         data["results_file"] = str(base / data["results_file"])
     return data

@@ -3,7 +3,7 @@
 Standardized schemas for prediction outputs across all tools.
 """
 
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, asdict
 import hashlib
 import json
@@ -77,7 +77,7 @@ class PredictionOutput:
             json.dump(self.to_dict(), f, indent=2)
 
 
-def compute_vocab_sha256(vocab_path: Optional[Path] = None, 
+def compute_vocab_sha256(vocab_path: Optional[Path] = None,
                         vocab_data: Optional[Dict] = None) -> str:
     """Compute SHA256 hash of vocabulary.
     
@@ -98,4 +98,74 @@ def compute_vocab_sha256(vocab_path: Optional[Path] = None,
             return hashlib.sha256(f.read()).hexdigest()
     else:
         return "unknown"
+
+
+def validate_schema(data: Union[Dict, Path, str]) -> bool:
+    """Validate that data conforms to the standard prediction schema.
+
+    Args:
+        data: Dictionary, path to JSON file, or JSON string
+
+    Returns:
+        True if valid
+
+    Raises:
+        ValueError: If schema validation fails with details
+    """
+    # Load data if needed
+    if isinstance(data, (Path, str)):
+        if isinstance(data, str) and data.startswith('{'):
+            # JSON string
+            data = json.loads(data)
+        else:
+            # File path
+            with open(data) as f:
+                data = json.load(f)
+
+    # Check top-level structure
+    if not isinstance(data, dict):
+        raise ValueError("Data must be a dictionary")
+
+    required_keys = {'metadata', 'results'}
+    if not required_keys.issubset(data.keys()):
+        raise ValueError(f"Missing required keys: {required_keys - set(data.keys())}")
+
+    # Validate metadata
+    metadata = data['metadata']
+    required_metadata = {
+        'top_k', 'threshold', 'vocab_sha256', 'normalize_mean', 
+        'normalize_std', 'image_size', 'patch_size'
+    }
+    if not required_metadata.issubset(metadata.keys()):
+        raise ValueError(f"Missing metadata fields: {required_metadata - set(metadata.keys())}")
+
+    # Validate results
+    results = data['results']
+    if not isinstance(results, list):
+        raise ValueError("Results must be a list")
+
+    for i, result in enumerate(results):
+        if not isinstance(result, dict):
+            raise ValueError(f"Result {i} must be a dictionary")
+
+        if 'image' not in result or 'tags' not in result:
+            raise ValueError(f"Result {i} missing 'image' or 'tags'")
+
+        if not isinstance(result['tags'], list):
+            raise ValueError(f"Result {i} tags must be a list")
+
+        for j, tag in enumerate(result['tags']):
+            if not isinstance(tag, dict):
+                raise ValueError(f"Result {i} tag {j} must be a dictionary")
+            if 'name' not in tag or 'score' not in tag:
+                raise ValueError(f"Result {i} tag {j} missing 'name' or 'score'")
+            if not isinstance(tag['name'], str):
+                raise ValueError(f"Result {i} tag {j} name must be string")
+            if not isinstance(tag['score'], (int, float)):
+                raise ValueError(f"Result {i} tag {j} score must be numeric")
+
+    return True
+
+
+# Legacy adapter is in convert_legacy_to_standard() below
 
