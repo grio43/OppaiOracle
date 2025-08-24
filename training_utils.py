@@ -7,6 +7,8 @@ Comprehensive training helpers including schedulers, checkpointing, and distribu
 import os
 import sys
 import json
+import gzip
+import base64
 import logging
 import math
 import shutil
@@ -14,6 +16,7 @@ import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
+import hashlib
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 import warnings
@@ -527,18 +530,56 @@ class CheckpointManager:
         if config is not None:
             checkpoint['config'] = config
 
-        # Save vocabulary info (but not full tag_names to avoid placeholders)
+        # CRITICAL: Embed vocabulary and preprocessing directly into checkpoint
         if hasattr(model, 'module'):
             model_to_check = model.module
         else:
             model_to_check = model
 
-        if hasattr(model_to_check, 'config'):
-            checkpoint['vocabulary_info'] = {
-                'num_tags': getattr(model_to_check.config, 'num_tags', None),
-                'vocab_path': str(VOCAB_PATH),
-                'has_vocabulary': True
+        # Load and embed vocabulary if available
+        vocab_path = config.get('vocab_path', VOCAB_PATH) if config else VOCAB_PATH
+        if Path(vocab_path).exists():
+            try:
+                with open(vocab_path, 'r', encoding='utf-8') as f:
+                    vocab_data = json.load(f)
+
+                # Compress vocabulary for efficient storage
+                vocab_json = json.dumps(vocab_data, ensure_ascii=False)
+                vocab_bytes = vocab_json.encode('utf-8')
+                vocab_compressed = gzip.compress(vocab_bytes)
+                vocab_b64 = base64.b64encode(vocab_compressed).decode('utf-8')
+                vocab_sha256 = hashlib.sha256(vocab_bytes).hexdigest()
+
+                checkpoint['vocab_b64_gzip'] = vocab_b64
+                checkpoint['vocab_format_version'] = '1'
+                checkpoint['vocab_sha256'] = vocab_sha256
+
+                logger.info(f"Embedded vocabulary ({len(vocab_data.get('tag_to_index', {}))} tags) into checkpoint")
+            except Exception as e:
+                logger.error(f"Failed to embed vocabulary: {e}")
+
+        # Embed preprocessing parameters
+        if config:
+            preprocessing_params = {
+                'normalize_mean': config.get('normalize_mean', [0.5, 0.5, 0.5]),
+                'normalize_std': config.get('normalize_std', [0.5, 0.5, 0.5]),
+                'image_size': config.get('image_size', 640),
+                'patch_size': config.get('patch_size', 16),
             }
+            checkpoint['preprocessing_params'] = preprocessing_params
+            logger.info(f"Embedded preprocessing params: {preprocessing_params}")
+
+        # Backwards compatibility info
+        if hasattr(model_to_check, 'config'):
+            num_tags = getattr(model_to_check.config, 'num_tags', None)
+            if num_tags is not None:
+                checkpoint['num_tags'] = num_tags
+                checkpoint['vocabulary_info'] = {
+                    'num_tags': num_tags,
+                    'vocab_path': str(vocab_path),
+                    'has_vocabulary': True,
+                    'embedded': 'vocab_b64_gzip' in checkpoint
+                }
 
         # Save regular checkpoint
         checkpoint_path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{step}.pt"

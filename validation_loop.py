@@ -52,6 +52,7 @@ from vocabulary import TagVocabulary, load_vocabulary_for_training
 from HDF5_loader import create_dataloaders, SimplifiedDataConfig
 from training_utils import DistributedTrainingHelper
 from model_architecture import create_model, VisionTransformerConfig
+from model_metadata import ModelMetadata
 
 
 logger = logging.getLogger(__name__)
@@ -134,26 +135,54 @@ class ValidationRunner:
         # Setup logging
         self._setup_logging()
         
-        # Load vocabulary
-        vocab_path = Path(config.vocab_path)
-        if vocab_path.exists():
-            if vocab_path.suffix == '.json':
-                self.vocab = TagVocabulary(vocab_path)
+        # Load model first to check for embedded vocabulary
+        self.model, checkpoint = self._load_model()
+
+        # Try to load vocabulary from checkpoint first
+        vocab_loaded = False
+        if checkpoint and 'vocab_b64_gzip' in checkpoint:
+            logger.info("Attempting to load embedded vocabulary from checkpoint")
+            vocab_data = ModelMetadata.extract_vocabulary(checkpoint)
+            if vocab_data:
+                self.vocab = TagVocabulary()
+                self.vocab.tag_to_index = vocab_data['tag_to_index']
+                self.vocab.index_to_tag = {int(k): v for k, v in vocab_data['index_to_tag'].items()}
+                self.vocab.tag_frequencies = vocab_data.get('tag_frequencies', {})
+                self.vocab.unk_index = self.vocab.tag_to_index.get(self.vocab.unk_token, 1)
+                vocab_loaded = True
+                logger.info(f"Loaded embedded vocabulary with {len(self.vocab.tag_to_index)} tags")
+
+        # Fall back to external vocabulary file
+        if not vocab_loaded:
+            logger.info("Loading vocabulary from external file")
+            vocab_path = Path(config.vocab_path)
+            if vocab_path.exists():
+                if vocab_path.suffix == '.json':
+                    self.vocab = TagVocabulary(vocab_path)
+                else:
+                    self.vocab = load_vocabulary_for_training(vocab_path)
             else:
-                self.vocab = load_vocabulary_for_training(vocab_path)
-        else:
-            for path in [DEFAULT_VOCAB_PATH, PROJECT_ROOT / "vocabulary/vocabulary.json"]:
-                if path.exists():
-                    self.vocab = TagVocabulary(path)
-                    break
-            else:
-                raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
+                for path in [DEFAULT_VOCAB_PATH, PROJECT_ROOT / "vocabulary/vocabulary.json"]:
+                    if path.exists():
+                        self.vocab = TagVocabulary(path)
+                        break
+                else:
+                    raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
 
         logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
+
+        # Verify vocabulary integrity
+        placeholder_count = sum(
+            1 for tag in self.vocab.tag_to_index.keys()
+            if tag.startswith("tag_") and tag[4:].isdigit()
+        )
+        if placeholder_count > 0:
+            raise ValueError(
+                f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags!\n"
+                f"Cannot run validation with corrupted vocabulary."
+            )
+
         self.num_tags = len(self.vocab.tag_to_index)
-        
-        # Load model
-        self.model = self._load_model()
         
         # Create metric config
         if config.metric_config:
@@ -225,8 +254,9 @@ class ValidationRunner:
                 logger.addHandler(fh)
         # else: workers only attach QueueHandler in worker_init_fn (see HDF5_loader)
     
-    def _load_model(self) -> nn.Module:
+    def _load_model(self) -> Tuple[nn.Module, Optional[Dict]]:
         """Load model from checkpoint"""
+        checkpoint = None
         if self.config.checkpoint_path:
             logger.info(f"Loading model from checkpoint: {self.config.checkpoint_path}")
             checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu')
@@ -265,7 +295,16 @@ class ValidationRunner:
                 state_dict = {key.replace('module.', ''): value for key, value in state_dict.items()}
             
             model.load_state_dict(state_dict)
-            
+
+            # Load preprocessing parameters if available
+            if 'preprocessing_params' in checkpoint:
+                preprocessing = checkpoint['preprocessing_params']
+                logger.info(f"Found preprocessing params in checkpoint: {preprocessing}")
+            elif 'normalization_params' in checkpoint:
+                # Legacy format
+                norm = checkpoint['normalization_params']
+                logger.info(f"Found normalization params in checkpoint (legacy): {norm}")
+
         elif self.config.model_path:
             logger.info(f"Loading model from path: {self.config.model_path}")
             model = torch.load(self.config.model_path, map_location='cpu')
@@ -278,8 +317,8 @@ class ValidationRunner:
         # Log model info
         total_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Model loaded with {total_params:,} parameters")
-        
-        return model
+
+        return model, checkpoint
     
     def create_dataloader(self) -> DataLoader:
         """Create validation dataloader"""
