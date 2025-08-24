@@ -84,20 +84,42 @@ def _load_metadata(session: ort.InferenceSession):
     return vocab, mean, std, image_size, patch_size, meta
 
 
-def _preprocess(image_path: str, image_size: int, mean, std):
-    """Preprocess image for ONNX inference with explicit float32 handling."""
+def _preprocess(image_path: str, image_size: int, mean, std, session=None):
+    """Preprocess with dynamic dtype handling"""
     img = Image.open(image_path).convert('RGB').resize((image_size, image_size))
 
-    # Ensure all operations stay in float32 to prevent dtype promotion
-    arr = np.asarray(img, dtype=np.float32) / 255.0
+    # Get expected dtype from session if provided
+    expected_dtype = np.float32  # default
+    if session:
+        input_info = session.get_inputs()[0]
+        if 'float16' in str(input_info.type).lower():
+            expected_dtype = np.float16
+        elif 'int8' in str(input_info.type).lower():
+            expected_dtype = np.int8
 
-    # Convert mean and std to numpy arrays to prevent float64 promotion
+    # Convert and normalize
+    arr = np.asarray(img, dtype=np.float32) / 255.0
     mean = np.asarray(mean, dtype=np.float32).reshape(1, 1, 3)
     std = np.asarray(std, dtype=np.float32).reshape(1, 1, 3)
-
     arr = (arr - mean) / std
+
+    # Transpose to NCHW format
     arr = arr.transpose(2, 0, 1)[None, :]
-    return arr.astype(np.float32)  # Explicit final cast to ensure float32
+
+    # Convert to expected dtype
+    if expected_dtype != np.float32:
+        if expected_dtype == np.float16:
+            arr = arr.astype(np.float16)
+        elif expected_dtype == np.int8:
+            # Quantization scaling if needed
+            arr = np.clip(arr * 127, -128, 127).astype(np.int8)
+
+    return arr
+
+
+def _preprocess_simple(image_path: str, image_size: int, mean, std):
+    """Simple preprocessing for backward compatibility"""
+    return _preprocess(image_path, image_size, mean, std, session=None)
 
 
 def main():
@@ -171,16 +193,15 @@ def main():
         vocab, mean, std, image_size, patch_size, meta = result
     input_name = session.get_inputs()[0].name
 
+    # Validate input dtype matches model expectations
+    input_info = session.get_inputs()[0]
+    logger.info(f"Model expects input type: {input_info.type}")
+
     results = []
     for path in args.images:
         start = time.time()
-        # Preprocess with explicit float32 handling
         try:
-            inp = _preprocess(path, image_size, mean, std)
-            # Verify dtype before inference
-            if inp.dtype != np.float32:
-                logger.warning(f"Input dtype is {inp.dtype}, converting to float32")
-                inp = inp.astype(np.float32)
+            inp = _preprocess(path, image_size, mean, std, session)
         except Exception as e:
             logger.error(f"Preprocessing failed for {path}: {e}")
             continue

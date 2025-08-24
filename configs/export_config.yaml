@@ -15,7 +15,7 @@ export_variants:  # Which variants to export
 # - 17 (2022): Added LayerNormalization, GroupNormalization improvements
 # - 18 (2023): Additional optimizations for transformers
 # - 19 (2024): Latest improvements
-opset_version: 18  # Minimum for transformer optimizations with LayerNorm
+opset_version: 17  # Use 17 for better LayerNorm compatibility, avoid opset 18 ReduceMean issues
 export_params: true  # Export model parameters
 do_constant_folding: true  # Optimize constants during export
 input_names:
@@ -226,15 +226,6 @@ deployment_profiles:
     export_format: tflite
     optimize: true
     quantize: true
-    batch_size: 1
-    
-  web:
-    # Settings for web deployment (ONNX.js/WebAssembly)
-    export_format: onnx
-    opset_version: 15  # Better web compatibility
-    optimize: true
-    quantize: true
-    quantization_type: dynamic
     batch_size: 1
     
   mobile_ios:
