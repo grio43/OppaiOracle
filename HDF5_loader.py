@@ -1776,6 +1776,7 @@ class SimplifiedDataset(Dataset):
                 if 'gray_background' not in tags:
                     tags.append('gray_background')
 
+            was_flipped = False  # Track if image was flipped
             # Random horizontal flip with orientation-aware tag swapping
             if (
                 self.orientation_handler is not None
@@ -1785,6 +1786,7 @@ class SimplifiedDataset(Dataset):
                 swapped_tags, should_flip = self.orientation_handler.handle_complex_tags(tags)
                 if should_flip:
                     image = TF.hflip(image)
+                    was_flipped = True
                     self._orientation_stats['flips'] += 1
                 else:
                     self._orientation_stats['skipped'] += 1
@@ -1900,6 +1902,7 @@ class SimplifiedDataset(Dataset):
                     'scale': lb_info['scale'],
                     'pad': lb_info['pad'],
                     'was_composited': was_composited,  # Add to metadata for debugging
+                    'was_flipped': was_flipped,  # Track if flip was applied
                 },
             }
         except (IOError, OSError) as e:
