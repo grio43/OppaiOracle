@@ -138,21 +138,37 @@ class ValidationRunner:
         # Load model first to check for embedded vocabulary
         self.model, checkpoint = self._load_model()
 
-        # Try to load vocabulary from checkpoint first
+        # Priority 1: Try to load vocabulary from checkpoint first
         vocab_loaded = False
         if checkpoint and 'vocab_b64_gzip' in checkpoint:
             logger.info("Attempting to load embedded vocabulary from checkpoint")
             vocab_data = ModelMetadata.extract_vocabulary(checkpoint)
             if vocab_data:
-                self.vocab = TagVocabulary()
-                self.vocab.tag_to_index = vocab_data['tag_to_index']
-                self.vocab.index_to_tag = {int(k): v for k, v in vocab_data['index_to_tag'].items()}
-                self.vocab.tag_frequencies = vocab_data.get('tag_frequencies', {})
-                self.vocab.unk_index = self.vocab.tag_to_index.get(self.vocab.unk_token, 1)
-                vocab_loaded = True
-                logger.info(f"Loaded embedded vocabulary with {len(self.vocab.tag_to_index)} tags")
+                try:
+                    self.vocab = TagVocabulary()
+                    self.vocab.tag_to_index = vocab_data['tag_to_index']
+                    self.vocab.index_to_tag = {int(k): v for k, v in vocab_data['index_to_tag'].items()}
+                    self.vocab.tag_frequencies = vocab_data.get('tag_frequencies', {})
+                    self.vocab.unk_index = self.vocab.tag_to_index.get(self.vocab.unk_token, 1)
 
-        # Fall back to external vocabulary file
+                    placeholder_count = sum(
+                        1 for tag in self.vocab.tag_to_index.keys()
+                        if tag.startswith("tag_") and tag[4:].isdigit()
+                    )
+                    if placeholder_count > 0:
+                        raise ValueError(
+                            f"Embedded vocabulary contains {placeholder_count} placeholder tags!"
+                        )
+
+                    vocab_loaded = True
+                    logger.info(
+                        f"Successfully loaded embedded vocabulary with {len(self.vocab.tag_to_index)} tags"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to use embedded vocabulary: {e}")
+                    vocab_loaded = False
+
+        # Priority 2: Fall back to external vocabulary file
         if not vocab_loaded:
             logger.info("Loading vocabulary from external file")
             vocab_path = Path(config.vocab_path)
@@ -171,15 +187,19 @@ class ValidationRunner:
 
         logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
 
-        # Verify vocabulary integrity
+        # Final vocabulary integrity check
         placeholder_count = sum(
             1 for tag in self.vocab.tag_to_index.keys()
             if tag.startswith("tag_") and tag[4:].isdigit()
         )
         if placeholder_count > 0:
+            logger.error(f"Found {placeholder_count} placeholder tags in vocabulary!")
+            logger.error(
+                f"Examples: {[t for t in list(self.vocab.tag_to_index.keys())[:20] if t.startswith('tag_')]}"
+            )
             raise ValueError(
-                f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags!\n"
-                f"Cannot run validation with corrupted vocabulary."
+                f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags! "
+                f"Cannot run validation with corrupted vocabulary. Please use a valid checkpoint."
             )
 
         self.num_tags = len(self.vocab.tag_to_index)
@@ -296,10 +316,13 @@ class ValidationRunner:
             
             model.load_state_dict(state_dict)
 
-            # Load preprocessing parameters if available
+            # Extract preprocessing parameters if available
             if 'preprocessing_params' in checkpoint:
-                preprocessing = checkpoint['preprocessing_params']
-                logger.info(f"Found preprocessing params in checkpoint: {preprocessing}")
+                preprocessing = ModelMetadata.extract_preprocessing_params(checkpoint)
+                if preprocessing:
+                    logger.info(f"Found preprocessing params in checkpoint: {preprocessing}")
+                    # Store for later use
+                    self.preprocessing_params = preprocessing
             elif 'normalization_params' in checkpoint:
                 # Legacy format
                 norm = checkpoint['normalization_params']
