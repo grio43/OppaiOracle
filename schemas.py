@@ -1,42 +1,43 @@
 #!/usr/bin/env python3
 """
-Standard schemas for prediction outputs
-Ensures consistent output format across all tools
+Standardized schemas for prediction outputs across all tools.
 """
 
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
+import hashlib
 import json
+from pathlib import Path
 
 
 @dataclass
 class TagPrediction:
-    """Single tag prediction"""
+    """Single tag prediction."""
     name: str
     score: float
-
+    
     def to_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "score": round(self.score, 4)}
 
 
 @dataclass
-class ImageResult:
-    """Result for a single image"""
-    image: str  # Image path or identifier
+class ImagePrediction:
+    """Prediction result for a single image."""
+    image: str  # Path or identifier
     tags: List[TagPrediction]
-    processing_time: Optional[float] = None  # milliseconds
-
+    processing_time: Optional[float] = None  # in milliseconds
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             "image": self.image,
             "tags": [t.to_dict() for t in self.tags],
-            "processing_time": round(self.processing_time, 2) if self.processing_time else None
+            "processing_time": self.processing_time
         }
 
 
 @dataclass
 class RunMetadata:
-    """Metadata for a prediction run"""
+    """Metadata for a prediction run."""
     top_k: int
     threshold: float
     vocab_sha256: str
@@ -45,80 +46,55 @@ class RunMetadata:
     image_size: int
     patch_size: int
     model_path: Optional[str] = None
-    timestamp: Optional[str] = None
-
+    num_tags: Optional[int] = None
+    
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
-class PredictionFormatter:
-    """Formats predictions according to standard schema"""
-
-    @staticmethod
-    def format_prediction(
-        image_path: str,
-        predictions: Dict[str, float],
-        processing_time_ms: Optional[float] = None,
-        threshold: float = 0.5
-    ) -> ImageResult:
-        """Format a single prediction"""
-
-        tags = []
-        for tag_name, score in predictions.items():
-            if score >= threshold:
-                tags.append(TagPrediction(name=tag_name, score=score))
-
-        # Sort by score descending
-        tags.sort(key=lambda t: t.score, reverse=True)
-
-        return ImageResult(
-            image=image_path,
-            tags=tags,
-            processing_time=processing_time_ms
-        )
-
-    @staticmethod
-    def format_batch_output(
-        results: List[ImageResult],
-        metadata: RunMetadata
-    ) -> Dict[str, Any]:
-        """Format batch prediction output"""
-
+@dataclass
+class PredictionOutput:
+    """Complete output with metadata and results."""
+    metadata: RunMetadata
+    results: List[ImagePrediction]
+    
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            "metadata": metadata.to_dict(),
-            "results": [r.to_dict() for r in results]
+            "metadata": self.metadata.to_dict(),
+            "results": [r.to_dict() for r in self.results]
         }
+    
+    def to_json(self, indent: int = 2) -> str:
+        """Convert to JSON string."""
+        return json.dumps(self.to_dict(), indent=indent)
+    
+    def save(self, filepath: Path) -> None:
+        """Save to JSON file."""
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        with open(filepath, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
 
-    @staticmethod
-    def save_results(
-        results: List[ImageResult],
-        metadata: RunMetadata,
-        output_path: str
-    ):
-        """Save results to JSON file"""
 
-        output = PredictionFormatter.format_batch_output(results, metadata)
-
-        with open(output_path, 'w') as f:
-            json.dump(output, f, indent=2)
-
-    @staticmethod
-    def load_results(input_path: str) -> Tuple[List[ImageResult], RunMetadata]:
-        """Load results from JSON file"""
-
-        with open(input_path, 'r') as f:
-            data = json.load(f)
-
-        metadata = RunMetadata(**data['metadata'])
-        results = []
-
-        for r in data['results']:
-            tags = [TagPrediction(**t) for t in r['tags']]
-            results.append(ImageResult(
-                image=r['image'],
-                tags=tags,
-                processing_time=r.get('processing_time')
-            ))
-
-        return results, metadata
+def compute_vocab_sha256(vocab_path: Optional[Path] = None, 
+                        vocab_data: Optional[Dict] = None) -> str:
+    """Compute SHA256 hash of vocabulary.
+    
+    Args:
+        vocab_path: Path to vocabulary file
+        vocab_data: Vocabulary data dict (if already loaded)
+    
+    Returns:
+        SHA256 hash as hex string
+    """
+    if vocab_data:
+        # Hash the vocabulary data directly
+        vocab_json = json.dumps(vocab_data, sort_keys=True)
+        return hashlib.sha256(vocab_json.encode()).hexdigest()
+    elif vocab_path and vocab_path.exists():
+        # Hash the file contents
+        with open(vocab_path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    else:
+        return "unknown"
 
