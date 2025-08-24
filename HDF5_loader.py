@@ -2470,10 +2470,15 @@ def create_dataloaders(
     worker_init_fn = _make_worker_init_fn(base_seed, log_queue)
 
     # Build dataloaders
+    # Shuffle training data only when no sampler is attached.
+    # This preserves correct behavior when using frequency/distributed sampling,
+    # where the Sampler controls shuffling across epochs.
+    use_shuffle = (train_sampler is None)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=(train_sampler is None),
+        shuffle=use_shuffle,
         sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory_config['enabled'],
@@ -2484,6 +2489,7 @@ def create_dataloaders(
         worker_init_fn=worker_init_fn,
         generator=generator,
     )
+    # Validation/Test loaders remain deterministic (no shuffling)
     val_loader = DataLoader(
         val_dataset,
         batch_size=val_bs,
