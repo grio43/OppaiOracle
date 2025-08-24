@@ -23,7 +23,7 @@ lr_end: 1.0e-6  # Minimum learning rate at the end
 # Mixed Precision Training
 use_amp: true  # Use automatic mixed precision
 amp_opt_level: O1  # Options: O0, O1, O2, O3
-amp_dtype: float16  # Options: float16, bfloat16
+amp_dtype: bfloat16  # Options: float16, bfloat16
 
 # Gradient Clipping
 max_grad_norm: 1.0  # Maximum gradient norm for clipping
