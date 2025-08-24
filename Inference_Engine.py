@@ -32,6 +32,7 @@ from torchvision import transforms
 from PIL import Image
 
 # Vocabulary utilities
+from model_metadata import ModelMetadata
 from vocabulary import TagVocabulary, load_vocabulary_for_training
 
 # Make cv2 optional - not needed for basic inference
@@ -198,37 +199,21 @@ class ModelWrapper:
 
             # Priority 1: Check for embedded vocabulary in checkpoint
             if 'vocab_b64_gzip' in checkpoint:
-                logger.info("Found embedded vocabulary in checkpoint")
-                try:
-                    # Decode embedded vocabulary
-                    vocab_b64 = checkpoint['vocab_b64_gzip']
-                    vocab_compressed = base64.b64decode(vocab_b64)
-                    vocab_bytes = gzip.decompress(vocab_compressed)
-                    vocab_json = vocab_bytes.decode('utf-8')
-                    vocab_data = json.loads(vocab_json)
-
-                    # Verify integrity
-                    if 'vocab_sha256' in checkpoint:
-                        expected_sha = checkpoint['vocab_sha256']
-                        actual_sha = hashlib.sha256(vocab_bytes).hexdigest()
-                        if expected_sha != actual_sha:
-                            logger.warning(f"Vocabulary SHA mismatch: expected {expected_sha}, got {actual_sha}")
-
-                    # Create vocabulary from embedded data
-                    from vocabulary import TagVocabulary
+                logger.info("Loading embedded vocabulary from checkpoint")
+                vocab_data = ModelMetadata.extract_vocabulary(checkpoint)
+                if vocab_data:
                     self.vocabulary = TagVocabulary()
                     self.vocabulary.tag_to_index = vocab_data['tag_to_index']
                     self.vocabulary.index_to_tag = {int(k): v for k, v in vocab_data['index_to_tag'].items()}
                     self.vocabulary.tag_frequencies = vocab_data.get('tag_frequencies', {})
-
+                    self.vocabulary.unk_index = self.vocabulary.tag_to_index.get(self.vocabulary.unk_token, 1)
                     self.tag_names = [
                         self.vocabulary.get_tag_from_index(i)
                         for i in range(len(self.vocabulary.tag_to_index))
                     ]
                     logger.info(f"Successfully loaded {len(self.tag_names)} tags from embedded vocabulary")
-
-                except Exception as e:
-                    logger.error(f"Failed to load embedded vocabulary: {e}")
+                else:
+                    logger.error("Failed to extract embedded vocabulary")
                     # Fall back to external vocabulary file
                     self._load_external_vocabulary()
             else:
@@ -241,18 +226,19 @@ class ModelWrapper:
 
             # Load preprocessing parameters from checkpoint
             if 'preprocessing_params' in checkpoint:
-                self.normalization_params = checkpoint['preprocessing_params']
-                # Update config with embedded parameters
-                self.config.normalize_mean = self.normalization_params.get('normalize_mean', [0.5, 0.5, 0.5])
-                self.config.normalize_std = self.normalization_params.get('normalize_std', [0.5, 0.5, 0.5])
-                self.config.image_size = self.normalization_params.get('image_size', 640)
-                logger.info(f"Loaded preprocessing params from checkpoint: {self.normalization_params}")
+                preprocessing = ModelMetadata.extract_preprocessing_params(checkpoint)
+                if preprocessing:
+                    self.config.normalize_mean = preprocessing.get('normalize_mean', [0.5, 0.5, 0.5])
+                    self.config.normalize_std = preprocessing.get('normalize_std', [0.5, 0.5, 0.5])
+                    self.config.image_size = preprocessing.get('image_size', 640)
+                    self.normalization_params = preprocessing
+                    logger.info(f"Loaded preprocessing params from checkpoint: {preprocessing}")
             elif 'normalization_params' in checkpoint:
                 # Legacy format
                 self.normalization_params = checkpoint['normalization_params']
                 self.config.normalize_mean = self.normalization_params['mean']
                 self.config.normalize_std = self.normalization_params['std']
-                logger.info(f"Loaded normalization params from checkpoint (legacy format)")
+                logger.info("Loaded normalization params from checkpoint (legacy format)")
             else:
                 logger.warning("Preprocessing params not found in checkpoint. Using config defaults.")
 
@@ -385,8 +371,11 @@ class ModelWrapper:
             if tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit()
         )
         if placeholder_count > 10:
+            logger.error(
+                f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags! "
+                f"Example placeholders: {[t for t in self.tag_names[:20] if t.startswith('tag_')]}"
+            )
             raise ValueError(
-                f"CRITICAL: Vocabulary contains {placeholder_count} placeholder tags!\n"
                 f"This checkpoint/vocabulary is corrupted. Cannot perform inference."
             )
 

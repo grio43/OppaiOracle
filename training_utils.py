@@ -510,7 +510,9 @@ class CheckpointManager:
         config: Optional[Dict] = None
     ) -> Path:
         """Save a checkpoint"""
-        
+
+        from model_metadata import ModelMetadata
+
         # Prepare checkpoint data
         checkpoint = {
             'epoch': epoch,
@@ -537,37 +539,28 @@ class CheckpointManager:
             model_to_check = model
 
         # Load and embed vocabulary if available
-        vocab_path = config.get('vocab_path', VOCAB_PATH) if config else VOCAB_PATH
-        if Path(vocab_path).exists():
-            try:
-                with open(vocab_path, 'r', encoding='utf-8') as f:
-                    vocab_data = json.load(f)
-
-                # Compress vocabulary for efficient storage
-                vocab_json = json.dumps(vocab_data, ensure_ascii=False)
-                vocab_bytes = vocab_json.encode('utf-8')
-                vocab_compressed = gzip.compress(vocab_bytes)
-                vocab_b64 = base64.b64encode(vocab_compressed).decode('utf-8')
-                vocab_sha256 = hashlib.sha256(vocab_bytes).hexdigest()
-
-                checkpoint['vocab_b64_gzip'] = vocab_b64
-                checkpoint['vocab_format_version'] = '1'
-                checkpoint['vocab_sha256'] = vocab_sha256
-
-                logger.info(f"Embedded vocabulary ({len(vocab_data.get('tag_to_index', {}))} tags) into checkpoint")
-            except Exception as e:
-                logger.error(f"Failed to embed vocabulary: {e}")
+        vocab_path = Path(config.get('vocab_path', VOCAB_PATH) if config else VOCAB_PATH)
+        if vocab_path.exists():
+            # Use ModelMetadata helper to embed vocabulary
+            checkpoint = ModelMetadata.embed_vocabulary(checkpoint, vocab_path)
+        else:
+            logger.error(f"Vocabulary file not found at {vocab_path} - checkpoint will not be self-contained!")
 
         # Embed preprocessing parameters
         if config:
-            preprocessing_params = {
-                'normalize_mean': config.get('normalize_mean', [0.5, 0.5, 0.5]),
-                'normalize_std': config.get('normalize_std', [0.5, 0.5, 0.5]),
-                'image_size': config.get('image_size', 640),
-                'patch_size': config.get('patch_size', 16),
-            }
-            checkpoint['preprocessing_params'] = preprocessing_params
-            logger.info(f"Embedded preprocessing params: {preprocessing_params}")
+            # Use ModelMetadata helper to embed preprocessing params
+            checkpoint = ModelMetadata.embed_preprocessing_params(
+                checkpoint,
+                normalize_mean=tuple(config.get('normalize_mean', [0.5, 0.5, 0.5])),
+                normalize_std=tuple(config.get('normalize_std', [0.5, 0.5, 0.5])),
+                image_size=config.get('image_size', 640),
+                patch_size=config.get('patch_size', 16)
+            )
+        else:
+            # Use defaults if no config provided
+            checkpoint = ModelMetadata.embed_preprocessing_params(
+                checkpoint, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), 640, 16)
+            logger.info("Embedded default preprocessing params")
 
         # Backwards compatibility info
         if hasattr(model_to_check, 'config'):

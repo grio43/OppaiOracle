@@ -17,15 +17,14 @@ from collections import defaultdict
 import time
 import warnings
 import sys
-import base64
-import gzip
-import hashlib
+# Base libraries
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 try:
+    from model_metadata import ModelMetadata
     import onnx
     import onnxruntime as ort
     from onnxruntime.quantization import quantize_dynamic, QuantType
@@ -169,28 +168,46 @@ class ONNXExporter:
         
         # Load vocabulary
         try:
-            # Try to load vocabulary from the specified path
-            vocab_path = Path(config.vocab_dir)
-            
-            # If it's a directory, look for vocabulary.json inside it
-            if vocab_path.is_dir():
-                vocab_path = vocab_path / "vocabulary.json"
-            
-            # Use the canonical path if not found
-            if not vocab_path.exists():
-                logger.warning(f"Vocabulary not found at {vocab_path}, trying canonical path")
-                vocab_path = Path("/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json")
-            
-            if not vocab_path.exists():
-                raise FileNotFoundError(
-                    f"Vocabulary file not found at {vocab_path}. "
-                    f"Cannot export model without valid vocabulary."
-                )
-            
-            logger.info(f"Loading vocabulary from {vocab_path}")
-            self.vocab = TagVocabulary(vocab_path)
-            logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
-            self.num_tags = len(self.vocab.tag_to_index)
+            # Check for embedded vocabulary in checkpoint first
+            checkpoint_path = Path(self.config.checkpoint_path)
+            if checkpoint_path.exists():
+                checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                if 'vocab_b64_gzip' in checkpoint:
+                    logger.info("Found embedded vocabulary in checkpoint, extracting...")
+                    vocab_data = ModelMetadata.extract_vocabulary(checkpoint)
+                    if vocab_data:
+                        self.vocab = TagVocabulary()
+                        self.vocab.tag_to_index = vocab_data['tag_to_index']
+                        self.vocab.index_to_tag = {int(k): v for k, v in vocab_data['index_to_tag'].items()}
+                        self.vocab.tag_frequencies = vocab_data.get('tag_frequencies', {})
+                        self.num_tags = len(self.vocab.tag_to_index)
+                        logger.info(
+                            f"Successfully extracted embedded vocabulary with {self.num_tags} tags"
+                        )
+                    else:
+                        logger.error("Failed to extract embedded vocabulary, falling back to external file")
+
+            # If vocabulary not loaded from checkpoint, load from file
+            if not hasattr(self, 'vocab'):
+                vocab_path = Path(config.vocab_dir)
+
+                if vocab_path.is_dir():
+                    vocab_path = vocab_path / "vocabulary.json"
+
+                if not vocab_path.exists():
+                    logger.warning(f"Vocabulary not found at {vocab_path}, trying canonical path")
+                    vocab_path = Path("/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json")
+
+                if not vocab_path.exists():
+                    raise FileNotFoundError(
+                        f"Vocabulary file not found at {vocab_path}. "
+                        f"Cannot export model without valid vocabulary."
+                    )
+
+                logger.info(f"Loading vocabulary from {vocab_path}")
+                self.vocab = TagVocabulary(vocab_path)
+                logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
+                self.num_tags = len(self.vocab.tag_to_index)
 
             # CRITICAL: Verify vocabulary before export
             self._verify_vocabulary()
@@ -734,11 +751,11 @@ class ONNXExporter:
             # Clear existing metadata
             del model.metadata_props[:]
             
-            # Serialize vocabulary
-            vocab_json = self.vocab.to_json()
-            vocab_bytes = vocab_json.encode('utf-8')
-            vocab_sha = hashlib.sha256(vocab_bytes).hexdigest()
-            vocab_b64 = base64.b64encode(gzip.compress(vocab_bytes)).decode('utf-8')
+            # Use ModelMetadata to prepare vocabulary for embedding
+            temp_checkpoint: Dict[str, Any] = {}
+            vocab_path = Path(self.config.vocab_dir) / "vocabulary.json" if Path(self.config.vocab_dir).is_dir() else Path(self.config.vocab_dir)
+            if vocab_path.exists():
+                temp_checkpoint = ModelMetadata.embed_vocabulary(temp_checkpoint, vocab_path)
 
             # Add metadata
             metadata = {
@@ -751,9 +768,9 @@ class ONNXExporter:
                 'patch_size': str(self.config.patch_size),
                 'normalize_mean': json.dumps(self.config.normalize_mean),
                 'normalize_std': json.dumps(self.config.normalize_std),
-                'vocab_format_version': '1',
-                'vocab_sha256': vocab_sha,
-                'vocab_b64_gzip': vocab_b64,
+                'vocab_format_version': temp_checkpoint.get('vocab_format_version', '1'),
+                'vocab_sha256': temp_checkpoint.get('vocab_sha256', ''),
+                'vocab_b64_gzip': temp_checkpoint.get('vocab_b64_gzip', ''),
                 'framework': 'PyTorch',
                 'framework_version': torch.__version__,
                 'onnx_version': onnx.__version__,
