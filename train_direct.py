@@ -235,12 +235,17 @@ def train_with_orientation_tracking():
         if ws not in (":4096:8", ":16:8"):
             # Automatically set the environment variable for deterministic behavior
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-            logger.info(
-                "Setting CUBLAS_WORKSPACE_CONFIG=:4096:8 for deterministic cuBLAS operations. "
-                "To avoid this message, set the environment variable before running:\n"
-                "    export CUBLAS_WORKSPACE_CONFIG=:4096:8\n"
-                "Or run via: scripts/run_train_deterministic.sh"
-            )
+            # Only log if not in quiet mode
+            if not os.getenv("OPPAI_QUIET_MODE"):
+                logger.info(
+                    "Setting CUBLAS_WORKSPACE_CONFIG=:4096:8 for deterministic cuBLAS operations. "
+                    "To avoid this message, set the environment variable before running:\n"
+                    "    export CUBLAS_WORKSPACE_CONFIG=:4096:8\n"
+                    "Or run via: scripts/run_train_deterministic.sh\n"
+                    "Or set OPPAI_QUIET_MODE=1 to suppress this message."
+                )
+            else:
+                logger.debug("Automatically set CUBLAS_WORKSPACE_CONFIG=:4096:8")
         else:
             logger.info(f"Using existing CUBLAS_WORKSPACE_CONFIG={ws}")
     
@@ -339,17 +344,13 @@ def train_with_orientation_tracking():
     
     
     # Show orientation statistics warning only once
-    orientation_stats_warning_shown = False
-    if config["num_workers"] > 0 and config["random_flip_prob"] > 0 and not orientation_stats_warning_shown:
+    if config["num_workers"] > 0 and config["random_flip_prob"] > 0 and not os.getenv("OPPAI_QUIET_MODE"):
         logger.info("\n" + "="*60)
-        logger.info("IMPORTANT: Orientation Statistics Limitation")
+        logger.info("Note: Orientation Statistics with Multiple Workers")
         logger.info("="*60)
-        logger.info(f"With num_workers={config['num_workers']}, orientation statistics will be incomplete.")
-        logger.info("Each worker tracks stats independently and they are not aggregated.")
-        logger.info("For accurate orientation statistics, use num_workers=0.")
-        logger.info("This does not affect training quality, only statistics reporting.")
+        logger.info(f"With num_workers={config['num_workers']}, orientation stats are aggregated from workers.")
+        logger.info("For most accurate statistics, consider using num_workers=0.")
         logger.info("="*60 + "\n")
-        orientation_stats_warning_shown = True
 
     # Create queue for augmentation stats collection
     stats_queue = mp.Queue(maxsize=1000) if config.get("log_augmentation_stats", True) else None
@@ -357,15 +358,21 @@ def train_with_orientation_tracking():
     device = torch.device(config["device"])
 
     # Create dataloaders with orientation-aware configuration
-    dataloader_config_updates = {
+    # Consolidate orientation settings from single source
+    orientation_settings = {
         "random_flip_prob": config["random_flip_prob"],
-        # Convert string back to Path if needed
-        "orientation_map_path": Path(config.get("orientation_map_path")) if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) else config.get("orientation_map_path"),
+        "orientation_map_path": Path(config.get("orientation_map_path")) \
+            if config.get("orientation_map_path") and isinstance(config.get("orientation_map_path"), str) \
+            else config.get("orientation_map_path"),
         "skip_unmapped": config.get("skip_unmapped", True),
         "strict_orientation_validation": config.get("strict_orientation", True),
+    }
+    
+    dataloader_config_updates = {
+        **orientation_settings,  # Include all orientation settings
         "num_workers": config["num_workers"],  # Pass to dataset for LMDB initialization
         "collect_augmentation_stats": config.get("log_augmentation_stats", True),
-        "stats_queue": stats_queue,  # Pass stats queue
+        "stats_queue": stats_queue,  # Pass stats queue 
         # Conservative colour jitter settings for anime
         "color_jitter_brightness": 0.1,
         "color_jitter_contrast": 0.1,
@@ -533,22 +540,27 @@ def train_with_orientation_tracking():
         """Get orientation stats from the dataset if available."""
         try:
             if hasattr(train_loader.dataset, 'get_orientation_stats'):
-                return train_loader.dataset.get_orientation_stats()
+                stats = train_loader.dataset.get_orientation_stats()
+                if 'processed_samples' in stats and 'processed' not in stats:
+                    stats['processed'] = stats.get('processed_samples', 0)
+                return stats
         except Exception as e:
             logger.debug(f"Could not get orientation stats: {e}")
-        
+
         return {
             'total_flips': 0,
             'skipped_flips': 0,
             'flip_rate': 0.0,
             'has_handler': False,
-            'worker_local': True
+            'worker_local': True,
+            'processed': 0,
         }
         
     # Training loop with orientation statistics
     global_step = 0
     orientation_stats_interval = 100  # Log orientation stats every N batches
     aggregated_aug_stats = AugmentationStats()
+    aggregated_orientation_stats = {'flips': 0, 'skipped': 0, 'processed': 0}
     
     # Log augmentation hparams at start
     if monitor.writer:
@@ -577,6 +589,10 @@ def train_with_orientation_tracking():
                     msg_type, stats = stats_queue.get_nowait()
                     if msg_type == 'aug_stats' and isinstance(stats, AugmentationStats):
                         aggregated_aug_stats.aggregate(stats)
+                    elif msg_type == 'orientation_stats' and isinstance(stats, dict):
+                        aggregated_orientation_stats['flips'] += stats.get('flips', 0)
+                        aggregated_orientation_stats['skipped'] += stats.get('skipped', 0)
+                        aggregated_orientation_stats['processed'] += stats.get('processed', 0)
                 except:
                     break
         
@@ -648,6 +664,10 @@ def train_with_orientation_tracking():
                             msg_type, stats = stats_queue.get_nowait()
                             if msg_type == 'aug_stats':
                                 aggregated_aug_stats.aggregate(stats)
+                            elif msg_type == 'orientation_stats':
+                                aggregated_orientation_stats['flips'] += stats.get('flips', 0)
+                                aggregated_orientation_stats['skipped'] += stats.get('skipped', 0)
+                                aggregated_orientation_stats['processed'] += stats.get('processed', 0)
                         except:
                             break
                 # Log aggregated stats
@@ -761,20 +781,22 @@ def train_with_orientation_tracking():
         )
 
         # Log orientation statistics at end of epoch
-        if config["random_flip_prob"] > 0:
-            stats = get_dataset_orientation_stats()
-            if stats['has_handler']:
+        if config["random_flip_prob"] > 0 and aggregated_orientation_stats['processed'] > 0:
+            flip_rate = aggregated_orientation_stats['flips'] / max(1, aggregated_orientation_stats['processed'])
+            logger.info(
+                f"Epoch {epoch + 1} orientation stats (aggregated): "
+                f"Flips: {aggregated_orientation_stats['flips']}, "
+                f"Skipped: {aggregated_orientation_stats['skipped']}, "
+                f"Processed: {aggregated_orientation_stats['processed']}, "
+                f"Flip rate: {flip_rate:.1%}"
+            )
+            # Also log local stats for comparison if available
+            local_stats = get_dataset_orientation_stats()
+            if local_stats['has_handler'] and local_stats['processed'] > 0:
                 logger.info(
-                    f"Epoch {epoch + 1} orientation stats (worker-local): "
-                    f"Flips: {stats['total_flips']}, "
-                    f"Skipped: {stats['skipped_flips']}, "
-                    f"Flip rate: {stats['flip_rate']:.1%}"
+                    f"  (Main process local stats - Flips: {local_stats['total_flips']}, "
+                    f"Flip rate: {local_stats['flip_rate']:.1%})"
                 )
-                if config["num_workers"] > 0:
-                    logger.info(
-                        "Note: These stats are from the main process only. "
-                        "Actual flip counts across all workers will be higher."
-                    )
 
     # Final augmentation stats summary
     if aggregated_aug_stats.flip_total > 0:
@@ -813,13 +835,12 @@ def train_with_orientation_tracking():
     
 
     # Log final warning about statistics limitation
-    if config["num_workers"] > 0 and config["random_flip_prob"] > 0:
-        logger.info("\n" + "="*60)
-        logger.info("IMPORTANT: Orientation statistics limitation")
-        logger.info("Statistics shown above are incomplete due to multi-worker data loading.")
-        logger.info("For accurate flip statistics, re-run with num_workers=0")
-        logger.info("="*60)
-    
+    if aggregated_orientation_stats['processed'] > 0:
+        logger.info(f"\nTotal orientation stats across all workers:")
+        logger.info(f"  Total flips: {aggregated_orientation_stats['flips']}")
+        logger.info(f"  Total skipped: {aggregated_orientation_stats['skipped']}")
+        logger.info(f"  Total processed: {aggregated_orientation_stats['processed']}")
+
     logger.info("\nTraining complete with orientation-aware augmentation!")
 
     monitor.close()
