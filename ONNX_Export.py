@@ -69,7 +69,10 @@ class ONNXExportConfig:
     output_path: str = "model.onnx"
     
     # Export settings
-    opset_version: int = 16
+    # Use opset 18 or higher for transformer models with LayerNormalization
+    # Opset 17 introduced LayerNormalization, while opset 18 added additional optimizations
+    # See: https://github.com/onnx/onnx/releases/tag/v1.12.0 (opset 17)
+    opset_version: int = 18  # Minimum for LayerNormalization support, 18 recommended
     input_names: List[str] = field(default_factory=lambda: ["input_image"])
     # Only export scores, not binary predictions (to avoid threshold-related validation issues)
     output_names: List[str] = field(default_factory=lambda: ["scores"])
@@ -602,7 +605,23 @@ class ONNXExporter:
     def _optimize_model(self, model_path: Path):
         """Optimize ONNX model"""
         logger.info("Optimizing ONNX model...")
-        
+
+        # Check opset version to determine optimization strategy
+        try:
+            model = onnx.load(str(model_path))
+            opset_version = model.opset_import[0].version if model.opset_import else 16
+
+            # Warn if using older opset that doesn't support LayerNormalization
+            if opset_version < 17:
+                logger.warning(
+                    f"Model uses opset {opset_version} which doesn't support LayerNormalization. "
+                    f"Some transformer optimizations will be skipped. "
+                    f"Consider upgrading to opset 17+ for better performance."
+                )
+        except Exception as e:
+            logger.warning(f"Could not determine opset version: {e}")
+            opset_version = self.config.opset_version
+
         try:
             # Try to use ONNX Runtime transformer optimizer (correct API)
             from onnxruntime.transformers.optimizer import optimize_model
@@ -615,10 +634,21 @@ class ONNXExporter:
 
             # Create fusion options
             fusion_options = FusionOptions('bert')  # Use BERT-style optimizations for transformers
-            fusion_options.enable_skip_layer_norm = True
             fusion_options.enable_gelu = True
             fusion_options.enable_bias_gelu = True
             fusion_options.enable_attention = True
+
+            # Only enable LayerNorm fusions if opset supports it
+            if opset_version >= 17:
+                fusion_options.enable_skip_layer_norm = True
+                fusion_options.enable_layer_norm = True
+                logger.info(f"Enabling LayerNormalization fusions (opset {opset_version})")
+            else:
+                fusion_options.enable_skip_layer_norm = False
+                fusion_options.enable_layer_norm = False
+                logger.info(
+                    f"Disabling LayerNormalization fusions for opset {opset_version} compatibility"
+                )
 
             # Optimize using the correct API
             optimized_model = optimize_model(
@@ -630,9 +660,10 @@ class ONNXExporter:
                 opt_level=2,
                 use_gpu=torch.cuda.is_available(),
                 only_onnxruntime=False,  # Apply both ONNX and ORT optimizations
+                verbose=0,  # Set to 1 for debugging optimization issues
                 # Note: float16 and input_int32 parameters removed - not supported in current API
             )
-            
+
             # Save the optimized model
             optimized_model.save_model_to_file(str(optimized_path))
 
@@ -1070,8 +1101,8 @@ def main():
                         help='Batch size for export')
     parser.add_argument('-s', '--image-size', type=int, default=640,
                         help='Input image size')
-    parser.add_argument('--opset', type=int, default=16,
-                        help='ONNX opset version')
+    parser.add_argument('--opset', type=int, default=18,
+                        help='ONNX opset version (>=17 for LayerNorm, 18 recommended)')
     parser.add_argument('--variants', nargs='+', default=['full'],
                         choices=['full', 'quantized'],
                         help='Export variants to generate')

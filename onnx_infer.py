@@ -85,11 +85,19 @@ def _load_metadata(session: ort.InferenceSession):
 
 
 def _preprocess(image_path: str, image_size: int, mean, std):
+    """Preprocess image for ONNX inference with explicit float32 handling."""
     img = Image.open(image_path).convert('RGB').resize((image_size, image_size))
-    arr = np.array(img).astype('float32') / 255.0
+
+    # Ensure all operations stay in float32 to prevent dtype promotion
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+
+    # Convert mean and std to numpy arrays to prevent float64 promotion
+    mean = np.asarray(mean, dtype=np.float32).reshape(1, 1, 3)
+    std = np.asarray(std, dtype=np.float32).reshape(1, 1, 3)
+
     arr = (arr - mean) / std
     arr = arr.transpose(2, 0, 1)[None, :]
-    return arr
+    return arr.astype(np.float32)  # Explicit final cast to ensure float32
 
 
 def main():
@@ -166,7 +174,17 @@ def main():
     results = []
     for path in args.images:
         start = time.time()
-        inp = _preprocess(path, image_size, mean, std)
+        # Preprocess with explicit float32 handling
+        try:
+            inp = _preprocess(path, image_size, mean, std)
+            # Verify dtype before inference
+            if inp.dtype != np.float32:
+                logger.warning(f"Input dtype is {inp.dtype}, converting to float32")
+                inp = inp.astype(np.float32)
+        except Exception as e:
+            logger.error(f"Preprocessing failed for {path}: {e}")
+            continue
+
         outputs = session.run(None, {input_name: inp})
 
         # Handle both old (predictions, scores) and new (scores only) model formats
