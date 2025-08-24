@@ -34,16 +34,19 @@ from torch.optim.lr_scheduler import _LRScheduler
 from torch.amp import GradScaler, autocast
 import torch.backends.cudnn as cudnn
 
-logger = logging.getLogger(__name__)
-
-# Import ModelMetadata at module level to avoid import issues
+# Import ModelMetadata at module level for fail-fast behavior
 try:
-    from model_metadata import ModelMetadata
-    MODEL_METADATA_AVAILABLE = True
+    from oppai_oracle.model_metadata import ModelMetadata
 except ImportError as e:
-    logger.warning(f"ModelMetadata module not available: {e}")
-    logger.warning("Checkpoints will not include embedded vocabulary")
-    MODEL_METADATA_AVAILABLE = False
+    # Fallback to relative import if package not installed
+    try:
+        from model_metadata import ModelMetadata
+    except ImportError:
+        raise ImportError(
+            "Could not import ModelMetadata. Please ensure the package is installed correctly with 'pip install -e .' from the project root."
+        ) from e
+
+logger = logging.getLogger(__name__)
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -519,7 +522,6 @@ class CheckpointManager:
         config: Optional[Dict] = None
     ) -> Path:
         """Save a checkpoint"""
-        global MODEL_METADATA_AVAILABLE
 
         # Prepare checkpoint data
         checkpoint = {
@@ -549,50 +551,26 @@ class CheckpointManager:
         # Load and embed vocabulary if available
         vocab_path = Path(config.get('vocab_path', VOCAB_PATH) if config else VOCAB_PATH)
         if vocab_path.exists():
-            if MODEL_METADATA_AVAILABLE:
-                # Use ModelMetadata helper to embed vocabulary
-                checkpoint = ModelMetadata.embed_vocabulary(checkpoint, vocab_path)
-            else:
-                logger.error(f"Cannot embed vocabulary - ModelMetadata module not available")
+            checkpoint = ModelMetadata.embed_vocabulary(checkpoint, vocab_path)
         else:
-            logger.error(f"Vocabulary file not found at {vocab_path} - checkpoint will not be self-contained!")
-            MODEL_METADATA_AVAILABLE = False  # Prevent trying to use it for preprocessing params
+            logger.error(
+                f"Vocabulary file not found at {vocab_path} - checkpoint will not be self-contained!"
+            )
 
         # Embed preprocessing parameters
         if config:
-            if MODEL_METADATA_AVAILABLE:
-                # Use ModelMetadata helper to embed preprocessing params
-                checkpoint = ModelMetadata.embed_preprocessing_params(
-                    checkpoint,
-                    normalize_mean=tuple(config.get('normalize_mean', [0.5, 0.5, 0.5])),
-                    normalize_std=tuple(config.get('normalize_std', [0.5, 0.5, 0.5])),
-                    image_size=config.get('image_size', 640),
-                    patch_size=config.get('patch_size', 16)
-                )
-            else:
-                # Fallback: embed preprocessing params directly
-                checkpoint['preprocessing_params'] = {
-                    'normalize_mean': list(config.get('normalize_mean', [0.5, 0.5, 0.5])),
-                    'normalize_std': list(config.get('normalize_std', [0.5, 0.5, 0.5])),
-                    'image_size': config.get('image_size', 640),
-                    'patch_size': config.get('patch_size', 16),
-                }
-                logger.info("Embedded preprocessing params directly (ModelMetadata not available)")
+            checkpoint = ModelMetadata.embed_preprocessing_params(
+                checkpoint,
+                normalize_mean=tuple(config.get('normalize_mean', [0.5, 0.5, 0.5])),
+                normalize_std=tuple(config.get('normalize_std', [0.5, 0.5, 0.5])),
+                image_size=config.get('image_size', 640),
+                patch_size=config.get('patch_size', 16),
+            )
         else:
-            if MODEL_METADATA_AVAILABLE:
-                # Use defaults if no config provided
-                checkpoint = ModelMetadata.embed_preprocessing_params(
-                    checkpoint, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), 640, 16)
-                logger.info("Embedded default preprocessing params")
-            else:
-                # Fallback: embed defaults directly
-                checkpoint['preprocessing_params'] = {
-                    'normalize_mean': [0.5, 0.5, 0.5],
-                    'normalize_std': [0.5, 0.5, 0.5],
-                    'image_size': 640,
-                    'patch_size': 16,
-                }
-                logger.info("Embedded default preprocessing params directly")
+            checkpoint = ModelMetadata.embed_preprocessing_params(
+                checkpoint, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), 640, 16
+            )
+            logger.info("Embedded default preprocessing params")
 
         # Backwards compatibility info
         if hasattr(model_to_check, 'config'):
