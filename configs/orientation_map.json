@@ -211,7 +211,20 @@
     "looking_through_own_legs",
     "looking_through_scope",
     "looking_to_the_side",
-    "looking_up"
+    "looking_up",
+    "facing_ahead",
+    "facing_another",
+    "facing_away",
+    "facing_to_the_side",
+    "pointing",
+    "pointing_at_another",
+    "pointing_at_self",
+    "pointing_at_viewer",
+    "pointing_down",
+    "pointing_forward",
+    "pointing_spider-man_(meme)",
+    "pointing_to_the_side",
+    "pointing_up"
   ],
   
   "skip_flip_tags": [
