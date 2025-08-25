@@ -9,7 +9,6 @@ import json
 import h5py
 import numpy as np
 import logging
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from collections import Counter
@@ -25,27 +24,9 @@ import yaml
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.metadata_ingestion import parse_tags_field, dedupe_preserve_order
+from utils.logging_utils import setup_logging
 
-def _setup_logging():
-    try:
-        cfg = yaml.safe_load(Path("configs/logging.yaml").read_text(encoding="utf-8"))
-    except Exception:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        return logging.getLogger(__name__)
-    level = getattr(logging, str(cfg.get("level", "INFO")).upper(), logging.INFO)
-    fmt = cfg.get("format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    logging.basicConfig(level=level, format=fmt)
-    if (cfg.get("file_logging") or {}).get("enabled"):
-        log_dir = Path((cfg.get("file_logging") or {}).get("dir", "./logs"))
-        log_dir.mkdir(parents=True, exist_ok=True)
-        rot = cfg.get("rotation", {}) or {}
-        fh = RotatingFileHandler(log_dir / "tag_vocabulary.log",
-                                 maxBytes=int(rot.get("max_bytes", 10 * 1024 * 1024)),
-                                 backupCount=int(rot.get("backups", 5)))
-        fh.setFormatter(logging.Formatter(fmt))
-        logging.getLogger().addHandler(fh)
-    return logging.getLogger(__name__)
-logger = _setup_logging()
+logger = setup_logging('tag_vocabulary', log_file_name='tag_vocabulary.log')
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent

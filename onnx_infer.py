@@ -6,7 +6,6 @@ import base64
 import gzip
 import hashlib
 import logging
-from logging.handlers import RotatingFileHandler
 import time
 import sys
 from pathlib import Path
@@ -18,33 +17,9 @@ import yaml
 
 from vocabulary import TagVocabulary, verify_vocabulary_integrity
 from schemas import RunMetadata, TagPrediction, ImagePrediction, PredictionOutput
+from utils.logging_utils import setup_logging
 
-
-logger = logging.getLogger('onnx_infer')
-
-def _setup_logging():
-    """Configure logging from configs/logging.yaml (console + optional rotating file)."""
-    try:
-        cfg = yaml.safe_load(Path('configs/logging.yaml').read_text(encoding='utf-8'))
-    except Exception:
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        return
-    level = getattr(logging, str(cfg.get('level', 'INFO')).upper(), logging.INFO)
-    fmt = cfg.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logging.basicConfig(level=level, format=fmt)
-    file_cfg = cfg.get('file_logging', {})
-    if file_cfg.get('enabled'):
-        log_dir = Path(file_cfg.get('dir', './logs'))
-        log_dir.mkdir(parents=True, exist_ok=True)
-        rot = cfg.get('rotation', {}) or {}
-        handler = RotatingFileHandler(
-            log_dir / 'onnx_infer.log',
-            maxBytes=int(rot.get('max_bytes', 10 * 1024 * 1024)),
-            backupCount=int(rot.get('backups', 5)),
-        )
-        handler.setFormatter(logging.Formatter(fmt))
-        handler.setLevel(level)
-        logging.getLogger().addHandler(handler)
+logger = setup_logging('onnx_infer', log_file_name='onnx_infer.log')
 
 def _load_infer_cfg():
     try:
@@ -151,7 +126,6 @@ def _preprocess_simple(image_path: str, image_size: int, mean, std):
 
 
 def main():
-    _setup_logging()
     parser = argparse.ArgumentParser(description='ONNX inference with embedded vocab')
     cfg = _load_infer_cfg()
     pp = (cfg.get('postprocessing') or {})
