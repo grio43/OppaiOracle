@@ -1,3 +1,10 @@
+# DEPRECATED (migrating to unified config):
+# Training knobs now live under training.* in unified_config.yaml.
+# Prefer editing: configs/unified_config.yaml.
+#
+# NOTE: `focal_alpha_pos/neg` are deprecated in favor of unified `focal_alpha`
+# (see MIGRATION.md).
+
 # Training Configuration for Anime Image Tagger
 # This configuration is for training a 1B parameter model with dual teacher distillation
 
