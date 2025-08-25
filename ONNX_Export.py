@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass, asdict, field
 from collections import defaultdict
+import yaml
 import base64
 import gzip
 import hashlib
@@ -80,6 +81,9 @@ class ONNXExportConfig:
     # Only export scores, not binary predictions (to avoid threshold-related validation issues)
     output_names: List[str] = field(default_factory=lambda: ["scores"])
     dynamic_axes: Optional[Dict[str, Dict[int, str]]] = None
+    use_dynamic_axes: bool = True
+    filenames: Dict[str, str] = field(default_factory=lambda: {"model": "model.onnx"})
+    metadata_paths: Dict[str, str] = field(default_factory=dict)
     
     # Model configuration
     batch_size: int = 1
@@ -113,11 +117,14 @@ class ONNXExportConfig:
     model_version: str = "1.0"
     
     def __post_init__(self):
-        if self.dynamic_axes is None:
-            self.dynamic_axes = {
-                "input_image": {0: "batch_size"},
-                "scores": {0: "batch_size"}
-            }
+        if self.use_dynamic_axes:
+            if self.dynamic_axes is None:
+                self.dynamic_axes = {
+                    "input_image": {0: "batch_size"},
+                    "scores": {0: "batch_size"}
+                }
+        else:
+            self.dynamic_axes = None
 
 
 class ModelWrapper(nn.Module):
@@ -163,9 +170,10 @@ class ModelWrapper(nn.Module):
 
 class ONNXExporter:
     """Main ONNX export class"""
-    
+
     def __init__(self, config: ONNXExportConfig):
-        self.config = config
+        # Allow YAML overrides for portability (no hard-coded local paths)
+        self.config = self._apply_yaml_overrides(config)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Using device: {self.device}")
         
@@ -1109,6 +1117,33 @@ class ONNXExporter:
         except Exception as e:
             logger.error(f"Benchmark failed: {e}")
             return None
+
+    @staticmethod
+    def _apply_yaml_overrides(cfg: ONNXExportConfig) -> ONNXExportConfig:
+        """Apply configuration overrides from YAML files."""
+        try:
+            paths = yaml.safe_load(Path("configs/paths.yaml").read_text(encoding="utf-8")) or {}
+        except Exception:
+            paths = {}
+        if paths.get("vocab_path"):
+            cfg.vocab_dir = Path(paths["vocab_path"])
+
+        try:
+            ec = yaml.safe_load(Path("configs/export_config.yaml").read_text(encoding="utf-8")) or {}
+            ec = ec.get("export", ec)
+        except Exception:
+            ec = {}
+        onnx_cfg = ec.get("onnx", {}) or {}
+        cfg.opset_version = int(onnx_cfg.get("opset", cfg.opset_version))
+        cfg.use_dynamic_axes = bool(onnx_cfg.get("dynamic_axes", cfg.use_dynamic_axes))
+        out_dir = Path(ec.get("output_dir", Path(cfg.output_path).parent))
+        filenames = ec.get("filenames", {}) or {}
+        model_name = filenames.get("model", Path(cfg.output_path).name)
+        cfg.output_path = str(out_dir / model_name)
+        cfg.metadata_paths = ec.get("metadata_paths", cfg.metadata_paths)
+        if not cfg.use_dynamic_axes:
+            cfg.dynamic_axes = None
+        return cfg
 
 
 def main():

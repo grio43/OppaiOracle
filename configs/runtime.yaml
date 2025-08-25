@@ -1,0 +1,5 @@
+runtime:
+  deterministic: false
+  cublas_workspace_config: ":16:8"
+  cudnn_benchmark: true
+  quiet_mode: false

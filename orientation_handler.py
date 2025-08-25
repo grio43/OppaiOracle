@@ -9,10 +9,28 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Counter
+import yaml
 import warnings
 import threading
 
 logger = logging.getLogger(__name__)
+
+
+def _paths():
+    try:
+        return yaml.safe_load(Path("configs/paths.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+DEFAULT_CONFIG = {
+    "data_dir": Path(_paths().get("dataset_image_root", "./data/images")),
+    "json_dir": Path(_paths().get("dataset_metadata_root", "./data/metadata")),
+    "orientation_map": None,
+    "strict": True,
+    "skip_unmapped": False,
+    "safety_mode": "strict"
+}
 
 
 class OrientationHandler:
