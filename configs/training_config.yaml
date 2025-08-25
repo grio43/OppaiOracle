@@ -1,6 +1,18 @@
 # Training Configuration for Anime Image Tagger
 # This configuration is for training a 1B parameter model with dual teacher distillation
 
+# ──────────────────────────────────────────────────────────────────────────────
+# QUICK START (safe knobs)
+# • num_epochs: Total passes over data. Increase for better convergence; watch val loss.
+# • learning_rate: Start at 1e-4 for AdamW; lower if you see divergence.
+# • gradient_accumulation_steps: Multiplies effective batch size without more GPU RAM.
+# • scheduler: Use `cosine_restarts` for long runs; `cosine` is simpler.
+# • use_amp/amp_dtype: Mixed precision (`bfloat16` on Ampere+ is stable) → faster/less RAM.
+# • save_steps/eval_steps/logging_steps: I/O cadence; larger values = fewer disk writes.
+# • distributed/world_size/ddp_backend: Multi‑GPU; keep `nccl` on Linux with CUDA.
+# • deterministic vs benchmark: determinism disables autotune; enable only when comparing runs.
+# ──────────────────────────────────────────────────────────────────────────────
+
 # Basic Training Settings
 num_epochs: 100
 learning_rate: 1.0e-4  # Base learning rate for AdamW
@@ -15,25 +27,25 @@ adam_epsilon: 1.0e-8
 
 # Learning Rate Scheduler
 scheduler: cosine_restarts  # Options: cosine, cosine_restarts, step, multistep, plateau, exponential
-warmup_steps: 10000  # Linear warmup for first 10k optimizer steps
+warmup_steps: 10000         # Steps to ramp LR from 0→base; prevents early instability
 # warmup_ratio: 0.0  # Deprecated - use warmup_steps directly
-num_cycles: 1.0  # Number of cosine cycles (for cosine_restarts)
-lr_end: 1.0e-6  # Minimum learning rate
+num_cycles: 1.0             # For cosine_restarts only; 1.0 = one full cycle
+lr_end: 1.0e-6              # Floor LR (useful to keep tiny updates late in training)
 
 # Mixed Precision Training
-use_amp: true  # Use automatic mixed precision
-amp_opt_level: O1  # Options: O0, O1, O2, O3
-amp_dtype: bfloat16  # Options: float16, bfloat16
+use_amp: true              # Enable AMP to speed up and reduce memory footprint
+amp_opt_level: O1          # Legacy naming; keep O1 unless using Apex explicitly
+amp_dtype: bfloat16        # Prefer bfloat16 on Ampere+ GPUs; use float16 otherwise
 
 # Gradient Clipping
 max_grad_norm: 1.0  # Maximum gradient norm for clipping
 
 # Checkpointing Strategy
-save_steps: 10000  # Save checkpoint every N steps
-save_total_limit: 3  # Keep only the last N checkpoints
-save_best_only: false  # Save all checkpoints, not just the best
-eval_steps: 1000  # Run validation every N steps
-logging_steps: 100  # Log metrics every N steps
+save_steps: 10000        # How often to write checkpoints
+save_total_limit: 3      # Max checkpoints to retain → controls disk usage
+save_best_only: false    # Set true to keep only best per val metric
+eval_steps: 1000         # Validation cadence (tradeoff speed vs signal)
+logging_steps: 100       # Metric/console logging cadence
 
 # Loss Configuration - Asymmetric Focal Loss
 focal_gamma_pos: 0.0  # Gamma for positive samples (0 = no focal weighting)
@@ -44,40 +56,40 @@ label_smoothing: 0.1  # Label smoothing factor
 use_class_weights: true  # Use frequency-based class weights
 
 # Knowledge Distillation from Dual Teachers
-use_distillation: false
-distillation_alpha: 0.7  # Weight for distillation loss vs ground truth
-distillation_temperature: 3.0  # Temperature for soft targets
-anime_teacher_weight: 0.7  # Weight for anime teacher (70k tags model)
-clip_teacher_weight: 0.3  # Weight for CLIP teacher
+use_distillation: false             # Enable to blend teacher logits with labels
+distillation_alpha: 0.7             # 0=only labels, 1=only teachers
+distillation_temperature: 3.0       # Higher = softer probability targets
+anime_teacher_weight: 0.7           # Blend across teachers
+clip_teacher_weight: 0.3
 
 # Curriculum Learning Strategy
-use_curriculum: true  # Enable curriculum learning
-start_region_training_epoch: 20  # Start region-based training after N epochs
-region_training_interval: 5  # Update region training every N epochs
-curriculum_difficulty_schedule: linear  # Options: linear, exponential, step
+use_curriculum: true                    # Train easy→hard to stabilize early epochs
+start_region_training_epoch: 20         # When to begin region emphasis
+region_training_interval: 5             # Update cadence for region schedule
+curriculum_difficulty_schedule: linear  # linear|exponential|step
 
 # Hardware Configuration
-device: cuda  # Options: cuda, cpu, mps
-distributed: false  # Enable for multi-GPU training
-local_rank: -1  # Local rank for distributed training
-world_size: 1  # Number of GPUs for distributed training
-ddp_backend: nccl  # Backend for distributed training
+device: cuda                 # Primary device: cuda|cpu|mps
+distributed: false           # Set true for multi‑GPU runs (DDP)
+local_rank: -1               # Populated by launcher; leave -1 for single‑GPU
+world_size: 1                # Number of GPUs to use
+ddp_backend: nccl            # DDP backend (use nccl on Linux/CUDA)
 
 # Experiment Tracking
-use_tensorboard: true
-use_wandb: false  # Set to true if using Weights & Biases
+use_tensorboard: true        # Local summaries written under ./runs
+use_wandb: false             # Remote experiment tracking
 wandb_project: anime-tagger
-wandb_run_name: null  # Will be auto-generated if null
-wandb_entity: null  # Your W&B entity/username
+wandb_run_name: null         # Auto‑named if null
+wandb_entity: null           # Your W&B username/team
 
 # Training Stability
-seed: 42  # Random seed for reproducibility
-deterministic: false  # True for exact reproducibility (slower)
-benchmark: true  # Enable cudnn benchmarking for performance
+seed: 42                      # Set for reproducibility across runs
+deterministic: false          # True disables certain autotuning for repeatability
+benchmark: true               # True enables cuDNN autotune (set false if deterministic)
 
 # Early Stopping
-early_stopping_patience: 10  # Stop if no improvement for N epochs
-early_stopping_threshold: 0.0001  # Minimum change to qualify as improvement
+early_stopping_patience: 10        # No improvement for N epochs → stop
+early_stopping_threshold: 0.0001   # Minimal delta that counts as improvement
 
 # Additional Settings for Production Training
 # These can be uncommented and adjusted as needed
