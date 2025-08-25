@@ -1,5 +1,5 @@
 runtime:
-  deterministic: false
-  cublas_workspace_config: ":16:8"
-  cudnn_benchmark: true
-  quiet_mode: false
+  deterministic: false            # True makes runs repeatable; slightly slower
+  cublas_workspace_config: ":16:8" # Repro preset for CUDA; leave unless you know why
+  cudnn_benchmark: true           # Auto‑tune convs for current shapes (disable if deterministic)
+  quiet_mode: false               # Reduce console logs where supported

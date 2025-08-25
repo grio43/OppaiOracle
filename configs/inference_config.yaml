@@ -1,6 +1,12 @@
 # Inference Configuration for Anime Image Tagger
 # This configuration controls model inference behavior and output formatting
 
+# QUICK NOTES
+# • Keep image_size/normalize_mean/normalize_std identical to training.
+# • If you hit VRAM limits, lower batch_size or set use_fp16:true (CUDA only).
+# • Enable compile_model for speedups on PyTorch 2.x; not all platforms benefit.
+# • API section only matters if running the server mode.
+
 # Model Settings
 model_path: "./checkpoints/best_model.pt"  # Path to trained model checkpoint
 vocab_dir: "./vocabulary"  # Directory containing vocabulary files
@@ -15,9 +21,10 @@ image_size: 640  # Input image size (must match training)
 normalize_mean: [0.5, 0.5, 0.5]  # Anime artwork normalization mean (matches training)
 normalize_std: [0.5, 0.5, 0.5]  # Anime artwork normalization std (matches training)
 pad_color: [114, 114, 114]  # Gray padding color for letterboxing
+ # Note: pad_color must match training/preprocessing to avoid artifacts.
 
 # Prediction Settings
-prediction_threshold: 0.5  # Base threshold for tag predictions
+prediction_threshold: 0.5  # Tags above this probability are returned
 adaptive_threshold: true  # Dynamically adjust threshold based on predictions
 min_predictions: 5  # Minimum number of tags to predict per image
 max_predictions: 50  # Maximum number of tags to predict per image
@@ -40,6 +47,7 @@ apply_implications: true  # Apply tag implications (e.g., cat_ears -> animal_ear
 resolve_aliases: true  # Resolve tag aliases to canonical forms
 group_by_category: false  # Group output tags by category (character, artist, etc.)
 remove_underscores: true  # Replace underscores with spaces in tag names
+ # Tip: For UI outputs, set group_by_category:true and include_scores:true for clarity.
 
 # Performance Settings
 batch_size: 32  # Batch size for processing multiple images
@@ -64,6 +72,7 @@ api_max_image_size: 10485760  # Maximum image size in bytes (10MB)
 api_rate_limit: 100  # Rate limit: requests per minute
 api_cors_origins:  # CORS allowed origins
   - "*"  # Allow all origins (configure properly for production)
+ # In production, replace "*" with a specific list of allowed origins.
 preprocessing:
   image_size: 640
   normalize_mean: [0.5, 0.5, 0.5]
