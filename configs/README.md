@@ -21,7 +21,6 @@ Files are plain YAML/JSON so you can commit changes and review diffs.
 - **`unified_config.yaml`** – ✅ **Single source of truth** covering model, data, training, inference, export.
 - **`training_config.yaml`** *(legacy)* – Optimizer, scheduler, checkpoint cadence, distillation, curriculum learning.
 - **`inference_config.yaml`** – How a trained model runs: device, preprocessing, thresholds, output format, API server.
-- **`augmentation.yaml`** – Train-time augmentations and orientation/flip policy.
 - **`dataset_prep.yaml`** – How we slice and stage the raw dataset for training.
 - **`export_config.yaml`** – ONNX/TensorRT export options and output paths.
 - **`runtime.yaml`** – Determinism and CUDA/cuDNN runtime toggles.
@@ -69,7 +68,6 @@ This folder contains all runtime knobs for training, inference, data prep, and e
 
 - **`training_config.yaml`** – Optimizer, scheduler, checkpoint cadence, distillation, curriculum learning.
 - **`inference_config.yaml`** – How a trained model runs: device, preprocessing, thresholds, output format, API server.
-- **`augmentation.yaml`** – Train‑time augmentations and orientation/flip policy.
 - **`dataset_prep.yaml`** – How we slice and stage the raw dataset for training.
 - **`export_config.yaml`** – ONNX/TensorRT export options and output paths.
 - **`runtime.yaml`** – Determinism and CUDA/cuDNN runtime toggles.

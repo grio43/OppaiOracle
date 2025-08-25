@@ -100,6 +100,9 @@ data:
   orientation_map_path: "./configs/orientation_map.json"
   strict_orientation_validation: true
   skip_unmapped: false
+  # Orientation flip safety policy.
+  # Legacy mapping: strict → conservative, balanced → balanced, lenient → permissive
+  orientation_safety_mode: "conservative"
 
 # Training Configuration (from training_config.yaml)
 training:

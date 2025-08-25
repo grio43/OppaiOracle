@@ -29,7 +29,8 @@ DEFAULT_CONFIG = {
     "orientation_map": None,
     "strict": True,
     "skip_unmapped": False,
-    "safety_mode": "strict"
+    # Legacy naming: "strict" → "conservative"
+    "safety_mode": "conservative"
 }
 
 
@@ -44,7 +45,7 @@ class OrientationHandler:
         mapping_file: Optional[Path] = None,
         random_flip_prob: float = 0.0,
         strict_mode: bool = False,  # Changed default to False
-        safety_mode: str = "conservative",  # New: "conservative", "balanced", "permissive"
+        safety_mode: str = "conservative",  # "conservative", "balanced", "permissive"
         skip_unmapped: bool = False
     ):
         """
@@ -207,40 +208,40 @@ class OrientationHandler:
             return False, ["Contains text/watermark/signature"]
         
         # 2. Check safety mode
-        if self.safety_mode == "conservative":
-            # Only flip if we have explicit mappings for ALL orientation tags
-            orientation_indicators = ['left', 'right', 'facing', 'looking', 'pointing', 
+        if self.safety_mode != "permissive":
+            # Determine orientation‑sensitive tags
+            orientation_indicators = ['left', 'right', 'facing', 'looking', 'pointing',
                                      'turned', 'profile', 'view_from']
-            
+
             orientation_tags = []
             for tag in tags:
-                # More precise: only tags that truly indicate orientation
                 if any(indicator in tag.lower() for indicator in orientation_indicators):
-                    # Skip false positives
-                    if any(skip in tag for skip in ['copyright', 'bright', 'upright', 
+                    if any(skip in tag for skip in ['copyright', 'bright', 'upright',
                                                      'straight', 'light', 'fight']):
                         continue
-                    # Skip style descriptors that don't need flipping (asymmetric/single tags are handled as-is)
                     if any(skip in tag for skip in ['asymmetric', 'asymmetrical', 'single_']):
                         continue
-                    # Skip symmetric tags that don't require mapping
                     if tag in self.symmetric_tags:
                         continue
                     orientation_tags.append(tag)
-            
-            # If NO orientation tags → SAFE to flip
+
             if not orientation_tags:
                 with self._stats_lock:
                     self.stats['safe_flips'] += 1
                 return True, ["No orientation-specific tags found"]
-            
-            # Check if ALL orientation tags are mapped
+
             unmapped = []
-            for tag in orientation_tags:
-                swapped = self.swap_tag(tag)
-                if swapped == tag:  # No mapping found
-                    unmapped.append(tag)
-            
+            if self.safety_mode == "conservative":
+                # Require explicit mapping for all orientation tags
+                for tag in orientation_tags:
+                    if tag not in self.explicit_mappings and tag not in self.reverse_mappings:
+                        unmapped.append(tag)
+            else:  # balanced
+                for tag in orientation_tags:
+                    swapped = self.swap_tag(tag)
+                    if swapped == tag:
+                        unmapped.append(tag)
+
             if unmapped:
                 with self._stats_lock:
                     self.stats['blocked_by_safety'] += 1
@@ -248,8 +249,8 @@ class OrientationHandler:
                         self.stats['unmapped_blocking_frequency'][tag] = \
                             self.stats['unmapped_blocking_frequency'].get(tag, 0) + 1
                 return False, [f"Unmapped orientation tags: {unmapped[:3]}..."]
-        
-        # All checks passed
+
+        # Permissive mode or all checks passed
         with self._stats_lock:
             self.stats['safe_flips'] += 1
         return True, ["All orientation tags have mappings"]
@@ -802,6 +803,7 @@ def test_orientation_handler():
             mapping_file=test_file,
             random_flip_prob=0.5,
             strict_mode=True,
+            safety_mode="balanced",
             skip_unmapped=True
         )
         
