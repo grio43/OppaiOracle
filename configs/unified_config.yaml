@@ -253,3 +253,20 @@ export:
   model_version: "1.0.0"
   model_license: "MIT"
   output_path: "./exported_model"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Validation (migrated from configs/validation_config.yaml)
+# Centralized knobs for validation dataloader & preprocessing.
+# These are read by validation_loop.py at runtime.
+validation:
+  dataloader:
+    batch_size: 64
+    num_workers: 8
+    prefetch_factor: 2
+    persistent_workers: true
+  preprocessing:
+    # Keep in sync with training/inference unless intentionally different.
+    normalize_mean: [0.485, 0.456, 0.406]
+    normalize_std:  [0.229, 0.224, 0.225]
+    image_size: 640
+    patch_size: 16

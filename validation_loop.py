@@ -16,6 +16,7 @@ import time
 from collections import defaultdict
 import gc
 import multiprocessing as mp
+import yaml
 import csv
 import pickle
 
@@ -61,6 +62,12 @@ logger = logging.getLogger(__name__)
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+UNIFIED_CONFIG_PATH = PROJECT_ROOT / "configs" / "unified_config.yaml"
+
+# Default validation preprocessing (will be overridden from unified_config.yaml if present)
+_DEFAULT_VAL_MEAN = (0.485, 0.456, 0.406)
+_DEFAULT_VAL_STD  = (0.229, 0.224, 0.225)
+_DEFAULT_VAL_IMAGE_SIZE = 640
 
 
 @dataclass
@@ -125,11 +132,47 @@ class ValidationRunner:
         self._log_queue: Optional[mp.Queue] = mp.Queue()
         self._listener = None  # Initialize listener attribute
 
+        # Load validation overrides from unified_config.yaml (if available)
+        self._val_mean = _DEFAULT_VAL_MEAN
+        self._val_std  = _DEFAULT_VAL_STD
+        self._val_image_size = _DEFAULT_VAL_IMAGE_SIZE
+        self._val_patch_size = 16
+        try:
+            if UNIFIED_CONFIG_PATH.exists():
+                unified = yaml.safe_load(UNIFIED_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+                v = (unified.get("validation") or {})
+                dl = (v.get("dataloader") or {})
+                pp = (v.get("preprocessing") or {})
+
+                # Map dataloader settings → ValidationConfig
+                self.config.batch_size  = int(dl.get("batch_size",  self.config.batch_size))
+                self.config.num_workers = int(dl.get("num_workers", self.config.num_workers))
+
+                # Preprocessing overrides (normalization, sizes)
+                mean = pp.get("normalize_mean")
+                std  = pp.get("normalize_std")
+                if isinstance(mean, (list, tuple)) and len(mean) == 3:
+                    self._val_mean = tuple(float(x) for x in mean)
+                if isinstance(std, (list, tuple)) and len(std) == 3:
+                    self._val_std = tuple(float(x) for x in std)
+                self._val_image_size = int(pp.get("image_size", self._val_image_size))
+                self._val_patch_size = int(pp.get("patch_size", self._val_patch_size))
+            else:
+                logger.info(f"Unified config not found at {UNIFIED_CONFIG_PATH}; using built-in defaults")
+        except Exception as e:
+            logger.warning(f"Failed to load unified validation config: {e}")
+
+        # Warn if legacy validation_config.yaml still exists (migration)
+        legacy_val = PROJECT_ROOT / "configs" / "validation_config.yaml"
+        if legacy_val.exists():
+            logger.warning("Detected legacy configs/validation_config.yaml; it is no longer used now that "
+                           "validation settings live under 'validation' in unified_config.yaml.")
+
         # Setup output directory
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.vocab_sha256 = "unknown"
-        self.patch_size = 16  # Default
+        self.patch_size = self._val_patch_size  # Default
         
         # Setup plotting directory
         self.plot_dir = Path(config.plot_dir)
@@ -346,8 +389,10 @@ class ValidationRunner:
             data_dir=Path(self.config.data_dir),
             json_dir=Path(self.config.json_dir),
             vocab_path=Path(self.config.vocab_path),
-            normalize_mean=(0.485, 0.456, 0.406),
-            normalize_std=(0.229, 0.224, 0.225),
+            normalize_mean=self._val_mean,
+            normalize_std=self._val_std,
+            image_size=self._val_image_size,
+            patch_size=self._val_patch_size,
             augmentation_enabled=False  # No augmentation for validation
         )
 
