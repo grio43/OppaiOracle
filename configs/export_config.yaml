@@ -1,3 +1,7 @@
+# DEPRECATED (migrating to unified config):
+# Export settings now live under export.* in unified_config.yaml.
+# Prefer editing: configs/unified_config.yaml.
+
 export:
   onnx:
     opset: 18                 # ONNX opset version; 17+ for recent PyTorch ops

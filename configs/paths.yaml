@@ -1,3 +1,7 @@
+# DEPRECATED (migrating to unified config):
+# Paths and storage locations now live under data.* in unified_config.yaml.
+# Prefer editing: configs/unified_config.yaml.
+
 vocab_path: "./vocabulary.json"     # Absolute or repo‑relative path to vocabulary.json
 log_dir: "./logs"                   # Where logs and summaries are written
 default_output_dir: "./outputs"     # Default artifact/exports folder
