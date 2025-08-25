@@ -25,7 +25,6 @@ Files are plain YAML/JSON so you can commit changes and review diffs.
 - **`export_config.yaml`** – ONNX/TensorRT export options and output paths.
 - **`runtime.yaml`** – Determinism and CUDA/cuDNN runtime toggles.
 - **`logging.yaml`** – Log level, file logging, rotation.
-- **`paths.yaml`** – Canonical paths used by scripts (vocab, logs, outputs).
 - **`vocabulary.yaml`** – Token/vocab hygiene: special tokens and frequency cutoffs.
 - **`orientation_map.json`** – Left↔Right mappings and patterns used by flips at train/infer time.
 
@@ -72,7 +71,6 @@ This folder contains all runtime knobs for training, inference, data prep, and e
 - **`export_config.yaml`** – ONNX/TensorRT export options and output paths.
 - **`runtime.yaml`** – Determinism and CUDA/cuDNN runtime toggles.
 - **`logging.yaml`** – Log level, file logging, rotation.
-- **`paths.yaml`** – Canonical paths used by scripts (vocab, logs, outputs).
 - **`vocabulary.yaml`** – Token/vocab hygiene: special tokens and frequency cutoffs.
 - **`orientation_map.json`** – Left↔Right mappings and patterns used by flips at train/infer time.
 

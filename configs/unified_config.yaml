@@ -11,6 +11,13 @@ log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 max_memory_gb: null
 max_gpu_memory_gb: null
 
+# --------------------------------------------------------------------
+# Back-compat: migrated from legacy configs/paths.yaml
+# These allow older scripts to read from a single unified place.
+vocab_path: "./vocabulary.json"
+log_dir: "./logs"
+default_output_dir: "./outputs"
+
 # Model Configuration
 model:
   architecture_type: "vit_large_extended"

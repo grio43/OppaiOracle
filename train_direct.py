@@ -28,13 +28,27 @@ from Monitor_log import MonitorConfig, TrainingMonitor
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+# config includes path to vocabulary and log/outputs (migrated to unified_config.yaml)
 def _load_paths():
+    """Read paths from configs/unified_config.yaml with fallbacks."""
     try:
-        return yaml.safe_load((PROJECT_ROOT / "configs" / "paths.yaml").read_text(encoding="utf-8")) or {}
+        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
     except Exception:
-        return {}
-_paths_cfg = _load_paths()
-VOCAB_PATH = Path(_paths_cfg.get("vocab_path", PROJECT_ROOT / "vocabulary.json"))
+        cfg = {}
+    data = (cfg.get("data") or {})
+    vp = cfg.get("vocab_path") or data.get("vocab_path")
+    if not vp:
+        vd = data.get("vocab_dir")
+        vp = str((PROJECT_ROOT / vd / "vocabulary.json").resolve()) if vd else str((PROJECT_ROOT / "vocabulary.json").resolve())
+    ld = cfg.get("log_dir") or data.get("log_dir") or os.getenv("OPPAI_LOG_DIR", str((PROJECT_ROOT / "logs").resolve()))
+    od = cfg.get("default_output_dir") or data.get("output_dir") or str((PROJECT_ROOT / "outputs").resolve())
+    return {"vocab_path": vp, "log_dir": ld, "default_output_dir": od}
+
+_paths = _load_paths()
+DEFAULT_OUTPUT_DIR = Path(_paths["default_output_dir"])
+LOG_DIR = Path(_paths["log_dir"])
+VOCAB_PATH = Path(_paths["vocab_path"])
 
 # Import the orientation handler
 from orientation_handler import OrientationHandler
@@ -281,9 +295,8 @@ def train_with_orientation_tracking():
     except Exception:
         pass
 
-    # Set up log directory (use environment variable or fallback to local)
-    # Prefer configs/paths.yaml, allow env override
-    log_dir = Path(os.environ.get('OPPAI_LOG_DIR', _paths_cfg.get("log_dir", "./logs")))
+    # Set up log directory (use environment variable or fallback to unified config)
+    log_dir = Path(os.environ.get('OPPAI_LOG_DIR', _paths.get("log_dir", "./logs")))
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         if not log_dir.is_dir():
