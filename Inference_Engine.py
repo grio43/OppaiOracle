@@ -62,13 +62,18 @@ logger = logging.getLogger(__name__)
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-def _load_vocab_path():
+def _load_vocab_path() -> Path:
+    """Resolve vocabulary path via unified_config.yaml, with sensible fallbacks."""
     try:
-        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "paths.yaml").read_text(encoding="utf-8")) or {}
-        p = cfg.get("vocab_path")
-        return Path(p) if p else PROJECT_ROOT / "vocabulary.json"
+        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
     except Exception:
-        return PROJECT_ROOT / "vocabulary.json"
+        cfg = {}
+    data = (cfg.get("data") or {})
+    p = cfg.get("vocab_path") or data.get("vocab_path")
+    if p:
+        return Path(p)
+    vd = data.get("vocab_dir")
+    return (PROJECT_ROOT / vd / "vocabulary.json") if vd else (PROJECT_ROOT / "vocabulary.json")
 DEFAULT_VOCAB_PATH = _load_vocab_path()
 
 

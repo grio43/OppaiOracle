@@ -66,14 +66,18 @@ def _derive_worker_generator(worker_id: int = 0) -> torch.Generator:
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-# Centralize vocabulary path in configs/paths.yaml
-def _load_vocab_path():
+# Centralize vocabulary path in configs/unified_config.yaml (with fallbacks)
+def _load_vocab_path() -> Path:
     try:
-        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "paths.yaml").read_text(encoding="utf-8"))
-        p = cfg.get("vocab_path")
-        return Path(p) if p else PROJECT_ROOT / "vocabulary.json"
+        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
     except Exception:
-        return PROJECT_ROOT / "vocabulary.json"
+        cfg = {}
+    data = (cfg.get("data") or {})
+    p = cfg.get("vocab_path") or data.get("vocab_path")
+    if p:
+        return Path(p)
+    vd = data.get("vocab_dir")
+    return (PROJECT_ROOT / vd / "vocabulary.json") if vd else (PROJECT_ROOT / "vocabulary.json")
 DEFAULT_VOCAB_PATH = _load_vocab_path()
 
 @dataclass

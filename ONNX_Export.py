@@ -1122,11 +1122,13 @@ class ONNXExporter:
     def _apply_yaml_overrides(cfg: ONNXExportConfig) -> ONNXExportConfig:
         """Apply configuration overrides from YAML files."""
         try:
-            paths = yaml.safe_load(Path("configs/paths.yaml").read_text(encoding="utf-8")) or {}
+            paths = yaml.safe_load(Path("configs/unified_config.yaml").read_text(encoding="utf-8")) or {}
         except Exception:
             paths = {}
-        if paths.get("vocab_path"):
-            cfg.vocab_dir = Path(paths["vocab_path"])
+        data = paths.get("data") or {}
+        vp = paths.get("vocab_path") or data.get("vocab_path")
+        if vp:
+            cfg.vocab_dir = Path(vp)
 
         try:
             ec = yaml.safe_load(Path("configs/export_config.yaml").read_text(encoding="utf-8")) or {}
