@@ -1,3 +1,7 @@
+# DEPRECATED (migrating to unified config):
+# Vocabulary settings now live under data.* in unified_config.yaml.
+# Prefer editing: configs/unified_config.yaml.
+
 vocabulary:
   ignore_tags_file: "./Tags_ignore.txt"          # Lives at repo root; keep path stable for loaders
   min_frequency: 1                               # Keep tokens appearing ≥ this many times
