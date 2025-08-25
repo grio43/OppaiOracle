@@ -1,4 +1,4 @@
-vocab_path: "./vocabulary.json"          # Absolute or repo-relative path to vocabulary.json
-log_dir: "./logs"
-default_output_dir: "./outputs"
-orientation_map_path: "configs/orientation_map.json"
+vocab_path: "./vocabulary.json"     # Absolute or repo‑relative path to vocabulary.json
+log_dir: "./logs"                   # Where logs and summaries are written
+default_output_dir: "./outputs"     # Default artifact/exports folder
+orientation_map_path: "configs/orientation_map.json"  # Flip mapping for augment/infer
