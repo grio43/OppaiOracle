@@ -5,11 +5,13 @@ Demonstrates integration of the orientation handler with fail-fast behavior and 
 """
 
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import hashlib
 import json
 import time
 from pathlib import Path
+import yaml
 from typing import Dict, Any, Optional
 import multiprocessing as mp
 import sys
@@ -26,8 +28,13 @@ from Monitor_log import MonitorConfig, TrainingMonitor
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-# Use the specific vocabulary path
-VOCAB_PATH = Path("/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json")
+def _load_paths():
+    try:
+        return yaml.safe_load((PROJECT_ROOT / "configs" / "paths.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+_paths_cfg = _load_paths()
+VOCAB_PATH = Path(_paths_cfg.get("vocab_path", PROJECT_ROOT / "vocabulary.json"))
 
 # Import the orientation handler
 from orientation_handler import OrientationHandler
@@ -167,10 +174,20 @@ def train_with_orientation_tracking():
 
     import tempfile
 
-    # Set up logger early so it's available for all messages
+    # Set up logger early from configs/logging.yaml
     import logging
     from logging.handlers import QueueListener, RotatingFileHandler
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # Configure root logger
+    try:
+        _log_cfg = yaml.safe_load(Path("configs/logging.yaml").read_text(encoding="utf-8")) or {}
+        level = getattr(logging, str(_log_cfg.get("level", "INFO")).upper(), logging.INFO)
+        fmt = _log_cfg.get("format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        logging.basicConfig(level=level, format=fmt)
+    except Exception:
+        level = logging.INFO
+        fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        logging.basicConfig(level=level, format=fmt)
+    formatter = logging.Formatter(fmt)
     
     # Use a proper multiprocessing.Queue for cross-process communication
     # The BoundedLevelAwareQueue uses threading primitives which cannot be
@@ -265,7 +282,8 @@ def train_with_orientation_tracking():
         pass
 
     # Set up log directory (use environment variable or fallback to local)
-    log_dir = Path(os.environ.get('OPPAI_LOG_DIR', './logs'))
+    # Prefer configs/paths.yaml, allow env override
+    log_dir = Path(os.environ.get('OPPAI_LOG_DIR', _paths_cfg.get("log_dir", "./logs")))
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         if not log_dir.is_dir():
