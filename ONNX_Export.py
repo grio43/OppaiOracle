@@ -120,52 +120,89 @@ class ONNXExportConfig:
     def __post_init__(self):
         if self.use_dynamic_axes:
             if self.dynamic_axes is None:
+                # The new wrapper takes a raw image with dynamic H and W
                 self.dynamic_axes = {
-                    "input_image": {0: "batch_size"},
+                    "input_image": {0: "batch_size", 1: "height", 2: "width"},
                     "scores": {0: "batch_size"}
                 }
         else:
             self.dynamic_axes = None
 
 
-class ModelWrapper(nn.Module):
-    """Wrapper to simplify model output for ONNX export"""
-
-    def __init__(self, model: nn.Module, config: ONNXExportConfig):
+class InferenceWrapper(nn.Module):
+    """
+    Wraps the model to include full preprocessing, creating a self-contained
+    ONNX model that takes a raw image and outputs final scores.
+    """
+    def __init__(self, model: nn.Module, image_size: int,
+                 normalize_mean: List[float], normalize_std: List[float]):
         super().__init__()
         self.model = model
-        self.config = config
+        self.target_size = image_size
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Register normalization constants as buffers
+        self.register_buffer('mean', torch.tensor(normalize_mean, dtype=torch.float32).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor(normalize_std, dtype=torch.float32).view(1, 3, 1, 1))
+        # Pad color is a neutral grey (114, 114, 114)
+        self.register_buffer('pad_color', torch.tensor([114.0, 114.0, 114.0], dtype=torch.float32).view(1, 3, 1, 1) / 255.0)
+
+    def forward(self, image_uint8: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass returning only scores (not binary predictions)
+        Forward pass from raw uint8 image to scores.
 
         Args:
-            x: Input tensor (batch_size, 3, H, W)
+            image_uint8: Input raw image tensor (batch_size, H, W, 3), dtype=uint8
 
         Returns:
             scores: Confidence scores (batch_size, num_tags)
         """
-        # Get model output
-        outputs = self.model(x)
+        # 1. Type Conversion and Permutation
+        image_f32 = image_uint8.permute(0, 3, 1, 2).float() / 255.0  # (B, 3, H, W)
+
+        # 2. Get dynamic shape as a tensor
+        # This uses a non-public ATen operator, which is a common practice for this specific problem in ONNX export.
+        shape = torch.ops.aten.shape_as_tensor(image_f32)
+        b, c, h, w = shape[0], shape[1], shape[2], shape[3]
+
+        # 3. Pad to square
+        max_dim = torch.max(h, w)
+        pad_h = max_dim - h
+        pad_w = max_dim - w
+
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+
+        padded_f32 = F.pad(image_f32, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+
+        # Fill padding with the correct color
+        pad_mask = F.pad(torch.ones_like(image_f32), (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0) == 0
+        padded_f32 = padded_f32.masked_scatter(pad_mask, self.pad_color.expand_as(padded_f32)[pad_mask])
+
+        # 4. Resize to target size
+        # The input is now a square, so we can resize to a fixed size.
+        resized = F.interpolate(padded_f32, size=(self.target_size, self.target_size), mode='bilinear', align_corners=False)
+
+        # 5. Normalization
+        normalized = (resized - self.mean) / self.std
+
+        # 6. Inference
+        outputs = self.model(normalized)
 
         if isinstance(outputs, dict):
             logits = outputs.get('logits', outputs.get('output', outputs))
             if isinstance(logits, dict):
-                # Handle nested dict structure
                 logits = logits.get('logits', next(iter(logits.values())))
         else:
             logits = outputs
 
-        # Handle hierarchical output - flatten it
         if logits.dim() == 3:
             batch_size = logits.shape[0]
             logits = logits.view(batch_size, -1)
 
-        # Convert to probabilities
         scores = torch.sigmoid(logits)
 
-        # Return only scores, not binary predictions
         return scores
 
 
@@ -457,8 +494,13 @@ class ONNXExporter:
         
         model.eval()
         
-        # Wrap model
-        wrapped_model = ModelWrapper(model, self.config)
+        # Wrap model for inference
+        wrapped_model = InferenceWrapper(
+            model,
+            image_size=self.config.image_size,
+            normalize_mean=self.config.normalize_mean,
+            normalize_std=self.config.normalize_std
+        )
         wrapped_model.to(self.device)
         
         return wrapped_model
@@ -513,32 +555,18 @@ class ONNXExporter:
         output_path = Path(self.config.output_path)
         
         try:
-            # Create dummy input
-            dummy_input = torch.randn(
-                self.config.batch_size,
-                3,
-                self.config.image_size,
-                self.config.image_size,
+            # Create dummy input for the new InferenceWrapper
+            # Input is a raw image: (B, H, W, C) with dtype=uint8
+            dummy_input = torch.randint(
+                0, 255,
+                (self.config.batch_size, 768, 512, 3), # Example dynamic H, W
+                dtype=torch.uint8,
                 device=self.device
             )
-            
-            # Get actual dtype from model parameters (ModelWrapper doesn't have .dtype attribute)
-            current_dtype = torch.float32  # Default assumption
-            try:
-                # Get dtype from first parameter
-                for param in self.model.parameters():
-                    current_dtype = param.dtype
-                    break
-            except Exception as e:
-                logger.warning(f"Could not determine model dtype: {e}, assuming float32")
 
-            # Ensure model is in FP32 for export (critical for BF16/FP16 trained models)
-            if current_dtype != torch.float32:
-                logger.info(f"Converting model from {current_dtype} to float32 for export")
-                self.model = self.model.float()
-
-            # Always ensure dummy input is float32
-            dummy_input = dummy_input.float()
+            # The model is internally converted to float32 for processing
+            logger.info("Ensuring model is in float32 for export")
+            self.model.float()
 
             # Export
             logger.info(f"Exporting to {output_path}")
