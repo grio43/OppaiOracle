@@ -15,6 +15,7 @@ import shutil
 import threading
 import tempfile
 from pathlib import Path
+import yaml
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
 import hashlib
@@ -85,7 +86,15 @@ def log_sample_order_hash(dataloader, epoch: int, N: int = 128):
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+def _load_paths():
+    try:
+        return yaml.safe_load((PROJECT_ROOT / "configs" / "paths.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+_paths_cfg = _load_paths()
+VOCAB_PATH = Path(_paths_cfg.get("vocab_path", PROJECT_ROOT / "vocabulary.json"))
+LOG_DIR = Path(_paths_cfg.get("log_dir", "./logs"))
+DEFAULT_OUTPUT_DIR = Path(_paths_cfg.get("default_output_dir", "./outputs"))
 
 
 @dataclass
