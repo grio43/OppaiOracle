@@ -36,5 +36,9 @@ See `orientation_map.README.md` in this folder for how flips and symmetric/asymm
 
 ### Changelog
 
-- Added human‑readable comments across configs
+-
+- Added human-readable comments across configs
 - Added this README and `orientation_map.README.md`
+- Migrated `inference_config.yaml` to nested schema (preprocessing/runtime/postprocessing/io/input).
+- Fixed `vocabulary.ignore_tags_file` to point at `./Tags_ignore.txt` (repo root).
+- Made `export_config.yaml` reference `./artifacts/thresholds.json` to match the calibration tool output.
