@@ -45,15 +45,8 @@ def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:
     Returns:
         A set of tag strings that should be ignored.
     """
-    # Prefer explicit configuration; fall back to repo-local file.
-    if ignore_file is None:
-        try:
-            vcfg = yaml.safe_load(Path("configs/vocabulary.yaml").read_text(encoding="utf-8")) or {}
-            ignore_path = (vcfg.get("vocabulary") or {}).get("ignore_tags_file")
-            if ignore_path:
-                ignore_file = Path(ignore_path)
-        except Exception:
-            ignore_file = None
+    # The logic for finding the ignore_file from vocabulary.yaml has been removed.
+    # The path should be passed in explicitly or it will fall back to the default.
     if ignore_file is None:
         module_path = Path(__file__).resolve()
         ignore_file = module_path.parent / 'Tags_ignore.txt'
@@ -83,37 +76,40 @@ class TagVocabulary:
     to worker processes.
     """
     
-    def __init__(self, vocab_path: Optional[Path] = None, min_frequency: Optional[int] = None) -> None:
+    def __init__(self,
+                 vocab_path: Optional[Path] = None,
+                 min_frequency: int = 1,
+                 ignore_file: Optional[Path] = None,
+                 pad_token: str = "<PAD>",
+                 unk_token: str = "<UNK>") -> None:
         """Initialize vocabulary, optionally loading from file.
         
         Args:
             vocab_path: Optional path to vocabulary file to load
             min_frequency: Minimum frequency for tags to be included when building vocabulary
+            ignore_file: Path to a file containing tags to ignore
+            pad_token: The token to use for padding
+            unk_token: The token to use for unknown tags
         """
         self.tag_to_index: Dict[str, int] = {}
         self.index_to_tag: Dict[int, str] = {}
         self.tag_frequencies: Dict[str, int] = {}
-        try:
-            _vconf = yaml.safe_load(Path("configs/vocabulary.yaml").read_text(encoding="utf-8")) or {}
-        except Exception:
-            _vconf = {}
-        vcfg = (_vconf.get("vocabulary") or {})
-        self.min_frequency = int(min_frequency if min_frequency is not None else vcfg.get("min_frequency", 1))
+        self.min_frequency = min_frequency
 
         # Load the ignore list once.  ``ignored_tags`` holds the set of tag
         # strings that should be ignored entirely.  ``ignored_tag_indices`` is
         # derived later once the vocabulary is built or loaded. These
         # attributes are instance specific so that unit tests or multiple
         # vocabularies can operate independently.
-        self.ignored_tags: Set[str] = _load_ignore_tags()
+        self.ignored_tags: Set[str] = _load_ignore_tags(ignore_file)
         self.ignored_tag_indices: List[int] = []
         
         # Special tokens
         # Use distinct strings for padding and unknown tokens.
         # The pad token (index 0) is reserved for masking and is not a valid output.
         # The unk token (index 1) represents unknown or rare tags.
-        self.pad_token = str(vcfg.get("special_tokens", {}).get("pad", "<PAD>"))
-        self.unk_token = str(vcfg.get("special_tokens", {}).get("unk", "<UNK>"))
+        self.pad_token = pad_token
+        self.unk_token = unk_token
         
         # Rating classes (fixed)
         self.rating_to_index: Dict[str, int] = {

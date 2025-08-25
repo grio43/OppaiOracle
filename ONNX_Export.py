@@ -36,6 +36,7 @@ try:
     import onnx.checker
     import onnx.helper
     import onnx.numpy_helper
+    from Configuration_System import ConfigManager, ConfigType, FullConfig
 except ImportError as e:
     print(f"Error importing ONNX libraries: {e}")
     print("Please install: pip install onnx onnxruntime")
@@ -172,8 +173,7 @@ class ONNXExporter:
     """Main ONNX export class"""
 
     def __init__(self, config: ONNXExportConfig):
-        # Allow YAML overrides for portability (no hard-coded local paths)
-        self.config = self._apply_yaml_overrides(config)
+        self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Using device: {self.device}")
         
@@ -1118,67 +1118,38 @@ class ONNXExporter:
             logger.error(f"Benchmark failed: {e}")
             return None
 
-    @staticmethod
-    def _apply_yaml_overrides(cfg: ONNXExportConfig) -> ONNXExportConfig:
-        """Apply configuration overrides from YAML files."""
-        try:
-            paths = yaml.safe_load(Path("configs/unified_config.yaml").read_text(encoding="utf-8")) or {}
-        except Exception:
-            paths = {}
-        data = paths.get("data") or {}
-        vp = paths.get("vocab_path") or data.get("vocab_path")
-        if vp:
-            cfg.vocab_dir = Path(vp)
-
-        try:
-            ec = yaml.safe_load(Path("configs/export_config.yaml").read_text(encoding="utf-8")) or {}
-            ec = ec.get("export", ec)
-        except Exception:
-            ec = {}
-        onnx_cfg = ec.get("onnx", {}) or {}
-        cfg.opset_version = int(onnx_cfg.get("opset", cfg.opset_version))
-        cfg.use_dynamic_axes = bool(onnx_cfg.get("dynamic_axes", cfg.use_dynamic_axes))
-        out_dir = Path(ec.get("output_dir", Path(cfg.output_path).parent))
-        filenames = ec.get("filenames", {}) or {}
-        model_name = filenames.get("model", Path(cfg.output_path).name)
-        cfg.output_path = str(out_dir / model_name)
-        cfg.metadata_paths = ec.get("metadata_paths", cfg.metadata_paths)
-        if not cfg.use_dynamic_axes:
-            cfg.dynamic_axes = None
-        return cfg
 
 
 def main():
     """Main entry point for ONNX export"""
     import argparse
-    
+
+    # Load unified config first to get defaults
+    try:
+        manager = ConfigManager(config_type=ConfigType.FULL)
+        unified_config = manager.load_from_file("configs/unified_config.yaml")
+        export_cfg = unified_config.export
+        data_cfg = unified_config.data
+        model_cfg = unified_config.model
+    except Exception as e:
+        logger.error(f"Could not load unified_config.yaml: {e}. Cannot proceed without configuration.")
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(description='Export Anime Tagger model to ONNX')
     parser.add_argument('checkpoint', type=str, help='Path to model checkpoint')
-    parser.add_argument('vocab_dir', type=str, nargs='?', default="/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json", help='Path to vocabulary directory or file')
-    parser.add_argument('-o', '--output', type=str, default='model.onnx',
-                        help='Output ONNX model path')
-    parser.add_argument('-b', '--batch-size', type=int, default=1,
-                        help='Batch size for export')
-    parser.add_argument('-s', '--image-size', type=int, default=640,
-                        help='Input image size')
-    parser.add_argument('--opset', type=int, default=18,
-                        help='ONNX opset version (17 recommended for LayerNorm compatibility)')
-    parser.add_argument('--variants', nargs='+', default=['full'],
-                        choices=['full', 'quantized'],
-                        help='Export variants to generate')
-    parser.add_argument('--optimize', action='store_true', default=True,
-                        help='Optimize exported model')
-    parser.add_argument('--quantize', action='store_true',
-                        help='Enable quantization')
-    parser.add_argument('--quantization-type', type=str, default='dynamic',
-                        choices=['dynamic', 'static'],
-                        help='Quantization type')
-    parser.add_argument('--no-validate', action='store_true',
-                        help='Skip validation')
-    parser.add_argument('--benchmark', action='store_true',
-                        help='Run benchmark after export')
-    parser.add_argument('--benchmark-runs', type=int, default=100,
-                        help='Number of benchmark iterations')
+    parser.add_argument('vocab_dir', type=str, nargs='?', default=None, help='Path to vocabulary directory or file')
+    parser.add_argument('-o', '--output', type=str, default=None, help=f'Output ONNX model path (default: {export_cfg.output_path})')
+    parser.add_argument('-b', '--batch-size', type=int, default=1, help='Batch size for export (for dummy input)')
+    parser.add_argument('-s', '--image-size', type=int, default=None, help=f'Input image size (default: {data_cfg.image_size})')
+    parser.add_argument('--opset', type=int, default=None, help=f'ONNX opset version (default: {export_cfg.opset_version})')
+    parser.add_argument('--variants', nargs='+', default=['full'], choices=['full', 'quantized'], help='Export variants to generate')
+    parser.add_argument('--optimize', action='store_true', default=None, help='Optimize exported model')
+    parser.add_argument('--no-optimize', action='store_true', default=None, help='Do not optimize exported model')
+    parser.add_argument('--quantize', action='store_true', default=None, help='Enable quantization')
+    parser.add_argument('--quantization-type', type=str, default=None, choices=['dynamic', 'static'], help=f'Quantization type (default: {export_cfg.quantization_type})')
+    parser.add_argument('--no-validate', action='store_true', default=None, help='Skip validation')
+    parser.add_argument('--benchmark', action='store_true', help='Run benchmark after export')
+    parser.add_argument('--benchmark-runs', type=int, default=100, help='Number of benchmark iterations')
     
     args = parser.parse_args()
 
@@ -1186,26 +1157,52 @@ def main():
     if not Path(args.checkpoint).exists():
         logger.error(f"Checkpoint not found: {args.checkpoint}")
         sys.exit(1)
-    
-    # Log vocabulary path being used
-    logger.info(f"Using vocabulary: {args.vocab_dir}")
-    logger.info(f"Checkpoint: {args.checkpoint}")
+
+    # Determine final optimize flag
+    if args.optimize is True and args.no_optimize is True:
+        raise ValueError("Cannot use both --optimize and --no-optimize")
+    if args.optimize is None and args.no_optimize is None:
+        optimize = export_cfg.optimize
+    else:
+        optimize = args.optimize is True
+
+    # Determine final quantize flag
+    quantize = args.quantize if args.quantize is not None else export_cfg.quantize
+
+    # Determine final validate flag
+    validate_export = not args.no_validate if args.no_validate is not None else export_cfg.validate_export
 
     # Create config
     config = ONNXExportConfig(
         checkpoint_path=args.checkpoint,
-        vocab_dir=args.vocab_dir,
-        output_path=args.output,
+        vocab_dir=args.vocab_dir or unified_config.vocab_path or data_cfg.vocab_dir,
+        output_path=args.output or export_cfg.output_path,
         batch_size=args.batch_size,
-        image_size=args.image_size,
-        opset_version=args.opset,
+        image_size=args.image_size or data_cfg.image_size,
+        patch_size=model_cfg.patch_size,
+        opset_version=args.opset or export_cfg.opset_version,
         export_variants=args.variants,
-        optimize=args.optimize,
-        quantize=args.quantize,
-        quantization_type=args.quantization_type,
-        validate_export=not args.no_validate
+        optimize=optimize,
+        quantize=quantize,
+        quantization_type=args.quantization_type or export_cfg.quantization_type,
+        validate_export=validate_export,
+        use_dynamic_axes=export_cfg.dynamic_batch_size,
+        export_params=export_cfg.export_params,
+        do_constant_folding=export_cfg.do_constant_folding,
+        add_metadata=export_cfg.add_metadata,
+        model_description=export_cfg.model_description,
+        model_author=export_cfg.model_author,
+        model_version=export_cfg.model_version,
+        normalize_mean=list(data_cfg.normalize_mean),
+        normalize_std=list(data_cfg.normalize_std),
+        tolerance_atol=export_cfg.tolerance_atol,
+        tolerance_rtol=export_cfg.tolerance_rtol,
     )
     
+    # Log vocabulary path being used
+    logger.info(f"Using vocabulary: {config.vocab_dir}")
+    logger.info(f"Checkpoint: {config.checkpoint_path}")
+
     # Create exporter
     exporter = ONNXExporter(config)
     

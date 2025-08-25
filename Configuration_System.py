@@ -783,6 +783,25 @@ class ExportConfig(BaseConfig):
 
 
 @dataclass
+class ValidationDataloaderConfig(BaseConfig):
+    batch_size: int = 64
+    num_workers: int = 8
+    prefetch_factor: int = 2
+    persistent_workers: bool = True
+
+@dataclass
+class ValidationPreprocessingConfig(BaseConfig):
+    normalize_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
+    normalize_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+    image_size: int = 640
+    patch_size: int = 16
+
+@dataclass
+class ValidationConfig(BaseConfig):
+    dataloader: ValidationDataloaderConfig = field(default_factory=ValidationDataloaderConfig)
+    preprocessing: ValidationPreprocessingConfig = field(default_factory=ValidationPreprocessingConfig)
+
+@dataclass
 class FullConfig(BaseConfig):
     """Complete configuration combining all components"""
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -790,6 +809,7 @@ class FullConfig(BaseConfig):
     training: TrainingConfig = field(default_factory=TrainingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
     
     # Global settings
     project_name: str = "anime-image-tagger"
@@ -881,6 +901,23 @@ class ConfigManager:
     def load_from_file(self, path: Union[str, Path]) -> BaseConfig:
         """Load configuration from file"""
         path = Path(path)
+
+        legacy_configs = {
+            "training_config.yaml",
+            "inference_config.yaml",
+            "dataset_prep.yaml",
+            "export_config.yaml",
+            "runtime.yaml",
+            "logging.yaml",
+            "vocabulary.yaml",
+            "orientation_map.json"
+        }
+
+        if path.name in legacy_configs:
+            logger.warning(
+                f"Loading legacy config file '{path.name}'. "
+                f"Please migrate to 'configs/unified_config.yaml'."
+            )
         
         if not path.exists():
             raise ConfigError(f"Config file not found: {path}")

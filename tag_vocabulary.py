@@ -20,47 +20,19 @@ import pickle
 import sys
 import os
 import yaml
+from Configuration_System import ConfigManager, ConfigType
 
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.metadata_ingestion import parse_tags_field, dedupe_preserve_order
 
-def _setup_logging():
-    try:
-        cfg = yaml.safe_load(Path("configs/logging.yaml").read_text(encoding="utf-8"))
-    except Exception:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        return logging.getLogger(__name__)
-    level = getattr(logging, str(cfg.get("level", "INFO")).upper(), logging.INFO)
-    fmt = cfg.get("format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    logging.basicConfig(level=level, format=fmt)
-    if (cfg.get("file_logging") or {}).get("enabled"):
-        log_dir = Path((cfg.get("file_logging") or {}).get("dir", "./logs"))
-        log_dir.mkdir(parents=True, exist_ok=True)
-        rot = cfg.get("rotation", {}) or {}
-        fh = RotatingFileHandler(log_dir / "tag_vocabulary.log",
-                                 maxBytes=int(rot.get("max_bytes", 10 * 1024 * 1024)),
-                                 backupCount=int(rot.get("backups", 5)))
-        fh.setFormatter(logging.Formatter(fmt))
-        logging.getLogger().addHandler(fh)
-    return logging.getLogger(__name__)
-logger = _setup_logging()
+# Logging will be set up in main()
+logger = logging.getLogger(__name__)
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-def _default_vocab_path():
-    try:
-        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
-    except Exception:
-        cfg = {}
-    data = (cfg.get("data") or {})
-    p = cfg.get("vocab_path") or data.get("vocab_path")
-    if p:
-        return Path(p)
-    vd = data.get("vocab_dir")
-    return (PROJECT_ROOT / vd / "vocabulary.json") if vd else (PROJECT_ROOT / "vocabulary.json")
-DEFAULT_VOCAB_PATH = _default_vocab_path()
+# DEFAULT_VOCAB_PATH will be determined in main() from the unified config
 
 
 class DanbooruDataPreprocessor:
@@ -82,18 +54,11 @@ class DanbooruDataPreprocessor:
         """
         self.vocab_path = Path(vocab_path)
 
-        # dataset_prep defaults
-        try:
-            _dp = yaml.safe_load(Path("configs/dataset_prep.yaml").read_text(encoding="utf-8")) or {}
-            dp = _dp.get("dataset_prep", {})
-        except Exception:
-            dp = {}
-        if output_dir is None:
-            output_dir = dp.get("output_dir", "./prepared")
-        self.output_dir = Path(output_dir)
+        # Defaults for output_dir and num_workers are now handled in main() and passed in.
+        self.output_dir = Path(output_dir or "./prepared")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.num_workers = int(num_workers if num_workers is not None else (dp.get("num_workers") or cpu_count()))
+        self.num_workers = int(num_workers or cpu_count())
 
         # ------------------------------------------------------------------
         # Tag ignoring support
@@ -115,14 +80,7 @@ class DanbooruDataPreprocessor:
         # If both are provided, the union of the two sets is used.  If
         # neither is provided, no tags are ignored.
         self.ignore_tags: set[str] = set()
-        if ignore_tags_file is None:
-            try:
-                _vc = yaml.safe_load(Path("configs/vocabulary.yaml").read_text(encoding="utf-8")) or {}
-                p = (_vc.get("vocabulary") or {}).get("ignore_tags_file")
-                if p:
-                    ignore_tags_file = Path(p)
-            except Exception:
-                pass
+        # The ignore_tags_file is now passed in from main(), which gets it from the unified config.
         if ignore_tags_file:
             try:
                 with open(ignore_tags_file, 'r', encoding='utf-8') as f:
@@ -600,6 +558,8 @@ def prepare_phased_training_data(
     metadata_dir: Path,
     vocab_path: Path,
     output_dir: Path,
+    num_workers: int,
+    ignore_tags_file: Optional[Path],
     phase1_size: int = 4_000_000,
     total_size: int = 8_500_000
 ):
@@ -610,6 +570,8 @@ def prepare_phased_training_data(
         metadata_dir: Directory with JSON metadata
         vocab_path: Path to vocabulary
         output_dir: Output directory
+        num_workers: Number of parallel workers
+        ignore_tags_file: Path to file with tags to ignore
         phase1_size: Size of Phase 1 dataset (high quality)
         total_size: Total dataset size
     """
@@ -621,7 +583,7 @@ def prepare_phased_training_data(
     logger.info("=" * 50)
     
     phase1_dir = output_dir / 'phase1_common_tags'
-    preprocessor = DanbooruDataPreprocessor(vocab_path, phase1_dir)
+    preprocessor = DanbooruDataPreprocessor(vocab_path, phase1_dir, num_workers=num_workers, ignore_tags_file=ignore_tags_file)
     
     # Process with quality filtering
     results = preprocessor.prepare_training_data(
@@ -638,7 +600,7 @@ def prepare_phased_training_data(
     logger.info("=" * 50)
     
     phase2_dir = output_dir / 'phase2_full_vocab'
-    preprocessor = DanbooruDataPreprocessor(vocab_path, phase2_dir)
+    preprocessor = DanbooruDataPreprocessor(vocab_path, phase2_dir, num_workers=num_workers, ignore_tags_file=ignore_tags_file)
     
     results = preprocessor.prepare_training_data(
         metadata_dir,
@@ -658,54 +620,66 @@ def prepare_phased_training_data(
 def main():
     """Main execution"""
     import argparse
+
+    # Load unified config to get defaults
+    try:
+        manager = ConfigManager(config_type=ConfigType.FULL)
+        unified_config = manager.load_from_file("configs/unified_config.yaml")
+        log_cfg = unified_config
+        data_cfg = unified_config.data
+    except Exception as e:
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        logger.error(f"Could not load unified_config.yaml: {e}. Using basic logging and default settings.")
+        from dataclasses import dataclass
+        @dataclass
+        class Dummy:
+            def __getattr__(self, name): return None
+        log_cfg = Dummy()
+        data_cfg = Dummy()
+
+    # Setup logging from unified config
+    level = getattr(logging, str(log_cfg.log_level or 'INFO').upper(), logging.INFO)
+    fmt = log_cfg.log_format or '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    logging.basicConfig(level=level, format=fmt)
+    if getattr(log_cfg, 'file_logging_enabled', False):
+        log_dir = Path(log_cfg.log_dir or './logs')
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            log_dir / 'tag_vocabulary.log',
+            maxBytes=log_cfg.log_rotation_max_bytes or (10*1024*1024),
+            backupCount=log_cfg.log_rotation_backups or 5,
+        )
+        handler.setFormatter(logging.Formatter(fmt))
+        handler.setLevel(level)
+        logging.getLogger().addHandler(handler)
     
-    parser = argparse.ArgumentParser(
-        description="Prepare Danbooru data for direct training"
-    )
-    parser.add_argument(
-        '--metadata_dir',
-        type=str,
-        required=True,
-        help='Directory with JSON metadata files'
-    )
-    parser.add_argument(
-        '--vocab_path',
-        type=str,
-        default=str(DEFAULT_VOCAB_PATH),
-        help='Path to vocabulary file'
-    )
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        required=True,
-        help='Output directory for processed data'
-    )
-    parser.add_argument(
-        '--phase1_size',
-        type=int,
-        default=4_000_000,
-        help='Size of Phase 1 dataset'
-    )
-    parser.add_argument(
-        '--total_size',
-        type=int,
-        default=8_500_000,
-        help='Total dataset size'
-    )
-    parser.add_argument(
-        '--num_workers',
-        type=int,
-        default=None,
-        help='Number of parallel workers'
-    )
+    # Determine default paths from config
+    DEFAULT_VOCAB_PATH = unified_config.vocab_path or data_cfg.vocab_dir
+    DEFAULT_OUTPUT_DIR = data_cfg.output_dir
+
+    parser = argparse.ArgumentParser(description="Prepare Danbooru data for direct training")
+    parser.add_argument('--metadata_dir', type=str, required=True, help='Directory with JSON metadata files')
+    parser.add_argument('--vocab_path', type=str, default=str(DEFAULT_VOCAB_PATH), help=f'Path to vocabulary file (default: {DEFAULT_VOCAB_PATH})')
+    parser.add_argument('--output_dir', type=str, default=str(DEFAULT_OUTPUT_DIR), help=f'Output directory for processed data (default: {DEFAULT_OUTPUT_DIR})')
+    parser.add_argument('--phase1_size', type=int, default=4_000_000, help='Size of Phase 1 dataset')
+    parser.add_argument('--total_size', type=int, default=8_500_000, help='Total dataset size')
+    parser.add_argument('--num_workers', type=int, default=data_cfg.num_workers, help=f'Number of parallel workers (default: {data_cfg.num_workers})')
+    parser.add_argument('--ignore_tags_file', type=str, default=None, help='Path to file with tags to ignore')
     
     args = parser.parse_args()
     
     try:
+        # Determine ignore_tags_file path from args or config
+        ignore_tags_file = args.ignore_tags_file or getattr(data_cfg, 'ignore_tags_file', None)
+        if ignore_tags_file:
+            ignore_tags_file = Path(ignore_tags_file)
+
         prepare_phased_training_data(
             metadata_dir=Path(args.metadata_dir),
             vocab_path=Path(args.vocab_path),
             output_dir=Path(args.output_dir),
+            num_workers=args.num_workers,
+            ignore_tags_file=ignore_tags_file,
             phase1_size=args.phase1_size,
             total_size=args.total_size
         )
