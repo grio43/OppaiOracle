@@ -117,6 +117,12 @@ class MonitorConfig:
     log_augmentation_histograms: bool = True
     log_augmentation_images: bool = False
     augmentation_image_interval: int = 500  # batches
+    # Parameter / gradient histogram logging
+    log_param_histograms: bool = True
+    log_grad_histograms: bool = True
+    # Log every N steps (set high if training is slow or memory-limited)
+    param_hist_interval_steps: int = 200
+    grad_hist_interval_steps: int = 200
 
     # Remote monitoring
     enable_prometheus: bool = False
@@ -782,6 +788,9 @@ class TrainingMonitor:
 
         # Register cleanup handlers
         self._register_cleanup()
+
+        # Internal flags
+        self._graph_logged = False
     
     def _setup_logging(self):
         """Setup logging configuration"""
@@ -861,6 +870,68 @@ class TrainingMonitor:
                 
         # Register atexit handler
         atexit.register(cleanup)
+
+    def log_model_graph(self, model: torch.nn.Module, example_images: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        """Write the model graph to TensorBoard once (safe in DDP)."""
+        if not self.writer or self._graph_logged:
+            return
+        try:
+            class _GraphWrapper(torch.nn.Module):
+                def __init__(self, m):
+                    super().__init__()
+                    self.m = m
+                def forward(self, x, padding_mask=None):
+                    out = self.m(x, padding_mask=padding_mask)
+                    return out['tag_logits'] if isinstance(out, dict) else out
+
+            wrapper = _GraphWrapper(model).eval()
+            with torch.no_grad():
+                if padding_mask is not None:
+                    self.writer.add_graph(wrapper, (example_images, padding_mask))
+                else:
+                    self.writer.add_graph(wrapper, (example_images,))
+            self._graph_logged = True
+            logger.info("Wrote model graph to TensorBoard")
+        except Exception as e:
+            logger.debug(f"Skipping add_graph: {e}")
+
+    def log_param_and_grad_histograms(self, model: torch.nn.Module, step: int):
+        """
+        Log parameter and gradient histograms + grad norms.
+        Call this after backward() and before optimizer.step().
+        """
+        if not self.writer:
+            return
+
+        # Respect config switches
+        log_params = getattr(self.config, "log_param_histograms", True)
+        log_grads = getattr(self.config, "log_grad_histograms", True)
+
+        try:
+            with torch.no_grad():
+                # Per-parameter weights/gradients
+                for name, p in model.named_parameters():
+                    if p is None:
+                        continue
+                    if log_params:
+                        try:
+                            self.writer.add_histogram(f"params/{name}", p.detach().float().cpu(), step)
+                        except Exception:
+                            pass
+                    if log_grads and p.grad is not None:
+                        try:
+                            self.writer.add_histogram(f"grads/{name}", p.grad.detach().float().cpu(), step)
+                            self.writer.add_scalar(f"grads/norm/{name}", float(p.grad.detach().norm(p=2).item()), step)
+                        except Exception:
+                            pass
+
+                # Global grad norm
+                norms = [p.grad.detach().norm(p=2).item() for p in model.parameters() if p.grad is not None]
+                if norms:
+                    total = (sum(n*n for n in norms)) ** 0.5
+                    self.writer.add_scalar("grads/global_norm", float(total), step)
+        except Exception as e:
+            logger.debug(f"Failed to log param/grad histograms: {e}")
     
     def log_step(
         self,
