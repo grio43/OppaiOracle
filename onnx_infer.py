@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image
 import onnxruntime as ort
 import yaml
+from Configuration_System import ConfigManager, ConfigType
 
 from vocabulary import TagVocabulary, verify_vocabulary_integrity
 from schemas import RunMetadata, TagPrediction, ImagePrediction, PredictionOutput
@@ -22,35 +23,7 @@ from schemas import RunMetadata, TagPrediction, ImagePrediction, PredictionOutpu
 
 logger = logging.getLogger('onnx_infer')
 
-def _setup_logging():
-    """Configure logging from configs/logging.yaml (console + optional rotating file)."""
-    try:
-        cfg = yaml.safe_load(Path('configs/logging.yaml').read_text(encoding='utf-8'))
-    except Exception:
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        return
-    level = getattr(logging, str(cfg.get('level', 'INFO')).upper(), logging.INFO)
-    fmt = cfg.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logging.basicConfig(level=level, format=fmt)
-    file_cfg = cfg.get('file_logging', {})
-    if file_cfg.get('enabled'):
-        log_dir = Path(file_cfg.get('dir', './logs'))
-        log_dir.mkdir(parents=True, exist_ok=True)
-        rot = cfg.get('rotation', {}) or {}
-        handler = RotatingFileHandler(
-            log_dir / 'onnx_infer.log',
-            maxBytes=int(rot.get('max_bytes', 10 * 1024 * 1024)),
-            backupCount=int(rot.get('backups', 5)),
-        )
-        handler.setFormatter(logging.Formatter(fmt))
-        handler.setLevel(level)
-        logging.getLogger().addHandler(handler)
-
-def _load_infer_cfg():
-    try:
-        return yaml.safe_load(Path('configs/inference_config.yaml').read_text(encoding='utf-8')) or {}
-    except Exception:
-        return {}
+# _setup_logging and _load_infer_cfg are removed, their logic is now in main()
 
 
 def _load_metadata(session: ort.InferenceSession):
@@ -152,29 +125,62 @@ def _preprocess_simple(image_path: str, image_size: int, mean, std):
 
 
 def main():
-    _setup_logging()
+    # Load unified config to get defaults
+    try:
+        manager = ConfigManager(config_type=ConfigType.FULL)
+        unified_config = manager.load_from_file("configs/unified_config.yaml")
+        log_cfg = unified_config
+        infer_cfg = unified_config.inference
+        data_cfg = unified_config.data
+    except Exception as e:
+        # Fallback to basic logging if config fails
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        logger.error(f"Could not load unified_config.yaml: {e}. Using basic logging and default settings.")
+        # Create dummy configs to avoid crashing
+        from dataclasses import dataclass
+        @dataclass
+        class Dummy:
+            def __getattr__(self, name):
+                if name == 'prediction_threshold': return 0.0
+                if name == 'top_k': return 5
+                return None
+        infer_cfg = Dummy()
+        log_cfg = Dummy()
+        data_cfg = Dummy()
+
+    # Setup logging from unified config
+    level = getattr(logging, str(log_cfg.log_level or 'INFO').upper(), logging.INFO)
+    fmt = log_cfg.log_format or '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    logging.basicConfig(level=level, format=fmt)
+    if getattr(log_cfg, 'file_logging_enabled', False):
+        log_dir = Path(log_cfg.log_dir or './logs')
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            log_dir / 'onnx_infer.log',
+            maxBytes=log_cfg.log_rotation_max_bytes or (10*1024*1024),
+            backupCount=log_cfg.log_rotation_backups or 5,
+        )
+        handler.setFormatter(logging.Formatter(fmt))
+        handler.setLevel(level)
+        logging.getLogger().addHandler(handler)
+
     parser = argparse.ArgumentParser(description='ONNX inference with embedded vocab')
-    cfg = _load_infer_cfg()
-    pp = (cfg.get('postprocessing') or {})
-    ort_cfg = (cfg.get('onnx_runtime') or {})
     parser.add_argument('model', type=str, help='Path to ONNX model')
     parser.add_argument('images', nargs='+', help='Image paths')
-    parser.add_argument('--top_k', type=int, default=pp.get('top_k', 5))
-    parser.add_argument('--threshold', type=float, default=pp.get('threshold', 0.0))
+    parser.add_argument('--top_k', type=int, default=infer_cfg.top_k, help=f"Default: {infer_cfg.top_k}")
+    parser.add_argument('--threshold', type=float, default=infer_cfg.prediction_threshold, help=f"Default: {infer_cfg.prediction_threshold}")
     parser.add_argument('--output', type=str, help='Output JSON file')
     parser.add_argument('--vocab', type=str, help='External vocabulary file (if not embedded)')
-    parser.add_argument('--providers', nargs='*', default=ort_cfg.get('providers', ['CUDAExecutionProvider', 'CPUExecutionProvider']))
+    parser.add_argument('--providers', nargs='*', default=['CUDAExecutionProvider', 'CPUExecutionProvider'])
     # Preprocessing parameters (required when metadata is missing)
-    parser.add_argument('--mean', type=float, nargs=3, metavar=('R', 'G', 'B'),
-                        help='Normalization mean values for RGB channels (required if not in model metadata)')
-    parser.add_argument('--std', type=float, nargs=3, metavar=('R', 'G', 'B'),
-                        help='Normalization std values for RGB channels (required if not in model metadata)')
-    parser.add_argument('--image-size', type=int, help='Input image size (required if not in model metadata)')
+    parser.add_argument('--mean', type=float, nargs=3, metavar=('R', 'G', 'B'), default=data_cfg.normalize_mean, help=f'Normalization mean values (default: {data_cfg.normalize_mean})')
+    parser.add_argument('--std', type=float, nargs=3, metavar=('R', 'G', 'B'), default=data_cfg.normalize_std, help=f'Normalization std values (default: {data_cfg.normalize_std})')
+    parser.add_argument('--image-size', type=int, default=data_cfg.image_size, help=f'Input image size (default: {data_cfg.image_size})')
     parser.add_argument('--patch-size', type=int, help='Model patch size (required if not in model metadata)')
     args = parser.parse_args()
 
     # Explicitly specify providers for better control
-    providers = args.providers or ort_cfg.get('providers') or ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    providers = args.providers or ['CUDAExecutionProvider', 'CPUExecutionProvider']
     session = ort.InferenceSession(
         args.model,
         providers=providers
@@ -196,24 +202,15 @@ def main():
         
         # Check for required preprocessing parameters
         missing_params = []
-        if args.mean is None:
-            missing_params.append("--mean")
-        if args.std is None:
-            missing_params.append("--std")
-        if args.image_size is None:
-            missing_params.append("--image-size")
-        if args.patch_size is None:
-            missing_params.append("--patch-size")
+        if args.mean is None: missing_params.append("--mean")
+        if args.std is None: missing_params.append("--std")
+        if args.image_size is None: missing_params.append("--image-size")
+        if args.patch_size is None: missing_params.append("--patch-size")
 
         if missing_params:
             raise RuntimeError(
                 f"Model lacks preprocessing metadata and required parameters are missing: {', '.join(missing_params)}\n"
-                f"When model metadata is not available, you must explicitly provide:\n"
-                f"  --mean R G B        (e.g., --mean 0.5 0.5 0.5)\n"
-                f"  --std R G B         (e.g., --std 0.5 0.5 0.5)\n"
-                f"  --image-size SIZE   (e.g., --image-size 640)\n"
-                f"  --patch-size SIZE   (e.g., --patch-size 16)\n"
-                f"These values must match those used during training to ensure correct predictions."
+                f"When model metadata is not available, you must explicitly provide them."
             )
 
         # Use explicitly provided parameters
@@ -221,7 +218,7 @@ def main():
         std = list(args.std)
         image_size = args.image_size
         patch_size = args.patch_size
-        meta = result[-1]  # Get the meta from the result
+        meta = result[-1]
         vocab_embedded = False
     else:
         vocab, mean, std, image_size, patch_size, meta = result
@@ -242,11 +239,10 @@ def main():
 
         outputs = session.run(None, {input_name: inp})
 
-        # Handle both old (predictions, scores) and new (scores only) model formats
         if len(outputs) == 1:
-            scores = outputs[0][0]  # New format: scores only
+            scores = outputs[0][0]
         else:
-            scores = outputs[-1][0]  # Old format: assume last output are scores
+            scores = outputs[-1][0]
 
         idxs = np.argsort(scores)[::-1][:args.top_k]
         tags = []
@@ -254,7 +250,6 @@ def main():
             score = float(scores[idx])
             if score < args.threshold:
                 continue
-            # This will raise ValueError if placeholder detected
             tag_name = vocab.get_tag_from_index(int(idx))
             tags.append(TagPrediction(name=tag_name, score=score))
 
@@ -264,7 +259,6 @@ def main():
             processing_time=int((time.time() - start) * 1000)
         ))
 
-    # Create metadata using the schema
     metadata = RunMetadata(
         top_k=args.top_k,
         threshold=args.threshold,
@@ -278,13 +272,11 @@ def main():
         vocab_embedded=vocab_embedded
     )
 
-    # Log metadata source
     if vocab_embedded:
         print(f"Using embedded vocabulary metadata from model", file=sys.stderr)
     else:
         print(f"Using external vocabulary from {args.vocab}", file=sys.stderr)
 
-    # Create output using schema
     output = PredictionOutput(metadata=metadata, results=results)
 
     if args.output:

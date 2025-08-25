@@ -9,29 +9,16 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Counter
-import yaml
 import warnings
 import threading
 
 logger = logging.getLogger(__name__)
 
 
-def _paths():
-    try:
-        return yaml.safe_load(Path("configs/paths.yaml").read_text(encoding="utf-8")) or {}
-    except Exception:
-        return {}
-
-
-DEFAULT_CONFIG = {
-    "data_dir": Path(_paths().get("dataset_image_root", "./data/images")),
-    "json_dir": Path(_paths().get("dataset_metadata_root", "./data/metadata")),
-    "orientation_map": None,
-    "strict": True,
-    "skip_unmapped": False,
-    # Legacy naming: "strict" → "conservative"
-    "safety_mode": "conservative"
-}
+# The _paths() function and DEFAULT_CONFIG dictionary that depended on legacy
+# configs/paths.yaml have been removed. The OrientationHandler is now initialized
+# directly with parameters from the scripts that use it, which in turn will
+# be updated to use the unified configuration.
 
 
 class OrientationHandler:
