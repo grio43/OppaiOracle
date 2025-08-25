@@ -1,3 +1,8 @@
+# DEPRECATED (migrating to unified config):
+# This file is kept for reference while migration completes.
+# Prefer editing: configs/unified_config.yaml (see configs/MIGRATION.md)
+# Orientation map path and policy now live under data.* in unified_config.yaml.
+
 # Train-time augmentation & orientation policy
 augmentation:
   enabled: true

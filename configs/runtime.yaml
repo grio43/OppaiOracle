@@ -1,3 +1,7 @@
+# DEPRECATED (migrating to unified config):
+# Runtime stability/benchmark toggles now live under training.* in unified_config.yaml.
+# Prefer editing: configs/unified_config.yaml.
+
 runtime:
   deterministic: false            # True makes runs repeatable; slightly slower
   cublas_workspace_config: ":16:8" # Repro preset for CUDA; leave unless you know why
