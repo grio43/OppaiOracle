@@ -38,6 +38,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler, Sampler
 import torchvision.transforms as T
+import torchvision.transforms.v2 as v2
 from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -1562,8 +1563,17 @@ class SimplifiedDataset(Dataset):
 
         transforms.append(T.Lambda(gamma_transform))
 
+        # RandAugment
+        if self.config.randaugment_num_ops > 0 and self.config.randaugment_magnitude > 0:
+            transforms.append(v2.RandAugment(num_ops=self.config.randaugment_num_ops, magnitude=self.config.randaugment_magnitude))
+
         # Final safety clamp to ensure valid range
         transforms.append(T.Lambda(lambda x: torch.clamp(x, 0.0, 1.0)))
+
+        # Random Erasing (applied after all other transforms)
+        if self.config.random_erasing_p > 0:
+            transforms.append(v2.RandomErasing(p=self.config.random_erasing_p, scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0))
+
 
         return T.Compose(transforms) if transforms else None
 
@@ -2293,6 +2303,38 @@ def create_dataloaders(
     if distributed:
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
+    # In order to apply MixUp or CutMix, we need to wrap the default collate_fn.
+    # These transforms operate on batches, not individual samples.
+    train_collate_fn = collate_fn
+    if data_config.mixup_alpha > 0.0 or data_config.cutmix_alpha > 0.0:
+        mixup_cutmix_transforms = []
+        if data_config.mixup_alpha > 0.0:
+            mixup_cutmix_transforms.append(
+                v2.MixUp(alpha=data_config.mixup_alpha, num_classes=len(vocab.tag_to_index))
+            )
+        if data_config.cutmix_alpha > 0.0:
+            mixup_cutmix_transforms.append(
+                v2.CutMix(alpha=data_config.cutmix_alpha, num_classes=len(vocab.tag_to_index))
+            )
+
+        mixup_cutmix = v2.RandomChoice(mixup_cutmix_transforms)
+
+        def collate_fn_with_aug(batch):
+            # The default collate_fn returns a dict. v2.MixUp/CutMix expect (images, labels)
+            # We need to adapt it to our dictionary structure.
+            collated_batch = collate_fn(batch)
+
+            # The labels to be mixed are the tag_labels. The rating_labels should not be mixed.
+            # We can create a simple lambda to extract the tag_labels for the transform.
+            images, tag_labels = mixup_cutmix(collated_batch['images'], collated_batch['tag_labels'])
+
+            collated_batch['images'] = images
+            collated_batch['tag_labels'] = tag_labels
+            return collated_batch
+
+        train_collate_fn = collate_fn_with_aug
+
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=data_config.batch_size,
@@ -2303,7 +2345,7 @@ def create_dataloaders(
         prefetch_factor=data_config.prefetch_factor,
         drop_last=True,
         persistent_workers=True if data_config.num_workers > 0 else False,
-        collate_fn=collate_fn,
+        collate_fn=train_collate_fn,
         worker_init_fn=_make_worker_init_fn(base_seed, log_queue),
         generator=generator,
     )
@@ -2317,7 +2359,7 @@ def create_dataloaders(
         prefetch_factor=validation_config.dataloader.prefetch_factor,
         drop_last=False,
         persistent_workers=validation_config.dataloader.persistent_workers,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn, # No mixup/cutmix on validation
         worker_init_fn=_make_worker_init_fn(base_seed, log_queue),
         generator=generator,
     )
