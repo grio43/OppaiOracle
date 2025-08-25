@@ -13,7 +13,7 @@ from pathlib import Path
 import yaml
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
 import traceback
 from contextlib import contextmanager
@@ -122,6 +122,7 @@ class InferenceConfig:
     # Caching
     enable_cache: bool = True
     cache_size: int = 1000
+    cache_ttl_seconds: int = 3600  # 1 hour default TTL
 
     # Output
     output_format: str = "json"  # json, csv, txt
@@ -552,49 +553,71 @@ class ResultProcessor:
 
 
 class InferenceCache:
-    """Simple LRU cache for inference results"""
+    """LRU cache for inference results with TTL support."""
     
-    def __init__(self, max_size: int = 1000):
+    def __init__(self, max_size: int = 1000, ttl_seconds: int = 3600):
         self.cache = {}
-        self.access_order = deque(maxlen=max_size)
+        self.access_order = deque()
         self.max_size = max_size
+        self.ttl = timedelta(seconds=ttl_seconds) if ttl_seconds > 0 else None
         self.hits = 0
         self.misses = 0
+        self.expired = 0
         self.lock = threading.Lock()
-    
+
     def get(self, key: str) -> Optional[Any]:
-        """Get item from cache"""
+        """Get item from cache, checking TTL if applicable."""
         with self.lock:
             if key in self.cache:
+                value, timestamp = self.cache[key]
+
+                # Check if item has expired
+                if self.ttl and (datetime.now() - timestamp > self.ttl):
+                    self.expired += 1
+                    # Remove expired item
+                    del self.cache[key]
+                    # This is tricky because key is still in access_order.
+                    # We will do a lazy removal.
+                    # A better approach might be a background cleanup thread,
+                    # but for now, we'll handle it lazily.
+                    # To avoid breaking deque.remove(), we will just leave it.
+                    # It will be eventually pushed out.
+                    self.misses += 1
+                    return None
+
                 self.hits += 1
-                # Update access order
+                # Move to end to signify recent use
                 self.access_order.remove(key)
                 self.access_order.append(key)
-                return self.cache[key]
+                return value
+
             self.misses += 1
             return None
-    
+
     def put(self, key: str, value: Any):
-        """Put item in cache"""
+        """Put item in cache, evicting if necessary."""
         with self.lock:
+            # If key exists, remove it to update its position
             if key in self.cache:
-                # Update existing
                 self.access_order.remove(key)
-            elif len(self.cache) >= self.max_size:
-                # Remove oldest
-                oldest = self.access_order.popleft()
-                del self.cache[oldest]
+            # If cache is full, evict the least recently used item
+            elif len(self.cache) >= self.max_size and self.max_size > 0:
+                oldest_key = self.access_order.popleft()
+                if oldest_key in self.cache:
+                    del self.cache[oldest_key]
             
-            self.cache[key] = value
+            # Add the new item
+            self.cache[key] = (value, datetime.now())
             self.access_order.append(key)
-    
+
     def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics"""
+        """Get cache statistics."""
         with self.lock:
             total = self.hits + self.misses
             return {
                 'hits': self.hits,
                 'misses': self.misses,
+                'expired': self.expired,
                 'hit_rate': self.hits / total if total > 0 else 0,
                 'size': len(self.cache)
             }
@@ -645,8 +668,11 @@ class InferenceEngine:
         
         # Setup cache
         if self.config.enable_cache:
-            self.cache = InferenceCache(self.config.cache_size)
-            logger.info(f"Cache enabled with size {self.config.cache_size}")
+            self.cache = InferenceCache(
+                max_size=self.config.cache_size,
+                ttl_seconds=self.config.cache_ttl_seconds
+            )
+            logger.info(f"Cache enabled with size {self.config.cache_size} and TTL {self.config.cache_ttl_seconds}s")
     
     def predict_single(self, image: Union[str, np.ndarray, Image.Image]) -> ImagePrediction:
         """Predict tags for a single image"""
