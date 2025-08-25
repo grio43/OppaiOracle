@@ -12,11 +12,11 @@ This JSON is consumed by the augmentation/inference pipeline to translate direct
 
 ## Safety levels
 
-The `augmentation.orientation.safety_mode` sets how strictly we require a known mapping before flipping:
+The `data.orientation_safety_mode` sets how strictly we require a known mapping before flipping:
 
-- `strict` – Only flip when an explicit mapping or regex applies.
-- `balanced` – Flip using regexes when explicit mapping is missing; skip risky tags.
-- `lenient` – Flip unless a tag appears in `skip_flip_tags`.
+- `conservative` – Only flip when an explicit mapping applies.
+- `balanced` – Flip when an explicit mapping or regex can swap tags; skip risky tags.
+- `permissive` – Flip unless a tag appears in `skip_flip_tags`.
 
 ## Tips
 

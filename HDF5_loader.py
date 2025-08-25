@@ -426,6 +426,7 @@ class SimplifiedDataConfig:
     # Safer default: fail if flips requested but mapping invalid
     strict_orientation_validation: bool = True
     skip_unmapped: bool = True
+    orientation_safety_mode: str = "conservative"
     # Narrow crop scale range to preserve most of the subject in the frame.
     # When (1.0, 1.0) no random cropping is performed.
     random_crop_scale: Tuple[float, float] = (0.95, 1.0)
@@ -1344,6 +1345,7 @@ class SimplifiedDataset(Dataset):
                     mapping_file=config.orientation_map_path,
                     random_flip_prob=config.random_flip_prob,
                     strict_mode=config.strict_orientation_validation,
+                    safety_mode=config.orientation_safety_mode,
                     skip_unmapped=config.skip_unmapped
                 )
 
