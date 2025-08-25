@@ -316,127 +316,6 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
         
         super().step(epoch)
 
-
-class LinearWarmupCosineAnnealingLR(_LRScheduler):
-    """Linear warmup followed by cosine annealing"""
-    
-    def __init__(
-        self,
-        optimizer: optim.Optimizer,
-        warmup_epochs: int,
-        max_epochs: int,
-        warmup_start_lr: float = 1e-8,
-        eta_min: float = 1e-8,
-        last_epoch: int = -1
-    ):
-        self.warmup_epochs = warmup_epochs
-        self.max_epochs = max_epochs
-        self.warmup_start_lr = warmup_start_lr
-        self.eta_min = eta_min
-        
-        super().__init__(optimizer, last_epoch)
-    
-    def get_lr(self):
-        if self.last_epoch < self.warmup_epochs:
-            # Linear warmup
-            return [self.warmup_start_lr + (base_lr - self.warmup_start_lr) * 
-                    self.last_epoch / self.warmup_epochs
-                    for base_lr in self.base_lrs]
-        else:
-            # Cosine annealing
-            progress = (self.last_epoch - self.warmup_epochs) / (self.max_epochs - self.warmup_epochs)
-            return [self.eta_min + (base_lr - self.eta_min) *
-                    (1 + math.cos(math.pi * progress)) / 2
-                    for base_lr in self.base_lrs]
-
-
-class GradientAccumulator:
-    """Helper for gradient accumulation"""
-    
-    def __init__(
-        self,
-        accumulation_steps: int = 1,
-        max_grad_norm: float = 1.0,
-        use_amp: bool = True
-    ):
-        self.accumulation_steps = accumulation_steps
-        self.max_grad_norm = max_grad_norm
-        self.use_amp = use_amp
-        
-        if use_amp and torch.cuda.is_available():
-            self.scaler = GradScaler(device='cuda')
-        else:
-            self.scaler = None
-        self.current_step = 0
-        
-    def backward(self, loss: torch.Tensor, retain_graph: bool = False):
-        """Backward pass with gradient accumulation"""
-        # Scale loss by accumulation steps
-        loss = loss / self.accumulation_steps
-        
-        if self.use_amp and self.scaler is not None:
-            self.scaler.scale(loss).backward(retain_graph=retain_graph)
-        else:
-            loss.backward(retain_graph=retain_graph)
-    
-    def step(self, optimizer: optim.Optimizer, model: nn.Module = None) -> bool:
-        """Optimizer step with gradient accumulation
-        
-        Returns:
-            True if optimizer step was taken, False otherwise
-        """
-        self.current_step += 1
-        
-        if self.current_step % self.accumulation_steps == 0:
-            # Clip gradients
-            if self.use_amp and self.scaler is not None:
-                self.scaler.unscale_(optimizer)
-            
-            if self.max_grad_norm > 0:
-                if model is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
-                else:
-                    # Clip all parameter gradients in optimizer
-                    params = []
-                    for group in optimizer.param_groups:
-                        params.extend(group['params'])
-                    torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm)
-            
-            # Optimizer step
-            if self.use_amp and self.scaler is not None:
-                self.scaler.step(optimizer)
-                self.scaler.update()
-            else:
-                optimizer.step()
-            
-            return True
-        
-        return False
-    
-    def zero_grad(self, optimizer: optim.Optimizer):
-        """Zero gradients if accumulation complete"""
-        if self.current_step % self.accumulation_steps == 0:
-            optimizer.zero_grad(set_to_none=True)
-    
-    def state_dict(self) -> Dict:
-        """Get state dict for checkpointing"""
-        state = {
-            'current_step': self.current_step,
-            'accumulation_steps': self.accumulation_steps,
-            'max_grad_norm': self.max_grad_norm,
-            'use_amp': self.use_amp
-        }
-        if self.scaler is not None:
-            state['scaler_state'] = self.scaler.state_dict()
-        return state
-    
-    def load_state_dict(self, state_dict: Dict):
-        """Load state from checkpoint"""
-        self.current_step = state_dict.get('current_step', 0)
-        if 'scaler_state' in state_dict and self.scaler is not None:
-            self.scaler.load_state_dict(state_dict['scaler_state'])
-
-
 class EarlyStopping:
     """Early stopping handler"""
     
@@ -839,8 +718,8 @@ class LearningRateSchedulerFactory:
         optimizer: optim.Optimizer,
         scheduler_type: str,
         num_epochs: int,
-        steps_per_epoch: int,
-        warmup_epochs: int = 0,
+        steps_per_epoch: int = 0,
+        warmup_epochs: int = 0,  # Deprecated, use warmup_steps
         warmup_steps: int = 0,
         min_lr: float = 1e-8,
         **kwargs
@@ -850,18 +729,15 @@ class LearningRateSchedulerFactory:
         Args:
             optimizer: Optimizer to schedule
             scheduler_type: Type of scheduler (cosine, linear, exponential, etc.)
-            num_epochs: Total number of epochs
-            steps_per_epoch: Number of steps per epoch
-            warmup_epochs: Number of warmup epochs
-            warmup_steps: Number of warmup steps (overrides warmup_epochs)
+            num_epochs: Total number of epochs (for epoch-based schedulers)
+            steps_per_epoch: Number of steps per epoch (for step-based schedulers)
+            warmup_epochs: Number of warmup epochs (deprecated, use warmup_steps)
+            warmup_steps: Number of warmup steps
             min_lr: Minimum learning rate
             **kwargs: Additional scheduler-specific arguments
         """
-        
-        # Calculate warmup steps if epochs specified
-        if warmup_epochs > 0 and warmup_steps == 0:
-            warmup_steps = warmup_epochs * steps_per_epoch
-        
+
+        # For step-based schedulers
         if scheduler_type == 'cosine':
             return LinearWarmupCosineAnnealingLR(
                 optimizer,
@@ -870,7 +746,7 @@ class LearningRateSchedulerFactory:
                 warmup_start_lr=kwargs.get('warmup_start_lr', min_lr),
                 eta_min=min_lr
             )
-        
+
         elif scheduler_type == 'cosine_restarts':
             return CosineAnnealingWarmupRestarts(
                 optimizer,
@@ -880,14 +756,6 @@ class LearningRateSchedulerFactory:
                 min_lr=min_lr,
                 warmup_steps=warmup_steps,
                 gamma=kwargs.get('gamma', 1.0)
-            )
-        
-        elif scheduler_type == 'linear':
-            return optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=kwargs.get('start_factor', 1.0),
-                end_factor=kwargs.get('end_factor', 0.01),
-                total_iters=num_epochs
             )
         
         elif scheduler_type == 'exponential':
@@ -918,13 +786,6 @@ class LearningRateSchedulerFactory:
                 patience=kwargs.get('patience', 10),
                 threshold=kwargs.get('threshold', 0.0001),
                 min_lr=min_lr
-            )
-        
-        elif scheduler_type == 'constant':
-            return optim.lr_scheduler.ConstantLR(
-                optimizer,
-                factor=kwargs.get('factor', 1.0),
-                total_iters=kwargs.get('total_iters', 1)
             )
         
         else:

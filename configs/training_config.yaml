@@ -14,11 +14,11 @@ adam_beta2: 0.999
 adam_epsilon: 1.0e-8
 
 # Learning Rate Scheduler
-scheduler: cosine  # Options: linear, cosine, constant, polynomial, exponential
-warmup_steps: 10000  # Linear warmup for first 10k steps
-warmup_ratio: 0.0  # Alternative: use ratio of total steps (0.0 means use warmup_steps)
-num_cycles: 0.5  # For cosine scheduler
-lr_end: 1.0e-6  # Minimum learning rate at the end
+scheduler: cosine_restarts  # Options: cosine, cosine_restarts, step, multistep, plateau, exponential
+warmup_steps: 10000  # Linear warmup for first 10k optimizer steps
+# warmup_ratio: 0.0  # Deprecated - use warmup_steps directly
+num_cycles: 1.0  # Number of cosine cycles (for cosine_restarts)
+lr_end: 1.0e-6  # Minimum learning rate
 
 # Mixed Precision Training
 use_amp: true  # Use automatic mixed precision
