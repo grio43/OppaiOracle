@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-import hashlib
 import warnings
 import traceback
 from contextlib import contextmanager
@@ -219,8 +218,7 @@ class ModelWrapper:
                     ]
                     logger.info(f"Successfully loaded {len(self.tag_names)} tags from embedded vocabulary")
                     # Compute vocabulary hash
-                    vocab_json = json.dumps(vocab_data, sort_keys=True)
-                    self.vocab_sha256 = hashlib.sha256(vocab_json.encode()).hexdigest()
+                    self.vocab_sha256 = compute_vocab_sha256(vocab_data=vocab_data)
                 else:
                     logger.error("Failed to extract embedded vocabulary")
                     # Fall back to external vocabulary file
@@ -374,8 +372,7 @@ class ModelWrapper:
             for i in range(len(self.vocabulary.tag_to_index))
         ]
         # Compute vocabulary hash for external vocabulary
-        vocab_json = json.dumps({'tag_to_index': self.vocabulary.tag_to_index}, sort_keys=True)
-        self.vocab_sha256 = hashlib.sha256(vocab_json.encode()).hexdigest()
+        self.vocab_sha256 = compute_vocab_sha256(vocab_data={'tag_to_index': self.vocabulary.tag_to_index})
 
     def _verify_vocabulary(self):
         """Verify vocabulary contains real tags, not placeholders"""
