@@ -6,6 +6,7 @@ Demonstrates integration of the orientation handler with fail-fast behavior and 
 
 import logging
 import os
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -53,7 +54,7 @@ Import error: {e}"""
     raise ImportError(error_msg)
 
 # Import training utilities for checkpointing
-from training_utils import CheckpointManager, TrainingState
+from training_utils import CheckpointManager, TrainingState, setup_seed, log_sample_order_hash
 from HDF5_loader import AugmentationStats
 
 # Add after other imports
@@ -249,27 +250,15 @@ def train_with_orientation_tracking():
         else:
             logger.info(f"Using existing CUBLAS_WORKSPACE_CONFIG={ws}")
     
-    # Add configuration option for deterministic mode
-    deterministic_mode = config.get("deterministic_mode", True)
-    if not deterministic_mode:
-        logger.info("Deterministic mode disabled - training may have slight variations between runs")
-    
-
-    seed = 42
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    # Opt-in seed and deterministic handling
+    seed: Optional[int] = config.get("seed")
+    deterministic_mode = config.get("deterministic_mode", False)
+    seed, deterministic_mode = setup_seed(seed, deterministic_mode)
     try:
         if deterministic_mode:
-            torch.use_deterministic_algorithms(True)  # raise if an op is nondeterministic
+            torch.use_deterministic_algorithms(True)
         else:
             torch.use_deterministic_algorithms(False)
-    except Exception:
-        pass
-    try:
-        import torch.backends.cudnn as cudnn
-        cudnn.deterministic = True
-        cudnn.benchmark = False
     except Exception:
         pass
 
@@ -374,10 +363,11 @@ def train_with_orientation_tracking():
         "collect_augmentation_stats": config.get("log_augmentation_stats", True),
         "stats_queue": stats_queue,  # Pass stats queue 
         # Conservative colour jitter settings for anime
-        "color_jitter_brightness": 0.1,
-        "color_jitter_contrast": 0.1,
+        "color_jitter_brightness": 0.05,
+        "color_jitter_contrast": 0.05,
         "color_jitter_saturation": 0.05,
-        "color_jitter_hue": 0.02,
+        "color_jitter_hue": 0.03,
+        "eye_color_weight_boost": 1.5,
     }
     train_loader, val_loader, vocab = create_dataloaders(
         data_dir=config["data_dir"],
@@ -587,6 +577,8 @@ def train_with_orientation_tracking():
             monitor.writer.add_text(key, value, 0)
 
     for epoch in range(config["num_epochs"]):
+        # Shuffle proof-of-life
+        log_sample_order_hash(train_loader, epoch)
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
