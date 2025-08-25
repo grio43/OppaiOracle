@@ -8,7 +8,8 @@ experiment_name: "default_experiment"
 output_root: "./experiments"
 log_level: "INFO"
 log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-max_memory_gb: null
+# Set a target for total system RAM usage. This is a guideline and not strictly enforced.
+max_memory_gb: 220.0
 max_gpu_memory_gb: null
 
 # --------------------------------------------------------------------
@@ -87,7 +88,7 @@ data:
   drop_last: false
   
   # Caching
-  cache_size_gb: 105.0
+  cache_size_gb: 80.0
   preload_files: 2
   use_memory_cache: true
   
