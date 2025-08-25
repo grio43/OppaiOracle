@@ -252,10 +252,14 @@ def train_with_orientation_tracking(config: FullConfig):
             label_smoothing=config.training.label_smoothing
         )
     )
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.training.learning_rate,
-        weight_decay=config.training.weight_decay
+    from training_utils import TrainingUtils
+    optimizer = TrainingUtils.get_optimizer(
+        model,
+        optimizer_type=config.training.optimizer,
+        learning_rate=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
+        betas=(config.training.adam_beta1, config.training.adam_beta2),
+        eps=config.training.adam_epsilon
     )
 
     monitor = TrainingMonitor(MonitorConfig(
