@@ -53,6 +53,7 @@ except ImportError:
 
 
 from orientation_handler import OrientationHandler, OrientationMonitor  # type: ignore
+from Configuration_System import DataConfig, ValidationConfig
 # Import TagVocabulary from the vocabulary module rather than a relative package path.
 # The vocabulary module should reside on the Python path for this import to succeed.
 from vocabulary import TagVocabulary
@@ -66,19 +67,8 @@ def _derive_worker_generator(worker_id: int = 0) -> torch.Generator:
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-# Centralize vocabulary path in configs/unified_config.yaml (with fallbacks)
-def _load_vocab_path() -> Path:
-    try:
-        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
-    except Exception:
-        cfg = {}
-    data = (cfg.get("data") or {})
-    p = cfg.get("vocab_path") or data.get("vocab_path")
-    if p:
-        return Path(p)
-    vd = data.get("vocab_dir")
-    return (PROJECT_ROOT / vd / "vocabulary.json") if vd else (PROJECT_ROOT / "vocabulary.json")
-DEFAULT_VOCAB_PATH = _load_vocab_path()
+# The default vocabulary path is now determined by the calling script
+# from the unified configuration and passed into create_dataloaders.
 
 @dataclass
 class AugmentationStats:
@@ -392,132 +382,9 @@ class TrackedColorJitter:
             out = TF.adjust_hue(out, hue_factor)
         return out
 
-@dataclass
-class SimplifiedDataConfig:
-    """
-    Configuration parameters controlling data loading and augmentation.
-
-    These settings are tailored for high‑resolution anime artwork.  The
-    ``pad_color`` is used during letterbox resizing to fill any empty
-    regions and should match the neutral colour used during inference.
-    ``patch_size`` defines the patch size expected by the vision
-    transformer; ``image_size`` should be divisible by ``patch_size``.
-    """
-
-    # Required locations
-    data_dir: Path
-    json_dir: Path
-    vocab_path: Path
-
-    # Image settings
-    image_size: int = 640
-    # Normalisation parameters (defaults tuned for anime artwork rather than ImageNet)
-    normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)
-    normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5)
-    # Padding colour used for letterbox resizing (RGB in 0‑255 range).
-    pad_color: Tuple[int, int, int] = (114, 114, 114)
-    # Patch size for downstream model.  ``image_size`` should be divisible by this.
-    patch_size: int = 16
-
-    # Vocabulary settings
-    top_k_tags: Optional[int] = None  # None means use all tags in vocabulary
-    min_tag_frequency: int = 1  # include all tags that appear at least once
-
-    # Augmentation settings
-    augmentation_enabled: bool = True
-    # Reduce flip probability because many tags encode left/right semantics
-    random_flip_prob: float = 0.35
-    # Safer default: fail if flips requested but mapping invalid
-    strict_orientation_validation: bool = True
-    skip_unmapped: bool = True
-    orientation_safety_mode: str = "conservative"
-    # Narrow crop scale range to preserve most of the subject in the frame.
-    # When (1.0, 1.0) no random cropping is performed.
-    random_crop_scale: Tuple[float, float] = (0.95, 1.0)
-    # Colour jitter parameters
-    color_jitter: bool = True
-    # Conservative defaults tuned for anime colour fidelity
-    color_jitter_brightness: float = 0.1
-    color_jitter_contrast: float = 0.1
-    color_jitter_saturation: float = 0.0
-    color_jitter_hue: float = 0.03  # ≤0.03 to protect eye-color semantics
-    eye_color_weight_boost: float = 1.5  # Configurable boost for eye color tags
-    # Optional path to orientation mapping (JSON or YAML).  If provided, the
-    # mapping is loaded on dataset initialisation.
-    orientation_map_path: Optional[Path] = None
-
-    # Transparency handling
-    update_transparency_tags: bool = True  # Whether to update tags when compositing transparent images
-    composite_background_tag: str = "gray_background"  # Tag to add when compositing
-
-    # Sampling settings
-    frequency_weighted_sampling: bool = True
-    sample_weight_power: float = 0.5
-
-    # Multi‑GPU settings
-    distributed: bool = False
-    rank: int = 0
-    world_size: int = 1
-    log_queue_maxsize: int = 5000    
-
-    # Cache settings
-    cache_size_gb: float = 8.0
-    cache_precision: str = 'float16'  # 'float32', 'float16' or 'uint8'
-    preload_metadata: bool = True
-
-    
-    # LMDB L2 cache settings (from plan)
-    l2_cache_enabled: bool = True
-    l2_cache_path: Path = Path(os.environ.get('OPPAI_L2_CACHE', './cache/lmdb'))
-    l2_max_size_gb: float = 48.0
-    l2_map_growth_gb: float = 4.0
-    l2_max_readers: int = 2048
-    l1_per_worker_mb: float = 128.0  # Small L1 cache per worker
-    
-    # Memory watermarks (from plan)
-    high_free_ram_pct: float = 25.0
-    low_free_ram_pct: float = 12.0  
-    critical_free_ram_pct: float = 5.0
-    monitor_interval_batches: int = 100
-    
-    # Working set sampler settings (from plan)
-    use_working_set_sampler: bool = True
-    working_set_pct: float = 5.0  # 5% of dataset
-    working_set_max_items: int = 400000
-    working_set_refresh_epochs: int = 2
-    trickle_in_pct: float = 1.0  # New uniques per epoch
-    max_new_uniques_per_epoch: int = 80000
-
-    # Error handling settings
-    # Cache budget and admission control
-    l2_max_value_mb: float = 32.0  # Max size per cached item
-    l2_grace_margin_pct: float = 5.0  # Grace margin for capacity
-    canonical_cache_dtype: str = 'uint8'  # Canonical storage format
-
-    # Frequency weighting limits
-    # Augmentation stats collection
-    collect_augmentation_stats: bool = True
-    stats_queue: Optional[object] = None  # Multiprocessing queue for stats
-    max_weight_multiplier: float = 5.0  # Clip extreme weights
-    weight_warmup_epochs: int = 2  # Warmup before full weighting
-    skip_error_samples: bool = True
-    validate_on_init: bool = True
-
-    def __post_init__(self) -> None:
-        # Validate flip probability
-        if not 0.0 <= self.random_flip_prob <= 1.0:
-            raise ValueError(f"random_flip_prob must be in [0, 1], got {self.random_flip_prob}")
-        # Validate cache precision
-        if self.cache_precision not in {'float32', 'float16', 'uint8'}:
-            raise ValueError(
-                f"cache_precision must be one of 'float32', 'float16' or 'uint8', got {self.cache_precision}"
-            )
-        # Ensure image_size divisible by patch_size
-        if self.image_size % self.patch_size != 0:
-            logger.warning(
-                f"image_size ({self.image_size}) is not divisible by patch_size ({self.patch_size}); "
-                f"letterbox_resize will pad further to the next multiple."
-            )
+# The SimplifiedDataConfig dataclass has been removed.
+# The create_dataloaders function now accepts DataConfig and ValidationConfig objects
+# from Configuration_System.py.
 
 
 def _make_worker_init_fn(base_seed: Optional[int], log_queue):
@@ -1268,7 +1135,7 @@ class SimplifiedDataset(Dataset):
 
     def __init__(
             self,
-            config: SimplifiedDataConfig,
+            config: DataConfig,
             json_files: List[Path],
             split: str,
             vocab: TagVocabulary,
@@ -1278,9 +1145,9 @@ class SimplifiedDataset(Dataset):
 
             # Create a shallow copy of config to avoid mutation by downstream components
             # Deep copy fails with multiprocessing.Queue objects
-            if isinstance(config, SimplifiedDataConfig):
+            if isinstance(config, DataConfig):
                 # For dataclass, create a new instance with same values
-                config = SimplifiedDataConfig(**{f.name: getattr(config, f.name)
+                config = DataConfig(**{f.name: getattr(config, f.name)
                                                 for f in config.__dataclass_fields__.values()})
             else:
                 config = copy.copy(config)
@@ -2386,104 +2253,76 @@ class SimplifiedDataset(Dataset):
             self.background_validator.stop()
 
 def create_dataloaders(
-    data_dir: Path,
-    json_dir: Path,
-    vocab_path: Path = DEFAULT_VOCAB_PATH,
-    batch_size: int = 32,
-    num_workers: int = 8,
+    data_config: DataConfig,
+    validation_config: ValidationConfig,
+    vocab_path: Path,
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
     frequency_sampling: bool = True,
-    val_batch_size: Optional[int] = None,
-    config_updates: Optional[Dict[str, Any]] = None,
     seed: Optional[int] = None,
     log_queue: Optional[object] = None,
-    force_val_persistent_workers: bool = False,
-    pin_memory_config: Optional[Dict[str, Any]] = None,
     sampler_type: str = "uniform",
     max_repeat_factor: float = 3.0,
 ) -> Tuple[DataLoader, DataLoader, TagVocabulary]:
     """Construct training and validation dataloaders with enhanced memory control."""
     
-    # Ensure cache and log directories exist in main process before workers spawn
-    cache_dir = Path(os.environ.get('OPPAI_L2_CACHE', './cache/lmdb'))
-    validation_dir = Path(os.environ.get('OPPAI_VALIDATION_DIR', './validation'))
-
-    try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        validation_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logger.warning(f"Failed to create directories: {e}")
-        # Fall back to temp directory if needed
-        import tempfile
-        fallback_dir = Path(tempfile.gettempdir()) / 'oppai_cache'
-        fallback_dir.mkdir(parents=True, exist_ok=True)
-        os.environ['OPPAI_L2_CACHE'] = str(fallback_dir / 'lmdb')
-        os.environ['OPPAI_VALIDATION_DIR'] = str(fallback_dir / 'validation')
-    
-    # Set up bounded logging queue if needed
-    if log_queue is None:
-        log_queue = mp.Queue(maxsize=5000)  # Bounded queue
-    
-    # Default pin memory config
-    if pin_memory_config is None:
-        pin_memory_config = {
-            'enabled': torch.cuda.is_available(),
-            'prefetch_factor': 2,
-            'max_inflight_per_worker': 2,
-            'global_max_inflight': 16,
-            'adaptive': True,
-        }
-    
-    # Create adaptive prefetch controller
-    prefetch_controller = AdaptivePrefetchController(pin_memory_config)
-    
-    json_files = list(json_dir.glob("*.json"))
+    json_files = list(Path(data_config.storage_locations[0]['path']).glob("*.json"))
     if not json_files:
-        raise ValueError(f"No JSON files found in {json_dir}")
-    # Shuffle and split files
+        raise ValueError(f"No JSON files found in {data_config.storage_locations[0]['path']}")
+
     json_files_sorted = sorted(json_files)
     np.random.shuffle(json_files_sorted)
     split_idx = int(len(json_files_sorted) * 0.9)
     train_files = json_files_sorted[:split_idx]
     val_files = json_files_sorted[split_idx:]
-    # Instantiate config and vocabulary
-    cfg = SimplifiedDataConfig(
-        data_dir=data_dir,
-        json_dir=json_dir,
-      vocab_path=vocab_path,
-      distributed=distributed,
-      rank=rank,
-      world_size=world_size,
-      frequency_weighted_sampling=frequency_sampling,
-      stats_queue=log_queue,  # Reuse log queue for stats
-      top_k_tags=None,  # Use all tags in vocabulary
-  )
 
-    # Apply any user‑provided overrides
-    if config_updates:
-        for k, v in config_updates.items():
-            if hasattr(cfg, k):
-                setattr(cfg, k, v)
-
-    vocab = TagVocabulary(vocab_path, min_frequency=cfg.min_tag_frequency)
+    vocab = TagVocabulary(vocab_path)
     if not vocab_path.exists():
-        # Build vocabulary from all available annotations
-        vocab.build_from_annotations(json_files_sorted, cfg.top_k_tags)
+        vocab.build_from_annotations(json_files_sorted, top_k=None)
         vocab.save_vocabulary(vocab_path)
 
-    # Set top_k_tags based on actual vocabulary size if not specified
-    if cfg.top_k_tags is None:
-        cfg.top_k_tags = len(vocab.tag_to_index)
-    # Create datasets
-    train_dataset = SimplifiedDataset(cfg, train_files, split='train', vocab=vocab)
-    val_dataset = SimplifiedDataset(cfg, val_files, split='val', vocab=vocab)
+    train_dataset = SimplifiedDataset(data_config, train_files, split='train', vocab=vocab)
+    val_dataset = SimplifiedDataset(data_config, val_files, split='val', vocab=vocab)
 
-    # Determine base seed for reproducible sampling and workers
     base_seed = int(seed if seed is not None else torch.initial_seed() % (2**31 - 1))
     generator = torch.Generator()
     generator.manual_seed(base_seed)
+
+    train_sampler = None
+    if distributed:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=data_config.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=data_config.num_workers,
+        pin_memory=data_config.pin_memory,
+        prefetch_factor=data_config.prefetch_factor,
+        drop_last=True,
+        persistent_workers=True if data_config.num_workers > 0 else False,
+        collate_fn=collate_fn,
+        worker_init_fn=_make_worker_init_fn(base_seed, log_queue),
+        generator=generator,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=validation_config.dataloader.batch_size,
+        shuffle=False,
+        num_workers=validation_config.dataloader.num_workers,
+        pin_memory=data_config.pin_memory,
+        prefetch_factor=validation_config.dataloader.prefetch_factor,
+        drop_last=False,
+        persistent_workers=validation_config.dataloader.persistent_workers,
+        collate_fn=collate_fn,
+        worker_init_fn=_make_worker_init_fn(base_seed, log_queue),
+        generator=generator,
+    )
+
+    return train_loader, val_loader, vocab
 
     # Choose sampler
     train_sampler: Optional[Any] = None
