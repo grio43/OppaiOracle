@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 # Type variable for generic config classes
 T = TypeVar('T', bound='BaseConfig')
 
+CONFIG_VERSION = "2.0.0"  # Bumped for unified config format
+
 
 class ConfigError(Exception):
     """Configuration related errors"""
@@ -50,7 +52,7 @@ class BaseConfig:
     """Base configuration class with common functionality"""
     
     # Config versioning
-    _config_version: str = field(default="1.0.0", init=False, repr=False)
+    _config_version: str = field(default=CONFIG_VERSION, init=False, repr=False)
     
     def to_dict(self, exclude_private: bool = True) -> Dict[str, Any]:
         """
@@ -379,7 +381,12 @@ class DataConfig(BaseConfig):
     eye_color_weight_boost: float = 1.5  # Boost for eye color tags in sampling
     random_crop_scale: Tuple[float, float] = (0.8, 1.0)
     random_rotation_degrees: float = 0.0
-    
+
+    # Orientation mapping (consolidated from augmentation.yaml)
+    orientation_map_path: Optional[str] = None
+    strict_orientation_validation: bool = True
+    skip_unmapped: bool = True
+
     def validate(self):
         """Validate data configuration"""
         errors = []
@@ -489,11 +496,15 @@ class TrainingConfig(BaseConfig):
     logging_steps: int = 100
     
     # Loss configuration
-    focal_gamma_pos: float = 1.0  # Updated from 0.0
-    focal_gamma_neg: float = 3.0  # Updated from 4.0
+    focal_gamma_pos: float = 0.0
+    focal_gamma_neg: float = 4.0
     focal_alpha: float = 0.75  # Unified weight for focal loss
     label_smoothing: float = 0.1
     use_class_weights: bool = True
+
+    # Additional focal loss params for compatibility
+    focal_alpha_pos: Optional[float] = None  # Deprecated, use focal_alpha
+    focal_alpha_neg: Optional[float] = None  # Deprecated, use focal_alpha
     
     # Curriculum learning
     use_curriculum: bool = True
@@ -523,6 +534,11 @@ class TrainingConfig(BaseConfig):
     # Early stopping
     early_stopping_patience: int = 10
     early_stopping_threshold: float = 0.0001
+
+    # Knowledge distillation (from training_config.yaml comments)
+    use_distillation: bool = False
+    distillation_alpha: float = 0.7
+    distillation_temperature: float = 3.0
     
     def validate(self):
         """Validate training configuration"""
@@ -775,6 +791,16 @@ class FullConfig(BaseConfig):
     output_root: str = "./experiments"
     log_level: str = "INFO"
     log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    # Paths (consolidated from paths.yaml)
+    vocab_path: str = "./vocabulary.json"
+    log_dir: str = "./logs"
+    default_output_dir: str = "./outputs"
+
+    # Logging settings (from logging.yaml)
+    file_logging_enabled: bool = True
+    log_rotation_max_bytes: int = 10485760
+    log_rotation_backups: int = 5
     
     # Resource limits
     max_memory_gb: Optional[float] = None
