@@ -114,7 +114,9 @@ def _load_metadata(session: ort.InferenceSession):
 
 def _preprocess(image_path: str, image_size: int, mean, std, session=None):
     """Preprocess with dynamic dtype handling"""
-    img = Image.open(image_path).convert('RGB').resize((image_size, image_size))
+    with Image.open(image_path) as img:
+        img = img.convert('RGB').resize((image_size, image_size))
+        arr = np.asarray(img, dtype=np.float32) / 255.0
 
     # Get expected dtype from session if provided
     expected_dtype = np.float32  # default
@@ -126,7 +128,6 @@ def _preprocess(image_path: str, image_size: int, mean, std, session=None):
             expected_dtype = np.int8
 
     # Convert and normalize
-    arr = np.asarray(img, dtype=np.float32) / 255.0
     mean = np.asarray(mean, dtype=np.float32).reshape(1, 1, 3)
     std = np.asarray(std, dtype=np.float32).reshape(1, 1, 3)
     arr = (arr - mean) / std
