@@ -15,7 +15,6 @@ import shutil
 import threading
 import tempfile
 from pathlib import Path
-import os
 import yaml
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
@@ -89,15 +88,31 @@ def log_sample_order_hash(dataloader, epoch: int, N: int = 128):
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Load canonical paths (vocab, logs, outputs) from unified_config.yaml (back-compat aware)
 def _load_paths():
+    """Read paths from configs/unified_config.yaml with fallbacks.
+    Prefers top-level keys (vocab_path, log_dir, default_output_dir).
+    Falls back to data.vocab_path / data.vocab_dir / data.output_dir."""
     try:
-        return yaml.safe_load((PROJECT_ROOT / "configs" / "paths.yaml").read_text(encoding="utf-8")) or {}
+        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
     except Exception:
-        return {}
+        cfg = {}
+    data = (cfg.get("data") or {})
+    # vocabulary path: explicit → from data.vocab_path → from data.vocab_dir/vocabulary.json → repo default
+    vp = cfg.get("vocab_path") or data.get("vocab_path")
+    if not vp:
+        vd = data.get("vocab_dir")
+        vp = str((PROJECT_ROOT / vd / "vocabulary.json").resolve()) if vd else str((PROJECT_ROOT / "vocabulary.json").resolve())
+    # logs & outputs
+    ld = cfg.get("log_dir") or data.get("log_dir") or os.getenv("OPPAI_LOG_DIR", str((PROJECT_ROOT / "logs").resolve()))
+    od = cfg.get("default_output_dir") or data.get("output_dir") or str((PROJECT_ROOT / "outputs").resolve())
+    return {"vocab_path": vp, "log_dir": ld, "default_output_dir": od}
+
 _paths_cfg = _load_paths()
-VOCAB_PATH = Path(_paths_cfg.get("vocab_path", PROJECT_ROOT / "vocabulary.json"))
-LOG_DIR = Path(_paths_cfg.get("log_dir", "./logs"))
-DEFAULT_OUTPUT_DIR = Path(_paths_cfg.get("default_output_dir", "./outputs"))
+VOCAB_PATH = Path(_paths_cfg["vocab_path"])
+LOG_DIR = Path(_paths_cfg["log_dir"])
+DEFAULT_OUTPUT_DIR = Path(_paths_cfg["default_output_dir"])
 
 # Optional runtime toggles (determinism, CuBLAS/CuDNN, quiet logging)
 def _apply_runtime_config():
