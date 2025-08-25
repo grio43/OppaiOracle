@@ -10,6 +10,7 @@ import json
 import time
 import logging
 from pathlib import Path
+import yaml
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -61,31 +62,40 @@ logger = logging.getLogger(__name__)
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-# Use the specific path for your setup
-DEFAULT_VOCAB_PATH = Path("/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json")
+def _load_vocab_path():
+    try:
+        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "paths.yaml").read_text(encoding="utf-8")) or {}
+        p = cfg.get("vocab_path")
+        return Path(p) if p else PROJECT_ROOT / "vocabulary.json"
+    except Exception:
+        return PROJECT_ROOT / "vocabulary.json"
+DEFAULT_VOCAB_PATH = _load_vocab_path()
 
 
 @dataclass
 class InferenceConfig:
-    """Configuration for inference engine"""
+    """
+    Thin shim preserving existing attributes.
+    Values are overridden from configs/inference_config.yaml if present.
+    """
     # Model settings
     vocab_path: Optional[str] = str(DEFAULT_VOCAB_PATH)  # Explicit vocabulary path
     model_path: str = "./checkpoints/best_model.pt"  # Standardize to .pt
     config_path: str = "./checkpoints/model_config.json"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     # Batch processing
     batch_size: int = 32
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
-    
+
     # Image preprocessing
-    image_size: int = 448
+    image_size: int = 640
     # Use same normalization as training (anime-optimized, not ImageNet)
     normalize_mean: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
     normalize_std: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
-    
+
     # Inference settings
     threshold: float = 0.5
     top_k: int = 10
@@ -94,24 +104,61 @@ class InferenceConfig:
     thresholds_path: Optional[str] = None
     eye_color_exclusive: bool = False
     tta_flip: bool = False
-    
+
     # Performance
     max_queue_size: int = 100
     timeout: float = 30.0
     enable_profiling: bool = False
-    
+
     # Monitoring
     enable_monitoring: bool = True
     monitor_config: Optional[MonitorConfig] = None
-    
+
     # Caching
     enable_cache: bool = True
     cache_size: int = 1000
-    
+
     # Output
     output_format: str = "json"  # json, csv, txt
     save_visualizations: bool = False
     visualization_dir: str = "./visualizations"
+    input_image_extensions: List[str] = field(default_factory=lambda: [".jpg", ".jpeg", ".png", ".webp"])
+
+    @classmethod
+    def apply_yaml_overrides(cls, path: Path = PROJECT_ROOT / "configs" / "inference_config.yaml"):
+        try:
+            cfg = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        except Exception:
+            return
+        pp = (cfg.get("preprocessing") or {})
+        rt = (cfg.get("runtime") or {})
+        post = (cfg.get("postprocessing") or {})
+        io = (cfg.get("io") or {})
+        inp = (cfg.get("input") or {})
+        updates = {
+            "image_size": pp.get("image_size"),
+            "normalize_mean": pp.get("normalize_mean"),
+            "normalize_std": pp.get("normalize_std"),
+            "device": rt.get("device"),
+            "use_fp16": rt.get("use_fp16"),
+            "tta_flip": rt.get("tta_flip"),
+            "threshold": post.get("threshold"),
+            "top_k": post.get("top_k"),
+            "output_format": io.get("output_format"),
+            "save_visualizations": io.get("save_visualizations"),
+            "visualization_dir": io.get("visualization_dir"),
+            "input_image_extensions": inp.get("image_extensions"),
+        }
+        for key, value in updates.items():
+            if value is not None:
+                setattr(cls, key, value)
+                if key in cls.__dataclass_fields__:
+                    field = cls.__dataclass_fields__[key]
+                    field.default = value
+                    field.default_factory = lambda v=value: v
+
+# Apply YAML overrides on import
+InferenceConfig.apply_yaml_overrides()
 
 
 class ImagePreprocessor:
