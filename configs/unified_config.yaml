@@ -1,0 +1,255 @@
+# Unified Configuration for Anime Image Tagger
+# This consolidates all previously scattered configs into the Configuration_System.py structure
+# Generated from: augmentation, dataloader, dataset_prep, export, inference, logging, paths, runtime, training, validation, vocabulary configs
+
+# Global Settings
+project_name: "anime-image-tagger"
+experiment_name: "default_experiment"
+output_root: "./experiments"
+log_level: "INFO"
+log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+max_memory_gb: null
+max_gpu_memory_gb: null
+
+# Model Configuration
+model:
+  architecture_type: "vit_large_extended"
+  hidden_size: 1536
+  num_hidden_layers: 28
+  num_attention_heads: 24
+  intermediate_size: 6144
+  image_size: 640
+  patch_size: 16
+  num_channels: 3
+  use_cls_token: true
+  use_style_token: true
+  use_line_token: true
+  use_color_token: true
+  num_special_tokens: 4
+  hidden_dropout_prob: 0.1
+  attention_probs_dropout_prob: 0.1
+  drop_path_rate: 0.1
+  initializer_range: 0.02
+  layer_norm_eps: 1.0e-6
+  use_flash_attention: true
+  attention_bias: true
+  token_ignore_threshold: 0.9
+  num_labels: 200000
+  num_groups: 20
+  tags_per_group: 10000
+  gradient_checkpointing: false
+
+# Data Configuration (consolidates dataloader.yaml, train_config.yaml, augmentation.yaml)
+data:
+  # Storage locations
+  storage_locations:
+    - path: "/home/user/datasets/anime_curated"
+      priority: 0
+      type: "local"
+      enabled: true
+    - path: "/mnt/das/anime_archive"
+      priority: 1
+      type: "das"
+      enabled: true
+    - path: "/mnt/nas/anime_dataset/primary"
+      priority: 2
+      type: "nas"
+      enabled: true
+    - path: "/mnt/nas/anime_dataset/video_frames"
+      priority: 3
+      type: "nas"
+      enabled: true
+  
+  # Paths (from paths.yaml)
+  hdf5_dir: "/home/user/datasets/teacher_features"
+  vocab_dir: "./vocabulary"
+  output_dir: "./outputs"
+  
+  # Image processing
+  image_size: 640
+  normalize_mean: [0.5, 0.5, 0.5]  # Anime-optimized (from inference_config.yaml)
+  normalize_std: [0.5, 0.5, 0.5]   # Anime-optimized
+  pad_color: [114, 114, 114]
+  
+  # Data loading (from dataloader.yaml)
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  drop_last: false
+  
+  # Caching
+  cache_size_gb: 105.0
+  preload_files: 2
+  use_memory_cache: true
+  
+  # Augmentation (from augmentation.yaml)
+  augmentation_enabled: true
+  random_flip_prob: 0.5
+  color_jitter: true
+  color_jitter_brightness: 0.1
+  color_jitter_contrast: 0.1
+  color_jitter_saturation: 0.1
+  color_jitter_hue: 0.05
+  eye_color_weight_boost: 0.0
+  random_crop_scale: [0.8, 1.0]
+  random_rotation_degrees: 0.0
+  
+  # Orientation mapping (from augmentation.yaml)
+  orientation_map_path: "./configs/orientation_map.json"
+  strict_orientation_validation: true
+  skip_unmapped: false
+
+# Training Configuration (from training_config.yaml)
+training:
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  gradient_accumulation_steps: 4
+  
+  # Optimizer
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  
+  # Scheduler
+  scheduler: "cosine_restarts"
+  warmup_steps: 10000
+  warmup_ratio: 0.0
+  num_cycles: 1.0
+  lr_end: 1.0e-6
+  
+  # Mixed precision
+  use_amp: true
+  amp_opt_level: "O1"
+  amp_dtype: "bfloat16"
+  
+  # Gradient clipping
+  max_grad_norm: 1.0
+  
+  # Checkpointing
+  save_steps: 10000
+  save_total_limit: 3
+  save_best_only: false
+  eval_steps: 1000
+  logging_steps: 100
+  
+  # Loss configuration
+  focal_gamma_pos: 0.0
+  focal_gamma_neg: 4.0
+  focal_alpha: 0.75  # Unified alpha weight
+  label_smoothing: 0.1
+  use_class_weights: true
+  
+  # Curriculum learning
+  use_curriculum: true
+  start_region_training_epoch: 20
+  region_training_interval: 5
+  curriculum_difficulty_schedule: "linear"
+  
+  # Hardware
+  device: "cuda"
+  distributed: false
+  local_rank: -1
+  world_size: 1
+  ddp_backend: "nccl"
+  
+  # Tracking
+  use_tensorboard: true
+  use_wandb: false
+  wandb_project: "anime-tagger"
+  wandb_run_name: null
+  wandb_entity: null
+  
+  # Training stability (from runtime.yaml)
+  seed: 42
+  deterministic: false
+  benchmark: true
+  
+  # Early stopping
+  early_stopping_patience: 10
+  early_stopping_threshold: 0.0001
+
+# Inference Configuration (from inference_config.yaml)
+inference:
+  model_path: "./checkpoints/best_model.pt"
+  use_fp16: true
+  compile_model: false
+  
+  # Prediction
+  prediction_threshold: 0.5
+  adaptive_threshold: true
+  min_predictions: 5
+  max_predictions: 50
+  top_k: null
+  
+  # Tag filtering
+  filter_nsfw: false
+  nsfw_tags:
+    - "explicit"
+    - "questionable"
+    - "sensitive"
+    - "nude"
+    - "sexual_content"
+  blacklist_tags: []
+  whitelist_tags: null
+  
+  # Post-processing
+  apply_implications: true
+  resolve_aliases: true
+  group_by_category: false
+  remove_underscores: true
+  
+  # Performance
+  use_tensorrt: false
+  optimize_for_speed: false
+  batch_timeout_ms: 100
+  max_batch_size: 32
+  
+  # Output
+  output_format: "json"
+  include_scores: true
+  score_decimal_places: 3
+  sort_by_score: true
+  
+  # API Settings
+  enable_api: false
+  api_host: "0.0.0.0"
+  api_port: 8000
+  api_workers: 4
+  api_max_image_size: 10485760
+  api_rate_limit: 100
+  api_cors_origins:
+    - "*"
+  
+  # Caching
+  enable_cache: true
+  cache_ttl_seconds: 3600
+  max_cache_size: 1000
+
+# Export Configuration (from export_config.yaml)
+export:
+  export_format: "onnx"
+  opset_version: 18
+  export_params: true
+  do_constant_folding: true
+  dynamic_batch_size: true
+  min_batch_size: 1
+  max_batch_size: 128
+  optimize: true
+  optimize_for_mobile: false
+  quantize: false
+  quantization_type: "dynamic"
+  calibration_dataset_size: 100
+  validate_export: true
+  tolerance_rtol: 1.0e-3
+  tolerance_atol: 1.0e-5
+  num_validation_samples: 10
+  add_metadata: true
+  model_description: "Anime Image Tagger Model"
+  model_author: "AnimeTaggers"
+  model_version: "1.0.0"
+  model_license: "MIT"
+  output_path: "./exported_model"
