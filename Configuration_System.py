@@ -369,10 +369,11 @@ class DataConfig(BaseConfig):
     augmentation_enabled: bool = True
     random_flip_prob: float = 0.35
     color_jitter: bool = True
-    color_jitter_brightness: float = 0.4
-    color_jitter_contrast: float = 0.4
-    color_jitter_saturation: float = 0.4
-    color_jitter_hue: float = 0.1
+    color_jitter_brightness: float = 0.10
+    color_jitter_contrast:   float = 0.10
+    color_jitter_hue:        float = 0.03  # cap hue to protect eye-color semantics
+    color_jitter_saturation: float = 0.00
+    eye_color_weight_boost: float = 1.5  # Boost for eye color tags in sampling
     random_crop_scale: Tuple[float, float] = (0.8, 1.0)
     random_rotation_degrees: float = 0.0
     
@@ -512,8 +513,8 @@ class TrainingConfig(BaseConfig):
     wandb_entity: Optional[str] = None
     
     # Training stability
-    seed: int = 42
-    deterministic: bool = False
+    seed: Optional[int] = None   # None => fresh, logged seed per run
+    deterministic: bool = False  # turn on only when seed is set
     benchmark: bool = True
     
     # Early stopping

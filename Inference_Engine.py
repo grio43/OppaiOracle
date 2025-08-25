@@ -92,6 +92,9 @@ class InferenceConfig:
     top_k: int = 10
     use_fp16: bool = True
     use_torch_compile: bool = False
+    thresholds_path: Optional[str] = None
+    eye_color_exclusive: bool = False
+    tta_flip: bool = False
     
     # Performance
     max_queue_size: int = 100
@@ -388,18 +391,20 @@ class ModelWrapper:
             images = images.half()
         
         outputs = self.model(images)
-        
+        if self.config.tta_flip:
+            images_flipped = torch.flip(images, dims=[-1])
+            outputs_flipped = self.model(images_flipped)
+            outputs = 0.5 * (outputs + outputs_flipped)
+
         # Handle dictionary output from SimplifiedTagger
         if isinstance(outputs, dict):
-            # Use tag_logits for predictions
             tag_outputs = outputs.get('tag_logits', outputs.get('logits'))
             if tag_outputs is None:
                 raise ValueError("Model output missing 'tag_logits' or 'logits' key")
             predictions = torch.sigmoid(tag_outputs)
         else:
-            # Fallback for tensor output
             predictions = torch.sigmoid(outputs)
-        
+
         return predictions.cpu().float()
 
 
@@ -410,6 +415,15 @@ class ResultProcessor:
         self.config = config
         self.tag_names = tag_names
         self.model_wrapper = model_wrapper
+        self._eye_idx = [i for i, t in enumerate(tag_names) if t.endswith("_eyes")]
+        self._th_by_idx = None
+        if config.thresholds_path:
+            try:
+                with open(config.thresholds_path, "r", encoding="utf-8") as f:
+                    th_map = json.load(f)
+                self._th_by_idx = {i: float(th_map.get(t, self.config.threshold)) for i, t in enumerate(tag_names)}
+            except Exception as e:
+                print(f"Warning: failed to load thresholds: {e}")
         
     def process_predictions(
         self,
@@ -429,22 +443,21 @@ class ResultProcessor:
                 )
                 results.append(result)
                 continue
-            
-            # Get top-k predictions
-            scores, indices = torch.topk(pred, min(self.config.top_k, len(pred)))
-            
-            # Filter by threshold
-            mask = scores >= self.config.threshold
-            scores = scores[mask]
-            indices = indices[mask]
-            
-            # Format results
-            tags = []
-            for score, idx in zip(scores.tolist(), indices.tolist()):
-                if idx < len(self.tag_names):
-                    # This will raise ValueError if placeholder detected
-                    tag_name = self.model_wrapper.vocabulary.get_tag_from_index(idx)
-                    tags.append(TagPrediction(name=tag_name, score=score))
+
+            if self._th_by_idx:
+                above = [i for i in range(pred.numel()) if pred[i].item() > self._th_by_idx.get(i, self.config.threshold)]
+            else:
+                above = (pred > self.config.threshold).nonzero(as_tuple=False).squeeze(-1).tolist()
+
+            items = [(self.tag_names[i], float(pred[i].item())) for i in above if i < len(self.tag_names)]
+            if self.config.eye_color_exclusive and self._eye_idx:
+                eye_items = [(t, s, i) for (t, s), i in zip(items, above) if i in self._eye_idx]
+                if eye_items:
+                    best = max(eye_items, key=lambda x: x[1])
+                    items = [(t, s) for (t, s) in items if not t.endswith("_eyes")] + [best[:2]]
+
+            items.sort(key=lambda x: x[1], reverse=True)
+            tags = [TagPrediction(name=t, score=s) for t, s in items[: self.config.top_k]]
 
             result = ImagePrediction(
                 image=path,

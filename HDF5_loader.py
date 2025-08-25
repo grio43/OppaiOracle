@@ -58,6 +58,11 @@ from vocabulary import TagVocabulary
 
 logger = logging.getLogger(__name__)
 
+# ---- RNG helpers ------------------------------------------------------------
+def _derive_worker_generator(worker_id: int = 0) -> torch.Generator:
+    """Derive a worker-specific generator from torch.initial_seed() and worker_id."""
+    return torch.Generator().manual_seed(torch.initial_seed() + worker_id)
+
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
@@ -318,43 +323,61 @@ def letterbox_resize(
 
 class TrackedColorJitter:
     """Wrapper for ColorJitter that tracks sampled parameters."""
-    
-    def __init__(self, brightness=0, contrast=0, saturation=0, hue=0):
-        self.jitter = T.ColorJitter(brightness, contrast, saturation, hue)
-        self.brightness_range = brightness
-        self.contrast_range = contrast
-        self.saturation_range = saturation
-        self.hue_range = hue
+
+    def __init__(self, brightness=0, contrast=0, saturation=0, hue=0,
+                 generator: Optional[torch.Generator] = None,
+                 max_hue_for_eyes: float = 0.03):
+        # Torchvision op used for application; params sampled by us (from torch RNG)
+        self._jitter = T.ColorJitter(brightness, contrast, saturation, hue)
+        self.brightness_range = float(brightness or 0.0)
+        self.contrast_range   = float(contrast or 0.0)
+        self.saturation_range = float(saturation or 0.0)
+        # Cap hue at configurable threshold for semantic safety (eye-color)
+        self.hue_range        = float(min(hue or 0.0, max_hue_for_eyes))
         self.last_params = {}
-        
+        self._external_gen = generator
+        self._worker_id = None  # Will be set if in worker process
+
+    def _gen(self) -> torch.Generator:
+        if self._external_gen is not None:
+            return self._external_gen
+        # Use worker-specific generator if available
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            return _derive_worker_generator(worker_info.id)
+        return _derive_worker_generator(0)
+
     def __call__(self, img):
-        """Apply jitter and track parameters."""
-        # Sample parameters (mimicking torchvision's internal behavior)
-        import random
-        
-        brightness_factor = 1.0
-        if self.brightness_range > 0:
-            brightness_factor = random.uniform(
-                max(0, 1 - self.brightness_range),
-                1 + self.brightness_range
-            )
-        
-        contrast_factor = 1.0
-        if self.contrast_range > 0:
-            contrast_factor = random.uniform(
-                max(0, 1 - self.contrast_range),
-                1 + self.contrast_range
-            )
-        
-        # Store for stats collection
+        """Apply jitter deterministically via torch.Generator and track params."""
+        g = self._gen()
+        # brightness ∈ [1-b, 1+b], contrast ∈ [1-c, 1+c], saturation ∈ [1-s, 1+s]
+        def _span(center: float, width: float) -> float:
+            if width <= 0: return center
+            lo = max(0.0, center - width)
+            hi = center + width
+            return (hi - lo) * torch.rand((), generator=g).item() + lo
+
+        brightness_factor = _span(1.0, self.brightness_range)
+        contrast_factor   = _span(1.0, self.contrast_range)
+        saturation_factor = _span(1.0, self.saturation_range)
+        hue_span          = self.hue_range
+        hue_factor        = 0.0 if hue_span <= 0 else (2.0 * torch.rand((), generator=g).item() - 1.0) * hue_span
+
+        # Record for stats/telemetry
         self.last_params = {
             'brightness': brightness_factor,
-            'contrast': contrast_factor,
-            'saturation': 1.0,  # Simplified for now
-            'hue': 0.0
+            'contrast':   contrast_factor,
+            'saturation': saturation_factor,
+            'hue':        hue_factor,
         }
-        
-        return self.jitter(img)
+
+        # Apply using torchvision.functional in a fixed order matching ColorJitter
+        out = TF.adjust_brightness(img, brightness_factor)
+        out = TF.adjust_contrast(out, contrast_factor)
+        out = TF.adjust_saturation(out, saturation_factor)
+        if hue_span > 0:
+            out = TF.adjust_hue(out, hue_factor)
+        return out
 
 @dataclass
 class SimplifiedDataConfig:
@@ -402,8 +425,9 @@ class SimplifiedDataConfig:
     # Conservative defaults tuned for anime colour fidelity
     color_jitter_brightness: float = 0.1
     color_jitter_contrast: float = 0.1
-    color_jitter_saturation: float = 0.05
-    color_jitter_hue: float = 0.02
+    color_jitter_saturation: float = 0.0
+    color_jitter_hue: float = 0.03  # ≤0.03 to protect eye-color semantics
+    eye_color_weight_boost: float = 1.5  # Configurable boost for eye color tags
     # Optional path to orientation mapping (JSON or YAML).  If provided, the
     # mapping is loaded on dataset initialisation.
     orientation_map_path: Optional[Path] = None
@@ -482,15 +506,17 @@ class SimplifiedDataConfig:
             )
 
 
-def _make_worker_init_fn(base_seed: int, log_queue: Optional[object]):
-    """Seed torch/numpy/random per worker and disable file logging in workers.
+def _make_worker_init_fn(base_seed: Optional[int], log_queue):
+    """
+    Seed torch/numpy/random per worker and disable file logging in workers.
     If a logging queue is provided, attach a QueueHandler so logs go to main.
     """
-    def _init_fn(worker_id: int):
-        seed = (base_seed + worker_id) % (2**31 - 1)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
+    def init_fn(worker_id: int):
+        # Derive from torch.initial_seed() so each worker & epoch stream is unique
+        torch_seed = torch.initial_seed() + worker_id
+        random.seed(torch_seed)
+        np.random.seed(torch_seed % (2**32 - 1))
+        torch.manual_seed(torch_seed)
 
         # Setup worker logging with rotation
         if log_queue is not None:
@@ -499,12 +525,12 @@ def _make_worker_init_fn(base_seed: int, log_queue: Optional[object]):
         # Important: Close any inherited LMDB environments in worker (run once)
         # This prevents issues with shared file descriptors
         # Use a flag to ensure this only runs once per process
-        if not hasattr(_init_fn, '_lmdb_cleaned'):
-            _init_fn._lmdb_cleaned = set()
-        
+        if not hasattr(init_fn, '_lmdb_cleaned'):
+            init_fn._lmdb_cleaned = set()
+
         current_pid = os.getpid()
-        if current_pid not in _init_fn._lmdb_cleaned:
-            _init_fn._lmdb_cleaned.add(current_pid)
+        if current_pid not in init_fn._lmdb_cleaned:
+            init_fn._lmdb_cleaned.add(current_pid)
             
             # Suppress deprecation warnings during the GC scan
             with warnings.catch_warnings():
@@ -518,8 +544,14 @@ def _make_worker_init_fn(base_seed: int, log_queue: Optional[object]):
                             except Exception:
                                 pass
 
-    return _init_fn
+        logger.debug(f"Worker {worker_id} seeded")
 
+    return init_fn
+
+
+# DataLoader construction lives below...
+#  - Seeds Python/NumPy per worker from torch.initial_seed()
+#  - Wires optional generator so transforms see independent RNG streams
 
 class LMDBCache:
     """Global file-backed LMDB cache (L2) with memory-mapped access"""
@@ -2354,6 +2386,8 @@ def create_dataloaders(
     log_queue: Optional[object] = None,
     force_val_persistent_workers: bool = False,
     pin_memory_config: Optional[Dict[str, Any]] = None,
+    sampler_type: str = "uniform",
+    max_repeat_factor: float = 3.0,
 ) -> Tuple[DataLoader, DataLoader, TagVocabulary]:
     """Construct training and validation dataloaders with enhanced memory control."""
     
@@ -2433,10 +2467,24 @@ def create_dataloaders(
 
     # Determine base seed for reproducible sampling and workers
     base_seed = int(seed if seed is not None else torch.initial_seed() % (2**31 - 1))
+    generator = torch.Generator()
+    generator.manual_seed(base_seed)
 
     # Choose sampler
     train_sampler: Optional[Any] = None
-    if distributed:
+    if sampler_type == "class_balanced_weighted" and hasattr(train_dataset, "label_frequencies"):
+        freqs = np.asarray(train_dataset.label_frequencies, dtype=np.float64)
+        class_w = 1.0 / np.maximum(freqs, 1.0)
+        class_w = class_w / class_w.max()
+        eye_mask = np.array([t.endswith("_eyes") for t in train_dataset.vocab.index_to_tag], dtype=bool)
+        eye_boost = cfg.eye_color_weight_boost
+        class_w[eye_mask] = np.minimum(class_w[eye_mask] * eye_boost, max_repeat_factor)
+        weights = []
+        for lbl_idx in getattr(train_dataset, "sample_label_indices", []):
+            w = float(np.mean(class_w[lbl_idx])) if len(lbl_idx) else 1.0
+            weights.append(w)
+        train_sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True, generator=generator)
+    elif distributed:
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -2464,9 +2512,7 @@ def create_dataloaders(
     # Determine validation batch size
     val_bs = val_batch_size or batch_size
 
-    # Deterministic generator and per-worker init
-    generator = torch.Generator()
-    generator.manual_seed(base_seed)
+    # Per-worker init
     worker_init_fn = _make_worker_init_fn(base_seed, log_queue)
 
     # Build dataloaders

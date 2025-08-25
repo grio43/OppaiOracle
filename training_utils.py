@@ -49,6 +49,40 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+def setup_seed(user_seed: Optional[int], deterministic: bool) -> tuple[int, bool]:
+    """
+    Opt-in seed: if None, derive a fresh seed from os.urandom, log it, and run non-deterministically.
+    """
+    if user_seed is None:
+        user_seed = int.from_bytes(os.urandom(8), "big") % (2**31 - 1)
+        logger.info(f"Training seed: {user_seed} (auto-generated)")
+        deterministic = False
+    else:
+        logger.info(f"Training seed: {user_seed} (user-specified)")
+    random.seed(user_seed)
+    np.random.seed(user_seed % (2**32 - 1))
+    torch.manual_seed(user_seed)
+    cudnn.deterministic = bool(deterministic)
+    cudnn.benchmark = not bool(deterministic)
+    return user_seed, bool(deterministic)
+
+
+def log_sample_order_hash(dataloader, epoch: int, N: int = 128):
+    """Log sha1 over first N sample 'paths' to prove shuffle changed."""
+    try:
+        it = iter(dataloader)
+        acc = []
+        while len(acc) < N:
+            batch = next(it)
+            meta = batch.get("meta", {})
+            paths = meta.get("paths") or meta.get("image_paths") or []
+            acc.extend(map(str, paths))
+        h = hashlib.sha1("|".join(acc[:N]).encode()).hexdigest()
+        logger.info(f"epoch={epoch} sample_hash={h}")
+    except Exception as e:
+        logger.debug(f"sample_hash logging skipped: {e}")
+
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
 VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
