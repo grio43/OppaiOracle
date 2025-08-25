@@ -11,6 +11,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mask_utils import ensure_pixel_padding_mask, pixel_to_token_ignore
 
 
 @dataclass
@@ -30,7 +31,8 @@ class VisionTransformerConfig:
     attention_dropout: float = 0.1
     layer_norm_eps: float = 1e-6
     use_flash_attention: bool = True
-    padding_mask_keep_threshold: float = 0.9  # Keep patches with >90% valid pixels
+    # Token ignore threshold: a token is ignored if >= this fraction of its pixels are PAD
+    token_ignore_threshold: float = 0.9
     # Enable gradient checkpointing by default to reduce memory usage
     gradient_checkpointing: bool = True
 
@@ -154,16 +156,8 @@ class SimplifiedTagger(nn.Module):
     def forward(
         self,
         pixel_values: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,  # (B,H,W) or (B,1,H,W), True=content/keep
+        padding_mask: Optional[torch.Tensor] = None,  # (B,H,W) or (B,1,H,W), auto-detected semantics
     ) -> Dict[str, torch.Tensor]:
-        # Validate padding_mask shape if provided
-        if padding_mask is not None:
-            expected_shape = pixel_values.shape[:2]  # (B, C)
-            actual_shape = padding_mask.shape[:2] if padding_mask.dim() >= 2 else (0, 0)
-            if actual_shape[0] != expected_shape[0]:
-                raise ValueError(
-                    f"padding_mask batch size {actual_shape[0]} doesn't match pixel_values batch size {expected_shape[0]}"
-                )
         B = pixel_values.shape[0]
         # Patch embedding
         x = self.patch_embed(pixel_values)
@@ -174,24 +168,16 @@ class SimplifiedTagger(nn.Module):
         # Add position embeddings
         x = x + self.pos_embed[:, :x.size(1), :]
         x = self.pos_drop(x)
-        # Build key-padding mask over tokens (CLS + patch tokens) from pixel-level mask.
-        # PyTorch MultiheadAttention expects True where positions should be MASKED/ignored.
+        # Build key-padding mask (CLS + patch tokens) from pixel-level mask.
+        # Semantics: True=PAD at pixel-level -> pooled to True=IGNORE at token-level.
         attn_kpm: Optional[torch.Tensor] = None
         if padding_mask is not None:
-            pm = padding_mask
-            if pm.dim() == 4:
-                pm = pm.squeeze(1)  # (B,H,W)
-            pm = pm.to(dtype=pixel_values.dtype)
-            # Downsample to patch grid via average pooling at patch stride.
-            ph = self.config.patch_size
-            grid = F.avg_pool2d(pm.unsqueeze(1), kernel_size=ph, stride=ph)  # (B,1,H/ps,W/ps)
-            # Use configurable threshold - patches with ratio of valid pixels above threshold are kept
-            keep_thresh = self.config.padding_mask_keep_threshold
-            grid = (grid.squeeze(1) > keep_thresh)  # True where sufficiently valid
-            token_valid = grid.flatten(1)  # (B, num_patches)
-            cls_valid = torch.ones(B, 1, dtype=torch.bool, device=token_valid.device)
-            token_valid = torch.cat([cls_valid, token_valid], dim=1)  # include CLS
-            attn_kpm = ~token_valid  # True = ignore
+            pm = ensure_pixel_padding_mask(padding_mask)          # -> (B,1,H,W) bool, True=PAD
+            thr = getattr(self.config, "token_ignore_threshold", 0.9)
+            token_ignore = pixel_to_token_ignore(pm, patch=self.config.patch_size, threshold=thr)  # (B,Lp)
+            # Prepend CLS token (never ignored)
+            cls_keep = torch.zeros(B, 1, dtype=torch.bool, device=token_ignore.device)
+            attn_kpm = torch.cat([cls_keep, token_ignore], dim=1) # (B, 1+Lp) True=IGNORE
 
         # Transformer blocks with optional gradient checkpointing
         for block in self.blocks:
