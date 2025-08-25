@@ -6,6 +6,7 @@ import base64
 import gzip
 import hashlib
 import logging
+from logging.handlers import RotatingFileHandler
 import time
 import sys
 from pathlib import Path
@@ -13,16 +14,43 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import onnxruntime as ort
+import yaml
 
 from vocabulary import TagVocabulary, verify_vocabulary_integrity
 from schemas import RunMetadata, TagPrediction, ImagePrediction, PredictionOutput
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('onnx_infer')
+
+def _setup_logging():
+    """Configure logging from configs/logging.yaml (console + optional rotating file)."""
+    try:
+        cfg = yaml.safe_load(Path('configs/logging.yaml').read_text(encoding='utf-8'))
+    except Exception:
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        return
+    level = getattr(logging, str(cfg.get('level', 'INFO')).upper(), logging.INFO)
+    fmt = cfg.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logging.basicConfig(level=level, format=fmt)
+    file_cfg = cfg.get('file_logging', {})
+    if file_cfg.get('enabled'):
+        log_dir = Path(file_cfg.get('dir', './logs'))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        rot = cfg.get('rotation', {}) or {}
+        handler = RotatingFileHandler(
+            log_dir / 'onnx_infer.log',
+            maxBytes=int(rot.get('max_bytes', 10 * 1024 * 1024)),
+            backupCount=int(rot.get('backups', 5)),
+        )
+        handler.setFormatter(logging.Formatter(fmt))
+        handler.setLevel(level)
+        logging.getLogger().addHandler(handler)
+
+def _load_infer_cfg():
+    try:
+        return yaml.safe_load(Path('configs/inference_config.yaml').read_text(encoding='utf-8')) or {}
+    except Exception:
+        return {}
 
 
 def _load_metadata(session: ort.InferenceSession):
@@ -123,13 +151,18 @@ def _preprocess_simple(image_path: str, image_size: int, mean, std):
 
 
 def main():
+    _setup_logging()
     parser = argparse.ArgumentParser(description='ONNX inference with embedded vocab')
+    cfg = _load_infer_cfg()
+    pp = (cfg.get('postprocessing') or {})
+    ort_cfg = (cfg.get('onnx_runtime') or {})
     parser.add_argument('model', type=str, help='Path to ONNX model')
     parser.add_argument('images', nargs='+', help='Image paths')
-    parser.add_argument('--top_k', type=int, default=5)
-    parser.add_argument('--threshold', type=float, default=0.0)
+    parser.add_argument('--top_k', type=int, default=pp.get('top_k', 5))
+    parser.add_argument('--threshold', type=float, default=pp.get('threshold', 0.0))
     parser.add_argument('--output', type=str, help='Output JSON file')
     parser.add_argument('--vocab', type=str, help='External vocabulary file (if not embedded)')
+    parser.add_argument('--providers', nargs='*', default=ort_cfg.get('providers', ['CUDAExecutionProvider', 'CPUExecutionProvider']))
     # Preprocessing parameters (required when metadata is missing)
     parser.add_argument('--mean', type=float, nargs=3, metavar=('R', 'G', 'B'),
                         help='Normalization mean values for RGB channels (required if not in model metadata)')
@@ -140,7 +173,7 @@ def main():
     args = parser.parse_args()
 
     # Explicitly specify providers for better control
-    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    providers = args.providers or ort_cfg.get('providers') or ['CUDAExecutionProvider', 'CPUExecutionProvider']
     session = ort.InferenceSession(
         args.model,
         providers=providers
