@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
+from multiprocessing import cpu_count
 from tqdm import tqdm
 import pickle
 import sys
@@ -62,10 +62,10 @@ DEFAULT_VOCAB_PATH = _default_vocab_path()
 class DanbooruDataPreprocessor:
     """Preprocessor for Danbooru dataset - direct training approach"""
     
-    def __init__(self, 
+    def __init__(self,
                  vocab_path: Path,
-                 output_dir: Path,
-                 num_workers: int = None,
+                 output_dir: Path | None = None,
+                 num_workers: int | None = None,
                  ignore_tags_file: Optional[Path] = None,
                  ignored_tags: Optional[List[str]] = None):
         """
@@ -77,10 +77,19 @@ class DanbooruDataPreprocessor:
             num_workers: Number of parallel workers
         """
         self.vocab_path = Path(vocab_path)
+
+        # dataset_prep defaults
+        try:
+            _dp = yaml.safe_load(Path("configs/dataset_prep.yaml").read_text(encoding="utf-8")) or {}
+            dp = _dp.get("dataset_prep", {})
+        except Exception:
+            dp = {}
+        if output_dir is None:
+            output_dir = dp.get("output_dir", "./prepared")
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.num_workers = num_workers or mp.cpu_count()
+
+        self.num_workers = int(num_workers if num_workers is not None else (dp.get("num_workers") or cpu_count()))
 
         # ------------------------------------------------------------------
         # Tag ignoring support
@@ -102,6 +111,14 @@ class DanbooruDataPreprocessor:
         # If both are provided, the union of the two sets is used.  If
         # neither is provided, no tags are ignored.
         self.ignore_tags: set[str] = set()
+        if ignore_tags_file is None:
+            try:
+                _vc = yaml.safe_load(Path("configs/vocabulary.yaml").read_text(encoding="utf-8")) or {}
+                p = (_vc.get("vocabulary") or {}).get("ignore_tags_file")
+                if p:
+                    ignore_tags_file = Path(p)
+            except Exception:
+                pass
         if ignore_tags_file:
             try:
                 with open(ignore_tags_file, 'r', encoding='utf-8') as f:
