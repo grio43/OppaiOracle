@@ -375,6 +375,7 @@ def train_with_orientation_tracking():
             else config.get("orientation_map_path"),
         "skip_unmapped": config.get("skip_unmapped", True),
         "strict_orientation_validation": config.get("strict_orientation", True),
+        "orientation_safety_mode": config.get("orientation_safety_mode", "conservative"),
     }
     
     dataloader_config_updates = {

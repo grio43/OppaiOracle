@@ -386,6 +386,7 @@ class DataConfig(BaseConfig):
     orientation_map_path: Optional[str] = None
     strict_orientation_validation: bool = True
     skip_unmapped: bool = True
+    orientation_safety_mode: str = "conservative"
 
     def validate(self):
         """Validate data configuration"""
@@ -449,6 +450,11 @@ class DataConfig(BaseConfig):
         # Validate augmentation parameters
         if self.random_flip_prob < 0 or self.random_flip_prob > 1:
             errors.append(f"random_flip_prob must be in [0, 1], got {self.random_flip_prob}")
+
+        if self.orientation_safety_mode not in {"conservative", "balanced", "permissive"}:
+            errors.append(
+                f"orientation_safety_mode must be one of 'conservative', 'balanced', 'permissive', got {self.orientation_safety_mode}"
+            )
 
         scale_min, scale_max = self.random_crop_scale
         if not (0 < scale_min <= scale_max <= 1):
