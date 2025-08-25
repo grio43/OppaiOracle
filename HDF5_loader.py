@@ -437,6 +437,7 @@ def _make_worker_init_fn(base_seed: Optional[int], log_queue):
 
 class LMDBCache:
     """Global file-backed LMDB cache (L2) with memory-mapped access"""
+    _logged_pids = set()
 
     def __init__(
         self,
@@ -498,7 +499,11 @@ class LMDBCache:
             max_readers=self.max_readers,
         )
         self._pid = os.getpid()
-        logger.debug(f"LMDB environment opened with map_size={self.current_map_size / (1024**3):.1f}GB for process {self._pid}")
+        if self._pid not in LMDBCache._logged_pids:
+            logger.info(f"LMDB environment opened with map_size={self.current_map_size / (1024**3):.1f}GB for process {self._pid}")
+            LMDBCache._logged_pids.add(self._pid)
+        else:
+            logger.debug(f"LMDB environment re-opened for process {self._pid}")
 
     def _ensure_env(self):
         """Ensure LMDB environment is open for current process"""
@@ -510,7 +515,6 @@ class LMDBCache:
                 except Exception:
                     pass
             self._open_env()
-            logger.debug(f"LMDB environment reopened for process {current_pid}")
 
     def _handle_map_resized(self):
         """Handle MDB_MAP_RESIZED error by reopening with larger size"""
@@ -1106,9 +1110,16 @@ def _compute_cache_key(
     dtype: Optional[str] = None
 ) -> str:
     """
-    Compute deduplicated cache key including transform parameters.
+    Compute deduplicated cache key including transform parameters and file modification time.
     """
-    key_parts = [image_path]
+    try:
+        # Include file modification time to invalidate cache if the file changes
+        mtime = os.path.getmtime(image_path)
+    except OSError:
+        # Handle cases where the file might not exist or is inaccessible
+        mtime = -1
+
+    key_parts = [image_path, str(mtime)]
     
     if transform_signature:
         key_parts.append(f"transform_{transform_signature}")
@@ -2363,97 +2374,6 @@ def create_dataloaders(
         worker_init_fn=_make_worker_init_fn(base_seed, log_queue),
         generator=generator,
     )
-
-    return train_loader, val_loader, vocab
-
-    # Choose sampler
-    train_sampler: Optional[Any] = None
-    if sampler_type == "class_balanced_weighted" and hasattr(train_dataset, "label_frequencies"):
-        freqs = np.asarray(train_dataset.label_frequencies, dtype=np.float64)
-        class_w = 1.0 / np.maximum(freqs, 1.0)
-        class_w = class_w / class_w.max()
-        eye_mask = np.array([t.endswith("_eyes") for t in train_dataset.vocab.index_to_tag], dtype=bool)
-        eye_boost = cfg.eye_color_weight_boost
-        class_w[eye_mask] = np.minimum(class_w[eye_mask] * eye_boost, max_repeat_factor)
-        weights = []
-        for lbl_idx in getattr(train_dataset, "sample_label_indices", []):
-            w = float(np.mean(class_w[lbl_idx])) if len(lbl_idx) else 1.0
-            weights.append(w)
-        train_sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True, generator=generator)
-    elif distributed:
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-        )
-    elif frequency_sampling and train_dataset.sample_weights is not None:
-        # Use working set-specific weights if available
-        if getattr(train_dataset, "working_set_weights", None) is not None:
-            weights = train_dataset.working_set_weights
-            num_samples = len(train_dataset.epoch_indices) if train_dataset.epoch_indices is not None else len(train_dataset)
-        else:
-            weights = train_dataset.sample_weights
-            num_samples = len(train_dataset)
-        # Use epoch-aware sampler for proper shuffling between epochs
-        train_sampler = EpochAwareWeightedSampler(
-            weights=weights,
-            num_samples=num_samples,
-            replacement=True,
-            base_seed=base_seed
-        )
-        logger.info(
-            f"Using EpochAwareWeightedSampler with {len(weights)} weights for {num_samples} samples"
-        )
-    # Determine validation batch size
-    val_bs = val_batch_size or batch_size
-
-    # Per-worker init
-    worker_init_fn = _make_worker_init_fn(base_seed, log_queue)
-
-    # Build dataloaders
-    # Shuffle training data only when no sampler is attached.
-    # This preserves correct behavior when using frequency/distributed sampling,
-    # where the Sampler controls shuffling across epochs.
-    use_shuffle = (train_sampler is None)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=use_shuffle,
-        sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=pin_memory_config['enabled'],
-        prefetch_factor=pin_memory_config['prefetch_factor'],
-        drop_last=True,
-        persistent_workers=True if num_workers > 0 else False,
-        collate_fn=collate_fn,
-        worker_init_fn=worker_init_fn,
-        generator=generator,
-    )
-    # Validation/Test loaders remain deterministic (no shuffling)
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=val_bs,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory_config['enabled'],
-        prefetch_factor=1,  # Conservative for validation
-        drop_last=False,
-        persistent_workers=(num_workers > 0 and force_val_persistent_workers),
-        collate_fn=collate_fn,
-        worker_init_fn=worker_init_fn,
-        generator=generator,
-    )
-
-    # Attach prefetch controller and update worker count
-    train_loader._prefetch_controller = prefetch_controller
-    prefetch_controller.update_inflight(num_workers)
-    
-    # Track pinned memory usage
-    if pin_memory_config['enabled']:
-        element_size = batch_size * 3 * 640 * 640 * 4  # Assuming float32
-        prefetch_controller.track_pinned_bytes(batch_size, element_size)
 
     return train_loader, val_loader, vocab
 
