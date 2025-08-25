@@ -1841,27 +1841,27 @@ class SimplifiedDataset(Dataset):
         
         try:
             # Open without forcing RGB so we can properly handle alpha first
-            pil_img = Image.open(image_path)
-            was_composited = False
+            with Image.open(image_path) as pil_img:
+                was_composited = False
 
-            # Validate and update index
-            if self.validation_index is not None:
-                self.validation_index.set_status(image_path, 'valid')
-            
-            pad_color = _resolve_pad_color(self.config)
-            
-            # Composite transparent images
-            if pil_img.mode in ('RGBA', 'LA') or ('transparency' in pil_img.info):
-                was_composited = True
-                rgba = pil_img.convert('RGBA')
-                bg = Image.new('RGB', rgba.size, pad_color)
-                bg.paste(rgba, mask=rgba.split()[3])
-                pil_img = bg
-            else:
-                pil_img = pil_img.convert('RGB')
-            
-            tensor = TF.to_tensor(pil_img)
-            
+                # Validate and update index
+                if self.validation_index is not None:
+                    self.validation_index.set_status(image_path, 'valid')
+
+                pad_color = _resolve_pad_color(self.config)
+
+                # Composite transparent images
+                if pil_img.mode in ('RGBA', 'LA') or ('transparency' in pil_img.info):
+                    was_composited = True
+                    rgba = pil_img.convert('RGBA')
+                    bg = Image.new('RGB', rgba.size, pad_color)
+                    bg.paste(rgba, mask=rgba.split()[3])
+                    pil_img = bg
+                else:
+                    pil_img = pil_img.convert('RGB')
+
+                tensor = TF.to_tensor(pil_img)
+
             # Add to L2 cache if memory allows
             if self.l2_cache is not None:
                 memory_pressure = self._check_memory_pressure()

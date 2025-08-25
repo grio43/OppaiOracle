@@ -183,7 +183,8 @@ class ImagePreprocessor:
         """Preprocess a single image"""
         # Load image if path
         if isinstance(image, str):
-            image = Image.open(image).convert('RGB')
+            with Image.open(image) as img:
+                image = img.convert('RGB')
         elif isinstance(image, np.ndarray):
             image = Image.fromarray(image)
         

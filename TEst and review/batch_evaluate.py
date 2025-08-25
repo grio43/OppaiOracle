@@ -150,23 +150,22 @@ def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0
 
     for idx, image_path in enumerate(image_paths):
         try:
-            img = Image.open(image_path)
+            with Image.open(image_path) as img:
+                # Handle transparency by compositing on gray background
+                if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                    # Create gray background
+                    background = Image.new('RGB', img.size, gray_background)
+                    # Convert image to RGBA if not already
+                    if img.mode != 'RGBA':
+                        img = img.convert('RGBA')
+                    # Composite image over gray background
+                    background.paste(img, mask=img.split()[3])  # Use alpha channel as mask
+                    img = background
+                else:
+                    img = img.convert('RGB')
 
-            # Handle transparency by compositing on gray background
-            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-                # Create gray background
-                background = Image.new('RGB', img.size, gray_background)
-                # Convert image to RGBA if not already
-                if img.mode != 'RGBA':
-                    img = img.convert('RGBA')
-                # Composite image over gray background
-                background.paste(img, mask=img.split()[3])  # Use alpha channel as mask
-                img = background
-            else:
-                img = img.convert('RGB')
-
-            # Use letterbox resize instead of thumbnail + center padding
-            img_array = np.array(img)
+                # Use letterbox resize instead of thumbnail + center padding
+                img_array = np.array(img)
             letterboxed, pad_info = letterbox_resize_numpy(img_array, image_size, gray_background)
 
             # Convert to float and normalize

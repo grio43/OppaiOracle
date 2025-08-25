@@ -767,26 +767,21 @@ class DatasetAnalyzer:
             
             for tag_file in tag_files:
                 if tag_file.exists():
-                    content = None
+                    tags = []
                     try:
-                        # Use 'replace' instead of 'ignore' to preserve character count
+                        # Use 'replace' to preserve character count and stream line-by-line
                         with open(tag_file, 'r', encoding='utf-8', errors='replace') as f:
-                            content = f.read()
+                            for line in f:
+                                tags.extend(tag.strip() for tag in line.split(',') if tag.strip())
                     except (IOError, OSError) as e:
                         logger.warning(f"Error reading tag file {tag_file}: {e}")
                         continue
                     except Exception as e:
                         logger.error(f"Unexpected error loading tags from {tag_file}: {e}")
                         continue
-                    
-                    if content:
+
+                    if tags:
                         try:
-                            # Handle different tag formats
-                            if ',' in content:
-                                tags = [tag.strip() for tag in content.split(',') if tag.strip()]
-                            else:
-                                tags = [tag.strip() for tag in content.split('\n') if tag.strip()]
-                            
                             # Add tags to analyzer
                             self.tag_analyzer.add_image_tags(str(image_path), tags)
                             break
