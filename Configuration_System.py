@@ -466,7 +466,7 @@ class TrainingConfig(BaseConfig):
     # Scheduler
     scheduler: str = "cosine"
     warmup_steps: int = 10000
-    warmup_ratio: float = 0.0  # Alternative to warmup_steps
+    warmup_ratio: float = 0.0  # Deprecated - use warmup_steps directly
     num_cycles: float = 0.5
     lr_end: float = 1e-6
     
@@ -547,7 +547,7 @@ class TrainingConfig(BaseConfig):
         if self.optimizer not in valid_optimizers:
             errors.append(f"Unknown optimizer: {self.optimizer}. Must be one of {valid_optimizers}")
         
-        valid_schedulers = ["linear", "cosine", "constant", "polynomial", "exponential"]
+        valid_schedulers = ["cosine", "cosine_restarts", "step", "multistep", "plateau", "exponential"]
         if self.scheduler not in valid_schedulers:
             errors.append(f"Unknown scheduler: {self.scheduler}. Must be one of {valid_schedulers}")
         

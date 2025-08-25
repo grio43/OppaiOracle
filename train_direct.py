@@ -191,7 +191,6 @@ def train_with_orientation_tracking():
         "gradient_accumulation": 2,
         "num_epochs": 8,
         "warmup_steps": 10_000,
-        "weight_decay": 0.01,
         "label_smoothing": 0.05,
         "max_grad_norm": 1.0,  # Add gradient clipping
         "data_dir": Path("/media/andrewk/qnap-public/workspace/shard_00022/"),
@@ -479,7 +478,7 @@ def train_with_orientation_tracking():
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config["learning_rate"],
-        weight_decay=config["weight_decay"]
+        weight_decay=config.get("weight_decay", 0.0)
     )
 
     # Monitoring setup
