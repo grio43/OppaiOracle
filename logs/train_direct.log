@@ -1,0 +1,5 @@
+2025-08-25 19:31:09,223 - Configuration_System - WARNING - amp_opt_level appears to target NVIDIA Apex; if using torch.cuda.amp, prefer configuring amp_dtype and ignore amp_opt_level
+2025-08-25 19:31:09,223 - Configuration_System - WARNING - CUDA device specified but not available
+2025-08-25 19:31:58,475 - Configuration_System - WARNING - amp_opt_level appears to target NVIDIA Apex; if using torch.cuda.amp, prefer configuring amp_dtype and ignore amp_opt_level
+2025-08-25 19:31:58,476 - Configuration_System - WARNING - CUDA device specified but not available
+2025-08-25 19:31:58,476 - __main__ - INFO - Configuration is valid.

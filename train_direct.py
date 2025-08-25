@@ -11,7 +11,6 @@ import hashlib
 import json
 import time
 from pathlib import Path
-import yaml
 from typing import Dict, Any, Optional
 import multiprocessing as mp
 import sys
@@ -32,6 +31,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 from Configuration_System import load_config, create_config_parser, FullConfig
 
 # Paths will be loaded from the unified config in the main function.
+logger = logging.getLogger(__name__)
 
 # Import the orientation handler
 from orientation_handler import OrientationHandler
@@ -219,35 +219,15 @@ def train_with_orientation_tracking(config: FullConfig):
     stats_queue = mp.Queue(maxsize=1000) if config.training.use_tensorboard else None
     device = torch.device(config.training.device)
 
-    # Dataloader config
-    dataloader_config_updates = {
-        "random_flip_prob": config.data.random_flip_prob,
-        "orientation_map_path": Path(config.data.orientation_map_path) if config.data.orientation_map_path else None,
-        "skip_unmapped": config.data.skip_unmapped,
-        "strict_orientation_validation": config.data.strict_orientation_validation,
-        "orientation_safety_mode": config.data.orientation_safety_mode,
-        "num_workers": config.data.num_workers,
-        "collect_augmentation_stats": config.training.use_tensorboard,
-        "stats_queue": stats_queue,
-        "color_jitter_brightness": config.data.color_jitter_brightness,
-        "color_jitter_contrast": config.data.color_jitter_contrast,
-        "color_jitter_saturation": config.data.color_jitter_saturation,
-        "color_jitter_hue": config.data.color_jitter_hue,
-        "eye_color_weight_boost": config.data.eye_color_weight_boost,
-    }
-
     train_loader, val_loader, vocab = create_dataloaders(
-        data_dir=Path(config.data.storage_locations[0]['path']),
-        json_dir=Path(config.data.storage_locations[0]['path']),
+        data_config=config.data,
+        validation_config=config.validation,
         vocab_path=Path(config.vocab_path),
-        batch_size=config.data.batch_size,
-        num_workers=config.data.num_workers,
-        frequency_sampling=True, # This should be in config
-        val_batch_size=config.validation.dataloader.batch_size,
-        config_updates=dataloader_config_updates,
+        distributed=config.training.distributed,
+        rank=config.training.local_rank,
+        world_size=config.training.world_size,
         seed=seed,
         log_queue=log_queue,
-        force_val_persistent_workers=config.validation.dataloader.persistent_workers,
     )
 
     num_tags = len(vocab.tag_to_index)
