@@ -367,6 +367,7 @@ class DataConfig(BaseConfig):
     
     # Caching
     cache_size_gb: float = 105.0
+    l1_per_worker_mb: int = 256
     preload_files: int = 2
     use_memory_cache: bool = True
     
