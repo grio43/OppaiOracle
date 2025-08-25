@@ -15,6 +15,7 @@ import shutil
 import threading
 import tempfile
 from pathlib import Path
+import os
 import yaml
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
@@ -64,8 +65,10 @@ def setup_seed(user_seed: Optional[int], deterministic: bool) -> tuple[int, bool
     random.seed(user_seed)
     np.random.seed(user_seed % (2**32 - 1))
     torch.manual_seed(user_seed)
-    cudnn.deterministic = bool(deterministic)
-    cudnn.benchmark = not bool(deterministic)
+    # Allow runtime.yaml to override cudnn behavior
+    det = bool(_RUNTIME.get("deterministic", deterministic))
+    cudnn.deterministic = det
+    cudnn.benchmark = bool(_RUNTIME.get("cudnn_benchmark", not det))
     return user_seed, bool(deterministic)
 
 
@@ -95,6 +98,20 @@ _paths_cfg = _load_paths()
 VOCAB_PATH = Path(_paths_cfg.get("vocab_path", PROJECT_ROOT / "vocabulary.json"))
 LOG_DIR = Path(_paths_cfg.get("log_dir", "./logs"))
 DEFAULT_OUTPUT_DIR = Path(_paths_cfg.get("default_output_dir", "./outputs"))
+
+# Optional runtime toggles (determinism, CuBLAS/CuDNN, quiet logging)
+def _apply_runtime_config():
+    try:
+        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "runtime.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        cfg = {}
+    rcfg = cfg.get("runtime", {}) or {}
+    if rcfg.get("cublas_workspace_config"):
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", str(rcfg["cublas_workspace_config"]))
+    if rcfg.get("quiet_mode"):
+        logging.getLogger().setLevel(logging.WARNING)
+    return rcfg
+_RUNTIME = _apply_runtime_config()
 
 
 @dataclass

@@ -1,0 +1,17 @@
+# Train-time augmentation & orientation policy
+augmentation:
+  enabled: true
+  random_flip_prob: 0.5
+  random_crop_scale: [0.8, 1.0]
+  color_jitter:
+    brightness: 0.1
+    contrast:   0.1
+    saturation: 0.1
+    hue:        0.05
+  eye_color_weight_boost: 0.0
+
+  orientation:
+    map_path: "./configs/orientation_map.json"
+    strict_validation: true
+    skip_unmapped: false
+    safety_mode: "strict"

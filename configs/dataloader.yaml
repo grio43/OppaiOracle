@@ -1,0 +1,17 @@
+# Centralized dataloader & core data preprocessing
+dataloader:
+  batch_size: 64
+  num_workers: 8
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true
+
+data:
+  image_size: 640
+  patch_size: 16
+  pad_color: 114
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std:  [0.229, 0.224, 0.225]
+
+cache:
+  preload_metadata: false

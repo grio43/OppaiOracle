@@ -1,0 +1,6 @@
+vocabulary:
+  ignore_tags_file: "./configs/Tags_ignore.txt"
+  min_frequency: 1
+  special_tokens:
+    pad: "<PAD>"
+    unk: "<UNK>"
