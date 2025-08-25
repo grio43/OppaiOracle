@@ -25,6 +25,7 @@ from pathlib import Path
 import hashlib
 import json
 import warnings
+import yaml
 import threading
 import logging
 from datetime import datetime, timedelta
@@ -65,7 +66,15 @@ def _derive_worker_generator(worker_id: int = 0) -> torch.Generator:
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+# Centralize vocabulary path in configs/paths.yaml
+def _load_vocab_path():
+    try:
+        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "paths.yaml").read_text(encoding="utf-8"))
+        p = cfg.get("vocab_path")
+        return Path(p) if p else PROJECT_ROOT / "vocabulary.json"
+    except Exception:
+        return PROJECT_ROOT / "vocabulary.json"
+DEFAULT_VOCAB_PATH = _load_vocab_path()
 
 @dataclass
 class AugmentationStats:

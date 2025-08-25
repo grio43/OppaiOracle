@@ -1,0 +1,23 @@
+paths:
+  model_path: null
+  checkpoint_path: null
+  data_dir: "data/images"
+  json_dir: "data/annotations"
+  vocab_path: "configs/vocabulary.json"
+batching:
+  batch_size: 64
+  num_workers: 8
+evaluation:
+  prediction_threshold: 0.5
+  adaptive_threshold: true
+  save_predictions: false
+  save_per_image_results: false
+visualization:
+  create_visualizations: true
+  plot_dir: "./validation_plots"
+performance:
+  measure_inference_time: true
+  profile_memory: false
+device:
+  device: "cuda"
+  use_amp: true
