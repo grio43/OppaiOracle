@@ -11,6 +11,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import StochasticDepth
 from mask_utils import ensure_pixel_padding_mask, pixel_to_token_ignore
 
 
@@ -35,11 +36,12 @@ class VisionTransformerConfig:
     token_ignore_threshold: float = 0.9
     # Enable gradient checkpointing by default to reduce memory usage
     gradient_checkpointing: bool = True
+    drop_path_rate: float = 0.0
 
 
 class TransformerBlock(nn.Module):
     """Single transformer block"""
-    def __init__(self, config: VisionTransformerConfig):
+    def __init__(self, config: VisionTransformerConfig, drop_path: float = 0.):
         super().__init__()
         self.config = config
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -63,6 +65,7 @@ class TransformerBlock(nn.Module):
                 batch_first=True
             )
 
+        self.drop_path = StochasticDepth(p=drop_path, mode="row") if drop_path > 0. else nn.Identity()
         self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = nn.Sequential(
             nn.Linear(config.hidden_size, config.intermediate_size),
@@ -92,16 +95,17 @@ class TransformerBlock(nn.Module):
                 dropout_p=self.attn_dropout if self.training else 0.0
             )
             attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
-            x = x + self.proj(attn_out)
+            x = x + self.drop_path(self.proj(attn_out))
         else:
             # Standard attention path
-            x = x + self.attn(
+            attn_output, _ = self.attn(
                 normed_x, normed_x, normed_x,
                key_padding_mask=key_padding_mask
-            )[0]
+            )
+            x = x + self.drop_path(attn_output)
       
         # MLP with residual
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 
@@ -127,8 +131,9 @@ class SimplifiedTagger(nn.Module):
         )
         self.pos_drop = nn.Dropout(p=config.dropout)
         # Transformer blocks
+        dpr = [x.item() for x in torch.linspace(0, getattr(config, 'drop_path_rate', 0.1), config.num_hidden_layers)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
-            TransformerBlock(config) for _ in range(config.num_hidden_layers)
+            TransformerBlock(config, drop_path=dpr[i]) for i in range(config.num_hidden_layers)
         ])
         # Final layer norm
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)

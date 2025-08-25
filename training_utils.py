@@ -1071,6 +1071,17 @@ class TrainingUtils:
                 eps=kwargs.get('eps', 1e-8)
             )
         
+        elif optimizer_type.lower() == 'adan':
+            from adan_optimizer import Adan
+            return Adan(
+                params,
+                lr=learning_rate,
+                betas=kwargs.get('betas', (0.98, 0.92, 0.99)),
+                eps=kwargs.get('eps', 1e-8),
+                weight_decay=weight_decay,
+                no_prox=kwargs.get('no_prox', False)
+            )
+
         else:
             raise ValueError(f"Unknown optimizer type: {optimizer_type}")
     

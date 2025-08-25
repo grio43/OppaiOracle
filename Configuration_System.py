@@ -382,6 +382,13 @@ class DataConfig(BaseConfig):
     random_crop_scale: Tuple[float, float] = (0.8, 1.0)
     random_rotation_degrees: float = 0.0
 
+    # Advanced Augmentation (set alpha/p to 0.0 to disable)
+    randaugment_num_ops: int = 2
+    randaugment_magnitude: int = 9
+    mixup_alpha: float = 0.0
+    cutmix_alpha: float = 0.0
+    random_erasing_p: float = 0.0
+
     # Orientation mapping (consolidated from augmentation.yaml)
     orientation_map_path: Optional[str] = None
     strict_orientation_validation: bool = True
@@ -459,6 +466,18 @@ class DataConfig(BaseConfig):
         scale_min, scale_max = self.random_crop_scale
         if not (0 < scale_min <= scale_max <= 1):
             errors.append(f"random_crop_scale must satisfy 0 < min <= max <= 1, got {self.random_crop_scale}")
+
+        # Validate advanced augmentations
+        if self.randaugment_num_ops < 1:
+            errors.append(f"randaugment_num_ops must be positive, got {self.randaugment_num_ops}")
+        if not 0 <= self.randaugment_magnitude <= 30:
+            errors.append(f"randaugment_magnitude must be in [0, 30], got {self.randaugment_magnitude}")
+        if self.mixup_alpha < 0:
+            errors.append(f"mixup_alpha must be non-negative, got {self.mixup_alpha}")
+        if self.cutmix_alpha < 0:
+            errors.append(f"cutmix_alpha must be non-negative, got {self.cutmix_alpha}")
+        if not 0 <= self.random_erasing_p <= 1:
+            errors.append(f"random_erasing_p must be in [0, 1], got {self.random_erasing_p}")
 
         if errors:
             raise ConfigValidationError("Data config validation failed:\n" + "\n".join(errors))
