@@ -1,5 +1,5 @@
 vocabulary:
-  ignore_tags_file: "./configs/Tags_ignore.txt"  # Tags to always drop during vocab build
+  ignore_tags_file: "./Tags_ignore.txt"          # Lives at repo root; keep path stable for loaders
   min_frequency: 1                               # Keep tokens appearing ≥ this many times
   special_tokens:
     pad: "<PAD>"

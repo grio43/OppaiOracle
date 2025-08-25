@@ -7,5 +7,5 @@ export:
     model: "model.onnx"
     quantized: "model.int8.onnx"
   metadata_paths:
-    thresholds: "./configs/thresholds.json"
+    thresholds: "./artifacts/thresholds.json"    # Matches tools/calibrate_thresholds.py default output
  # Tip: After export, use onnxruntime to sanity‑check a forward pass.
