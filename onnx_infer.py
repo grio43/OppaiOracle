@@ -85,20 +85,31 @@ def _load_metadata(session: ort.InferenceSession):
     return vocab, mean, std, image_size, patch_size, meta
 
 
-def _preprocess(image_path: str):
+def _preprocess(image_path: str) -> tuple[np.ndarray, bool]:
     """
     Loads an image and prepares it for the self-contained ONNX model.
-    No resizing or normalization is done here, as it's handled by the model.
+    Handles transparent images by compositing them on a grey background.
+    Returns the image array and a flag indicating if compositing occurred.
     """
+    was_composited = False
     with Image.open(image_path) as img:
-        # Ensure image is RGB
-        img = img.convert('RGB')
+        # Check for transparency and composite if necessary
+        if img.mode in ('RGBA', 'LA') or 'transparency' in img.info:
+            was_composited = True
+            # Create a grey background to match training
+            background = Image.new('RGB', img.size, (114, 114, 114))
+            # Paste the image using its alpha channel as a mask
+            background.paste(img, mask=img)
+            img = background
+        else:
+            img = img.convert('RGB')
+
         # Convert to numpy array
         arr = np.asarray(img, dtype=np.uint8)
 
     # Add batch dimension -> (1, H, W, 3)
     arr = np.expand_dims(arr, axis=0)
-    return arr
+    return arr, was_composited
 
 
 def _preprocess_simple(image_path: str, image_size: int, mean, std):
@@ -187,8 +198,8 @@ def main():
     for path in args.images:
         start = time.time()
         try:
-            # Preprocessing is now much simpler
-            inp = _preprocess(path)
+            # Preprocessing now returns a flag for compositing
+            inp, was_composited = _preprocess(path)
         except Exception as e:
             logger.error(f"Preprocessing failed for {path}: {e}")
             continue
@@ -208,6 +219,10 @@ def main():
                 continue
             tag_name = vocab.get_tag_from_index(int(idx))
             tags.append(TagPrediction(name=tag_name, score=score))
+
+        # Conditionally filter the gray_background tag if we added it
+        if was_composited:
+            tags = [tag for tag in tags if tag.name != 'gray_background']
 
         results.append(ImagePrediction(
             image=path,
