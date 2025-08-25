@@ -1,10 +1,10 @@
 # Train-time augmentation & orientation policy
 augmentation:
   enabled: true
-  random_flip_prob: 0.5
+  random_flip_prob: 0.5        # Probability of horizontal flip per image [0..1]
   random_crop_scale: [0.8, 1.0]
   color_jitter:
-    brightness: 0.1
+    brightness: 0.1            # Reasonable range: 0.0–0.4
     contrast:   0.1
     saturation: 0.1
     hue:        0.05
@@ -12,6 +12,6 @@ augmentation:
 
   orientation:
     map_path: "./configs/orientation_map.json"
-    strict_validation: true
+    strict_validation: true     # If true, require a known mapping or regex to flip
     skip_unmapped: false
-    safety_mode: "strict"
+    safety_mode: "strict"       # strict|balanced|lenient – how aggressive to flip
