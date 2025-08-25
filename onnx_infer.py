@@ -85,37 +85,19 @@ def _load_metadata(session: ort.InferenceSession):
     return vocab, mean, std, image_size, patch_size, meta
 
 
-def _preprocess(image_path: str, image_size: int, mean, std, session=None):
-    """Preprocess with dynamic dtype handling"""
+def _preprocess(image_path: str):
+    """
+    Loads an image and prepares it for the self-contained ONNX model.
+    No resizing or normalization is done here, as it's handled by the model.
+    """
     with Image.open(image_path) as img:
-        img = img.convert('RGB').resize((image_size, image_size))
-        arr = np.asarray(img, dtype=np.float32) / 255.0
+        # Ensure image is RGB
+        img = img.convert('RGB')
+        # Convert to numpy array
+        arr = np.asarray(img, dtype=np.uint8)
 
-    # Get expected dtype from session if provided
-    expected_dtype = np.float32  # default
-    if session:
-        input_info = session.get_inputs()[0]
-        if 'float16' in str(input_info.type).lower():
-            expected_dtype = np.float16
-        elif 'int8' in str(input_info.type).lower():
-            expected_dtype = np.int8
-
-    # Convert and normalize
-    mean = np.asarray(mean, dtype=np.float32).reshape(1, 1, 3)
-    std = np.asarray(std, dtype=np.float32).reshape(1, 1, 3)
-    arr = (arr - mean) / std
-
-    # Transpose to NCHW format
-    arr = arr.transpose(2, 0, 1)[None, :]
-
-    # Convert to expected dtype
-    if expected_dtype != np.float32:
-        if expected_dtype == np.float16:
-            arr = arr.astype(np.float16)
-        elif expected_dtype == np.int8:
-            # Quantization scaling if needed
-            arr = np.clip(arr * 127, -128, 127).astype(np.int8)
-
+    # Add batch dimension -> (1, H, W, 3)
+    arr = np.expand_dims(arr, axis=0)
     return arr
 
 
@@ -170,13 +152,8 @@ def main():
     parser.add_argument('--top_k', type=int, default=infer_cfg.top_k, help=f"Default: {infer_cfg.top_k}")
     parser.add_argument('--threshold', type=float, default=infer_cfg.prediction_threshold, help=f"Default: {infer_cfg.prediction_threshold}")
     parser.add_argument('--output', type=str, help='Output JSON file')
-    parser.add_argument('--vocab', type=str, help='External vocabulary file (if not embedded)')
+    parser.add_argument('--vocab', type=str, help='External vocabulary file (if not embedded and model is old)')
     parser.add_argument('--providers', nargs='*', default=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-    # Preprocessing parameters (required when metadata is missing)
-    parser.add_argument('--mean', type=float, nargs=3, metavar=('R', 'G', 'B'), default=data_cfg.normalize_mean, help=f'Normalization mean values (default: {data_cfg.normalize_mean})')
-    parser.add_argument('--std', type=float, nargs=3, metavar=('R', 'G', 'B'), default=data_cfg.normalize_std, help=f'Normalization std values (default: {data_cfg.normalize_std})')
-    parser.add_argument('--image-size', type=int, default=data_cfg.image_size, help=f'Input image size (default: {data_cfg.image_size})')
-    parser.add_argument('--patch-size', type=int, help='Model patch size (required if not in model metadata)')
     args = parser.parse_args()
 
     # Explicitly specify providers for better control
@@ -186,53 +163,32 @@ def main():
         providers=providers
     )
     logger.info(f"Using providers: {session.get_providers()}")
-    result = _load_metadata(session)
+
+    # Load metadata - this contains the vocabulary
+    vocab, mean, std, image_size, patch_size, meta = _load_metadata(session)
     vocab_embedded = True
 
-    if result[0] is None:
-        # Need to load external vocabulary
+    if vocab is None:
+        # Fallback for old models without embedded vocab
         if not args.vocab:
             raise RuntimeError(
                 "Model lacks embedded vocabulary and no --vocab file provided. "
                 "Please specify vocabulary with --vocab vocabulary.json"
             )
         vocab = TagVocabulary(Path(args.vocab))
-        # Verify external vocabulary
         verify_vocabulary_integrity(vocab, Path(args.vocab))
-        
-        # Check for required preprocessing parameters
-        missing_params = []
-        if args.mean is None: missing_params.append("--mean")
-        if args.std is None: missing_params.append("--std")
-        if args.image_size is None: missing_params.append("--image-size")
-        if args.patch_size is None: missing_params.append("--patch-size")
-
-        if missing_params:
-            raise RuntimeError(
-                f"Model lacks preprocessing metadata and required parameters are missing: {', '.join(missing_params)}\n"
-                f"When model metadata is not available, you must explicitly provide them."
-            )
-
-        # Use explicitly provided parameters
-        mean = list(args.mean)
-        std = list(args.std)
-        image_size = args.image_size
-        patch_size = args.patch_size
-        meta = result[-1]
         vocab_embedded = False
-    else:
-        vocab, mean, std, image_size, patch_size, meta = result
-    input_name = session.get_inputs()[0].name
 
-    # Validate input dtype matches model expectations
+    input_name = session.get_inputs()[0].name
     input_info = session.get_inputs()[0]
-    logger.info(f"Model expects input type: {input_info.type}")
+    logger.info(f"Model expects input '{input_name}' with type: {input_info.type}")
 
     results = []
     for path in args.images:
         start = time.time()
         try:
-            inp = _preprocess(path, image_size, mean, std, session)
+            # Preprocessing is now much simpler
+            inp = _preprocess(path)
         except Exception as e:
             logger.error(f"Preprocessing failed for {path}: {e}")
             continue
