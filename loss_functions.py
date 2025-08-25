@@ -204,7 +204,11 @@ class FrequencyWeightedSampler:
         elif self.weighting_type == 'log_inverse':
             weights = 1.0 / torch.log(freqs + 1.0)
         else:
-            raise ValueError(f"Unknown weighting_type: {self.weighting_type}")
+            logger.warning(
+                "Unknown weighting_type %s, defaulting to sqrt_inverse",
+                self.weighting_type,
+            )
+            weights = 1.0 / torch.sqrt(freqs)
         weights = weights / weights.max()
         weights = torch.clamp(weights, self.min_weight, self.max_weight)
         return weights
