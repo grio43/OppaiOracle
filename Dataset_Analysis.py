@@ -209,25 +209,27 @@ class ImageAnalyzer:
         self.config = config
         
     def analyze_image(self, image_path: Path) -> Optional[ImageStats]:
-        """Analyze a single image
-        
+        """Analyze a single image.
+
         Args:
             image_path: Path to image file
-            
+
         Returns:
-            ImageStats object or None if image is corrupted
-            
+            ImageStats object or ``None`` if the image is missing,
+            inaccessible or corrupted.
+
         Raises:
-            FileNotFoundError: If image file doesn't exist
             PermissionError: If file can't be accessed
             RuntimeError: For unexpected errors
         """
         # Check file exists before processing
         if not image_path.exists():
-            raise FileNotFoundError(f"Image file not found: {image_path}")
-        
+            logger.warning("Image file not found: %s", image_path)
+            return None
+
         if not image_path.is_file():
-            raise ValueError(f"Path is not a file: {image_path}")
+            logger.warning("Path is not a file: %s", image_path)
+            return None
         
         try:
             # Get file stats (may raise PermissionError)
