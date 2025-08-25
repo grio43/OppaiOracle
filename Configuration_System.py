@@ -265,6 +265,9 @@ class ModelConfig(BaseConfig):
     use_flash_attention: bool = True
     attention_bias: bool = True
     
+    # Masking
+    token_ignore_threshold: float = 0.9  # Fraction of padding pixels to ignore token
+    
     # Tag prediction
     num_labels: int = 200000
     num_groups: int = 20

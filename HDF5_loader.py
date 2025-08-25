@@ -2587,6 +2587,8 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
     # Derive a per-pixel padding mask (True=content, False=padding) so downstream
     # modules (e.g., ViT attention) can ignore padded regions.
+    # NOTE: This creates masks with True=content semantics, which will be auto-detected
+    # and converted by mask_utils.ensure_pixel_padding_mask() if needed
     B, C, H, W = images_tensor.shape
     padding_mask = torch.ones((B, H, W), dtype=torch.bool)
     for i, pad in enumerate(metadata['pads']):

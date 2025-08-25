@@ -464,9 +464,12 @@ class ValidationRunner:
                     torch.cuda.synchronize()
                     start_time = time.time()
                 
-                # Forward pass
+                # Forward pass (propagate padding masks when available)
+                pmask = batch.get('padding_mask', None)
+                if pmask is not None:
+                    pmask = pmask.to(self.device)
                 with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
-                    outputs = self.model(images)
+                    outputs = self.model(images, padding_mask=pmask)
                     logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
                 if self.config.measure_inference_time and torch.cuda.is_available():
@@ -630,9 +633,12 @@ class ValidationRunner:
                 images = batch['images'].to(self.device)
                 tag_labels = batch['tag_labels']
                 
-                # Forward pass
+                # Forward pass (propagate padding masks when available)
+                pmask = batch.get('padding_mask', None)
+                if pmask is not None:
+                    pmask = pmask.to(self.device)
                 with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
-                    outputs = self.model(images)
+                    outputs = self.model(images, padding_mask=pmask)
                     logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
                 # Handle hierarchical output
@@ -726,8 +732,11 @@ class ValidationRunner:
                     return {'error': "Batch missing 'tag_labels' for hierarchical validation"}
                 
                 # Forward pass
+                pmask = batch.get('padding_mask', None)
+                if pmask is not None:
+                    pmask = pmask.to(self.device)
                 with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
-                    outputs = self.model(images)
+                    outputs = self.model(images, padding_mask=pmask)
                     tag_logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
                 # Expect (batch, num_groups, tags_per_group)
