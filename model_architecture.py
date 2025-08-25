@@ -219,6 +219,20 @@ class SimplifiedTagger(nn.Module):
             'logits': tag_logits
         }
 
+    # Convenience helpers for instrumentation / TensorBoard
+    def forward_for_graph(self, pixel_values: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Returns a single Tensor (tag_logits) so tools like SummaryWriter.add_graph
+        can trace the model without dealing with dict outputs.
+        """
+        out = self.forward(pixel_values, padding_mask=padding_mask)
+        return out['tag_logits']
+
+    def example_inputs(self, batch_size: int = 1) -> torch.Tensor:
+        """Create a dummy pixel tensor on the correct device for graph tracing."""
+        device = next(self.parameters()).device
+        return torch.zeros(batch_size, 3, self.config.image_size, self.config.image_size, device=device)
+
 
 def create_model(**kwargs):
     """Create model from configuration arguments."""

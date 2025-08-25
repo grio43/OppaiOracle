@@ -216,6 +216,9 @@ def train_with_orientation_tracking():
         "log_augmentation_stats": True,
         "augmentation_stats_interval": 100,
         "log_augmentation_images": True,
+        # TensorBoard histograms
+        "param_hist_interval": 200,
+
         # Model configuration
         "model_config": {
             "hidden_size": 768,
@@ -491,7 +494,20 @@ def train_with_orientation_tracking():
         wandb_run_name=f"train_{datetime.now():%Y%m%d_%H%M%S}"
     )
     monitor = TrainingMonitor(monitor_config)
-    
+
+    # --- Write model graph once ---
+    try:
+        sample_batch = next(iter(train_loader))
+        sample_img = sample_batch['images'][:1].to(device)
+        sample_mask = sample_batch.get('padding_mask', None)
+        if sample_mask is not None:
+            sample_mask = sample_mask[:1].to(device)
+        # Use monitor helper (wraps dict output to a Tensor)
+        if monitor.writer:
+            monitor.log_model_graph(model, sample_img, sample_mask)
+    except Exception as e:
+        logger.debug(f"Could not add model graph: {e}")
+
     # AMP setup (prefer BF16 on modern NVIDIA GPUs like Blackwell when available)
     is_cuda = config["device"].startswith("cuda") and torch.cuda.is_available()
     device_type = "cuda" if is_cuda else "cpu"
@@ -655,7 +671,11 @@ def train_with_orientation_tracking():
                     sample_weights=None
                 )
                 loss.backward()
-            
+
+            # --- Param/grad histograms (after backward, before step) ---
+            if monitor.writer and (global_step % config.get("param_hist_interval", 200) == 0):
+                monitor.log_param_and_grad_histograms(model, global_step)
+
             running_loss += loss.item()
 
             if global_step % 10 == 0:
