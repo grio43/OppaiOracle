@@ -214,6 +214,12 @@ class SimplifiedTagger(nn.Module):
         # Predictions
         tag_logits = self.tag_head(cls_output)
         rating_logits = self.rating_head(cls_output)
+
+        # Clamp logits to prevent numerical instability with mixed precision.
+        # This is the PRIMARY FIX for the non-finite error.
+        tag_logits = torch.clamp(tag_logits, min=-15.0, max=15.0)
+        rating_logits = torch.clamp(rating_logits, min=-15.0, max=15.0)
+
         return {
             'tag_logits': tag_logits,
             'rating_logits': rating_logits,
