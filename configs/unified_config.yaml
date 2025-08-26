@@ -344,3 +344,21 @@ monitor:
   # Replace "your_webhook_url_here" with your actual Discord webhook URL.
   alert_webhook_url: "https://discord.com/api/webhooks/1349139188804485201/1YQ3LmlLVndj7dHSEIPc13fep_EYI3hqEyKtMUuUOnP8YGWMnPDMAR7x-wgkgkvzw35I"
   # --------------------------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Debug
+# Options for debugging training runs.
+debug:
+  # Enable debug mode. This will activate additional checks and logging,
+  # which may impact performance.
+  enabled: true
+
+  # If true, dump the input tensors and model outputs to a .pt file
+  # when a non-finite value is detected in the model's output logits.
+  # This is useful for offline analysis of the exact data causing the issue.
+  dump_tensors_on_error: true
+
+  # If true, log detailed information about the batch that caused a
+  # non-finite error. This includes file paths or other identifiers from the
+  # dataloader, which can help in reproducing the error.
+  log_batch_info_on_error: true
