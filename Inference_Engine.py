@@ -676,13 +676,30 @@ class InferenceEngine:
         
         # Setup monitoring
         if self.config.enable_monitoring and MONITORING_AVAILABLE:
-            monitor_config = self.config.monitor_config or MonitorConfig(
-                log_level="INFO",
-                use_tensorboard=False,
-                use_wandb=False,
-                track_gpu_metrics=True,
-                enable_alerts=False
-            )
+            monitor_config = None
+            try:
+                from Configuration_System import load_config
+                # Assuming unified_config.yaml is the single source of truth
+                unified_config_path = PROJECT_ROOT / "configs" / "unified_config.yaml"
+                if unified_config_path.exists():
+                    unified_config = load_config(unified_config_path)
+                    if hasattr(unified_config, 'monitor'):
+                        monitor_config = unified_config.monitor
+                        logger.info("Loaded monitor configuration from unified_config.yaml")
+            except Exception as e:
+                logger.warning(f"Could not load monitor settings from unified_config.yaml: {e}")
+
+            if monitor_config is None:
+                monitor_config = self.config.monitor_config or MonitorConfig(
+                    log_level="INFO",
+                    use_tensorboard=False,
+                    use_wandb=False,
+                    track_gpu_metrics=True,
+                    enable_alerts=False,
+                    alert_webhook_url=None  # Ensure webhook is not used by default
+                )
+                logger.info("Using default or legacy monitor configuration for inference.")
+
             self.monitor = TrainingMonitor(monitor_config)
             logger.info("Monitoring enabled for inference")
         
