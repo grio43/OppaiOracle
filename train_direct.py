@@ -60,6 +60,7 @@ Import error: {e}"""
 # Import training utilities for checkpointing
 from training_utils import CheckpointManager, TrainingState, setup_seed, log_sample_order_hash
 from HDF5_loader import AugmentationStats
+from utils.logging_sanitize import ensure_finite_tensor
 
 # Add after other imports
 
@@ -359,6 +360,9 @@ def train_with_orientation_tracking(config: FullConfig):
                 if pmask is not None: pmask = pmask.to(device)
                 outputs = model(images, padding_mask=pmask)
                 loss, losses = criterion(outputs['tag_logits'], outputs['rating_logits'], tag_labels, rating_labels)
+
+            # --- make sure the loss is finite before backward ---
+            loss = ensure_finite_tensor(loss)
 
             scaler.scale(loss).backward()
 
