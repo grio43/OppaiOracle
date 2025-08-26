@@ -940,6 +940,31 @@ class MonitorConfig(BaseConfig):
 
 
 @dataclass
+class DebugConfig(BaseConfig):
+    """Configuration for debugging and diagnosing training issues."""
+    # When enabled, additional checks and logging are activated.
+    # This may impact performance and should be disabled for regular training.
+    enabled: bool = False
+
+    # If true, dump the input tensors and model outputs to a .pt file
+    # when a non-finite value is detected in the model's output logits.
+    dump_tensors_on_error: bool = False
+
+    # If true, log detailed information about the batch that caused a
+    # non-finite error. This includes file paths or other identifiers.
+    log_batch_info_on_error: bool = False
+
+    def validate(self):
+        """Validate debug configuration."""
+        if self.enabled:
+            logger.warning("Debug mode is enabled. This may slow down training.")
+        if self.dump_tensors_on_error and not self.enabled:
+            logger.warning("`dump_tensors_on_error` is true but debug mode is disabled.")
+        if self.log_batch_info_on_error and not self.enabled:
+            logger.warning("`log_batch_info_on_error` is true but debug mode is disabled.")
+
+
+@dataclass
 class FullConfig(BaseConfig):
     """Complete configuration combining all components"""
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -949,6 +974,7 @@ class FullConfig(BaseConfig):
     export: ExportConfig = field(default_factory=ExportConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
     
     # Global settings
     project_name: str = "anime-image-tagger"
@@ -976,7 +1002,7 @@ class FullConfig(BaseConfig):
         errors = []
         
         # Validate each sub-config
-        for config_name in ['model', 'data', 'training', 'inference', 'export', 'monitor']:
+        for config_name in ['model', 'data', 'training', 'inference', 'export', 'monitor', 'debug']:
             try:
                 config_obj = getattr(self, config_name)
                 if hasattr(config_obj, 'validate') and callable(getattr(config_obj, 'validate')):

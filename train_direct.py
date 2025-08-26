@@ -86,13 +86,44 @@ def _flatten_dict(d: Dict[str, Any], parent_key: str = '', sep: str = '.') -> Di
     return dict(items)
 
 
-def assert_finite(*tensors, names=None):
-    """Assert that all tensors are finite."""
+def assert_finite(*tensors, names=None, batch=None, outputs=None, config=None):
+    """Assert that all tensors are finite, with optional debugging hooks."""
     if names is None:
         names = [f"Tensor {i}" for i in range(len(tensors))]
+
     for name, t in zip(names, tensors):
         if t is not None and hasattr(t, 'dtype') and t.is_floating_point():
             if not torch.isfinite(t).all():
+                # Non-finite value detected, attempt to perform debug actions
+                if config and hasattr(config, 'debug') and config.debug.enabled:
+                    logger.error(f"Non-finite detected in '{name}'. Debug mode enabled, attempting to save context.")
+
+                    # Log batch info if available and enabled
+                    if config.debug.log_batch_info_on_error and batch:
+                        # Log available metadata, avoiding large tensors
+                        batch_info = {k: v for k, v in batch.items() if not isinstance(v, torch.Tensor) or v.numel() < 10}
+                        logger.error(f"Problematic batch info: {batch_info}")
+
+                    # Dump tensors to file if available and enabled
+                    if config.debug.dump_tensors_on_error and batch and outputs:
+                        dump_dir = Path(config.output_root) / config.experiment_name / "debug_dumps"
+                        dump_dir.mkdir(parents=True, exist_ok=True)
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                        dump_path = dump_dir / f"non_finite_dump_{name}_{timestamp}.pt"
+
+                        dump_data = {
+                            'failed_tensor_name': name,
+                            'batch': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()},
+                            'outputs': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
+                        }
+
+                        try:
+                            torch.save(dump_data, dump_path)
+                            logger.error(f"Saved debug tensors for failed tensor '{name}' to: {dump_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to save debug tensor dump: {e}")
+
+                # Always raise the error to halt training
                 raise RuntimeError(f"Non-finite detected in {name}")
 
 
@@ -385,7 +416,7 @@ def train_with_orientation_tracking(config: FullConfig):
             rating_labels = batch['rating_labels'].to(device)
 
             # Assert that input data is finite and labels are in range
-            assert_finite(images, tag_labels, names=['images', 'tag_labels'])
+            assert_finite(images, tag_labels, names=['images', 'tag_labels'], batch=batch, config=config)
             if rating_labels.dtype in (torch.long, torch.int64):
                 if not ((rating_labels >= 0) & (rating_labels < num_ratings)).all():
                     raise RuntimeError(f"Rating label out of range. Found min {rating_labels.min()} / max {rating_labels.max()}, expected 0 to {num_ratings-1}")
@@ -396,7 +427,14 @@ def train_with_orientation_tracking(config: FullConfig):
                 outputs = model(images, padding_mask=pmask)
 
                 # Assert that model outputs are finite before loss calculation
-                assert_finite(outputs['tag_logits'], outputs['rating_logits'], names=['tag_logits', 'rating_logits'])
+                assert_finite(
+                    outputs['tag_logits'],
+                    outputs['rating_logits'],
+                    names=['tag_logits', 'rating_logits'],
+                    batch=batch,
+                    outputs=outputs,
+                    config=config
+                )
 
                 loss, losses = criterion(outputs['tag_logits'], outputs['rating_logits'], tag_labels, rating_labels)
 
