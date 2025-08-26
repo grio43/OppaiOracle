@@ -417,6 +417,12 @@ def _make_worker_init_fn(base_seed: Optional[int], log_queue):
             # Suppress deprecation warnings during the GC scan
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=DeprecationWarning)
+            # The following line suppresses a `FutureWarning` about `torch.distributed.reduce_op`.
+            # This warning is triggered indirectly when the garbage collector inspects objects,
+            # and the root cause is likely in a dependency rather than in this codebase.
+            # Since we cannot find the source to fix it directly, we suppress the warning
+            # to keep the logs clean.
+            warnings.filterwarnings("ignore", category=FutureWarning)
                 import gc
                 for obj in gc.get_objects():
                     if hasattr(obj, '__class__') and obj.__class__.__name__ == 'LMDBCache':
