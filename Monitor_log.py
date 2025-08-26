@@ -190,7 +190,16 @@ class AlertSystem:
         self._print_colored_alert(alert)
     
     def _send_webhook_alert(self, alert: dict):
-        """Send alert to webhook (Slack/Discord compatible)"""
+        """Spawns a background thread to send a webhook alert to avoid blocking."""
+        thread = threading.Thread(
+            target=self._execute_webhook_in_thread,
+            args=(alert,),
+            daemon=True
+        )
+        thread.start()
+
+    def _execute_webhook_in_thread(self, alert: dict):
+        """Send alert to webhook (Slack/Discord compatible) in a thread."""
         try:
             import requests
             
@@ -207,9 +216,10 @@ class AlertSystem:
                 }]
             }
             
-            requests.post(self.config.alert_webhook_url, json=payload, timeout=5)
+            response = requests.post(self.config.alert_webhook_url, json=payload, timeout=10)
+            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
         except Exception as e:
-            logger.error(f"Failed to send webhook alert: {e}")
+            logger.error(f"Failed to send webhook alert for '{alert['title']}': {e}")
     
     def _print_colored_alert(self, alert: dict):
         """Print colored alert to console"""
