@@ -1690,6 +1690,8 @@ class SimplifiedDataset(Dataset):
                     result = cached.float() / 255.0
                 elif cached.dtype == torch.float16:
                     result = cached.float()
+                elif cached.dtype == torch.bfloat16:
+                    result = cached.float()
                 else:
                     result = cached.clone()
 
@@ -1832,6 +1834,8 @@ class SimplifiedDataset(Dataset):
                 cached = (tensor * 255).to(torch.uint8)
             elif self.cache_precision == 'float16':
                 cached = tensor.half()
+            elif self.cache_precision == 'bfloat16':
+                cached = tensor.to(torch.bfloat16)
             else:
                 cached = tensor.clone()
             
