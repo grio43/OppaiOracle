@@ -339,12 +339,7 @@ class StorageLocation:
 class DataConfig(BaseConfig):
     """Data loading and preprocessing configuration"""
     # Storage locations
-    storage_locations: List[Dict[str, Any]] = field(default_factory=lambda: [
-        {"path": "/home/user/datasets/anime_curated", "priority": 0, "type": "local", "enabled": True},
-        {"path": "/mnt/das/anime_archive", "priority": 1, "type": "das", "enabled": True},
-        {"path": "/mnt/nas/anime_dataset/primary", "priority": 2, "type": "nas", "enabled": True},
-        {"path": "/mnt/nas/anime_dataset/video_frames", "priority": 3, "type": "nas", "enabled": True}
-    ])
+    storage_locations: List[Dict[str, Any]] = field(default_factory=list)
     
     # Paths
     hdf5_dir: str = "/home/user/datasets/teacher_features"

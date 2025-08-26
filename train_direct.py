@@ -219,7 +219,13 @@ def train_with_orientation_tracking(config: FullConfig):
     active_location = next((loc for loc in config.data.storage_locations if loc.get('enabled')), None)
 
     if not active_location:
-        raise ValueError("No enabled storage location found in data.storage_locations. Please check your configuration.")
+        error_msg = (
+            "No enabled storage location found in your configuration.\n"
+            "Please ensure you are providing a configuration file using the --config argument, for example:\n"
+            "  python train_direct.py --config configs/unified_config.yaml\n"
+            "And that your configuration file has an enabled entry under data.storage_locations."
+        )
+        raise ValueError(error_msg)
 
     active_data_path = Path(active_location['path'])
     logger.info(f"Using active data path: {active_data_path}")
