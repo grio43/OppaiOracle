@@ -50,23 +50,30 @@ model:
 # Data Configuration (consolidates dataloader.yaml, train_config.yaml, augmentation.yaml)
 data:
   # Storage locations
+  # Add the path to your raw training data (images and JSONs) here.
+  # The script will look for .json files in this directory and then find the
+  # corresponding images based on the "filename" field in each JSON.
   storage_locations:
-    - path: "/home/user/datasets/anime_curated"
+    - path: "/path/to/your/training_data"  # <-- IMPORTANT: Change this to your actual data path
       priority: 0
       type: "local"
       enabled: true
-    - path: "/mnt/das/anime_archive"
+    - path: "/home/user/datasets/anime_curated"
       priority: 1
-      type: "das"
-      enabled: true
-    - path: "/mnt/nas/anime_dataset/primary"
+      type: "local"
+      enabled: false  # Disabled by default
+    - path: "/mnt/das/anime_archive"
       priority: 2
-      type: "nas"
-      enabled: true
-    - path: "/mnt/nas/anime_dataset/video_frames"
+      type: "das"
+      enabled: false  # Disabled by default
+    - path: "/mnt/nas/anime_dataset/primary"
       priority: 3
       type: "nas"
-      enabled: true
+      enabled: false  # Disabled by default
+    - path: "/mnt/nas/anime_dataset/video_frames"
+      priority: 4
+      type: "nas"
+      enabled: false  # Disabled by default
   
   # Paths (from paths.yaml)
   hdf5_dir: "/home/user/datasets/teacher_features"
