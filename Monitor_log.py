@@ -34,6 +34,7 @@ import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 import torchvision
 import matplotlib.pyplot as plt
+from utils.logging_sanitize import sanitize_metrics
 import seaborn as sns
 from tqdm import tqdm
 
@@ -736,6 +737,7 @@ class TrainingMonitor:
             'augmentation_times': []
         }
         self.last_aug_log_step = 0
+        self.wandb_run = None
 
         use_tb = bool(getattr(self.config, "use_tensorboard", False))
         is_primary = bool(getattr(self, "is_primary", True))  # falls back to True if not set
@@ -768,6 +770,7 @@ class TrainingMonitor:
                 })
             except Exception:
                 pass
+
 
         # Final setup
         self._setup_logging()
@@ -1317,15 +1320,22 @@ class TrainingMonitor:
     
     def _log_to_backends(self, step: int, metrics: dict, use_epoch: bool = False):
         if getattr(self, "writer", None):
-            for name, value in metrics.items():
+            safe_metrics = sanitize_metrics(metrics)
+            for name, value in safe_metrics.items():
                 tag = f"{name}{'/epoch' if use_epoch else ''}"
                 try:
-                    if torch.is_tensor(value):
-                        value = value.detach()
-                    self.writer.add_scalar(tag, float(value), step)
+                    self.writer.add_scalar(tag, value, step)
                 except Exception as e:
                     if getattr(self, "logger", None):
                         self.logger.warning(f"TensorBoard add_scalar failed for tag={tag}: {e}")
+
+            if self.wandb_run is not None:
+                try:
+                    # Note: include step so W&B aligns correctly
+                    self.wandb_run.log({**safe_metrics, "step": step})
+                except Exception as e:
+                    if self.logger:
+                        self.logger.warning(f"W&B log failed: {e}")
     
     def _save_metrics_checkpoint(self, epoch: int):
         """Save metrics checkpoint to file"""
