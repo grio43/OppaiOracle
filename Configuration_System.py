@@ -668,7 +668,7 @@ class InferenceConfig(BaseConfig):
     """Inference configuration"""
     # Model
     model_path: Optional[str] = None
-    precision: str = "fp16"  # Options: "fp32", "fp16", "bf16"
+    precision: str = "bf16"  # Options: "fp32", "fp16", "bf16"
     compile_model: bool = False
     
     # Prediction

@@ -319,8 +319,17 @@ def train_with_orientation_tracking(config: FullConfig):
     )
 
     amp_enabled = config.training.use_amp and device.type == 'cuda'
-    amp_dtype = torch.bfloat16 if amp_enabled and torch.cuda.is_bf16_supported() else torch.float16
-    scaler = GradScaler(device='cuda', enabled=amp_enabled and amp_dtype == torch.float16)
+    if amp_enabled:
+        if config.training.amp_dtype == 'bfloat16' and torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+            logger.info("Using bfloat16 for training.")
+        else:
+            amp_dtype = torch.float16
+            logger.info("Using float16 for training.")
+    else:
+        amp_dtype = torch.float32
+
+    scaler = GradScaler(device='cuda', enabled=(amp_enabled and amp_dtype == torch.float16))
 
     checkpoint_dir = Path(config.output_root) / config.experiment_name / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
