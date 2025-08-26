@@ -14,7 +14,7 @@ YOLO models.  The pad colour and patch size are configurable via
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import copy
 import multiprocessing as mp
@@ -1158,9 +1158,16 @@ class SimplifiedDataset(Dataset):
             # Create a shallow copy of config to avoid mutation by downstream components
             # Deep copy fails with multiprocessing.Queue objects
             if isinstance(config, DataConfig):
-                # For dataclass, create a new instance with same values
-                config = DataConfig(**{f.name: getattr(config, f.name)
-                                                for f in config.__dataclass_fields__.values()})
+                # Create a new instance, passing only init=True fields
+                # This is a robust way to copy the dataclass instance while avoiding
+                # issues with fields that are not part of the constructor.
+                init_field_names = {f.name for f in fields(DataConfig) if f.init}
+                config_kwargs = {
+                    key: getattr(config, key)
+                    for key in init_field_names
+                    if hasattr(config, key)
+                }
+                config = DataConfig(**config_kwargs)
             else:
                 config = copy.copy(config)
 
