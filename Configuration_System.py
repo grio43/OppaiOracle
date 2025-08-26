@@ -391,6 +391,37 @@ class DataConfig(BaseConfig):
     skip_unmapped: bool = True
     orientation_safety_mode: str = "conservative"
 
+    # L2 Caching (from HDF5_loader.py usage)
+    l2_cache_enabled: bool = field(default=False, metadata={"help": "Enable L2 (LMDB) caching"})
+    l2_cache_path: str = field(default="./l2_cache", metadata={"help": "Path to L2 cache directory"})
+    l2_max_size_gb: float = field(default=48.0, metadata={"help": "Maximum size of L2 cache in GB"})
+    l2_max_readers: int = field(default=2048, metadata={"help": "Max readers for LMDB"})
+    cache_precision: str = field(default='uint8', metadata={"help": "Precision for cached images ('uint8', 'float16', 'float32')"})
+    canonical_cache_dtype: str = field(default='uint8', metadata={"help": "Canonical dtype for cache storage"})
+
+    # Dataset behavior (from HDF5_loader.py usage)
+    patch_size: int = field(default=16, metadata={"help": "Patch size for vision transformer"})
+    validate_on_init: bool = field(default=False, metadata={"help": "Validate all images on dataset init"})
+    skip_error_samples: bool = field(default=True, metadata={"help": "Skip samples that cause loading errors"})
+    collect_augmentation_stats: bool = field(default=False, metadata={"help": "Collect detailed augmentation stats"})
+
+    # Weighted Sampling (from HDF5_loader.py usage)
+    frequency_weighted_sampling: bool = field(default=False, metadata={"help": "Enable frequency-weighted sampling"})
+    sample_weight_power: float = field(default=0.5, metadata={"help": "Power for inverse frequency weighting"})
+
+    # Working Set Sampler (from HDF5_loader.py usage)
+    use_working_set_sampler: bool = field(default=False, metadata={"help": "Enable working set sampler"})
+    working_set_pct: float = field(default=5.0, metadata={"help": "Percentage of dataset in the working set"})
+    working_set_max_items: int = field(default=400000, metadata={"help": "Max items in the working set"})
+    trickle_in_pct: float = field(default=1.0, metadata={"help": "Percentage of new items to trickle in each epoch"})
+    max_new_uniques_per_epoch: int = field(default=80000, metadata={"help": "Max new unique items per epoch"})
+    working_set_refresh_epochs: int = field(default=2, metadata={"help": "Epochs before refreshing working set"})
+
+    # Memory Management (from HDF5_loader.py usage)
+    critical_free_ram_pct: float = field(default=5.0, metadata={"help": "Critical free RAM percentage threshold"})
+    low_free_ram_pct: float = field(default=12.0, metadata={"help": "Low free RAM percentage threshold"})
+    high_free_ram_pct: float = field(default=25.0, metadata={"help": "High free RAM percentage threshold"})
+
     def validate(self):
         """Validate data configuration"""
         errors = []
