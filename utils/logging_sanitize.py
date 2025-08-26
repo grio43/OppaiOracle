@@ -61,12 +61,14 @@ def sanitize_metrics(metrics: Dict[str, Any], reduce: str = "mean") -> Dict[str,
 
 def ensure_finite_tensor(x):
     """
-    Replace non-finite tensors with zeros (same device/dtype) to avoid backprop explosions.
+    Replace non-finite tensors with zeros (same device/dtype) to avoid backprop explosions,
+    while preserving the computation graph.
     """
     import torch
     if torch.isfinite(x).all():
         return x
-    return torch.zeros_like(x)
+    # Return a tensor of zeros with the same graph as the input
+    return x * 0
 
 def assert_all_finite(metrics: Dict[str, Any], where: str = ""):
     import math
