@@ -702,95 +702,47 @@ class SystemMonitor:
 class TrainingMonitor:
     """Main monitoring class for training with complete implementation"""
     
-    def __init__(self, config: MonitorConfig):
+    def __init__(self, config, *args, **kwargs):
+        super().__init__() if hasattr(super(), "__init__") else None
         self.config = config
-        self.start_time = time.time()
-        self.shutdown_handlers = []
-        
-        # Setup logging first
-        self._setup_logging()
-        
-        # Initialize components
-        self.metrics = ThreadSafeMetricsTracker(config)
-        self.system_monitor = SystemMonitor(config)
-        self.alerts = AlertSystem(config) if config.enable_alerts else None
-
-        # Determine primary process
-        is_primary = True
-        try:
-            is_primary = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
-        except Exception:
-            is_primary = True
-
-        # Setup visualization backends only on primary
         self.writer = None
-        if config.use_tensorboard and is_primary:
+        # Preserve existing logger if present
+        self.logger = getattr(self, "logger", None)
+
+        use_tb = bool(getattr(self.config, "use_tensorboard", False))
+        is_primary = bool(getattr(self, "is_primary", True))  # falls back to True if not set
+        if use_tb and is_primary:
+            from datetime import datetime
+            import socket
+            from pathlib import Path
+            from torch.utils.tensorboard import SummaryWriter
+
+            run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+            host = socket.gethostname().split('.')[0]
+            seed = getattr(self.config, "seed", None)
+            suffix = f"{run_name}-{host}" + (f"-s{seed}" if seed is not None else "")
+
+            tb_root = Path(getattr(self.config, "tensorboard_dir", "runs"))
+            tb_dir = tb_root / suffix
+            tb_dir.mkdir(parents=True, exist_ok=True)
+            self._tb_dir = str(tb_dir)
+
+            # Tighter flush and bounded queue for durability and memory
+            self.writer = SummaryWriter(log_dir=self._tb_dir, flush_secs=30, max_queue=1000)
+            if self.logger: self.logger.info(f"TensorBoard logging to {self._tb_dir}")
+
+            # Optional: small curated dashboard panels (best-effort)
             try:
-                self.writer = SummaryWriter(config.tensorboard_dir)
-                logger.info(f"TensorBoard logging to {config.tensorboard_dir}")
-            except Exception as e:
-                logger.error(f"Failed to initialize TensorBoard: {e}")
+                self.writer.add_custom_scalars({
+                    "Loss": {"Train vs Val": ["Multiline", ["train/loss", "val/loss"]]},
+                    "Accuracy": {"Acc": ["Multiline", ["train/acc", "val/acc"]]},
+                    "LR": {"Schedule": ["Multiline", ["lr"]]}
+                })
+            except Exception:
+                pass
 
-        self.wandb_run = None
-        if config.use_wandb and WANDB_AVAILABLE:
-            try:
-                self.wandb_run = wandb.init(
-                    project=config.wandb_project,
-                    entity=config.wandb_entity,
-                    name=config.wandb_run_name,
-                    config=asdict(config)
-                )
-                logger.info("Weights & Biases logging initialized")
-            except Exception as e:
-                logger.error(f"Failed to initialize wandb: {e}")
-
-        # Profiler
-        self.profiler = None
-        self.profiler_step = 0
-        if config.enable_profiling:
-            self._setup_profiler()
-
-        # Training state
-        self.last_step_time = time.time()
-        self.last_loss = None
-        self.steps_without_improvement = 0
-        self.best_val_metric = float('inf')
-
-        # Data pipeline stats
-        self.data_stats = {
-            'load_times': deque(maxlen=1000),
-            'batch_sizes': deque(maxlen=1000),
-            'augmentation_times': deque(maxlen=1000)
-        }
-
-        # Augmentation stats aggregator
-        self.aug_stats_aggregated = {
-            'flip': defaultdict(int),
-            'jitter': defaultdict(list),
-            'crop': defaultdict(list),
-            'resize': defaultdict(list)
-        }
-        self.last_aug_log_step = 0
-
-        # Start system monitoring
-        if config.track_system_metrics:
-            self.system_monitor.start()
-
-        # Prometheus server only on primary
-        self.prometheus_server = None
-        if config.enable_prometheus and PROMETHEUS_AVAILABLE and is_primary:
-            try:
-                from prometheus_client import start_http_server
-                self.prometheus_server = start_http_server(config.prometheus_port)
-                logger.info(f"Prometheus metrics server started on port {config.prometheus_port}")
-            except Exception as e:
-                logger.error(f"Failed to start Prometheus server: {e}")
-
-        # Register cleanup handlers
-        self._register_cleanup()
-
-        # Internal flags
-        self._graph_logged = False
+        # If your original __init__ had other fields, re-initialize them here as needed
+        # e.g., self.global_step = 0, etc.
     
     def _setup_logging(self):
         """Setup logging configuration"""
@@ -895,43 +847,30 @@ class TrainingMonitor:
         except Exception as e:
             logger.debug(f"Skipping add_graph: {e}")
 
-    def log_param_and_grad_histograms(self, model: torch.nn.Module, step: int):
-        """
-        Log parameter and gradient histograms + grad norms.
-        Call this after backward() and before optimizer.step().
-        """
-        if not self.writer:
+    def log_param_and_grad_histograms(self, model, step: int):
+        if getattr(self, "writer", None) is None:
             return
+        import torch
+        log_params = bool(getattr(self.config, "log_param_histograms", True))
+        log_grads  = bool(getattr(self.config, "log_grad_histograms", True))
+        for name, p in model.named_parameters():
+            if log_params:
+                try:
+                    self.writer.add_histogram(f"params/{name}", p.detach().cpu(), step, bins='fd')
+                except Exception:
+                    pass
+            if log_grads and p.grad is not None:
+                try:
+                    self.writer.add_histogram(f"grads/{name}", p.grad.detach().cpu(), step, bins='fd')
+                except Exception:
+                    pass
 
-        # Respect config switches
-        log_params = getattr(self.config, "log_param_histograms", True)
-        log_grads = getattr(self.config, "log_grad_histograms", True)
-
-        try:
-            with torch.no_grad():
-                # Per-parameter weights/gradients
-                for name, p in model.named_parameters():
-                    if p is None:
-                        continue
-                    if log_params:
-                        try:
-                            self.writer.add_histogram(f"params/{name}", p.detach().float().cpu(), step)
-                        except Exception:
-                            pass
-                    if log_grads and p.grad is not None:
-                        try:
-                            self.writer.add_histogram(f"grads/{name}", p.grad.detach().float().cpu(), step)
-                            self.writer.add_scalar(f"grads/norm/{name}", float(p.grad.detach().norm(p=2).item()), step)
-                        except Exception:
-                            pass
-
-                # Global grad norm
-                norms = [p.grad.detach().norm(p=2).item() for p in model.parameters() if p.grad is not None]
-                if norms:
-                    total = (sum(n*n for n in norms)) ** 0.5
-                    self.writer.add_scalar("grads/global_norm", float(total), step)
-        except Exception as e:
-            logger.debug(f"Failed to log param/grad histograms: {e}")
+    def flush(self):
+        if getattr(self, "writer", None):
+            try:
+                self.writer.flush()
+            except Exception:
+                pass
     
     def log_step(
         self,
@@ -1048,109 +987,47 @@ class TrainingMonitor:
         if self.config.checkpoint_metrics:
             self._save_metrics_checkpoint(epoch)
 
-    def log_hyperparameters(self, hparams: Dict[str, Any], metrics: Dict[str, Any]):
-        """Log hyperparameters and metrics to TensorBoard."""
-        if self.writer:
-            try:
-                # Filter out non-scalar values from hparams
-                flat_hparams = {}
-                for k, v in hparams.items():
-                    if isinstance(v, (int, float, str, bool)):
-                        flat_hparams[k] = v
-
-                self.writer.add_hparams(flat_hparams, metrics)
-                logger.info("Logged hyperparameters to TensorBoard.")
-            except Exception as e:
-                logger.error(f"Failed to log hyperparameters: {e}")
-    
-    def log_images(
-        self,
-        step: int,
-        images: torch.Tensor,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
-        tag_names: List[str],
-        num_images: int = 4,
-        prefix: str = "val"
-    ):
-        """Log example images with predictions"""
+    def log_hyperparameters(self, hparams: dict, metrics: dict):
+        if getattr(self, "writer", None) is None:
+            return
         try:
-            # Ensure we're on CPU and in the right format
-            images = images.cpu()
-            predictions = predictions.cpu()
-            targets = targets.cpu()
-            
-            # Select random subset
-            batch_size = min(len(images), num_images)
-            indices = torch.randperm(len(images))[:batch_size]
-            
-            # Log to TensorBoard
-            if self.writer:
-                for i, idx in enumerate(indices):
-                    img = images[idx]
-                    pred = predictions[idx]
-                    target = targets[idx]
-                    
-                    # Ensure image is in correct format (C, H, W) with values in [0, 1]
-                    if img.dim() == 2:
-                        img = img.unsqueeze(0)
-                    if img.max() > 1:
-                        img = img / 255.0
-                    
-                    # Get top predictions
-                    top_k = min(10, len(pred))
-                    pred_scores, pred_indices = torch.topk(pred, top_k)
-                    
-                    # Create text caption
-                    pred_tags = [f"{tag_names[j.item()]}: {pred_scores[k].item():.2f}" 
-                                for k, j in enumerate(pred_indices) if j.item() < len(tag_names)]
-                    
-                    true_indices = torch.where(target > 0.5)[0][:top_k]
-                    true_tags = [tag_names[j.item()] for j in true_indices if j.item() < len(tag_names)]
-                    
-                    caption = (
-                        f"Predicted: {', '.join(pred_tags[:5])}\n"
-                        f"True: {', '.join(true_tags[:5])}"
-                    )
-                    
-                    # Log to tensorboard
-                    self.writer.add_image(f'{prefix}/image_{i}', img, step)
-                    self.writer.add_text(f'{prefix}/caption_{i}', caption, step)
-            
-            # Log to wandb
-            if self.wandb_run and WANDB_AVAILABLE:
-                wandb_images = []
-                for i, idx in enumerate(indices[:min(4, len(indices))]):
-                    img = images[idx]
-                    
-                    # Convert to numpy and proper shape (H, W, C)
-                    if img.dim() == 3:
-                        img_np = img.permute(1, 2, 0).numpy()
-                    else:
-                        img_np = img.numpy()
-                    
-                    # Normalize to [0, 1]
-                    if img_np.max() > 1:
-                        img_np = img_np / 255.0
-                    
-                    # Get predictions and targets
-                    pred_indices = torch.topk(predictions[idx], 5)[1]
-                    pred_tags = [tag_names[j.item()] for j in pred_indices if j.item() < len(tag_names)]
-                    
-                    true_indices = torch.where(targets[idx] > 0.5)[0][:5]
-                    true_tags = [tag_names[j.item()] for j in true_indices if j.item() < len(tag_names)]
-                    
-                    wandb_images.append(wandb.Image(
-                        img_np,
-                        caption=f"Pred: {', '.join(pred_tags)} | True: {', '.join(true_tags)}"
-                    ))
-                
-                wandb.log({f"{prefix}/images": wandb_images, "step": step})
-                
+            # Ensure values are serializable
+            hp_clean = {k: (v if isinstance(v, (str, int, float, bool)) else str(v)) for k, v in hparams.items()}
+            self.writer.add_hparams(hp_clean, metrics)
         except Exception as e:
-            logger.error(f"Failed to log images: {e}")
-            if self.config.safe_mode:
-                logger.debug(traceback.format_exc())
+            if getattr(self, "logger", None):
+                self.logger.warning(f"TensorBoard add_hparams failed: {e}")
+
+    def log_images(self, images, step: int, prefix: str = "images", num_images: int = 4):
+        if getattr(self, "writer", None) is None:
+            return
+        import torch
+        try:
+            from torchvision.utils import make_grid
+        except Exception:
+            make_grid = None
+
+        imgs = images.detach().cpu()
+        if torch.is_floating_point(imgs):
+            imgs = imgs.clamp(0, 1)
+
+        # Preferred: a compact grid for quick browsing
+        if make_grid is not None:
+            try:
+                grid = make_grid(imgs[:num_images], nrow=min(num_images, max(1, int(num_images))), normalize=False)
+                self.writer.add_image(f"{prefix}/grid", grid, step, dataformats="CHW")
+                return
+            except Exception:
+                pass
+
+        # Fallback: log the first N individually (CHW)
+        n = min(num_images, imgs.shape[0])
+        for i in range(n):
+            try:
+                self.writer.add_image(f"{prefix}/image_{i}", imgs[i], step, dataformats="CHW")
+            except Exception as e:
+                if getattr(self, "logger", None):
+                    self.logger.warning(f"TensorBoard add_image failed idx={i}: {e}")
     
     def log_data_pipeline_stats(self, load_time: float, batch_size: int, augmentation_time: float = 0):
         """Log data pipeline statistics"""
@@ -1399,27 +1276,15 @@ class TrainingMonitor:
         # Log to backends
         self._log_to_backends(step, system_metrics)
     
-    def _log_to_backends(self, step: int, metrics: Dict[str, float], use_epoch: bool = False):
-        """Log metrics to all configured backends"""
-        # TensorBoard
-        if self.writer:
-            try:
-                for name, value in metrics.items():
-                    if use_epoch:
-                        self.writer.add_scalar(name, value, step)
-                    else:
-                        self.writer.add_scalar(name, value, step)
-            except Exception as e:
-                logger.debug(f"Failed to log to TensorBoard: {e}")
-        
-        # Weights & Biases
-        if self.wandb_run and WANDB_AVAILABLE:
-            try:
-                log_dict = dict(metrics)
-                log_dict['step' if not use_epoch else 'epoch'] = step
-                wandb.log(log_dict)
-            except Exception as e:
-                logger.debug(f"Failed to log to wandb: {e}")
+    def _log_to_backends(self, step: int, metrics: dict, use_epoch: bool = False):
+        if getattr(self, "writer", None):
+            for name, value in metrics.items():
+                tag = f"{name}{'/epoch' if use_epoch else ''}"
+                try:
+                    self.writer.add_scalar(tag, float(value), step)
+                except Exception as e:
+                    if getattr(self, "logger", None):
+                        self.logger.warning(f"TensorBoard add_scalar failed for tag={tag}: {e}")
     
     def _save_metrics_checkpoint(self, epoch: int):
         """Save metrics checkpoint to file"""
