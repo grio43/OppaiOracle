@@ -246,6 +246,7 @@ def train_with_orientation_tracking(config: FullConfig):
         data_config=config.data,
         validation_config=config.validation,
         vocab_path=Path(config.vocab_path),
+        active_data_path=active_data_path,
         distributed=config.training.distributed,
         rank=config.training.local_rank,
         world_size=config.training.world_size,
