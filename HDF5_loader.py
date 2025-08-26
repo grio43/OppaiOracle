@@ -1754,8 +1754,34 @@ class SimplifiedDataset(Dataset):
             return default
         
         try:
-            # Open without forcing RGB so we can properly handle alpha first
-            with Image.open(image_path) as pil_img:
+            try:
+                # Open without forcing RGB so we can properly handle alpha first
+                pil_img = Image.open(image_path)
+            except FileNotFoundError:
+                logger.warning(f"File not found: {image_path}. Attempting fallback search.")
+                directory = os.path.dirname(image_path)
+                filename = os.path.basename(image_path)
+
+                if not os.path.isdir(directory):
+                    raise # Directory itself doesn't exist, re-raise original error.
+
+                found_files = [f for f in os.listdir(directory) if f.endswith(filename)]
+
+                if len(found_files) == 1:
+                    new_path = os.path.join(directory, found_files[0])
+                    logger.info(f"Fallback found: loading {new_path} instead.")
+                    image_path = new_path
+                    pil_img = Image.open(image_path)
+                elif len(found_files) > 1:
+                    logger.warning(f"Found multiple possible matches for {filename}: {found_files}. Using the first one.")
+                    new_path = os.path.join(directory, found_files[0])
+                    image_path = new_path
+                    pil_img = Image.open(image_path)
+                else:
+                    logger.error(f"Fallback search failed for {filename} in {directory}.")
+                    raise # Re-raise the FileNotFoundError
+
+            with pil_img:
                 was_composited = False
 
                 # Validate and update index
