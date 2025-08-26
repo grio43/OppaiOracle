@@ -954,6 +954,21 @@ class DebugConfig(BaseConfig):
     # non-finite error. This includes file paths or other identifiers.
     log_batch_info_on_error: bool = False
 
+    # Enable PyTorch's anomaly detection for debugging gradients.
+    detect_anomaly: bool = False
+
+    # If true, log the gradient norm of the model's parameters to TensorBoard.
+    log_gradient_norm: bool = False
+
+    # If true, perform a pre-training validation step to check the integrity of the input data.
+    validate_input_data: bool = False
+
+    # If true, save intermediate images during the data augmentation process for visual inspection.
+    visualize_augmentations: bool = False
+
+    # Directory to save the visualized augmentation images.
+    augmentation_visualization_path: str = "./aug_visualizations"
+
     def validate(self):
         """Validate debug configuration."""
         if self.enabled:

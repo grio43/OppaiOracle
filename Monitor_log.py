@@ -1006,6 +1006,15 @@ class TrainingMonitor:
             if getattr(self, "logger", None):
                 self.logger.warning(f"TensorBoard add_hparams failed: {e}")
 
+    def log_scalar(self, tag: str, value: float, step: int):
+        """Logs a single scalar value to the configured backends."""
+        if self.writer:
+            try:
+                self.writer.add_scalar(tag, value, step)
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"TensorBoard add_scalar failed for tag={tag}: {e}")
+
     def log_images(
         self,
         images: torch.Tensor,
