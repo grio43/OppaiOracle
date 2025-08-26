@@ -15,6 +15,14 @@ from torchvision.ops import StochasticDepth
 from mask_utils import ensure_pixel_padding_mask, pixel_to_token_ignore
 
 
+class LayerNormFp32(nn.LayerNorm):
+    """
+    LayerNorm that casts to float32 before calling the original LayerNorm.
+    This is to improve stability when using mixed precision training.
+    """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x.float()).type_as(x)
+
 @dataclass
 class VisionTransformerConfig:
     """Configuration for the Vision Transformer used in direct training."""
@@ -44,7 +52,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, config: VisionTransformerConfig, drop_path: float = 0.):
         super().__init__()
         self.config = config
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm1 = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps)
 
         # Use flash attention if available and requested
         self.use_flash = config.use_flash_attention and hasattr(F, 'scaled_dot_product_attention')
@@ -66,7 +74,7 @@ class TransformerBlock(nn.Module):
             )
 
         self.drop_path = StochasticDepth(p=drop_path, mode="row") if drop_path > 0. else nn.Identity()
-        self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm2 = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = nn.Sequential(
             nn.Linear(config.hidden_size, config.intermediate_size),
             nn.GELU(),
@@ -136,7 +144,7 @@ class SimplifiedTagger(nn.Module):
             TransformerBlock(config, drop_path=dpr[i]) for i in range(config.num_hidden_layers)
         ])
         # Final layer norm
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps)
         # Classification heads
         self.tag_head = nn.Linear(config.hidden_size, config.num_tags)
         self.rating_head = nn.Linear(config.hidden_size, config.num_ratings)
@@ -148,7 +156,7 @@ class SimplifiedTagger(nn.Module):
             torch.nn.init.trunc_normal_(module.weight, std=0.02)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, (nn.LayerNorm, LayerNormFp32)):
             nn.init.constant_(module.bias, 0)
             nn.init.constant_(module.weight, 1.0)
         elif isinstance(module, nn.Conv2d):

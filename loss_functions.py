@@ -88,7 +88,7 @@ class AsymmetricFocalLoss(nn.Module):
         neg_weights = (1 - targets) * torch.pow(probs, self.gamma_neg)
 
         # Binary cross entropy
-        bce = -(targets * torch.log(probs) + (1 - targets) * torch.log(1 - probs))
+        bce = -(targets * torch.log(probs + 1e-8) + (1 - targets) * torch.log(1 - probs + 1e-8))
 
         # Check for NaN/Inf in intermediate calculations
         if torch.isnan(bce).any() or torch.isinf(bce).any():
