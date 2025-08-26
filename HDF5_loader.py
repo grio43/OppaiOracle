@@ -2288,9 +2288,18 @@ def create_dataloaders(
 ) -> Tuple[DataLoader, DataLoader, TagVocabulary]:
     """Construct training and validation dataloaders with enhanced memory control."""
     
-    json_files = list(Path(data_config.storage_locations[0]['path']).glob("*.json"))
+    # Find the active data path from storage_locations
+    active_location = next((loc for loc in data_config.storage_locations if loc.get('enabled')), None)
+
+    if not active_location:
+        raise ValueError("No enabled storage location found in data_config.storage_locations. Please check your configuration.")
+
+    active_data_path = Path(active_location['path'])
+    logger.info(f"HDF5_loader using active data path: {active_data_path}")
+
+    json_files = list(active_data_path.glob("*.json"))
     if not json_files:
-        raise ValueError(f"No JSON files found in {data_config.storage_locations[0]['path']}")
+        raise ValueError(f"No JSON files found in {active_data_path}")
 
     json_files_sorted = sorted(json_files)
     np.random.shuffle(json_files_sorted)
