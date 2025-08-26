@@ -5,7 +5,7 @@ Vision Transformer adjusted for orientation-aware tagger
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Dict, Optional
 
 import torch
@@ -227,8 +227,11 @@ class SimplifiedTagger(nn.Module):
 
 def create_model(**kwargs):
     """Create model from configuration arguments."""
-    # The 'architecture_type' is a meta-parameter from the main config
-    # and is not part of the VisionTransformerConfig, so we remove it.
-    kwargs.pop('architecture_type', None)
-    config = VisionTransformerConfig(**kwargs)
+    # Get the names of the fields in the VisionTransformerConfig dataclass
+    config_fields = {f.name for f in fields(VisionTransformerConfig)}
+
+    # Filter kwargs to only include keys that are in the config_fields
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+
+    config = VisionTransformerConfig(**filtered_kwargs)
     return SimplifiedTagger(config)
