@@ -273,7 +273,6 @@ def train_with_orientation_tracking(config: FullConfig):
     model.to(device)
 
     # Ensure tensorboard_dir points to a stable experiment root; TrainingMonitor will create a per-run subdir.
-    from pathlib import Path
     config.tensorboard_dir = str(Path(getattr(config, "output_root", "experiments")) / getattr(config, "experiment_name", "default_experiment"))
     monitor = TrainingMonitor(MonitorConfig(
         log_dir=str(log_dir),
