@@ -1,8 +1,0 @@
-level: "INFO"                          # DEBUG|INFO|WARNING|ERROR|CRITICAL
-format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-file_logging:
-  enabled: true                         # Write logs to files under ./logs
-  dir: "./logs"
-rotation:
-  max_bytes: 10485760                   # Max size per log file before rotation
-  backups: 5                            # How many rotated files to keep
