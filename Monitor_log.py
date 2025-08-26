@@ -1104,10 +1104,11 @@ class TrainingMonitor:
             plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.3)
 
             fig.canvas.draw()
-            plot_img_np = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            plot_img_np = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
             plot_img_np = plot_img_np.reshape(
-                fig.canvas.get_width_height()[::-1] + (3,)
+                fig.canvas.get_width_height()[::-1] + (4,)
             )
+            plot_img_np = plot_img_np[:, :, :3]
             plt.close(fig)
 
             plot_img_tensor = torch.from_numpy(plot_img_np).permute(2, 0, 1)
