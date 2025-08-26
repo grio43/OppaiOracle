@@ -187,14 +187,16 @@ class SimplifiedTagger(nn.Module):
         # Transformer blocks with optional gradient checkpointing
         for block in self.blocks:
             if self.config.gradient_checkpointing and self.training:
+                # use_reentrant=True is more robust with AMP, though it uses more memory.
+                # This is to fix the CheckpointError where recomputed values have different metadata.
                 if attn_kpm is not None:
                     # checkpoint requires tensor args; pass mask explicitly
                     x = torch.utils.checkpoint.checkpoint(
                         lambda _x, _m: block(_x, key_padding_mask=_m), x, attn_kpm,
-                        use_reentrant=False
+                        use_reentrant=True
                     )
                 else:
-                    x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+                    x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=True)
             else:
                 x = block(x, key_padding_mask=attn_kpm)
         # Final norm
