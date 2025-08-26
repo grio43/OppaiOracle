@@ -272,12 +272,23 @@ def train_with_orientation_tracking(config: FullConfig):
     model = create_model(**model_config)
     model.to(device)
 
+    # Ensure tensorboard_dir points to a stable experiment root; TrainingMonitor will create a per-run subdir.
+    from pathlib import Path
+    config.tensorboard_dir = str(Path(getattr(config, "output_root", "experiments")) / getattr(config, "experiment_name", "default_experiment"))
     monitor = TrainingMonitor(MonitorConfig(
         log_dir=str(log_dir),
         use_tensorboard=config.training.use_tensorboard,
         tensorboard_dir=str(Path(config.output_root) / config.experiment_name),
         use_wandb=config.training.use_wandb,
     ))
+
+    # --- TensorBoard: initial hparams snapshot ---
+    try:
+        to_dict = getattr(config, "to_dict", None)
+        hparams = to_dict() if callable(to_dict) else (vars(config) if hasattr(config, "__dict__") else {})
+        monitor.log_hyperparameters(hparams, {"init/placeholder": 0})
+    except Exception:
+        pass
 
     # Log the model graph
     if config.training.use_tensorboard:
@@ -353,10 +364,17 @@ def train_with_orientation_tracking(config: FullConfig):
             scaler.scale(loss).backward()
 
             if (step + 1) % config.training.gradient_accumulation_steps == 0:
+                # --- TensorBoard: param/grad histograms (throttled) ---
+                try:
+                    interval = getattr(config, "param_hist_interval_steps", None)
+                    if interval is None:
+                        training_cfg = getattr(config, "training", None)
+                        interval = getattr(training_cfg, "param_hist_interval_steps", None) if training_cfg else None
+                    if interval and (global_step % int(interval) == 0):
+                        monitor.log_param_and_grad_histograms(model, global_step)
+                except Exception:
+                    pass
                 scaler.unscale_(optimizer)
-
-                if global_step % config.training.logging_steps == 0 and config.training.use_tensorboard:
-                    monitor.log_param_and_grad_histograms(model, global_step)
 
                 if config.training.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
@@ -416,6 +434,12 @@ def train_with_orientation_tracking(config: FullConfig):
         logger.info(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         monitor.log_validation(global_step, {'loss': avg_val_loss})
 
+        # --- TensorBoard: periodic flush ---
+        try:
+            monitor.flush()
+        except Exception:
+            pass
+
         # Checkpointing
         is_best = avg_val_loss < best_val_loss
         if is_best:
@@ -433,14 +457,17 @@ def train_with_orientation_tracking(config: FullConfig):
                 config=config.to_dict()
             )
 
-    # Log hyperparameters at the end of training
-    hparams = _flatten_dict(config.to_dict())
-    final_metrics = {
-        'hparam/best_val_loss': best_val_loss,
-        'hparam/final_train_loss': avg_train_loss,
-        'hparam/final_epoch': epoch + 1
-    }
-    monitor.log_hyperparameters(hparams, final_metrics)
+    # --- TensorBoard: final hparams snapshot ---
+    try:
+        to_dict = getattr(config, "to_dict", None)
+        hparams = to_dict() if callable(to_dict) else (vars(config) if hasattr(config, "__dict__") else {})
+        final_metrics = {}
+        if 'avg_val_loss' in locals(): final_metrics["final/val_loss"] = float(avg_val_loss)
+        if 'avg_train_loss' in locals(): final_metrics["final/train_loss"] = float(avg_train_loss)
+        if 'best_val_metric' in locals(): final_metrics["final/best_val_metric"] = float(best_val_metric)
+        monitor.log_hyperparameters(hparams, final_metrics if final_metrics else {"final/placeholder": 1})
+    except Exception:
+        pass
 
     monitor.close()
     if _listener:
