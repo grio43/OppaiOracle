@@ -45,7 +45,7 @@ model:
   num_labels: 200000
   num_groups: 20
   tags_per_group: 10000
-  gradient_checkpointing: false
+  gradient_checkpointing: true
 
 # Data Configuration (consolidates dataloader.yaml, train_config.yaml, augmentation.yaml)
 data:
@@ -87,7 +87,7 @@ data:
   pad_color: [114, 114, 114]
 
   # Data loading (from dataloader.yaml)
-  batch_size: 2  # Reduced to fit within ~31GB GPU memory
+  batch_size: 4  # Increased after enabling gradient checkpointing
   num_workers: 8
   pin_memory: true
   prefetch_factor: 2
@@ -204,7 +204,7 @@ training:
 # Inference Configuration (from inference_config.yaml)
 inference:
   model_path: "./checkpoints/best_model.pt"
-  use_fp16: true
+  precision: "bfloat16"  # Set precision to bfloat16 for inference
   compile_model: false
   
   # Prediction

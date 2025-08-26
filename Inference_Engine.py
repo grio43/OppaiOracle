@@ -105,6 +105,7 @@ class InferenceConfig:
     threshold: float = 0.5
     top_k: int = 10
     use_fp16: bool = True
+    precision: str = "bfloat16"  # Add precision setting: "fp32", "fp16", "bf16"
     use_torch_compile: bool = False
     thresholds_path: Optional[str] = None
     eye_color_exclusive: bool = False
@@ -165,6 +166,17 @@ class InferenceConfig:
 
 # Apply YAML overrides on import
 InferenceConfig.apply_yaml_overrides()
+
+# Also try to load from unified config for key settings
+try:
+    from Configuration_System import load_config
+    unified_config = load_config(PROJECT_ROOT / "configs" / "unified_config.yaml")
+    if unified_config and unified_config.inference:
+        InferenceConfig.precision = unified_config.inference.get("precision", InferenceConfig.precision)
+        InferenceConfig.use_fp16 = unified_config.inference.get("use_fp16", InferenceConfig.use_fp16)
+        logger.info(f"Loaded precision '{InferenceConfig.precision}' from unified_config.yaml")
+except Exception as e:
+    logger.warning(f"Could not load settings from unified_config.yaml: {e}")
 
 
 class ImagePreprocessor:
@@ -383,13 +395,17 @@ class ModelWrapper:
             
             # Setup mixed precision
             if self.config.device == 'cuda':
-                if self.config.precision == "fp16":
+                if self.config.precision == "fp16" or (self.config.use_fp16 and self.config.precision not in ["bf16", "fp32"]):
+                    logger.info("Using fp16 for inference.")
                     self.model = self.model.half()
                 elif self.config.precision == "bf16":
                     if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+                        logger.info("Using bfloat16 for inference.")
                         self.model = self.model.to(torch.bfloat16)
                     else:
-                        logger.warning("bfloat16 not supported on this device, falling back to float32")
+                        logger.warning("bfloat16 not supported on this device, falling back to float32.")
+                else:
+                    logger.info("Using float32 for inference.")
             
             logger.info(f"SimplifiedTagger model loaded successfully:")
             logger.info(f"  - Image size: {vit_config.image_size}")
@@ -444,12 +460,9 @@ class ModelWrapper:
         images = images.to(self.device)
         
         # Match model precision
-        if self.config.device == 'cuda':
-            if self.config.precision == "fp16":
-                images = images.half()
-            elif self.config.precision == "bf16":
-                if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
-                    images = images.to(torch.bfloat16)
+        model_dtype = next(self.model.parameters()).dtype
+        if images.dtype != model_dtype:
+            images = images.to(dtype=model_dtype)
         
         outputs = self.model(images)
         if self.config.tta_flip:
