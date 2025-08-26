@@ -2000,6 +2000,14 @@ class SimplifiedDataset(Dataset):
                 # Load image tensor and get composite flag
                 image, was_composited, lb_info = self._load_image(image_path)
 
+                # --- Augmentation Visualization ---
+                vis_dir = None
+                metadata = {'steps': []}
+                if self.config.visualize_augmentations:
+                    vis_dir = Path(self.config.augmentation_visualization_path) / f"{actual_idx}_{Path(image_path).stem}"
+                    vis_dir.mkdir(parents=True, exist_ok=True)
+                    TF.to_pil_image(image).save(vis_dir / "00_original.png")
+
                 # Validate image tensor
                 if image is None or torch.isnan(image).any() or torch.isinf(image).any():
                     raise ValueError(f"Invalid image tensor for {image_path}")
@@ -2034,6 +2042,9 @@ class SimplifiedDataset(Dataset):
                         self._orientation_stats['flips'] += 1
                         if self.aug_stats:
                             self.aug_stats.flip_safe += 1
+                        if vis_dir:
+                            TF.to_pil_image(image).save(vis_dir / "01_flipped.png")
+                            metadata['steps'].append('flipped')
                     else:
                         self._orientation_stats['skipped'] += 1
                         # Determine skip reason from handler stats
@@ -2106,7 +2117,13 @@ class SimplifiedDataset(Dataset):
                             # Re-apply flip if it was done
                             if was_flipped:
                                 image = TF.hflip(image)
-                        elif (image < 0).any() or (image > 1).any():
+                        else:
+                            if vis_dir:
+                                TF.to_pil_image(image).save(vis_dir / "02_augmented.png")
+                                metadata['steps'].append('augmented')
+                                if self.color_jitter_transform:
+                                    metadata['jitter_params'] = self.color_jitter_transform.last_params
+                        if (image < 0).any() or (image > 1).any():
                             logger.debug(
                                 f"Values outside [0,1] detected, clamping for {image_path}"
                             )
@@ -2142,6 +2159,11 @@ class SimplifiedDataset(Dataset):
                         )(image)
                         # This lb_info is a dummy, as RandomResizedCrop does not pad.
                         lb_info = {'scale': 1.0, 'pad': (0, 0, 0, 0), 'out_size': image.shape[1:], 'in_size': image.shape[1:]}
+                        if vis_dir:
+                            TF.to_pil_image(image).save(vis_dir / "03_cropped.png")
+                            metadata['steps'].append('cropped')
+                            metadata['crop_scale'] = crop_scale
+                            metadata['crop_aspect'] = crop_aspect
                     except Exception as e:
                         logger.warning(f"RandomResizedCrop failed for {image_path}: {e}, using letterbox instead")
                         # Fallback to letterbox if crop fails
@@ -2189,6 +2211,11 @@ class SimplifiedDataset(Dataset):
                             # Keep pool size bounded
                             if len(self._known_good_indices) > 200:
                                 self._known_good_indices.pop(0)
+
+                # Save metadata for augmentation visualization
+                if vis_dir:
+                    with open(vis_dir / "metadata.json", 'w') as f:
+                        json.dump(metadata, f, indent=2)
 
                 # Package the sample as a dictionary
                 return {
@@ -2325,6 +2352,39 @@ class SimplifiedDataset(Dataset):
         """Cleanup when dataset is destroyed."""
         if hasattr(self, 'background_validator'):
             self.background_validator.stop()
+
+def validate_dataset(dataloader: DataLoader, vocab: TagVocabulary, config: Any, num_batches_to_check: int):
+    """
+    Performs a pre-training validation of the dataset to catch issues early.
+    """
+    logger.info(f"Performing pre-training validation for {num_batches_to_check} batches...")
+
+    for i, batch in enumerate(dataloader):
+        if i >= num_batches_to_check:
+            break
+
+        images = batch['images']
+        tag_labels = batch['tag_labels']
+        rating_labels = batch['rating_labels']
+
+        # Check for non-finite values
+        if not torch.isfinite(images).all():
+            raise ValueError(f"Batch {i} contains non-finite values in images.")
+
+        # Check image dimensions
+        if images.dim() != 4 or images.shape[1] != 3:
+            raise ValueError(f"Batch {i} has incorrect image dimensions: {images.shape}")
+
+        # Check label ranges
+        if not ((tag_labels >= 0) & (tag_labels <= 1)).all():
+            raise ValueError(f"Batch {i} has tag labels out of range [0, 1].")
+
+        num_ratings = len(vocab.rating_to_index)
+        if not ((rating_labels >= 0) & (rating_labels < num_ratings)).all():
+            raise ValueError(f"Batch {i} has rating labels out of range [0, {num_ratings-1}].")
+
+    logger.info("Pre-training validation passed.")
+
 
 def create_dataloaders(
     data_config: DataConfig,
