@@ -122,7 +122,7 @@ data:
   # Orientation mapping (from augmentation.yaml)
   orientation_map_path: "./configs/orientation_map.json"
   strict_orientation_validation: true
-  skip_unmapped: false
+  skip_unmapped: true
   # Orientation flip safety policy.
   # Legacy mapping: strict → conservative, balanced → balanced, lenient → permissive
   orientation_safety_mode: "conservative"
