@@ -295,9 +295,10 @@ def train_with_orientation_tracking(config: FullConfig):
         tag_loss_weight=0.9,
         rating_loss_weight=0.1,
         tag_loss_fn=AsymmetricFocalLoss(
-            gamma_pos=config.training.focal_gamma_pos,
-            gamma_neg=config.training.focal_gamma_neg,
             alpha=config.training.focal_alpha,
+            clip=config.training.focal_clip,
+            gamma_neg=config.training.focal_gamma_neg,
+            gamma_pos=config.training.focal_gamma_pos,
             label_smoothing=config.training.label_smoothing
         )
     )

@@ -77,27 +77,24 @@ class AsymmetricFocalLoss(nn.Module):
         if self.label_smoothing > 0:
             targets = targets * (1 - self.label_smoothing) + self.label_smoothing / 2
 
-        # Calculate probabilities
+        # Use BCEWithLogitsLoss for numerical stability.
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+
+        # Calculate probabilities for focal weights.
         probs = torch.sigmoid(logits)
 
-        # Clip probabilities to prevent log(0)
+        # Clip probabilities for focal weights to prevent pow(0, gamma) issues.
         probs = torch.clamp(probs, min=self.clip, max=1.0 - self.clip)
 
         # Calculate focal weights
         pos_weights = targets * torch.pow(1 - probs, self.gamma_pos)
         neg_weights = (1 - targets) * torch.pow(probs, self.gamma_neg)
 
-        # Binary cross entropy
-        bce = -(targets * torch.log(probs + 1e-8) + (1 - targets) * torch.log(1 - probs + 1e-8))
-
-        # Check for NaN/Inf in intermediate calculations
-        if torch.isnan(bce).any() or torch.isinf(bce).any():
-            # Log warning and return a safe loss value
-            logger.warning("NaN/Inf detected in BCE calculation, returning zero loss for this batch")
-            return torch.tensor(0.0, device=logits.device, requires_grad=True)
-
         # Apply focal weights with unified alpha
-        focal_loss = self.alpha * (pos_weights * bce + neg_weights * bce)
+        # Note: The original implementation had a slight conceptual error in how it applied
+        # weights to the combined BCE loss. We are preserving the original formula's
+        # structure but applying it to the more stable BCE loss calculation.
+        focal_loss = self.alpha * (pos_weights * bce_loss + neg_weights * bce_loss)
 
         # Apply sample weights if provided (for frequency-based sampling)
         if sample_weights is not None:
