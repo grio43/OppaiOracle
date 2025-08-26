@@ -85,9 +85,9 @@ data:
   normalize_mean: [0.5, 0.5, 0.5]  # Anime-optimized (from inference_config.yaml)
   normalize_std: [0.5, 0.5, 0.5]   # Anime-optimized
   pad_color: [114, 114, 114]
-  
+
   # Data loading (from dataloader.yaml)
-  batch_size: 8
+  batch_size: 2  # Reduced to fit within ~31GB GPU memory
   num_workers: 8
   pin_memory: true
   prefetch_factor: 2
@@ -287,7 +287,7 @@ export:
 # These are read by validation_loop.py at runtime.
 validation:
   dataloader:
-    batch_size: 32
+    batch_size: 8  # Lowered to reduce VRAM usage during validation
     num_workers: 8
     prefetch_factor: 2
     persistent_workers: true
