@@ -1160,7 +1160,7 @@ class SimplifiedDataset(Dataset):
             if isinstance(config, DataConfig):
                 # For dataclass, create a new instance with same values
                 config = DataConfig(**{f.name: getattr(config, f.name)
-                                                for f in config.__dataclass_fields__.values()})
+                                                for f in type(config).__dataclass_fields__.values() if f.init})
             else:
                 config = copy.copy(config)
 
