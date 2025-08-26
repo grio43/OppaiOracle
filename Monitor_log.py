@@ -70,6 +70,22 @@ from Configuration_System import MonitorConfig
 logger = logging.getLogger(__name__)
 
 
+# Discord Webhook constants
+MAX_CONTENT = 2000
+MAX_TITLE = 256
+MAX_DESC = 4096
+MAX_FIELDS = 25
+MAX_FIELD_NAME = 256
+MAX_FIELD_VALUE = 1024
+
+def trim(s: str, n: int) -> str:
+    """Trim a string to a max length, adding an ellipsis if truncated."""
+    if s is None:
+        return None
+    s = str(s)
+    return s if len(s) <= n else s[:n-1] + '…'
+
+
 class AlertSystem:
     """System for sending alerts and notifications"""
     
@@ -124,25 +140,40 @@ class AlertSystem:
         thread.start()
 
     def _execute_webhook_in_thread(self, alert: dict):
-        """Send alert to webhook (Slack/Discord compatible) in a thread."""
+        """Send alert to webhook (Discord optimized) in a thread."""
         try:
             import requests
             
-            # Format for common webhook formats
+            title = f"[{alert['severity'].upper()}] {alert['title']}"
+            description = alert['message']
+
+            fields = [
+                {"name": "Time", "value": alert['timestamp'], "inline": True},
+                {"name": "Occurrence", "value": str(alert['count']), "inline": True},
+            ]
+
+            embed = {
+                "title": trim(title, MAX_TITLE),
+                "description": trim(description, MAX_DESC),
+                "color": int(self._get_severity_color(alert['severity']).lstrip('#'), 16),
+                "fields": [
+                    {
+                        "name": trim(f["name"], MAX_FIELD_NAME),
+                        "value": trim(f["value"], MAX_FIELD_VALUE),
+                        "inline": bool(f.get("inline", False)),
+                    }
+                    for f in fields
+                ][:MAX_FIELDS],
+                "timestamp": datetime.now().isoformat()
+            }
+
             payload = {
-                'text': f"**{alert['severity'].upper()}**: {alert['title']}",
-                'attachments': [{
-                    'color': self._get_severity_color(alert['severity']),
-                    'fields': [
-                        {'title': 'Message', 'value': alert['message']},
-                        {'title': 'Time', 'value': alert['timestamp']},
-                        {'title': 'Occurrence', 'value': str(alert['count'])}
-                    ]
-                }]
+                "content": trim(f"Training Alert: {alert['title']}", MAX_CONTENT),
+                "embeds": [embed],
             }
             
             response = requests.post(self.config.alert_webhook_url, json=payload, timeout=10)
-            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+            response.raise_for_status()
         except Exception as e:
             logger.error(f"Failed to send webhook alert for '{alert['title']}': {e}")
     
