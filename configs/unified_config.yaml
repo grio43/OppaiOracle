@@ -305,3 +305,42 @@ validation:
     normalize_std:  [0.229, 0.224, 0.225]
     image_size: 640
     patch_size: 16
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Monitoring & Alerts
+# Configures the monitoring system, including alerts for training events.
+monitor:
+  log_level: "INFO"
+  log_to_file: true
+  log_to_console: true
+
+  # System resource tracking
+  track_system_metrics: true
+  system_metrics_interval: 30.0
+  track_gpu_metrics: true
+  track_disk_io: true
+  track_network_io: false
+
+  # Visualization
+  # Note: These are often overridden by the training config for convenience
+  use_tensorboard: true
+  tensorboard_dir: "./tensorboard"
+  use_wandb: false
+  wandb_project: "anime-tagger"
+  wandb_entity: null
+  wandb_run_name: null
+
+  # Alerts
+  enable_alerts: true
+  alert_on_gpu_memory_threshold: 0.9
+  alert_on_cpu_memory_threshold: 0.9
+  alert_on_disk_space_threshold: 0.95
+  alert_on_training_stuck_minutes: 30
+  alert_on_loss_explosion: 10.0
+  alert_on_nan_loss: true
+  # --------------------------------------------------------------------
+  # --- WEBHOOK REVIEW POINT ---
+  # This is the new field for the Discord webhook URL.
+  # Replace "your_webhook_url_here" with your actual Discord webhook URL.
+  alert_webhook_url: "your_webhook_url_here"
+  # --------------------------------------------------------------------
