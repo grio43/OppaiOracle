@@ -557,6 +557,7 @@ class TrainingConfig(BaseConfig):
     focal_gamma_pos: float = 0.0
     focal_gamma_neg: float = 4.0
     focal_alpha: float = 0.75  # Unified weight for focal loss
+    focal_clip: float = 0.05  # Clipping parameter for focal loss to prevent pow(0, gamma)
     label_smoothing: float = 0.1
     use_class_weights: bool = True
 

@@ -169,6 +169,7 @@ training:
   focal_gamma_pos: 0.0
   focal_gamma_neg: 4.0
   focal_alpha: 0.75  # Unified alpha weight
+  focal_clip: 0.05
   label_smoothing: 0.1
   use_class_weights: true
   
