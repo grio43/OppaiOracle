@@ -185,6 +185,12 @@ def train_with_orientation_tracking(config: FullConfig):
     
     # Seeding & determinism
     seed, deterministic_mode = setup_seed(config.training.seed, config.training.deterministic)
+
+    # Enable anomaly detection if configured (for debugging NaN gradients)
+    if getattr(config.training, 'detect_anomaly', False):
+        logger.warning("PyTorch anomaly detection is enabled. This will slow down training.")
+        torch.autograd.set_detect_anomaly(True)
+
     try:
         torch.use_deterministic_algorithms(deterministic_mode)
     except Exception:
@@ -379,6 +385,8 @@ def train_with_orientation_tracking(config: FullConfig):
                     pass
                 scaler.unscale_(optimizer)
 
+                # Clip gradients to prevent exploding gradients, a common cause of NaN loss.
+                # A max_grad_norm of 1.0 to 5.0 is a common best practice.
                 if config.training.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
 
