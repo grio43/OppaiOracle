@@ -635,6 +635,9 @@ class TrainingConfig(BaseConfig):
         if not 0 <= self.focal_alpha <= 1:
             errors.append(f"focal_alpha must be in [0, 1], got {self.focal_alpha}")
 
+        if not 0 <= self.focal_clip < 0.5:
+            errors.append(f"focal_clip must be in [0, 0.5), got {self.focal_clip}")
+
         # Validate focal loss gamma parameters
         if self.focal_gamma_pos < 0:
             errors.append(f"focal_gamma_pos must be >= 0, got {self.focal_gamma_pos}")
