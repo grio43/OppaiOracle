@@ -104,8 +104,7 @@ class InferenceConfig:
     # Inference settings
     threshold: float = 0.5
     top_k: int = 10
-    use_fp16: bool = True
-    precision: str = "bfloat16"  # Add precision setting: "fp32", "fp16", "bf16"
+    precision: str = "bf16"  # Add precision setting: "fp32", "fp16", "bf16"
     use_torch_compile: bool = False
     thresholds_path: Optional[str] = None
     eye_color_exclusive: bool = False
@@ -147,7 +146,6 @@ class InferenceConfig:
             "normalize_mean": pp.get("normalize_mean"),
             "normalize_std": pp.get("normalize_std"),
             "device": rt.get("device"),
-            "use_fp16": rt.get("use_fp16"),
             "tta_flip": rt.get("tta_flip"),
             "threshold": post.get("threshold"),
             "top_k": post.get("top_k"),
@@ -173,7 +171,6 @@ try:
     unified_config = load_config(PROJECT_ROOT / "configs" / "unified_config.yaml")
     if unified_config and unified_config.inference:
         InferenceConfig.precision = unified_config.inference.get("precision", InferenceConfig.precision)
-        InferenceConfig.use_fp16 = unified_config.inference.get("use_fp16", InferenceConfig.use_fp16)
         logger.info(f"Loaded precision '{InferenceConfig.precision}' from unified_config.yaml")
 except Exception as e:
     logger.warning(f"Could not load settings from unified_config.yaml: {e}")
@@ -395,15 +392,15 @@ class ModelWrapper:
             
             # Setup mixed precision
             if self.config.device == 'cuda':
-                if self.config.precision == "fp16" or (self.config.use_fp16 and self.config.precision not in ["bf16", "fp32"]):
+                if self.config.precision == "fp16":
                     logger.info("Using fp16 for inference.")
                     self.model = self.model.half()
                 elif self.config.precision == "bf16":
                     if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
-                        logger.info("Using bfloat16 for inference.")
+                        logger.info("Using bf16 for inference.")
                         self.model = self.model.to(torch.bfloat16)
                     else:
-                        logger.warning("bfloat16 not supported on this device, falling back to float32.")
+                        logger.warning("bf16 not supported on this device, falling back to float32.")
                 else:
                     logger.info("Using float32 for inference.")
             
