@@ -31,8 +31,9 @@ def ensure_pixel_padding_mask(mask: torch.Tensor) -> Optional[torch.Tensor]:
     B = mask.shape[0]
     frac_true = mask.flatten(1).float().mean(dim=1)  # per-sample fraction
     # If most samples are mostly True, it's almost surely "valid" -> invert
-    if torch.median(frac_true) > 0.5:
-        mask = ~mask
+    # Use torch.where to make this tracer-friendly
+    should_invert = torch.median(frac_true) > 0.5
+    mask = torch.where(should_invert, ~mask, mask)
     return mask
 
 @torch.no_grad()
@@ -42,16 +43,18 @@ def pixel_to_token_ignore(mask_b1hw: torch.Tensor, patch: int, threshold: float 
     Pools pad-fraction per patch via avg_pool2d(kernel=stride=patch) and marks
     tokens IGNORE when pad_fraction >= threshold.
     """
-    if mask_b1hw.dim() != 4 or mask_b1hw.size(1) != 1:
-        raise ValueError(f"Expected (B,1,H,W) bool, got {tuple(mask_b1hw.shape)}")
-    if mask_b1hw.dtype is not torch.bool:
-        raise ValueError("mask_b1hw must be bool with True=PAD")
+    # These checks are not tracer-friendly, so we disable them during tracing.
+    if not torch.jit.is_tracing():
+        if mask_b1hw.dim() != 4 or mask_b1hw.size(1) != 1:
+            raise ValueError(f"Expected (B,1,H,W) bool, got {tuple(mask_b1hw.shape)}")
+        if mask_b1hw.dtype is not torch.bool:
+            raise ValueError("mask_b1hw must be bool with True=PAD")
 
-    B, _, H, W = mask_b1hw.shape  # Fixed typo: was mask*b1hw.shape
-    if H % patch != 0 or W % patch != 0:
-        raise AssertionError(
-            f"Image size (H={H},W={W}) must be divisible by patch={patch} before pooling."
-        )
+        B, _, H, W = mask_b1hw.shape
+        if H % patch != 0 or W % patch != 0:
+            raise AssertionError(
+                f"Image size (H={H},W={W}) must be divisible by patch={patch} before pooling."
+            )
     # pad_fraction per patch
     pad_frac = F.avg_pool2d(mask_b1hw.float(), kernel_size=patch, stride=patch)  # (B,1,GH,GW)
     ignore = (pad_frac.squeeze(1) >= threshold)                                   # (B,GH,GW)
