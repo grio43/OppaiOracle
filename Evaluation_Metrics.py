@@ -1411,8 +1411,9 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
+    from utils.logging_setup import setup_logging
     # Test metrics computation with improved test case
-    logging.basicConfig(level=logging.INFO)
+    listener = setup_logging(log_level="INFO")
     logger.info("Testing improved metrics computation...")
     
     # Create more realistic dummy data
@@ -1471,3 +1472,6 @@ if __name__ == "__main__":
         print(f"\nError during test: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        if listener:
+            listener.stop()

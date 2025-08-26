@@ -118,142 +118,127 @@ def _preprocess_simple(image_path: str, image_size: int, mean, std):
 
 
 def main():
-    # Load unified config to get defaults
+    from utils.logging_setup import setup_logging
+    listener = setup_logging()
+
     try:
-        manager = ConfigManager(config_type=ConfigType.FULL)
-        unified_config = manager.load_from_file("configs/unified_config.yaml")
-        log_cfg = unified_config
-        infer_cfg = unified_config.inference
-        data_cfg = unified_config.data
-    except Exception as e:
-        # Fallback to basic logging if config fails
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        logger.error(f"Could not load unified_config.yaml: {e}. Using basic logging and default settings.")
-        # Create dummy configs to avoid crashing
-        from dataclasses import dataclass
-        @dataclass
-        class Dummy:
-            def __getattr__(self, name):
-                if name == 'prediction_threshold': return 0.0
-                if name == 'top_k': return 5
-                return None
-        infer_cfg = Dummy()
-        log_cfg = Dummy()
-        data_cfg = Dummy()
-
-    # Setup logging from unified config
-    level = getattr(logging, str(log_cfg.log_level or 'INFO').upper(), logging.INFO)
-    fmt = log_cfg.log_format or '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    logging.basicConfig(level=level, format=fmt)
-    if getattr(log_cfg, 'file_logging_enabled', False):
-        log_dir = Path(log_cfg.log_dir or './logs')
-        log_dir.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
-            log_dir / 'onnx_infer.log',
-            maxBytes=log_cfg.log_rotation_max_bytes or (10*1024*1024),
-            backupCount=log_cfg.log_rotation_backups or 5,
-        )
-        handler.setFormatter(logging.Formatter(fmt))
-        handler.setLevel(level)
-        logging.getLogger().addHandler(handler)
-
-    parser = argparse.ArgumentParser(description='ONNX inference with embedded vocab')
-    parser.add_argument('model', type=str, help='Path to ONNX model')
-    parser.add_argument('images', nargs='+', help='Image paths')
-    parser.add_argument('--top_k', type=int, default=infer_cfg.top_k, help=f"Default: {infer_cfg.top_k}")
-    parser.add_argument('--threshold', type=float, default=infer_cfg.prediction_threshold, help=f"Default: {infer_cfg.prediction_threshold}")
-    parser.add_argument('--output', type=str, help='Output JSON file')
-    parser.add_argument('--vocab', type=str, help='External vocabulary file (if not embedded and model is old)')
-    parser.add_argument('--providers', nargs='*', default=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-    args = parser.parse_args()
-
-    # Explicitly specify providers for better control
-    providers = args.providers or ['CUDAExecutionProvider', 'CPUExecutionProvider']
-    session = ort.InferenceSession(
-        args.model,
-        providers=providers
-    )
-    logger.info(f"Using providers: {session.get_providers()}")
-
-    # Load metadata - this contains the vocabulary
-    vocab, mean, std, image_size, patch_size, meta = _load_metadata(session)
-    vocab_embedded = True
-
-    if vocab is None:
-        # Fallback for old models without embedded vocab
-        if not args.vocab:
-            raise RuntimeError(
-                "Model lacks embedded vocabulary and no --vocab file provided. "
-                "Please specify vocabulary with --vocab vocabulary.json"
-            )
-        vocab = TagVocabulary(Path(args.vocab))
-        verify_vocabulary_integrity(vocab, Path(args.vocab))
-        vocab_embedded = False
-
-    input_name = session.get_inputs()[0].name
-    input_info = session.get_inputs()[0]
-    logger.info(f"Model expects input '{input_name}' with type: {input_info.type}")
-
-    results = []
-    for path in args.images:
-        start = time.time()
+        # Load unified config to get defaults
         try:
-            # Preprocessing now returns a flag for compositing
-            inp, was_composited = _preprocess(path)
+            manager = ConfigManager(config_type=ConfigType.FULL)
+            unified_config = manager.load_from_file("configs/unified_config.yaml")
+            infer_cfg = unified_config.inference
         except Exception as e:
-            logger.error(f"Preprocessing failed for {path}: {e}")
-            continue
+            logger.warning(f"Could not load unified_config.yaml: {e}. Using default settings.")
+            # Create dummy configs to avoid crashing
+            from dataclasses import dataclass
+            @dataclass
+            class Dummy:
+                def __getattr__(self, name):
+                    if name == 'prediction_threshold': return 0.0
+                    if name == 'top_k': return 5
+                    return None
+            infer_cfg = Dummy()
 
-        outputs = session.run(None, {input_name: inp})
+        parser = argparse.ArgumentParser(description='ONNX inference with embedded vocab')
+        parser.add_argument('model', type=str, help='Path to ONNX model')
+        parser.add_argument('images', nargs='+', help='Image paths')
+        parser.add_argument('--top_k', type=int, default=infer_cfg.top_k, help=f"Default: {infer_cfg.top_k}")
+        parser.add_argument('--threshold', type=float, default=infer_cfg.prediction_threshold, help=f"Default: {infer_cfg.prediction_threshold}")
+        parser.add_argument('--output', type=str, help='Output JSON file')
+        parser.add_argument('--vocab', type=str, help='External vocabulary file (if not embedded and model is old)')
+        parser.add_argument('--providers', nargs='*', default=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        args = parser.parse_args()
 
-        if len(outputs) == 1:
-            scores = outputs[0][0]
-        else:
-            scores = outputs[-1][0]
+        # Explicitly specify providers for better control
+        providers = args.providers or ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        session = ort.InferenceSession(
+            args.model,
+            providers=providers
+        )
+        logger.info(f"Using providers: {session.get_providers()}")
 
-        idxs = np.argsort(scores)[::-1][:args.top_k]
-        tags = []
-        for idx in idxs:
-            score = float(scores[idx])
-            if score < args.threshold:
+        # Load metadata - this contains the vocabulary
+        vocab, mean, std, image_size, patch_size, meta = _load_metadata(session)
+        vocab_embedded = True
+
+        if vocab is None:
+            # Fallback for old models without embedded vocab
+            if not args.vocab:
+                raise RuntimeError(
+                    "Model lacks embedded vocabulary and no --vocab file provided. "
+                    "Please specify vocabulary with --vocab vocabulary.json"
+                )
+            vocab = TagVocabulary(Path(args.vocab))
+            verify_vocabulary_integrity(vocab, Path(args.vocab))
+            vocab_embedded = False
+
+        input_name = session.get_inputs()[0].name
+        input_info = session.get_inputs()[0]
+        logger.info(f"Model expects input '{input_name}' with type: {input_info.type}")
+
+        results = []
+        for path in args.images:
+            start = time.time()
+            try:
+                # Preprocessing now returns a flag for compositing
+                inp, was_composited = _preprocess(path)
+            except Exception as e:
+                logger.error(f"Preprocessing failed for {path}: {e}")
                 continue
-            tag_name = vocab.get_tag_from_index(int(idx))
-            tags.append(TagPrediction(name=tag_name, score=score))
 
-        # Conditionally filter the gray_background tag if we added it
-        if was_composited:
-            tags = [tag for tag in tags if tag.name != 'gray_background']
+            outputs = session.run(None, {input_name: inp})
 
-        results.append(ImagePrediction(
-            image=path,
-            tags=tags,
-            processing_time=int((time.time() - start) * 1000)
-        ))
+            if len(outputs) == 1:
+                scores = outputs[0][0]
+            else:
+                scores = outputs[-1][0]
 
-    metadata = RunMetadata(
-        top_k=args.top_k,
-        threshold=args.threshold,
-        vocab_sha256=meta.get('vocab_sha256', 'unknown'),
-        normalize_mean=mean,
-        normalize_std=std,
-        image_size=image_size,
-        patch_size=patch_size,
-        model_path=args.model,
-        num_tags=len(vocab.tags) if hasattr(vocab, 'tags') else None,
-        vocab_embedded=vocab_embedded
-    )
+            idxs = np.argsort(scores)[::-1][:args.top_k]
+            tags = []
+            for idx in idxs:
+                score = float(scores[idx])
+                if score < args.threshold:
+                    continue
+                tag_name = vocab.get_tag_from_index(int(idx))
+                tags.append(TagPrediction(name=tag_name, score=score))
 
-    if vocab_embedded:
-        print(f"Using embedded vocabulary metadata from model", file=sys.stderr)
-    else:
-        print(f"Using external vocabulary from {args.vocab}", file=sys.stderr)
+            # Conditionally filter the gray_background tag if we added it
+            if was_composited:
+                tags = [tag for tag in tags if tag.name != 'gray_background']
 
-    output = PredictionOutput(metadata=metadata, results=results)
+            results.append(ImagePrediction(
+                image=path,
+                tags=tags,
+                processing_time=int((time.time() - start) * 1000)
+            ))
 
-    if args.output:
-        output.save(Path(args.output))
-    else:
-        print(output.to_json())
+        metadata = RunMetadata(
+            top_k=args.top_k,
+            threshold=args.threshold,
+            vocab_sha256=meta.get('vocab_sha256', 'unknown'),
+            normalize_mean=mean,
+            normalize_std=std,
+            image_size=image_size,
+            patch_size=patch_size,
+            model_path=args.model,
+            num_tags=len(vocab.tags) if hasattr(vocab, 'tags') else None,
+            vocab_embedded=vocab_embedded
+        )
+
+        if vocab_embedded:
+            print(f"Using embedded vocabulary metadata from model", file=sys.stderr)
+        else:
+            print(f"Using external vocabulary from {args.vocab}", file=sys.stderr)
+
+        output = PredictionOutput(metadata=metadata, results=results)
+
+        if args.output:
+            output.save(Path(args.output))
+        else:
+            print(output.to_json())
+    finally:
+        if listener:
+            listener.stop()
 
 
 if __name__ == '__main__':
