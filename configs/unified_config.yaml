@@ -87,7 +87,7 @@ data:
   pad_color: [114, 114, 114]
   
   # Data loading (from dataloader.yaml)
-  batch_size: 16
+  batch_size: 8
   num_workers: 8
   pin_memory: true
   prefetch_factor: 2
@@ -287,7 +287,7 @@ export:
 # These are read by validation_loop.py at runtime.
 validation:
   dataloader:
-    batch_size: 64
+    batch_size: 32
     num_workers: 8
     prefetch_factor: 2
     persistent_workers: true
