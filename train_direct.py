@@ -5,7 +5,6 @@ Demonstrates integration of the orientation handler with fail-fast behavior and 
 """
 
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import hashlib
 import json
@@ -29,6 +28,7 @@ from Monitor_log import MonitorConfig, TrainingMonitor
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 from Configuration_System import load_config, create_config_parser, FullConfig
+from utils.logging_setup import setup_logging
 
 # Paths will be loaded from the unified config in the main function.
 logger = logging.getLogger(__name__)
@@ -237,32 +237,6 @@ def train_with_orientation_tracking(config: FullConfig):
     except Exception:
         pass
 
-    # Set up log directory
-    log_dir = Path(config.log_dir or "./logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    os.environ['OPPAI_LOG_DIR'] = str(log_dir)
-    logger.info(f"Log directory: {log_dir}")
-
-    log_queue = mp.Queue(maxsize=5000)
-
-    is_primary = not dist.is_initialized() or dist.get_rank() == 0 if dist.is_available() else True
-
-    _listener = None
-    if is_primary:
-        from HDF5_loader import CompressingRotatingFileHandler
-        fh = CompressingRotatingFileHandler(
-            log_dir / 'training.log',
-            maxBytes=config.log_rotation_max_bytes,
-            backupCount=config.log_rotation_backups,
-            compress=True
-        )
-        formatter = logging.Formatter(config.log_format)
-        fh.setFormatter(formatter)
-        fh.setLevel(getattr(logging, config.log_level, logging.INFO))
-        _listener = logging.handlers.QueueListener(log_queue, fh, respect_handler_level=True)
-        _listener.start()
-
     # Find the active data path from storage_locations
     active_location = next((loc for loc in config.data.storage_locations if loc.get('enabled')), None)
 
@@ -305,7 +279,6 @@ def train_with_orientation_tracking(config: FullConfig):
         rank=config.training.local_rank,
         world_size=config.training.world_size,
         seed=seed,
-        log_queue=log_queue,
     )
 
     # Pre-training validation
@@ -336,7 +309,7 @@ def train_with_orientation_tracking(config: FullConfig):
         # In case the config file is old and doesn't have a monitor section
         config.monitor = MonitorConfig()
 
-    config.monitor.log_dir = str(log_dir)
+    config.monitor.log_dir = config.log_dir
     config.monitor.use_tensorboard = config.training.use_tensorboard
     config.monitor.tensorboard_dir = str(Path(config.output_root) / config.experiment_name)
     config.monitor.use_wandb = config.training.use_wandb
@@ -574,8 +547,6 @@ def train_with_orientation_tracking(config: FullConfig):
         pass
 
     monitor.close()
-    if _listener:
-        _listener.stop()
 
 
 def validate_orientation_mappings():
@@ -591,20 +562,14 @@ def main():
     config = load_config(args.config, args=args)
 
     # Setup logging
-    level = getattr(logging, config.log_level, logging.INFO)
-    fmt = config.log_format
-    logging.basicConfig(level=level, format=fmt)
-
-    if config.file_logging_enabled:
-        log_dir = Path(config.log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
-            log_dir / 'train_direct.log',
-            maxBytes=config.log_rotation_max_bytes,
-            backupCount=config.log_rotation_backups,
-        )
-        handler.setFormatter(logging.Formatter(fmt))
-        logging.getLogger().addHandler(handler)
+    listener = setup_logging(
+        log_level=config.log_level,
+        log_dir=config.log_dir,
+        log_to_file=config.file_logging_enabled,
+        json_console=True, # Or get from config if you add it
+        rank=config.training.local_rank,
+        world_size=config.training.world_size,
+    )
 
     if args.validate_only:
         try:
@@ -615,7 +580,11 @@ def main():
             logger.error(f"Configuration validation failed: {e}")
             sys.exit(1)
 
-    train_with_orientation_tracking(config)
+    try:
+        train_with_orientation_tracking(config)
+    finally:
+        if listener:
+            listener.stop()
 
 
 if __name__ == "__main__":

@@ -80,7 +80,6 @@ except ImportError:
 
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -1242,64 +1241,71 @@ class DatasetAnalyzer:
 def main():
     """Main function for command-line usage"""
     import argparse
+    from utils.logging_setup import setup_logging
     
-    parser = argparse.ArgumentParser(description='Analyze anime image dataset')
-    parser.add_argument('dataset_paths', nargs='+', help='Paths to dataset directories or images')
-    parser.add_argument('--output-dir', default='./dataset_analysis', help='Output directory for results')
-    parser.add_argument('--cache-dir', default='./analysis_cache', help='Cache directory')
-    parser.add_argument('--sample-size', type=int, help='Sample size for image analysis')
-    parser.add_argument('--num-workers', type=int, default=8, help='Number of parallel workers')
-    parser.add_argument('--no-images', action='store_true', help='Skip image analysis')
-    parser.add_argument('--no-tags', action='store_true', help='Skip tag analysis')
-    parser.add_argument('--no-duplicates', action='store_true', help='Skip duplicate detection')
-    parser.add_argument('--no-visualizations', action='store_true', help='Skip creating visualizations')
-    parser.add_argument('--report-format', choices=['html', 'markdown', 'json'], default='html', help='Report format')
-    parser.add_argument('--use-cache', action='store_true', help='Use cached results if available')
-    
-    args = parser.parse_args()
-    
-    # Create configuration
-    config = AnalysisConfig(
-        dataset_paths=args.dataset_paths,
-        output_dir=args.output_dir,
-        cache_dir=args.cache_dir,
-        sample_size_for_stats=args.sample_size,
-        num_workers=args.num_workers,
-        analyze_images=not args.no_images,
-        analyze_tags=not args.no_tags,
-        analyze_duplicates=not args.no_duplicates,
-        create_visualizations=not args.no_visualizations,
-        report_format=args.report_format
-    )
-    
-    # Create analyzer
-    analyzer = DatasetAnalyzer(config)
-    
-    # Load cache if requested
-    if args.use_cache and analyzer.load_cache():
-        logger.info("Using cached results")
-        # Still generate visualizations and report
-        if config.create_visualizations:
-            analyzer._create_visualizations()
-        if config.generate_report:
-            analyzer._generate_report()
-    else:
-        # Run analysis
-        stats = analyzer.analyze_dataset()
+    listener = setup_logging()
+
+    try:
+        parser = argparse.ArgumentParser(description='Analyze anime image dataset')
+        parser.add_argument('dataset_paths', nargs='+', help='Paths to dataset directories or images')
+        parser.add_argument('--output-dir', default='./dataset_analysis', help='Output directory for results')
+        parser.add_argument('--cache-dir', default='./analysis_cache', help='Cache directory')
+        parser.add_argument('--sample-size', type=int, help='Sample size for image analysis')
+        parser.add_argument('--num-workers', type=int, default=8, help='Number of parallel workers')
+        parser.add_argument('--no-images', action='store_true', help='Skip image analysis')
+        parser.add_argument('--no-tags', action='store_true', help='Skip tag analysis')
+        parser.add_argument('--no-duplicates', action='store_true', help='Skip duplicate detection')
+        parser.add_argument('--no-visualizations', action='store_true', help='Skip creating visualizations')
+        parser.add_argument('--report-format', choices=['html', 'markdown', 'json'], default='html', help='Report format')
+        parser.add_argument('--use-cache', action='store_true', help='Use cached results if available')
         
-        # Save cache
-        analyzer.save_cache()
-    
-    # Print summary
-    print("\n" + "="*50)
-    print("ANALYSIS COMPLETE")
-    print("="*50)
-    print(f"Total Images: {analyzer.dataset_stats.total_images:,}")
-    print(f"Unique Tags: {analyzer.dataset_stats.unique_tags:,}")
-    print(f"Corrupted Images: {analyzer.dataset_stats.corrupted_images}")
-    print(f"Duplicate Images: {analyzer.dataset_stats.duplicate_images}")
-    print(f"Analysis Duration: {analyzer.dataset_stats.analysis_duration_seconds:.2f}s")
-    print(f"\nResults saved to: {analyzer.output_dir}")
+        args = parser.parse_args()
+
+        # Create configuration
+        config = AnalysisConfig(
+            dataset_paths=args.dataset_paths,
+            output_dir=args.output_dir,
+            cache_dir=args.cache_dir,
+            sample_size_for_stats=args.sample_size,
+            num_workers=args.num_workers,
+            analyze_images=not args.no_images,
+            analyze_tags=not args.no_tags,
+            analyze_duplicates=not args.no_duplicates,
+            create_visualizations=not args.no_visualizations,
+            report_format=args.report_format
+        )
+
+        # Create analyzer
+        analyzer = DatasetAnalyzer(config)
+
+        # Load cache if requested
+        if args.use_cache and analyzer.load_cache():
+            logger.info("Using cached results")
+            # Still generate visualizations and report
+            if config.create_visualizations:
+                analyzer._create_visualizations()
+            if config.generate_report:
+                analyzer._generate_report()
+        else:
+            # Run analysis
+            stats = analyzer.analyze_dataset()
+
+            # Save cache
+            analyzer.save_cache()
+
+        # Print summary
+        print("\n" + "="*50)
+        print("ANALYSIS COMPLETE")
+        print("="*50)
+        print(f"Total Images: {analyzer.dataset_stats.total_images:,}")
+        print(f"Unique Tags: {analyzer.dataset_stats.unique_tags:,}")
+        print(f"Corrupted Images: {analyzer.dataset_stats.corrupted_images}")
+        print(f"Duplicate Images: {analyzer.dataset_stats.duplicate_images}")
+        print(f"Analysis Duration: {analyzer.dataset_stats.analysis_duration_seconds:.2f}s")
+        print(f"\nResults saved to: {analyzer.output_dir}")
+    finally:
+        if listener:
+            listener.stop()
 
 
 if __name__ == "__main__":

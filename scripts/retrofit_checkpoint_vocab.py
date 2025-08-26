@@ -16,7 +16,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from model_metadata import ModelMetadata
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -90,30 +89,37 @@ def retrofit_checkpoint(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Retrofit checkpoints with embedded vocabulary')
-    parser.add_argument('checkpoint', type=str, help='Path to checkpoint file')
-    parser.add_argument('vocabulary', type=str, help='Path to vocabulary.json file')
-    parser.add_argument('-o', '--output', type=str, help='Output path (default: adds _retrofitted suffix)')
-    parser.add_argument('--normalize-mean', nargs=3, type=float, default=[0.5, 0.5, 0.5])
-    parser.add_argument('--normalize-std', nargs=3, type=float, default=[0.5, 0.5, 0.5])
-    parser.add_argument('--image-size', type=int, default=640)
-    parser.add_argument('--patch-size', type=int, default=16)
-    parser.add_argument('--force', action='store_true', help='Overwrite existing embedded vocabulary')
+    from utils.logging_setup import setup_logging
+    listener = setup_logging()
 
-    args = parser.parse_args()
+    try:
+        parser = argparse.ArgumentParser(description='Retrofit checkpoints with embedded vocabulary')
+        parser.add_argument('checkpoint', type=str, help='Path to checkpoint file')
+        parser.add_argument('vocabulary', type=str, help='Path to vocabulary.json file')
+        parser.add_argument('-o', '--output', type=str, help='Output path (default: adds _retrofitted suffix)')
+        parser.add_argument('--normalize-mean', nargs=3, type=float, default=[0.5, 0.5, 0.5])
+        parser.add_argument('--normalize-std', nargs=3, type=float, default=[0.5, 0.5, 0.5])
+        parser.add_argument('--image-size', type=int, default=640)
+        parser.add_argument('--patch-size', type=int, default=16)
+        parser.add_argument('--force', action='store_true', help='Overwrite existing embedded vocabulary')
 
-    success = retrofit_checkpoint(
-        checkpoint_path=Path(args.checkpoint),
-        vocab_path=Path(args.vocabulary),
-        output_path=Path(args.output) if args.output else None,
-        normalize_mean=tuple(args.normalize_mean),
-        normalize_std=tuple(args.normalize_std),
-        image_size=args.image_size,
-        patch_size=args.patch_size,
-        force=args.force
-    )
+        args = parser.parse_args()
 
-    sys.exit(0 if success else 1)
+        success = retrofit_checkpoint(
+            checkpoint_path=Path(args.checkpoint),
+            vocab_path=Path(args.vocabulary),
+            output_path=Path(args.output) if args.output else None,
+            normalize_mean=tuple(args.normalize_mean),
+            normalize_std=tuple(args.normalize_std),
+            image_size=args.image_size,
+            patch_size=args.patch_size,
+            force=args.force
+        )
+
+        sys.exit(0 if success else 1)
+    finally:
+        if listener:
+            listener.stop()
 
 
 if __name__ == '__main__':

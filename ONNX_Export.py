@@ -55,10 +55,6 @@ from vocabulary import load_vocabulary_for_training, TagVocabulary
 
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
@@ -1151,103 +1147,110 @@ class ONNXExporter:
 def main():
     """Main entry point for ONNX export"""
     import argparse
+    from utils.logging_setup import setup_logging
 
-    # Load unified config first to get defaults
+    listener = setup_logging()
+
     try:
-        manager = ConfigManager(config_type=ConfigType.FULL)
-        unified_config = manager.load_from_file("configs/unified_config.yaml")
-        export_cfg = unified_config.export
-        data_cfg = unified_config.data
-        model_cfg = unified_config.model
-    except Exception as e:
-        logger.error(f"Could not load unified_config.yaml: {e}. Cannot proceed without configuration.")
-        sys.exit(1)
+        # Load unified config first to get defaults
+        try:
+            manager = ConfigManager(config_type=ConfigType.FULL)
+            unified_config = manager.load_from_file("configs/unified_config.yaml")
+            export_cfg = unified_config.export
+            data_cfg = unified_config.data
+            model_cfg = unified_config.model
+        except Exception as e:
+            logger.error(f"Could not load unified_config.yaml: {e}. Cannot proceed without configuration.")
+            sys.exit(1)
 
-    parser = argparse.ArgumentParser(description='Export Anime Tagger model to ONNX')
-    parser.add_argument('checkpoint', type=str, help='Path to model checkpoint')
-    parser.add_argument('vocab_dir', type=str, nargs='?', default=None, help='Path to vocabulary directory or file')
-    parser.add_argument('-o', '--output', type=str, default=None, help=f'Output ONNX model path (default: {export_cfg.output_path})')
-    parser.add_argument('-b', '--batch-size', type=int, default=1, help='Batch size for export (for dummy input)')
-    parser.add_argument('-s', '--image-size', type=int, default=None, help=f'Input image size (default: {data_cfg.image_size})')
-    parser.add_argument('--opset', type=int, default=None, help=f'ONNX opset version (default: {export_cfg.opset_version})')
-    parser.add_argument('--variants', nargs='+', default=['full'], choices=['full', 'quantized'], help='Export variants to generate')
-    parser.add_argument('--optimize', action='store_true', default=None, help='Optimize exported model')
-    parser.add_argument('--no-optimize', action='store_true', default=None, help='Do not optimize exported model')
-    parser.add_argument('--quantize', action='store_true', default=None, help='Enable quantization')
-    parser.add_argument('--quantization-type', type=str, default=None, choices=['dynamic', 'static'], help=f'Quantization type (default: {export_cfg.quantization_type})')
-    parser.add_argument('--no-validate', action='store_true', default=None, help='Skip validation')
-    parser.add_argument('--benchmark', action='store_true', help='Run benchmark after export')
-    parser.add_argument('--benchmark-runs', type=int, default=100, help='Number of benchmark iterations')
-    
-    args = parser.parse_args()
+        parser = argparse.ArgumentParser(description='Export Anime Tagger model to ONNX')
+        parser.add_argument('checkpoint', type=str, help='Path to model checkpoint')
+        parser.add_argument('vocab_dir', type=str, nargs='?', default=None, help='Path to vocabulary directory or file')
+        parser.add_argument('-o', '--output', type=str, default=None, help=f'Output ONNX model path (default: {export_cfg.output_path})')
+        parser.add_argument('-b', '--batch-size', type=int, default=1, help='Batch size for export (for dummy input)')
+        parser.add_argument('-s', '--image-size', type=int, default=None, help=f'Input image size (default: {data_cfg.image_size})')
+        parser.add_argument('--opset', type=int, default=None, help=f'ONNX opset version (default: {export_cfg.opset_version})')
+        parser.add_argument('--variants', nargs='+', default=['full'], choices=['full', 'quantized'], help='Export variants to generate')
+        parser.add_argument('--optimize', action='store_true', default=None, help='Optimize exported model')
+        parser.add_argument('--no-optimize', action='store_true', default=None, help='Do not optimize exported model')
+        parser.add_argument('--quantize', action='store_true', default=None, help='Enable quantization')
+        parser.add_argument('--quantization-type', type=str, default=None, choices=['dynamic', 'static'], help=f'Quantization type (default: {export_cfg.quantization_type})')
+        parser.add_argument('--no-validate', action='store_true', default=None, help='Skip validation')
+        parser.add_argument('--benchmark', action='store_true', help='Run benchmark after export')
+        parser.add_argument('--benchmark-runs', type=int, default=100, help='Number of benchmark iterations')
 
-    # Verify checkpoint exists
-    if not Path(args.checkpoint).exists():
-        logger.error(f"Checkpoint not found: {args.checkpoint}")
-        sys.exit(1)
+        args = parser.parse_args()
 
-    # Determine final optimize flag
-    if args.optimize is True and args.no_optimize is True:
-        raise ValueError("Cannot use both --optimize and --no-optimize")
-    if args.optimize is None and args.no_optimize is None:
-        optimize = export_cfg.optimize
-    else:
-        optimize = args.optimize is True
+        # Verify checkpoint exists
+        if not Path(args.checkpoint).exists():
+            logger.error(f"Checkpoint not found: {args.checkpoint}")
+            sys.exit(1)
 
-    # Determine final quantize flag
-    quantize = args.quantize if args.quantize is not None else export_cfg.quantize
+        # Determine final optimize flag
+        if args.optimize is True and args.no_optimize is True:
+            raise ValueError("Cannot use both --optimize and --no-optimize")
+        if args.optimize is None and args.no_optimize is None:
+            optimize = export_cfg.optimize
+        else:
+            optimize = args.optimize is True
 
-    # Determine final validate flag
-    validate_export = not args.no_validate if args.no_validate is not None else export_cfg.validate_export
+        # Determine final quantize flag
+        quantize = args.quantize if args.quantize is not None else export_cfg.quantize
 
-    # Create config
-    config = ONNXExportConfig(
-        checkpoint_path=args.checkpoint,
-        vocab_dir=args.vocab_dir or unified_config.vocab_path or data_cfg.vocab_dir,
-        output_path=args.output or export_cfg.output_path,
-        batch_size=args.batch_size,
-        image_size=args.image_size or data_cfg.image_size,
-        patch_size=model_cfg.patch_size,
-        opset_version=args.opset or export_cfg.opset_version,
-        export_variants=args.variants,
-        optimize=optimize,
-        quantize=quantize,
-        quantization_type=args.quantization_type or export_cfg.quantization_type,
-        validate_export=validate_export,
-        use_dynamic_axes=export_cfg.dynamic_batch_size,
-        export_params=export_cfg.export_params,
-        do_constant_folding=export_cfg.do_constant_folding,
-        add_metadata=export_cfg.add_metadata,
-        model_description=export_cfg.model_description,
-        model_author=export_cfg.model_author,
-        model_version=export_cfg.model_version,
-        normalize_mean=list(data_cfg.normalize_mean),
-        normalize_std=list(data_cfg.normalize_std),
-        tolerance_atol=export_cfg.tolerance_atol,
-        tolerance_rtol=export_cfg.tolerance_rtol,
-    )
-    
-    # Log vocabulary path being used
-    logger.info(f"Using vocabulary: {config.vocab_dir}")
-    logger.info(f"Checkpoint: {config.checkpoint_path}")
+        # Determine final validate flag
+        validate_export = not args.no_validate if args.no_validate is not None else export_cfg.validate_export
 
-    # Create exporter
-    exporter = ONNXExporter(config)
-    
-    # Export
-    results = exporter.export()
-    
-    # Benchmark if requested
-    if args.benchmark:
-        logger.info("\n" + "="*60)
-        logger.info("RUNNING BENCHMARKS")
-        logger.info("="*60)
+        # Create config
+        config = ONNXExportConfig(
+            checkpoint_path=args.checkpoint,
+            vocab_dir=args.vocab_dir or unified_config.vocab_path or data_cfg.vocab_dir,
+            output_path=args.output or export_cfg.output_path,
+            batch_size=args.batch_size,
+            image_size=args.image_size or data_cfg.image_size,
+            patch_size=model_cfg.patch_size,
+            opset_version=args.opset or export_cfg.opset_version,
+            export_variants=args.variants,
+            optimize=optimize,
+            quantize=quantize,
+            quantization_type=args.quantization_type or export_cfg.quantization_type,
+            validate_export=validate_export,
+            use_dynamic_axes=export_cfg.dynamic_batch_size,
+            export_params=export_cfg.export_params,
+            do_constant_folding=export_cfg.do_constant_folding,
+            add_metadata=export_cfg.add_metadata,
+            model_description=export_cfg.model_description,
+            model_author=export_cfg.model_author,
+            model_version=export_cfg.model_version,
+            normalize_mean=list(data_cfg.normalize_mean),
+            normalize_std=list(data_cfg.normalize_std),
+            tolerance_atol=export_cfg.tolerance_atol,
+            tolerance_rtol=export_cfg.tolerance_rtol,
+        )
+
+        # Log vocabulary path being used
+        logger.info(f"Using vocabulary: {config.vocab_dir}")
+        logger.info(f"Checkpoint: {config.checkpoint_path}")
+
+        # Create exporter
+        exporter = ONNXExporter(config)
         
-        for variant, path in results.items():
-            if path and path.exists():
-                exporter.benchmark(path, args.benchmark_runs)
-    
-    logger.info("\n✓ Export complete!")
+        # Export
+        results = exporter.export()
+
+        # Benchmark if requested
+        if args.benchmark:
+            logger.info("\n" + "="*60)
+            logger.info("RUNNING BENCHMARKS")
+            logger.info("="*60)
+
+            for variant, path in results.items():
+                if path and path.exists():
+                    exporter.benchmark(path, args.benchmark_runs)
+
+        logger.info("\n✓ Export complete!")
+    finally:
+        if listener:
+            listener.stop()
 
 
 if __name__ == '__main__':

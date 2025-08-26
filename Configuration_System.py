@@ -1534,12 +1534,10 @@ def generate_example_configs(output_dir: Path = Path("./config_examples")):
 
 if __name__ == "__main__":
     import sys
+    from utils.logging_setup import setup_logging
     
     # Set up logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+    listener = setup_logging()
     
     if len(sys.argv) > 1:
         if sys.argv[1] == "generate":
@@ -1639,3 +1637,6 @@ if __name__ == "__main__":
         
         print("\n" + "=" * 60)
         print("All tests completed successfully!")
+
+    if listener:
+        listener.stop()
