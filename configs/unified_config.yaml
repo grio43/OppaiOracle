@@ -149,6 +149,8 @@ training:
   lr_end: 1.0e-6
   
   # Mixed precision
+  # Enabled by default to reduce VRAM usage and improve performance.
+  # bfloat16 is preferred for its numerical stability and range, similar to float32.
   use_amp: true
   amp_opt_level: "O1"
   amp_dtype: "bfloat16"
