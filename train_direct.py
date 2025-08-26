@@ -215,10 +215,19 @@ def train_with_orientation_tracking(config: FullConfig):
         _listener = logging.handlers.QueueListener(log_queue, fh, respect_handler_level=True)
         _listener.start()
 
+    # Find the active data path from storage_locations
+    active_location = next((loc for loc in config.data.storage_locations if loc.get('enabled')), None)
+
+    if not active_location:
+        raise ValueError("No enabled storage location found in data.storage_locations. Please check your configuration.")
+
+    active_data_path = Path(active_location['path'])
+    logger.info(f"Using active data path: {active_data_path}")
+
     # Setup orientation handling
     orientation_config = setup_orientation_aware_training(
-        data_dir=Path(config.data.storage_locations[0]['path']),
-        json_dir=Path(config.data.storage_locations[0]['path']),
+        data_dir=active_data_path,
+        json_dir=active_data_path,
         vocab_path=Path(config.vocab_path),
         orientation_map_path=Path(config.data.orientation_map_path) if config.data.orientation_map_path else None,
         random_flip_prob=config.data.random_flip_prob,
