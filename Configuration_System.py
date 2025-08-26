@@ -397,7 +397,7 @@ class DataConfig(BaseConfig):
     l2_cache_path: str = field(default="./l2_cache", metadata={"help": "Path to L2 cache directory"})
     l2_max_size_gb: float = field(default=48.0, metadata={"help": "Maximum size of L2 cache in GB"})
     l2_max_readers: int = field(default=2048, metadata={"help": "Max readers for LMDB"})
-    cache_precision: str = field(default='uint8', metadata={"help": "Precision for cached images ('uint8', 'float16', 'float32')"})
+    cache_precision: str = field(default='uint8', metadata={"help": "Precision for cached images ('uint8', 'float16', 'bfloat16', 'float32')"})
     canonical_cache_dtype: str = field(default='uint8', metadata={"help": "Canonical dtype for cache storage"})
 
     # Dataset behavior (from HDF5_loader.py usage)
@@ -506,6 +506,10 @@ class DataConfig(BaseConfig):
             errors.append(f"cutmix_alpha must be non-negative, got {self.cutmix_alpha}")
         if not 0 <= self.random_erasing_p <= 1:
             errors.append(f"random_erasing_p must be in [0, 1], got {self.random_erasing_p}")
+
+        valid_precisions = ["uint8", "float16", "bfloat16", "float32"]
+        if self.cache_precision not in valid_precisions:
+            errors.append(f"Invalid cache_precision: {self.cache_precision}. Must be one of {valid_precisions}")
 
         if errors:
             raise ConfigValidationError("Data config validation failed:\n" + "\n".join(errors))
@@ -663,7 +667,7 @@ class InferenceConfig(BaseConfig):
     """Inference configuration"""
     # Model
     model_path: Optional[str] = None
-    use_fp16: bool = True
+    precision: str = "fp16"  # Options: "fp32", "fp16", "bf16"
     compile_model: bool = False
     
     # Prediction
@@ -735,6 +739,10 @@ class InferenceConfig(BaseConfig):
 
         if self.min_predictions < 0:
             errors.append(f"min_predictions must be non-negative, got {self.min_predictions}")
+
+        valid_precisions = ["fp32", "fp16", "bf16"]
+        if self.precision not in valid_precisions:
+            errors.append(f"Invalid precision: {self.precision}. Must be one of {valid_precisions}")
 
         valid_formats = ["json", "text", "csv", "xml", "yaml"]
         if self.output_format not in valid_formats:

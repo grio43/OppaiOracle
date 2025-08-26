@@ -246,7 +246,6 @@ class ModelWrapper:
         self.tag_names = []
         self.vocabulary = None  # Loaded vocabulary
         self.normalization_params = None
-        self.use_fp16 = config.use_fp16 and config.device == "cuda"
         self.vocab_sha256 = "unknown"  # Will be computed when vocabulary is loaded
         self.patch_size = 16  # Default, will be updated from model config
 
@@ -383,8 +382,14 @@ class ModelWrapper:
                 self.model = torch.compile(self.model)
             
             # Setup mixed precision
-            if self.use_fp16:
-                self.model = self.model.half()
+            if self.config.device == 'cuda':
+                if self.config.precision == "fp16":
+                    self.model = self.model.half()
+                elif self.config.precision == "bf16":
+                    if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+                        self.model = self.model.to(torch.bfloat16)
+                    else:
+                        logger.warning("bfloat16 not supported on this device, falling back to float32")
             
             logger.info(f"SimplifiedTagger model loaded successfully:")
             logger.info(f"  - Image size: {vit_config.image_size}")
@@ -438,8 +443,13 @@ class ModelWrapper:
         """Run inference on batch of images"""
         images = images.to(self.device)
         
-        if self.use_fp16:
-            images = images.half()
+        # Match model precision
+        if self.config.device == 'cuda':
+            if self.config.precision == "fp16":
+                images = images.half()
+            elif self.config.precision == "bf16":
+                if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+                    images = images.to(torch.bfloat16)
         
         outputs = self.model(images)
         if self.config.tta_flip:
