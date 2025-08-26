@@ -74,6 +74,17 @@ Import error: {e}"""
     raise ImportError(error_msg)
 
 
+def _flatten_dict(d: Dict[str, Any], parent_key: str = '', sep: str = '.') -> Dict[str, Any]:
+    items = []
+    for k, v in d.items():
+        new_key = parent_key + sep + k if parent_key else k
+        if isinstance(v, dict):
+            items.extend(_flatten_dict(v, new_key, sep=sep).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+
 def setup_orientation_aware_training(
     data_dir: Path,
     json_dir: Path,
@@ -219,6 +230,9 @@ def train_with_orientation_tracking(config: FullConfig):
     stats_queue = mp.Queue(maxsize=1000) if config.training.use_tensorboard else None
     device = torch.device(config.training.device)
 
+    if stats_queue:
+        config.data.stats_queue = stats_queue
+
     train_loader, val_loader, vocab = create_dataloaders(
         data_config=config.data,
         validation_config=config.validation,
@@ -241,6 +255,18 @@ def train_with_orientation_tracking(config: FullConfig):
     model_config["num_ratings"] = num_ratings
     model = create_model(**model_config)
     model.to(device)
+
+    # Log the model graph
+    if config.training.use_tensorboard:
+        try:
+            sample_batch = next(iter(train_loader))
+            images = sample_batch['images'].to(device)
+            padding_mask = sample_batch.get('padding_mask', None)
+            if padding_mask is not None:
+                padding_mask = padding_mask.to(device)
+            monitor.log_model_graph(model, images, padding_mask)
+        except Exception as e:
+            logger.warning(f"Could not log model graph: {e}")
 
     criterion = MultiTaskLoss(
         tag_loss_weight=0.9,
@@ -304,15 +330,31 @@ def train_with_orientation_tracking(config: FullConfig):
             scaler.scale(loss).backward()
 
             if (step + 1) % config.training.gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+
+                if global_step % config.training.logging_steps == 0 and config.training.use_tensorboard:
+                    monitor.log_param_and_grad_histograms(model, global_step)
+
                 if config.training.max_grad_norm > 0:
-                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
             
             running_loss += loss.item()
             global_step += 1
+
+            if stats_queue:
+                while not stats_queue.empty():
+                    try:
+                        stat_type, stats_data = stats_queue.get_nowait()
+                        if stat_type == 'aug_stats':
+                            monitor.log_augmentations(global_step, stats_data)
+                    except queue.Empty:
+                        break
+                    except Exception as e:
+                        logger.warning(f"Error processing stats queue: {e}")
 
             if global_step % config.training.logging_steps == 0:
                 monitor.log_step(global_step, loss.item(), losses, optimizer.param_groups[0]['lr'], images.size(0))
@@ -323,7 +365,7 @@ def train_with_orientation_tracking(config: FullConfig):
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for batch in val_loader:
+            for val_step, batch in enumerate(val_loader):
                 images = batch['images'].to(device)
                 tag_labels = batch['tag_labels'].to(device)
                 rating_labels = batch['rating_labels'].to(device)
@@ -334,6 +376,18 @@ def train_with_orientation_tracking(config: FullConfig):
                     outputs = model(images, padding_mask=pmask)
                     loss, _ = criterion(outputs['tag_logits'], outputs['rating_logits'], tag_labels, rating_labels)
                 val_loss += loss.item()
+
+                if val_step == 0 and config.training.use_tensorboard:
+                    tag_preds = torch.sigmoid(outputs['tag_logits'])
+                    tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
+                    monitor.log_images(
+                        step=global_step,
+                        images=images,
+                        predictions=tag_preds,
+                        targets=tag_labels,
+                        tag_names=tag_names,
+                        prefix="val"
+                    )
         
         avg_val_loss = val_loss / len(val_loader)
         logger.info(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
@@ -355,6 +409,15 @@ def train_with_orientation_tracking(config: FullConfig):
                 is_best=is_best,
                 config=config.to_dict()
             )
+
+    # Log hyperparameters at the end of training
+    hparams = _flatten_dict(config.to_dict())
+    final_metrics = {
+        'hparam/best_val_loss': best_val_loss,
+        'hparam/final_train_loss': avg_train_loss,
+        'hparam/final_epoch': epoch + 1
+    }
+    monitor.log_hyperparameters(hparams, final_metrics)
 
     monitor.close()
     if _listener:
