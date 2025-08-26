@@ -524,6 +524,7 @@ class TrainingConfig(BaseConfig):
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
+    adan_beta3: float = 0.99  # Beta3 for Adan optimizer
     adam_epsilon: float = 1e-8
     
     # Scheduler
