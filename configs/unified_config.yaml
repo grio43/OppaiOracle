@@ -342,5 +342,5 @@ monitor:
   # --- WEBHOOK REVIEW POINT ---
   # This is the new field for the Discord webhook URL.
   # Replace "your_webhook_url_here" with your actual Discord webhook URL.
-  alert_webhook_url: "your_webhook_url_here"
+  alert_webhook_url: "https://discord.com/api/webhooks/1349139188804485201/1YQ3LmlLVndj7dHSEIPc13fep_EYI3hqEyKtMUuUOnP8YGWMnPDMAR7x-wgkgkvzw35I"
   # --------------------------------------------------------------------
