@@ -6,6 +6,7 @@ import json
 import uuid
 import subprocess
 import socket
+import multiprocessing
 from pathlib import Path
 from typing import Optional, Dict, Any
 from HDF5_loader import CompressingRotatingFileHandler
@@ -124,7 +125,7 @@ def setup_logging(
         handlers.append(file_handler)
 
     # Queue for multiprocessing-safe logging
-    log_queue = logging.handlers.Queue(-1)
+    log_queue = multiprocessing.Queue(-1)
     queue_handler = logging.handlers.QueueHandler(log_queue)
 
     # The listener will pull from the queue and send to the actual handlers
