@@ -54,7 +54,7 @@ except ImportError:
 
 
 from orientation_handler import OrientationHandler, OrientationMonitor  # type: ignore
-from Configuration_System import DataConfig, ValidationConfig
+from Configuration_System import DataConfig, ValidationConfig, DebugConfig
 # Import TagVocabulary from the vocabulary module rather than a relative package path.
 # The vocabulary module should reside on the Python path for this import to succeed.
 from vocabulary import TagVocabulary
@@ -1169,6 +1169,7 @@ class SimplifiedDataset(Dataset):
             json_files: List[Path],
             split: str,
             vocab: TagVocabulary,
+            debug_config: Optional[DebugConfig] = None,
         ) -> None:
             # Extract unpicklable objects before copying
             stats_queue = config.stats_queue if hasattr(config, 'stats_queue') else None
@@ -1193,6 +1194,7 @@ class SimplifiedDataset(Dataset):
 
             assert split in {'train', 'val', 'test'}, f"Unknown split '{split}'"
             self.config = config
+            self.debug_config = debug_config or DebugConfig()
             self.split = split
             self.vocab = vocab
             # List of annotation dictionaries loaded from JSON files
@@ -2003,8 +2005,8 @@ class SimplifiedDataset(Dataset):
                 # --- Augmentation Visualization ---
                 vis_dir = None
                 metadata = {'steps': []}
-                if self.config.visualize_augmentations:
-                    vis_dir = Path(self.config.augmentation_visualization_path) / f"{actual_idx}_{Path(image_path).stem}"
+                if self.debug_config.visualize_augmentations:
+                    vis_dir = Path(self.debug_config.augmentation_visualization_path) / f"{actual_idx}_{Path(image_path).stem}"
                     vis_dir.mkdir(parents=True, exist_ok=True)
                     TF.to_pil_image(image).save(vis_dir / "00_original.png")
 
@@ -2399,6 +2401,7 @@ def create_dataloaders(
     log_queue: Optional[object] = None,
     sampler_type: str = "uniform",
     max_repeat_factor: float = 3.0,
+    debug_config: Optional[DebugConfig] = None,
 ) -> Tuple[DataLoader, DataLoader, TagVocabulary]:
     """Construct training and validation dataloaders with enhanced memory control."""
     
@@ -2419,8 +2422,8 @@ def create_dataloaders(
         vocab.build_from_annotations(json_files_sorted, top_k=None)
         vocab.save_vocabulary(vocab_path)
 
-    train_dataset = SimplifiedDataset(data_config, train_files, split='train', vocab=vocab)
-    val_dataset = SimplifiedDataset(data_config, val_files, split='val', vocab=vocab)
+    train_dataset = SimplifiedDataset(data_config, train_files, split='train', vocab=vocab, debug_config=debug_config)
+    val_dataset = SimplifiedDataset(data_config, val_files, split='val', vocab=vocab, debug_config=debug_config)
 
     base_seed = int(seed if seed is not None else torch.initial_seed() % (2**31 - 1))
     generator = torch.Generator()

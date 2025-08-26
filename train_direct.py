@@ -279,6 +279,7 @@ def train_with_orientation_tracking(config: FullConfig):
         rank=config.training.local_rank,
         world_size=config.training.world_size,
         seed=seed,
+        debug_config=config.debug,
     )
 
     # Pre-training validation
