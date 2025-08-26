@@ -227,5 +227,8 @@ class SimplifiedTagger(nn.Module):
 
 def create_model(**kwargs):
     """Create model from configuration arguments."""
+    # The 'architecture_type' is a meta-parameter from the main config
+    # and is not part of the VisionTransformerConfig, so we remove it.
+    kwargs.pop('architecture_type', None)
     config = VisionTransformerConfig(**kwargs)
     return SimplifiedTagger(config)
