@@ -1,5 +1,0 @@
-dataset_prep:
-  phase1_size: 4000000        # First pass subset for coarse filtering/sharding
-  total_size: 8500000         # Overall target size after filtering
-  num_workers: null           # null → use CPU core count; set lower on shared hosts
-  output_dir: "./prepared"    # Where intermediate HDF5/LMDB shards are written
