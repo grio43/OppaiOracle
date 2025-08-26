@@ -574,7 +574,7 @@ class LMDBCache:
                 metadata_bytes = data[4:4 + metadata_len]
                 tensor_bytes = data[4 + metadata_len:]
 
-                metadata = json.loads(metadata_bytes.decode('utf-8'))
+                metadata = json.loads(bytes(metadata_bytes).decode('utf-8'))
 
                 # ``np.frombuffer`` returns a read-only array which subsequently
                 # triggers a PyTorch warning when wrapping it with ``torch.from_numpy``.
