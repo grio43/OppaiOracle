@@ -272,6 +272,13 @@ def train_with_orientation_tracking(config: FullConfig):
     model = create_model(**model_config)
     model.to(device)
 
+    monitor = TrainingMonitor(MonitorConfig(
+        log_dir=str(log_dir),
+        use_tensorboard=config.training.use_tensorboard,
+        tensorboard_dir=str(Path(config.output_root) / config.experiment_name),
+        use_wandb=config.training.use_wandb,
+    ))
+
     # Log the model graph
     if config.training.use_tensorboard:
         try:
@@ -296,11 +303,10 @@ def train_with_orientation_tracking(config: FullConfig):
     )
     from training_utils import TrainingUtils
     # Construct betas tuple based on the selected optimizer
+    betas = (config.training.adam_beta1, config.training.adam_beta2)
     if config.training.optimizer == 'adan':
-        betas = (config.training.adam_beta1, config.training.adam_beta2, config.training.adan_beta3)
-    else:
-        # Default for AdamW and other 2-beta optimizers
-        betas = (config.training.adam_beta1, config.training.adam_beta2)
+        beta3 = getattr(config.training, 'adan_beta3', 0.99)
+        betas = betas + (beta3,)
 
     optimizer = TrainingUtils.get_optimizer(
         model,
@@ -310,13 +316,6 @@ def train_with_orientation_tracking(config: FullConfig):
         betas=betas,
         eps=config.training.adam_epsilon
     )
-
-    monitor = TrainingMonitor(MonitorConfig(
-        log_dir=str(log_dir),
-        use_tensorboard=config.training.use_tensorboard,
-        tensorboard_dir=str(Path(config.output_root) / config.experiment_name),
-        use_wandb=config.training.use_wandb,
-    ))
 
     amp_enabled = config.training.use_amp and device.type == 'cuda'
     amp_dtype = torch.bfloat16 if amp_enabled and torch.cuda.is_bf16_supported() else torch.float16
