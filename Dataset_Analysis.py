@@ -8,7 +8,6 @@ import os
 import json
 import logging
 import hashlib
-import pickle
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Set
 from dataclasses import dataclass, field, asdict
@@ -285,11 +284,11 @@ class ImageAnalyzer:
                             # sharpness left as None without cv2
                     except Exception as e:
                         # Color stats are optional, log but don't fail
-                        logger.debug(f"Could not extract color stats for {image_path}: {e}")
+                        logger.debug("Could not extract color stats for %s: %s", image_path, e)
                         
         except (IOError, OSError) as e:
             # Image is corrupted or unreadable - this is expected for some files
-            logger.debug(f"Image corrupted or unreadable: {image_path}: {e}")
+            logger.debug("Image corrupted or unreadable: %s: %s", image_path, e)
             stats.is_corrupted = True
             stats.quality_issues.append("corrupted")
             return stats  # Return partial stats for corrupted images
@@ -302,7 +301,7 @@ class ImageAnalyzer:
         try:
             stats.file_hash = self._compute_file_hash(image_path)
         except Exception as e:
-            logger.debug(f"Could not compute file hash: {e}")
+            logger.debug("Could not compute file hash: %s", e)
             # Hash is optional, continue
         
         # Perceptual hash
@@ -310,7 +309,7 @@ class ImageAnalyzer:
             try:
                 stats.perceptual_hash = self._compute_perceptual_hash(image_path)
             except Exception as e:
-                logger.debug(f"Could not compute perceptual hash: {e}")
+                logger.debug("Could not compute perceptual hash: %s", e)
                 # Perceptual hash is optional, continue
         
         # Quality checks
@@ -327,7 +326,7 @@ class ImageAnalyzer:
                     hasher.update(chunk)
             return hasher.hexdigest()
         except Exception as e:
-            logger.debug(f"Could not compute file hash for {path}: {e}")
+            logger.debug("Could not compute file hash for %s: %s", path, e)
             return ""
     
     def _compute_perceptual_hash(self, path: Path) -> str:
@@ -340,7 +339,7 @@ class ImageAnalyzer:
                 hash_val = imagehash.dhash(img, hash_size=self.config.perceptual_hash_size)
             return str(hash_val)
         except Exception as e:
-            logger.debug(f"Could not compute perceptual hash for {path}: {e}")
+            logger.debug("Could not compute perceptual hash for %s: %s", path, e)
             return ""
     
     def _check_quality(self, stats: ImageStats):
@@ -569,7 +568,7 @@ class DuplicateDetector:
                         hash1 = imagehash.hex_to_hash(hashes[i])
                         hash2 = imagehash.hex_to_hash(hashes[j])
                     except (ValueError, TypeError) as e:
-                        logger.debug(f"Invalid hash format: {e}")
+                        logger.debug("Invalid hash format: %s", e)
                         continue
                     
                     # Calculate hamming distance
@@ -1206,37 +1205,37 @@ class DatasetAnalyzer:
     
     def save_cache(self):
         """Save analysis cache for faster re-analysis"""
-        cache_file = self.cache_dir / 'analysis_cache.pkl'
+        cache_file = self.cache_dir / 'analysis_cache.json'
         cache_data = {
-            'image_stats': self.image_stats,
-            'dataset_stats': self.dataset_stats,
+            'schema': 1,
+            'image_stats': [asdict(s) for s in self.image_stats],
+            'dataset_stats': asdict(self.dataset_stats),
             'tag_counts': dict(self.tag_analyzer.tag_counts),
-            'timestamp': datetime.now()
+            'timestamp': datetime.now().isoformat()
         }
-        
-        with open(cache_file, 'wb') as f:
-            pickle.dump(cache_data, f)
-        
-        logger.info(f"Saved cache to {cache_file}")
+
+        cache_file.write_text(json.dumps(cache_data), encoding='utf-8')
+        logger.info("Saved cache to %s", cache_file)
     
     def load_cache(self) -> bool:
         """Load analysis cache if available"""
-        cache_file = self.cache_dir / 'analysis_cache.pkl'
-        
+        cache_file = self.cache_dir / 'analysis_cache.json'
+
         if cache_file.exists():
             try:
-                with open(cache_file, 'rb') as f:
-                    cache_data = pickle.load(f)
-                
-                self.image_stats = cache_data['image_stats']
-                self.dataset_stats = cache_data['dataset_stats']
+                cache_data = json.loads(cache_file.read_text(encoding='utf-8'))
+                if cache_data.get('schema') != 1:
+                    raise ValueError('cache schema mismatch')
+
+                self.image_stats = [ImageStats(**s) for s in cache_data['image_stats']]
+                self.dataset_stats = DatasetStats(**cache_data['dataset_stats'])
                 self.tag_analyzer.tag_counts = Counter(cache_data['tag_counts'])
-                
-                logger.info(f"Loaded cache from {cache_data['timestamp']}")
+
+                logger.info("Loaded cache from %s", cache_data.get('timestamp'))
                 return True
             except Exception as e:
-                logger.warning(f"Could not load cache: {e}")
-        
+                logger.warning("Could not load cache: %s", e)
+
         return False
 
 

@@ -208,7 +208,7 @@ class CompressingRotatingFileHandler(RotatingFileHandler):
                 with lz4.frame.open(compressed_path, 'wb') as f_out:
                     f_out.write(f_in.read())
             os.remove(filepath)
-            logger.debug(f"Compressed {filepath} -> {compressed_path}")
+            logger.debug("Compressed %s -> %s", filepath, compressed_path)
         except Exception as e:
             logger.warning(f"Failed to compress {filepath}: {e}")
 
@@ -240,7 +240,7 @@ def setup_worker_logging(worker_id: int, log_queue: object):
     module_logger.addHandler(queue_handler)
     module_logger.setLevel(logging.INFO)
 
-    logger.debug(f"Worker {worker_id} logging configured (queue-only)")
+    logger.debug("Worker %d logging configured (queue-only)", worker_id)
 
 def letterbox_resize(
     image: torch.Tensor,
@@ -432,7 +432,7 @@ def _make_worker_init_fn(base_seed: Optional[int], log_queue):
                             except Exception:
                                 pass
 
-        logger.debug(f"Worker {worker_id} seeded")
+        logger.debug("Worker %d seeded", worker_id)
 
     return init_fn
 
@@ -509,7 +509,7 @@ class LMDBCache:
             logger.info(f"LMDB environment opened with map_size={self.current_map_size / (1024**3):.1f}GB for process {self._pid}")
             LMDBCache._logged_pids.add(self._pid)
         else:
-            logger.debug(f"LMDB environment re-opened for process {self._pid}")
+            logger.debug("LMDB environment re-opened for process %d", self._pid)
 
     def _ensure_env(self):
         """Ensure LMDB environment is open for current process"""
@@ -560,7 +560,7 @@ class LMDBCache:
                 return self.get(key)
             return None
         except Exception as e:
-            logger.debug(f"LMDB get error for key {key}: {e}")
+            logger.debug("LMDB get error for key %s: %s", key, e)
             return None
         finally:
             if txn is not None:
@@ -1668,7 +1668,7 @@ class SimplifiedDataset(Dataset):
         if self.l2_cache is None and hasattr(self, '_l2_cache_config'):
             try:
                 self.l2_cache = LMDBCache(**self._l2_cache_config)
-                logger.debug(f"L2 cache initialized in worker process {os.getpid()}")
+                logger.debug("L2 cache initialized in worker process %d", os.getpid())
             except Exception as e:
                 logger.warning(f"Failed to initialize L2 cache in worker: {e}")
                 self.l2_cache = None
@@ -1732,7 +1732,7 @@ class SimplifiedDataset(Dataset):
                 # Check if we should retry
                 if not self.validation_index.should_retry(image_path):
                     # Skip permanently failed image
-                    logger.debug(f"Skipping permanently failed image: {image_path}")
+                    logger.debug("Skipping permanently failed image: %s", image_path)
                     blank_img, lb_info = letterbox_resize(
                         torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32),
                         self.config.image_size, self.config.pad_color, self.config.patch_size
@@ -1845,7 +1845,7 @@ class SimplifiedDataset(Dataset):
             
             if memory_pressure == "critical":
                 # Don't add to cache under critical pressure
-                logger.debug(f"Critical memory: skipping L1 cache add")
+                logger.debug("Critical memory: skipping L1 cache add")
                 return
             elif memory_pressure == "low":
                 # Reduce L1 size under low memory
