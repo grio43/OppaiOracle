@@ -620,55 +620,38 @@ def prepare_phased_training_data(
 def main():
     """Main execution"""
     import argparse
+    from utils.logging_setup import setup_logging
+    listener = setup_logging()
 
-    # Load unified config to get defaults
     try:
-        manager = ConfigManager(config_type=ConfigType.FULL)
-        unified_config = manager.load_from_file("configs/unified_config.yaml")
-        log_cfg = unified_config
-        data_cfg = unified_config.data
-    except Exception as e:
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        logger.error(f"Could not load unified_config.yaml: {e}. Using basic logging and default settings.")
-        from dataclasses import dataclass
-        @dataclass
-        class Dummy:
-            def __getattr__(self, name): return None
-        log_cfg = Dummy()
-        data_cfg = Dummy()
+        # Load unified config to get defaults
+        try:
+            manager = ConfigManager(config_type=ConfigType.FULL)
+            unified_config = manager.load_from_file("configs/unified_config.yaml")
+            data_cfg = unified_config.data
+        except Exception as e:
+            logger.warning(f"Could not load unified_config.yaml: {e}. Using default settings.")
+            from dataclasses import dataclass
+            @dataclass
+            class Dummy:
+                def __getattr__(self, name): return None
+            data_cfg = Dummy()
 
-    # Setup logging from unified config
-    level = getattr(logging, str(log_cfg.log_level or 'INFO').upper(), logging.INFO)
-    fmt = log_cfg.log_format or '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    logging.basicConfig(level=level, format=fmt)
-    if getattr(log_cfg, 'file_logging_enabled', False):
-        log_dir = Path(log_cfg.log_dir or './logs')
-        log_dir.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
-            log_dir / 'tag_vocabulary.log',
-            maxBytes=log_cfg.log_rotation_max_bytes or (10*1024*1024),
-            backupCount=log_cfg.log_rotation_backups or 5,
-        )
-        handler.setFormatter(logging.Formatter(fmt))
-        handler.setLevel(level)
-        logging.getLogger().addHandler(handler)
-    
-    # Determine default paths from config
-    DEFAULT_VOCAB_PATH = unified_config.vocab_path or data_cfg.vocab_dir
-    DEFAULT_OUTPUT_DIR = data_cfg.output_dir
+        # Determine default paths from config
+        DEFAULT_VOCAB_PATH = unified_config.vocab_path or data_cfg.vocab_dir
+        DEFAULT_OUTPUT_DIR = data_cfg.output_dir
 
-    parser = argparse.ArgumentParser(description="Prepare Danbooru data for direct training")
-    parser.add_argument('--metadata_dir', type=str, required=True, help='Directory with JSON metadata files')
-    parser.add_argument('--vocab_path', type=str, default=str(DEFAULT_VOCAB_PATH), help=f'Path to vocabulary file (default: {DEFAULT_VOCAB_PATH})')
-    parser.add_argument('--output_dir', type=str, default=str(DEFAULT_OUTPUT_DIR), help=f'Output directory for processed data (default: {DEFAULT_OUTPUT_DIR})')
-    parser.add_argument('--phase1_size', type=int, default=4_000_000, help='Size of Phase 1 dataset')
-    parser.add_argument('--total_size', type=int, default=8_500_000, help='Total dataset size')
-    parser.add_argument('--num_workers', type=int, default=data_cfg.num_workers, help=f'Number of parallel workers (default: {data_cfg.num_workers})')
-    parser.add_argument('--ignore_tags_file', type=str, default=None, help='Path to file with tags to ignore')
-    
-    args = parser.parse_args()
-    
-    try:
+        parser = argparse.ArgumentParser(description="Prepare Danbooru data for direct training")
+        parser.add_argument('--metadata_dir', type=str, required=True, help='Directory with JSON metadata files')
+        parser.add_argument('--vocab_path', type=str, default=str(DEFAULT_VOCAB_PATH), help=f'Path to vocabulary file (default: {DEFAULT_VOCAB_PATH})')
+        parser.add_argument('--output_dir', type=str, default=str(DEFAULT_OUTPUT_DIR), help=f'Output directory for processed data (default: {DEFAULT_OUTPUT_DIR})')
+        parser.add_argument('--phase1_size', type=int, default=4_000_000, help='Size of Phase 1 dataset')
+        parser.add_argument('--total_size', type=int, default=8_500_000, help='Total dataset size')
+        parser.add_argument('--num_workers', type=int, default=data_cfg.num_workers, help=f'Number of parallel workers (default: {data_cfg.num_workers})')
+        parser.add_argument('--ignore_tags_file', type=str, default=None, help='Path to file with tags to ignore')
+
+        args = parser.parse_args()
+
         # Determine ignore_tags_file path from args or config
         ignore_tags_file = args.ignore_tags_file or getattr(data_cfg, 'ignore_tags_file', None)
         if ignore_tags_file:
@@ -688,6 +671,9 @@ def main():
         import traceback
         traceback.print_exc()
         return 1
+    finally:
+        if listener:
+            listener.stop()
     
     return 0
 
