@@ -19,9 +19,6 @@ import time
 from collections import defaultdict
 import re
 
-from Monitor_log import MonitorConfig
-
-
 logger = logging.getLogger(__name__)
 
 # Type variable for generic config classes
@@ -863,6 +860,84 @@ class ValidationPreprocessingConfig(BaseConfig):
 class ValidationConfig(BaseConfig):
     dataloader: ValidationDataloaderConfig = field(default_factory=ValidationDataloaderConfig)
     preprocessing: ValidationPreprocessingConfig = field(default_factory=ValidationPreprocessingConfig)
+
+
+@dataclass
+class MonitorConfig(BaseConfig):
+    """Configuration for monitoring system"""
+    # Logging
+    log_level: str = "INFO"
+    log_dir: str = "./logs"
+    log_to_file: bool = True
+    log_to_console: bool = True
+    log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    # Metrics tracking
+    track_system_metrics: bool = True
+    system_metrics_interval: float = 30.0  # seconds
+    track_gpu_metrics: bool = True
+    track_disk_io: bool = True
+    track_network_io: bool = False
+
+    # Visualization
+    use_tensorboard: bool = True
+    tensorboard_dir: str = "./tensorboard"
+    use_wandb: bool = False
+    wandb_project: str = "anime-tagger"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+
+    # Alerts
+    enable_alerts: bool = True
+    alert_on_gpu_memory_threshold: float = 0.9  # 90% usage
+    alert_on_cpu_memory_threshold: float = 0.9
+    alert_on_disk_space_threshold: float = 0.95
+    alert_on_training_stuck_minutes: int = 30
+    alert_on_loss_explosion: float = 10.0
+    alert_on_nan_loss: bool = True
+    alert_webhook_url: Optional[str] = None  # For Slack/Discord alerts
+
+    # Performance profiling
+    enable_profiling: bool = False
+    profile_interval_steps: int = 1000
+    profile_duration_steps: int = 10
+    profile_memory: bool = True
+    profile_shapes: bool = True
+    profile_output_dir: str = "./profiles"
+
+    # Data pipeline monitoring
+    monitor_data_pipeline: bool = True
+    data_pipeline_stats_interval: int = 100  # batches
+    augmentation_stats_interval: int = 100  # batches
+    log_augmentation_histograms: bool = True
+    log_augmentation_images: bool = False
+    augmentation_image_interval: int = 500  # batches
+    # Parameter / gradient histogram logging
+    log_param_histograms: bool = True
+    log_grad_histograms: bool = True
+    # Log every N steps (set high if training is slow or memory-limited)
+    param_hist_interval_steps: int = 200
+    grad_hist_interval_steps: int = 200
+
+    # Remote monitoring
+    enable_prometheus: bool = False
+    prometheus_port: int = 8080
+
+    # History
+    max_history_size: int = 10000
+    history_save_interval: int = 100
+    checkpoint_metrics: bool = True
+
+    # Distributed training
+    distributed: bool = False
+    rank: int = 0
+    world_size: int = 1
+
+    # Safety
+    auto_recovery: bool = True
+    max_retries: int = 3
+    safe_mode: bool = True  # Disable features that might crash
+
 
 @dataclass
 class FullConfig(BaseConfig):
