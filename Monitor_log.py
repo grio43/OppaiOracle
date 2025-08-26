@@ -1320,6 +1320,8 @@ class TrainingMonitor:
             for name, value in metrics.items():
                 tag = f"{name}{'/epoch' if use_epoch else ''}"
                 try:
+                    if torch.is_tensor(value):
+                        value = value.detach()
                     self.writer.add_scalar(tag, float(value), step)
                 except Exception as e:
                     if getattr(self, "logger", None):
