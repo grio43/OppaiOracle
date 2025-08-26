@@ -758,7 +758,8 @@ class ValidationIndex:
         self.backoff_base = 60  # seconds        
         
         # Create/open database
-        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        # Set a 30-second timeout to mitigate "database is locked" errors under high concurrency
+        self.conn = sqlite3.connect(str(self.path), timeout=30.0, check_same_thread=False)
         self.lock = threading.Lock()
         
         # Create table if not exists
