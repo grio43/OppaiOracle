@@ -4,75 +4,89 @@ This document provides guidance for AI agents working in this repository.
 
 ## Project Overview
 
-This repository contains the code for **MAID (Model for AI-based Detection)**, a deep learning project built with PyTorch. The primary purpose of this project is to train, evaluate, and deploy a model for AI-based detection tasks.
+OppaiOracle, also known as **MAID (Model for AI-based Detection)**, is a PyTorch-based system for training, evaluating, and deploying image-tagging models. It supports configuration-driven experimentation, ONNX export, FastAPI serving, and a suite of utilities for data handling and evaluation.
 
 ## Key Files and Directories
 
--   `AGENTS.md`: This file. Provides guidance for AI agents.
--   `Configuration_System.py`: Handles configuration management.
--   `Dataset_Analysis.py`: Scripts for analyzing datasets.
--   `Evaluation_Metrics.py`: Defines evaluation metrics for the model.
--   `HDF5_loader.py`: Loads data from HDF5 files for training and evaluation.
--   `Inference_Engine.py`: Core engine for running model inference.
--   `model_architecture.py`: Defines the neural network architecture for the model.
--   `ONNX_Export.py`: Exports the trained PyTorch model to the ONNX format for optimized inference.
--   `train_direct.py`: The main script for training the model.
--   `validation_loop.py`: Contains the logic for the model validation loop.
--   `requirements.txt`: A list of the Python dependencies for this project.
--   `configs/`: Contains configuration files, including `unified_config.yaml`, which is the main config file for training.
--   `TEst and review/`: Contains scripts for testing, evaluation, and visualization of results.
--   `scripts/`: Contains various utility scripts.
--   `tools/`: Contains tools for tasks like model calibration.
--   `utils/`: Contains utility functions used across the project.
+- `AGENTS.md`: this document.
+- `README.md` and `maid/README.md`: high-level project documentation.
+- `configs/`: configuration files, including the primary `unified_config.yaml`.
+- `train_direct.py`: main training entry point.
+- `Inference_Engine.py`: PyTorch inference logic and FastAPI application.
+- `onnx_infer.py`: inference using exported ONNX models.
+- `ONNX_Export.py`: exports trained models to ONNX format.
+- `Configuration_System.py`: validates and manages configuration files.
+- `validation_loop.py`: core validation logic used during training.
+- `HDF5_loader.py`: utilities for loading datasets stored in HDF5 format.
+- `logs/`, `scripts/`, `tools/`, `TEst and review/`, `utils/`: logging, helper scripts, calibration tools, evaluation/visualization scripts, and shared utilities.
 
 ## Development Workflow
 
 ### 1. Environment Setup
 
-To get started, install the required dependencies from `requirements.txt`:
+Install project dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Training the Model
+### 2. Configuration
 
-The main training script is `train_direct.py`. To run it, you need to provide a configuration file. The primary config file is `configs/unified_config.yaml`.
+Validate configuration before running other scripts:
 
-Example training command:
+```bash
+python Configuration_System.py validate configs/unified_config.yaml
+```
+
+### 3. Training
+
+Train the model using:
+
 ```bash
 python train_direct.py --config configs/unified_config.yaml
 ```
 
-*Note: You may need to adjust the arguments based on the specific requirements of your task. Check the script's argument parser for more details.*
+Adjust arguments as needed for your experiment.
 
-### 3. Running Inference
+### 4. Export and Inference
 
-For running inference with a trained model, use `Inference_Engine.py` or `onnx_infer.py` for ONNX models.
+- Export to ONNX:
 
--   **PyTorch Inference:** `Inference_Engine.py`
--   **ONNX Inference:** `onnx_infer.py` (after exporting the model using `ONNX_Export.py`)
+  ```bash
+  python ONNX_Export.py --config configs/unified_config.yaml
+  ```
+- PyTorch inference:
 
-## Testing and Validation
+  ```bash
+  python Inference_Engine.py --config configs/unified_config.yaml --image <path>
+  ```
+- ONNX inference:
 
-The primary script for testing and validating the model is `TEst and review/batch_evaluate.py`. This script evaluates a trained model against a dataset and computes performance metrics.
+  ```bash
+  python onnx_infer.py --config configs/unified_config.yaml --image <path>
+  ```
+- Serve the FastAPI API:
 
-### How to Run Evaluation
+  ```bash
+  uvicorn Inference_Engine:app --host 0.0.0.0 --port 8000
+  ```
 
-1.  **Prepare your data:**
-    -   You need a folder containing images and corresponding `.json` files with ground truth tags. The script expects each JSON file to have a `filename` key pointing to the image file and a `tags` key with a space-separated list of tags.
+### 5. Evaluation
 
-2.  **Run the evaluation script:**
-    -   Modify the `main` function in `TEst and review/batch_evaluate.py` to point to your data folder, model path, and desired output directory.
-    -   Execute the script:
-        ```bash
-        python "TEst and review/batch_evaluate.py"
-        ```
+`TEst and review/batch_evaluate.py` evaluates a trained model against a directory of images and associated JSON tag files, producing aggregate metrics and per-image results.
 
-3.  **Review the results:**
-    -   The script will generate a summary JSON file with aggregate metrics (precision, recall, F1-score) and detailed per-tag performance. It also creates a `.jsonl` file with results for each individual image.
+### 6. Additional Tools
 
-### Other Tools
+- `Dataset_Analysis.py`: compute dataset statistics or visualizations.
+- `scripts/`: assorted helper scripts.
+- `tools/`: calibration and other utilities.
 
--   `TEst and review/live_viewer.py`: Likely for interactive, real-time model evaluation.
--   `TEst and review/visualize_results.py`: Can be used to create visualizations from the evaluation results.
+## Testing
+
+This project has no formal test suite. For code changes, ensure Python files compile by running:
+
+```bash
+python -m py_compile $(git ls-files '*.py')
+```
+
+Run relevant scripts with sample data when possible to verify behavior.
