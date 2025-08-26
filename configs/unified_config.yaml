@@ -362,3 +362,22 @@ debug:
   # non-finite error. This includes file paths or other identifiers from the
   # dataloader, which can help in reproducing the error.
   log_batch_info_on_error: true
+
+  # Enable PyTorch's anomaly detection for debugging gradients.
+  # This will slow down training significantly.
+  detect_anomaly: false
+
+  # If true, log the gradient norm of the model's parameters to TensorBoard.
+  # This is useful for monitoring training stability.
+  log_gradient_norm: false
+
+  # If true, perform a pre-training validation step to check the integrity
+  # of the input data. This can help catch issues early.
+  validate_input_data: false
+
+  # If true, save intermediate images during the data augmentation process
+  # for visual inspection.
+  visualize_augmentations: false
+
+  # Directory to save the visualized augmentation images.
+  augmentation_visualization_path: "./aug_visualizations"

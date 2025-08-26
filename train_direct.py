@@ -59,7 +59,7 @@ Import error: {e}"""
 
 # Import training utilities for checkpointing
 from training_utils import CheckpointManager, TrainingState, setup_seed, log_sample_order_hash
-from HDF5_loader import AugmentationStats
+from HDF5_loader import AugmentationStats, validate_dataset
 from utils.logging_sanitize import ensure_finite_tensor
 
 # Add after other imports
@@ -228,7 +228,7 @@ def train_with_orientation_tracking(config: FullConfig):
     seed, deterministic_mode = setup_seed(config.training.seed, config.training.deterministic)
 
     # Enable anomaly detection if configured (for debugging NaN gradients)
-    if getattr(config.training, 'detect_anomaly', False):
+    if getattr(config.debug, 'detect_anomaly', False):
         logger.warning("PyTorch anomaly detection is enabled. This will slow down training.")
         torch.autograd.set_detect_anomaly(True)
 
@@ -307,6 +307,14 @@ def train_with_orientation_tracking(config: FullConfig):
         seed=seed,
         log_queue=log_queue,
     )
+
+    # Pre-training validation
+    if getattr(config.debug, 'validate_input_data', False):
+        logger.info("Starting pre-training input validation...")
+        # Limiting validation to a few batches to avoid long startup times
+        validate_dataset(train_loader, vocab, config, num_batches_to_check=10)
+        validate_dataset(val_loader, vocab, config, num_batches_to_check=5)
+        logger.info("Pre-training input validation complete.")
 
     num_tags = len(vocab.tag_to_index)
     num_ratings = len(vocab.rating_to_index)
@@ -460,6 +468,16 @@ def train_with_orientation_tracking(config: FullConfig):
                 except Exception:
                     pass
                 scaler.unscale_(optimizer)
+
+                # --- Gradient Norm Monitoring ---
+                if getattr(config.debug, 'log_gradient_norm', False) and (global_step % config.training.logging_steps == 0):
+                    total_norm = 0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** 0.5
+                    monitor.log_scalar('train/grad_norm', total_norm, global_step)
 
                 # Clip gradients to prevent exploding gradients.
                 if config.training.max_grad_norm > 0:
