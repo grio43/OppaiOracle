@@ -543,7 +543,7 @@ class LMDBCache:
         self._open_env()
         return True
 
-    def get(self, key: str) -> Optional[torch.Tensor]:
+    def get(self, key: str) -> Optional[Tuple[torch.Tensor, Dict]]:
         """Get item from cache"""
         self._ensure_env()
         txn = None
@@ -569,22 +569,28 @@ class LMDBCache:
         try:
             if data is not None:
                 self.hits += 1
-                # Deserialize tensor.  ``np.frombuffer`` returns a read-only array
-                # which subsequently triggers a PyTorch warning when wrapping it
-                # with ``torch.from_numpy``. Copy the buffer to ensure writability
-                # and avoid the warning about undefined behaviour when tensors are
-                # created from non-writable NumPy arrays.
-                buffer = np.frombuffer(data, dtype=np.uint8).copy()
+                # Deserialize tensor and metadata
+                metadata_len = int.from_bytes(data[:4], 'big')
+                metadata_bytes = data[4:4 + metadata_len]
+                tensor_bytes = data[4 + metadata_len:]
+
+                metadata = json.loads(metadata_bytes.decode('utf-8'))
+
+                # ``np.frombuffer`` returns a read-only array which subsequently
+                # triggers a PyTorch warning when wrapping it with ``torch.from_numpy``.
+                # Copy the buffer to ensure writability and avoid the warning.
+                buffer = np.frombuffer(tensor_bytes, dtype=np.uint8).copy()
                 tensor = torch.from_numpy(buffer)
-                return tensor
+
+                return tensor, metadata
             else:
                 self.misses += 1
                 return None
         except Exception as e:
-            logger.error(f"Error deserializing cached tensor: {e}")
+            logger.error(f"Error deserializing cached item for key {key}: {e}")
             return None
     
-    def put(self, key: str, value: torch.Tensor, check_memory: bool = True) -> bool:
+    def put(self, key: str, value: Tuple[torch.Tensor, Dict], check_memory: bool = True) -> bool:
         """Put item in cache with memory checking"""
         with self._lock:
             if self.readonly:
@@ -605,12 +611,17 @@ class LMDBCache:
                 self.duplicate_keys += 1
                 return True  # Already cached
 
-            # Serialize tensor with canonical dtype
-            if value.dtype != torch.uint8:
-                value = (value * 255).to(torch.uint8) if value.dtype.is_floating_point else value.to(torch.uint8)
+            tensor, metadata = value
 
-            value_np = value.cpu().numpy()
-            value_bytes = value_np.tobytes()
+            # Serialize tensor with canonical dtype
+            if tensor.dtype != torch.uint8:
+                tensor = (tensor * 255).to(torch.uint8) if tensor.dtype.is_floating_point else tensor.to(torch.uint8)
+
+            # Serialize metadata and tensor
+            metadata_bytes = json.dumps(metadata).encode('utf-8')
+            metadata_len_bytes = len(metadata_bytes).to_bytes(4, 'big')
+            tensor_bytes = tensor.cpu().numpy().tobytes()
+            value_bytes = metadata_len_bytes + metadata_bytes + tensor_bytes
 
             # Check value size limit
             if len(value_bytes) > self.max_value_bytes:
@@ -1223,7 +1234,7 @@ class SimplifiedDataset(Dataset):
             self.batch_counter = 0
             self.color_jitter_transform = None  # Will be set in _setup_augmentation
             
-            self.l1_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+            self.l1_cache: OrderedDict[str, Tuple[torch.Tensor, Dict, bool]] = OrderedDict()
             self.l1_cache_bytes = 0  # Track actual bytes in L1
             self.l1_max_size_mb = config.l1_per_worker_mb
             self.l1_min_size_mb = 32  # Minimum L1 size when shrinking
@@ -1650,7 +1661,7 @@ class SimplifiedDataset(Dataset):
             return "high"
         return "normal"
 
-    def _load_image(self, image_path: str) -> Tuple[torch.Tensor, bool]:
+    def _load_image(self, image_path: str) -> Tuple[torch.Tensor, bool, Dict]:
         """Load an image using tiered cache (L1 -> L2 -> disk)"""
 
         # Lazy initialization of L2 cache for workers
@@ -1680,51 +1691,39 @@ class SimplifiedDataset(Dataset):
                 cached_data = self.l1_cache[image_path]
                 self.l1_cache.move_to_end(image_path)  # LRU
                 
-                if isinstance(cached_data, tuple):
-                    cached, was_composited = cached_data
-                else:
-                    cached = cached_data
-                    was_composited = False
+                cached_tensor, lb_info, was_composited = cached_data
 
-                if cached.dtype == torch.uint8:
-                    result = cached.float() / 255.0
-                elif cached.dtype == torch.float16:
-                    result = cached.float()
-                elif cached.dtype == torch.bfloat16:
-                    result = cached.float()
+                if cached_tensor.dtype == torch.uint8:
+                    result = cached_tensor.float() / 255.0
+                elif cached_tensor.dtype == torch.float16:
+                    result = cached_tensor.float()
+                elif cached_tensor.dtype == torch.bfloat16:
+                    result = cached_tensor.float()
                 else:
-                    result = cached.clone()
+                    result = cached_tensor.clone()
 
-                return result, was_composited
+                return result, was_composited, lb_info
+
         # Check L2 cache (LMDB, global)
         if self.l2_cache is not None:
-            cached = self.l2_cache.get(cache_key)
-            if cached is not None:
+            cached_item = self.l2_cache.get(cache_key)
+            if cached_item is not None:
                 self.cache_stats['l2_hits'] += 1
-                # Deserialize and reshape from flattened tensor
-                was_composited = False  # TODO: store this metadata
+                cached_tensor, metadata = cached_item
 
-                # The cached tensor is flattened, need to reshape to (C, H, W)
-                # We know it's stored as uint8 and the target shape
-                if cached.dim() == 1:
-                    # Calculate expected shape
-                    C, H, W = 3, self.config.image_size, self.config.image_size
-                    expected_elements = C * H * W
-                    if cached.numel() >= expected_elements:
-                        # Reshape to image dimensions
-                        cached = cached[:expected_elements].view(C, H, W)
-                    else:
-                        # Size mismatch, load from disk instead
-                        logger.warning(f"Cached tensor size mismatch for {image_path}, loading from disk")
-                        cached = None
+                lb_info = metadata['lb_info']
+                was_composited = metadata['was_composited']
 
-                if cached is not None:
-                    tensor = cached.float() / 255.0  # Convert uint8 to float
+                # Reshape flattened tensor from cache
+                c, (h, w) = 3, lb_info['out_size']
+                cached_tensor = cached_tensor.view(c, h, w)
 
-                    # Add to L1 with memory-aware eviction
-                    self._add_to_l1_cache(image_path, (tensor.clone(), was_composited))
+                tensor = cached_tensor.float() / 255.0  # Convert uint8 to float
 
-                    return tensor, was_composited
+                # Add to L1 with memory-aware eviction
+                self._add_to_l1_cache(image_path, (tensor.clone(), lb_info, was_composited))
+
+                return tensor, was_composited, lb_info
         
         # Lazy validation before loading from disk
         if self.validation_index is not None:
@@ -1734,7 +1733,12 @@ class SimplifiedDataset(Dataset):
                 if not self.validation_index.should_retry(image_path):
                     # Skip permanently failed image
                     logger.debug(f"Skipping permanently failed image: {image_path}")
-                    return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32), False
+                    blank_img, lb_info = letterbox_resize(
+                        torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32),
+                        self.config.image_size, self.config.pad_color, self.config.patch_size
+                    )
+                    return blank_img, False, lb_info
+
         # Load from disk
         self.cache_stats['disk_loads'] += 1
         
@@ -1772,28 +1776,42 @@ class SimplifiedDataset(Dataset):
 
                 tensor = TF.to_tensor(pil_img)
 
+            # Perform letterbox resize before caching
+            resized_tensor, lb_info = letterbox_resize(
+                tensor,
+                target_size=self.config.image_size,
+                pad_color=self.config.pad_color,
+                patch_size=self.config.patch_size,
+            )
+
             # Add to L2 cache if memory allows
             if self.l2_cache is not None:
                 memory_pressure = self._check_memory_pressure()
                 if memory_pressure in ["normal", "high"]:
                     # Store as uint8 to save space
-                    cached_tensor = (tensor * 255).to(torch.uint8)
-                    self.l2_cache.put(cache_key, cached_tensor, check_memory=True)
+                    cached_tensor = (resized_tensor * 255).to(torch.uint8)
+                    metadata = {'lb_info': lb_info, 'was_composited': was_composited}
+                    self.l2_cache.put(cache_key, (cached_tensor, metadata), check_memory=True)
             
             # Add to L1 cache
-            self._add_to_l1_cache(image_path, (tensor.clone(), was_composited))
+            self._add_to_l1_cache(image_path, (resized_tensor.clone(), lb_info, was_composited))
             
-            return tensor, was_composited
+            return resized_tensor, was_composited, lb_info
             
         except Exception as e:
             logger.error(f"Error loading image {image_path}: {e}")
             # Update validation index
             if self.validation_index is not None:
                 self.validation_index.set_status(image_path, 'failed', str(e))
-            # Return black image
-            return torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32), False
+
+            # Return black image and dummy info
+            blank_img, lb_info = letterbox_resize(
+                torch.zeros(3, self.config.image_size, self.config.image_size, dtype=torch.float32),
+                self.config.image_size, self.config.pad_color, self.config.patch_size
+            )
+            return blank_img, False, lb_info
     
-    def _add_to_l1_cache(self, key: str, value: Tuple[torch.Tensor, bool]):
+    def _add_to_l1_cache(self, key: str, value: Tuple[torch.Tensor, Dict, bool]):
         """Add item to L1 cache with memory-aware eviction"""
         with self.cache_lock:
             # Check memory pressure
@@ -1815,7 +1833,7 @@ class SimplifiedDataset(Dataset):
                 max_bytes = self.l1_max_size_mb * 1024 * 1024
             
             # Evict if needed
-            tensor, was_composited = value
+            tensor, lb_info, was_composited = value
             
             # Calculate actual bytes for this tensor
             tensor_bytes = tensor.element_size() * tensor.numel()
@@ -1823,10 +1841,7 @@ class SimplifiedDataset(Dataset):
             # Evict until we have space
             while self.l1_cache_bytes + tensor_bytes > max_bytes and len(self.l1_cache) > 0:
                 evicted_key, evicted_value = self.l1_cache.popitem(last=False)  # Remove LRU
-                if isinstance(evicted_value, tuple):
-                    evicted_tensor = evicted_value[0]
-                else:
-                    evicted_tensor = evicted_value
+                evicted_tensor, _, _ = evicted_value
                 self.l1_cache_bytes -= evicted_tensor.element_size() * evicted_tensor.numel()
             
             # Store compressed version
@@ -1839,7 +1854,7 @@ class SimplifiedDataset(Dataset):
             else:
                 cached = tensor.clone()
             
-            self.l1_cache[key] = (cached, was_composited)
+            self.l1_cache[key] = (cached, lb_info, was_composited)
             self.l1_cache_bytes += cached.element_size() * cached.numel()
 
     
@@ -1957,7 +1972,7 @@ class SimplifiedDataset(Dataset):
 
             try:
                 # Load image tensor and get composite flag
-                image, was_composited = self._load_image(image_path)
+                image, was_composited, lb_info = self._load_image(image_path)
 
                 # Validate image tensor
                 if image is None or torch.isnan(image).any() or torch.isinf(image).any():
@@ -2061,7 +2076,7 @@ class SimplifiedDataset(Dataset):
                                 f"NaN/Inf detected after augmentation for {image_path}, skipping augmentation"
                             )
                             # Reload clean image
-                            image, _ = self._load_image(image_path)
+                            image, _, _ = self._load_image(image_path)
                             # Re-apply flip if it was done
                             if was_flipped:
                                 image = TF.hflip(image)
@@ -2099,23 +2114,17 @@ class SimplifiedDataset(Dataset):
                             ratio=(0.9, 1.1),
                             interpolation=T.InterpolationMode.BICUBIC
                         )(image)
-                        lb_info = {'scale': 1.0, 'pad': (0, 0, 0, 0)}
+                        # This lb_info is a dummy, as RandomResizedCrop does not pad.
+                        lb_info = {'scale': 1.0, 'pad': (0, 0, 0, 0), 'out_size': image.shape[1:], 'in_size': image.shape[1:]}
                     except Exception as e:
                         logger.warning(f"RandomResizedCrop failed for {image_path}: {e}, using letterbox instead")
+                        # Fallback to letterbox if crop fails
                         image, lb_info = letterbox_resize(
                             image,
                             target_size=self.config.image_size,
                             pad_color=self.config.pad_color,
                             patch_size=self.config.patch_size,
                         )
-                else:
-                    # Perform letterbox resize to preserve aspect ratio
-                    image, lb_info = letterbox_resize(
-                        image,
-                        target_size=self.config.image_size,
-                        pad_color=self.config.pad_color,
-                        patch_size=self.config.patch_size,
-                    )
 
                 # Track resize stats
                 if self.aug_stats and lb_info:
