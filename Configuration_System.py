@@ -342,6 +342,7 @@ class DataConfig(BaseConfig):
     storage_locations: List[Dict[str, Any]] = field(default_factory=list)
     
     # Paths
+    data_dir: str = "./data"
     hdf5_dir: str = "/home/user/datasets/teacher_features"
     vocab_dir: str = "/home/user/datasets/vocabulary"
     output_dir: str = "./outputs"
