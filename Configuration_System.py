@@ -583,7 +583,7 @@ class TrainingConfig(BaseConfig):
         if self.gradient_accumulation_steps <= 0:
             errors.append(f"gradient_accumulation_steps must be positive, got {self.gradient_accumulation_steps}")
         
-        valid_optimizers = ["adam", "adamw", "sgd", "rmsprop", "adagrad"]
+        valid_optimizers = ["adam", "adamw", "sgd", "rmsprop", "adagrad", "adan"]
         if self.optimizer not in valid_optimizers:
             errors.append(f"Unknown optimizer: {self.optimizer}. Must be one of {valid_optimizers}")
         
