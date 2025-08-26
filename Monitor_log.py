@@ -1047,6 +1047,21 @@ class TrainingMonitor:
         # Save metrics checkpoint
         if self.config.checkpoint_metrics:
             self._save_metrics_checkpoint(epoch)
+
+    def log_hyperparameters(self, hparams: Dict[str, Any], metrics: Dict[str, Any]):
+        """Log hyperparameters and metrics to TensorBoard."""
+        if self.writer:
+            try:
+                # Filter out non-scalar values from hparams
+                flat_hparams = {}
+                for k, v in hparams.items():
+                    if isinstance(v, (int, float, str, bool)):
+                        flat_hparams[k] = v
+
+                self.writer.add_hparams(flat_hparams, metrics)
+                logger.info("Logged hyperparameters to TensorBoard.")
+            except Exception as e:
+                logger.error(f"Failed to log hyperparameters: {e}")
     
     def log_images(
         self,
