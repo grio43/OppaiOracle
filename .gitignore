@@ -4,3 +4,5 @@ processed_data
 __pycache__/
 utils/__pycache__
 *.log
+logs/*
+!logs/.gitkeep
