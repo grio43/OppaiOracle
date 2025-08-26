@@ -1438,7 +1438,7 @@ class SimplifiedDataset(Dataset):
                             deduplicated_tags.append(tag)
 
                     record: Dict[str, Any] = {
-                        'image_path': str(self.config.data_dir / filename),
+                        'image_path': str(json_file.parent / filename),
                         'tags': deduplicated_tags,
                         'rating': entry.get('rating', 'unknown'),
                         'num_tags': len(deduplicated_tags)
