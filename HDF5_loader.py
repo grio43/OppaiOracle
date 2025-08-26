@@ -2304,7 +2304,15 @@ def create_dataloaders(
         vocab.save_vocabulary(vocab_path)
 
     train_dataset = SimplifiedDataset(data_config, train_files, split='train', vocab=vocab)
-    val_dataset = SimplifiedDataset(data_config, val_files, split='val', vocab=vocab)
+
+    val_data_config = copy.deepcopy(data_config)
+    if hasattr(validation_config, 'preprocessing') and validation_config.preprocessing:
+        val_data_config.normalize_mean = validation_config.preprocessing.normalize_mean
+        val_data_config.normalize_std = validation_config.preprocessing.normalize_std
+        val_data_config.image_size = validation_config.preprocessing.image_size
+        val_data_config.patch_size = validation_config.preprocessing.patch_size
+
+    val_dataset = SimplifiedDataset(val_data_config, val_files, split='val', vocab=vocab)
 
     base_seed = int(seed if seed is not None else torch.initial_seed() % (2**31 - 1))
     generator = torch.Generator()

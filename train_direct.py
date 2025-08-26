@@ -288,6 +288,18 @@ def train_with_orientation_tracking(config: FullConfig):
         eps=config.training.adam_epsilon
     )
 
+    scheduler = None
+    if config.training.scheduler == "plateau":
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=config.training.lr_scheduler_factor,
+            patience=config.training.lr_scheduler_patience,
+            threshold=config.training.lr_scheduler_threshold,
+            verbose=True
+        )
+
     monitor = TrainingMonitor(MonitorConfig(
         log_dir=str(log_dir),
         use_tensorboard=config.training.use_tensorboard,
@@ -309,6 +321,7 @@ def train_with_orientation_tracking(config: FullConfig):
     
     training_state = TrainingState()
     best_val_loss = float('inf')
+    early_stopping_patience_counter = 0
 
     global_step = 0
     for epoch in range(config.training.num_epochs):
@@ -317,6 +330,12 @@ def train_with_orientation_tracking(config: FullConfig):
         optimizer.zero_grad()
         
         for step, batch in enumerate(train_loader):
+            # Manual learning rate warmup
+            if global_step < config.training.warmup_steps:
+                lr_scale = float(global_step) / float(max(1, config.training.warmup_steps))
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = config.training.learning_rate * lr_scale
+
             images = batch['images'].to(device)
             tag_labels = batch['tag_labels'].to(device)
             rating_labels = batch['rating_labels'].to(device)
@@ -393,22 +412,36 @@ def train_with_orientation_tracking(config: FullConfig):
         logger.info(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         monitor.log_validation(global_step, {'loss': avg_val_loss})
 
-        # Checkpointing
+        # Step the scheduler
+        if scheduler:
+            scheduler.step(avg_val_loss)
+
+        # Checkpointing & Early Stopping
         is_best = avg_val_loss < best_val_loss
-        if is_best:
+
+        if avg_val_loss < best_val_loss - config.training.early_stopping_threshold:
             best_val_loss = avg_val_loss
+            early_stopping_patience_counter = 0
+            logger.info(f"Validation loss improved significantly, resetting early stopping patience.")
+        else:
+            early_stopping_patience_counter += 1
+            logger.info(f"Validation loss did not improve significantly. Early stopping patience: {early_stopping_patience_counter}/{config.training.early_stopping_patience}")
 
         if global_step % config.training.save_steps == 0 or is_best:
             checkpoint_manager.save_checkpoint(
                 model=model,
                 optimizer=optimizer,
-                scheduler=None,
+                scheduler=scheduler,
                 epoch=epoch + 1,
                 step=global_step,
                 metrics={'train_loss': avg_train_loss, 'val_loss': avg_val_loss},
                 is_best=is_best,
                 config=config.to_dict()
             )
+
+        if early_stopping_patience_counter >= config.training.early_stopping_patience:
+            logger.info(f"Early stopping triggered after {config.training.early_stopping_patience} epochs with no significant improvement.")
+            break
 
     # Log hyperparameters at the end of training
     hparams = _flatten_dict(config.to_dict())

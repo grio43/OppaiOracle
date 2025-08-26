@@ -108,8 +108,8 @@ data:
   randaugment_num_ops: 2
   randaugment_magnitude: 9
   mixup_alpha: 0.2
-  cutmix_alpha: 1.0
-  random_erasing_p: 0.5
+  cutmix_alpha: 0.0  # Disabled CutMix as it can be too aggressive for tagging
+  random_erasing_p: 0.2 # Reduced from 0.5, as it can erase important small features
 
   # Orientation mapping (from augmentation.yaml)
   orientation_map_path: "./configs/orientation_map.json"
@@ -127,17 +127,19 @@ training:
   gradient_accumulation_steps: 4
   
   # Optimizer
-  optimizer: "adan"
+  optimizer: "adamw"  # Switched to AdamW, a more standard and robust choice for ViTs
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1.0e-8
   
   # Scheduler
-  scheduler: "cosine_restarts"
-  warmup_steps: 10000
-  warmup_ratio: 0.0
-  num_cycles: 1.0
-  lr_end: 1.0e-6
+  scheduler: "plateau"
+  warmup_steps: 10000 # Kept for manual warmup phase if needed
+
+  # Settings for ReduceLROnPlateau scheduler
+  lr_scheduler_patience: 3
+  lr_scheduler_factor: 0.1
+  lr_scheduler_threshold: 0.001
   
   # Mixed precision
   use_amp: true
@@ -186,7 +188,7 @@ training:
   deterministic: false
   benchmark: true
   
-  # Early stopping
+  # Early stopping parameters used in train_direct.py
   early_stopping_patience: 10
   early_stopping_threshold: 0.0001
 
@@ -284,7 +286,7 @@ validation:
     persistent_workers: true
   preprocessing:
     # Keep in sync with training/inference unless intentionally different.
-    normalize_mean: [0.485, 0.456, 0.406]
-    normalize_std:  [0.229, 0.224, 0.225]
+    normalize_mean: [0.5, 0.5, 0.5]
+    normalize_std:  [0.5, 0.5, 0.5]
     image_size: 640
     patch_size: 16
