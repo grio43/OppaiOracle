@@ -138,6 +138,7 @@ training:
   optimizer: "adan"
   adam_beta1: 0.9
   adam_beta2: 0.999
+  adan_beta3: 0.99
   adam_epsilon: 1.0e-8
   
   # Scheduler
