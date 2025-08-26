@@ -709,6 +709,34 @@ class TrainingMonitor:
         # Preserve existing logger if present
         self.logger = getattr(self, "logger", None)
 
+        # Core state
+        self.start_time = time.time()
+        self.metrics = ThreadSafeMetricsTracker(config)
+        self.last_step_time = self.start_time
+        self.last_loss = None
+        self.steps_without_improvement = 0
+        self.best_val_metric = float('inf')
+        self._graph_logged = False
+
+        # Optional components
+        self.alerts = AlertSystem(config) if config.enable_alerts else None
+        self.system_monitor = SystemMonitor(config) if config.track_system_metrics else None
+        if self.system_monitor:
+            try:
+                self.system_monitor.start()
+            except Exception as e:
+                logger.warning(f"System monitor failed to start: {e}")
+
+        # Profiling and logging helpers
+        self.profiler = None
+        self.profiler_step = 0
+        self.data_stats = {
+            'load_times': [],
+            'batch_sizes': [],
+            'augmentation_times': []
+        }
+        self.last_aug_log_step = 0
+
         use_tb = bool(getattr(self.config, "use_tensorboard", False))
         is_primary = bool(getattr(self, "is_primary", True))  # falls back to True if not set
         if use_tb and is_primary:
@@ -741,8 +769,11 @@ class TrainingMonitor:
             except Exception:
                 pass
 
-        # If your original __init__ had other fields, re-initialize them here as needed
-        # e.g., self.global_step = 0, etc.
+        # Final setup
+        self._setup_logging()
+        if self.config.enable_profiling:
+            self._setup_profiler()
+        self._register_cleanup()
     
     def _setup_logging(self):
         """Setup logging configuration"""
@@ -792,7 +823,7 @@ class TrainingMonitor:
         def signal_handler(signum, frame):
             """Signal handler function"""
             logger.info(f"Received signal {signum}, shutting down...")
-            if hasattr(self, 'system_monitor'):
+            if getattr(self, 'system_monitor', None):
                 self.system_monitor.stop()
             if hasattr(self, 'writer') and self.writer:
                 try:
@@ -812,7 +843,7 @@ class TrainingMonitor:
 
         def cleanup():
             """Cleanup function for atexit"""
-            if hasattr(self, 'system_monitor'):
+            if getattr(self, 'system_monitor', None):
                 self.system_monitor.stop()
             if hasattr(self, 'writer') and self.writer:
                 try:
