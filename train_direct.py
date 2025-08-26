@@ -281,12 +281,18 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # Ensure tensorboard_dir points to a stable experiment root; TrainingMonitor will create a per-run subdir.
     config.tensorboard_dir = str(Path(getattr(config, "output_root", "experiments")) / getattr(config, "experiment_name", "default_experiment"))
-    monitor = TrainingMonitor(MonitorConfig(
-        log_dir=str(log_dir),
-        use_tensorboard=config.training.use_tensorboard,
-        tensorboard_dir=str(Path(config.output_root) / config.experiment_name),
-        use_wandb=config.training.use_wandb,
-    ))
+
+    # Update monitor config with values from other parts of the config for backward compatibility
+    if not hasattr(config, 'monitor'):
+        # In case the config file is old and doesn't have a monitor section
+        config.monitor = MonitorConfig()
+
+    config.monitor.log_dir = str(log_dir)
+    config.monitor.use_tensorboard = config.training.use_tensorboard
+    config.monitor.tensorboard_dir = str(Path(config.output_root) / config.experiment_name)
+    config.monitor.use_wandb = config.training.use_wandb
+
+    monitor = TrainingMonitor(config.monitor)
 
     # --- TensorBoard: initial hparams snapshot ---
     try:

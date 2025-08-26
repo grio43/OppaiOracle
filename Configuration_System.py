@@ -19,6 +19,9 @@ import time
 from collections import defaultdict
 import re
 
+from Monitor_log import MonitorConfig
+
+
 logger = logging.getLogger(__name__)
 
 # Type variable for generic config classes
@@ -870,6 +873,7 @@ class FullConfig(BaseConfig):
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
     
     # Global settings
     project_name: str = "anime-image-tagger"
@@ -897,9 +901,13 @@ class FullConfig(BaseConfig):
         errors = []
         
         # Validate each sub-config
-        for config_name in ['model', 'data', 'training', 'inference', 'export']:
+        for config_name in ['model', 'data', 'training', 'inference', 'export', 'monitor']:
             try:
-                getattr(self, config_name).validate()
+                config_obj = getattr(self, config_name)
+                if hasattr(config_obj, 'validate') and callable(getattr(config_obj, 'validate')):
+                    config_obj.validate()
+                else:
+                    logger.debug(f"Config section '{config_name}' has no validate() method, skipping.")
             except ConfigValidationError as e:
                 errors.append(f"{config_name}: {str(e)}")
         
