@@ -86,6 +86,16 @@ def _flatten_dict(d: Dict[str, Any], parent_key: str = '', sep: str = '.') -> Di
     return dict(items)
 
 
+def assert_finite(*tensors, names=None):
+    """Assert that all tensors are finite."""
+    if names is None:
+        names = [f"Tensor {i}" for i in range(len(tensors))]
+    for name, t in zip(names, tensors):
+        if t is not None and hasattr(t, 'dtype') and t.is_floating_point():
+            if not torch.isfinite(t).all():
+                raise RuntimeError(f"Non-finite detected in {name}")
+
+
 def setup_orientation_aware_training(
     data_dir: Path,
     json_dir: Path,
@@ -343,7 +353,14 @@ def train_with_orientation_tracking(config: FullConfig):
 
     amp_enabled = config.training.use_amp and device.type == 'cuda'
     amp_dtype = torch.bfloat16 if amp_enabled and torch.cuda.is_bf16_supported() else torch.float16
-    scaler = GradScaler(device='cuda', enabled=amp_enabled and amp_dtype == torch.float16)
+
+    # GradScaler is only needed for float16 AMP.
+    use_scaler = amp_enabled and amp_dtype == torch.float16
+    scaler = GradScaler(device='cuda', enabled=use_scaler)
+    if amp_enabled:
+        logger.info(f"AMP enabled with dtype={amp_dtype} and GradScaler={'enabled' if use_scaler else 'disabled'}.")
+    else:
+        logger.info("AMP disabled.")
 
     checkpoint_dir = Path(config.output_root) / config.experiment_name / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -366,15 +383,30 @@ def train_with_orientation_tracking(config: FullConfig):
             images = batch['images'].to(device)
             tag_labels = batch['tag_labels'].to(device)
             rating_labels = batch['rating_labels'].to(device)
+
+            # Assert that input data is finite and labels are in range
+            assert_finite(images, tag_labels, names=['images', 'tag_labels'])
+            if rating_labels.dtype in (torch.long, torch.int64):
+                if not ((rating_labels >= 0) & (rating_labels < num_ratings)).all():
+                    raise RuntimeError(f"Rating label out of range. Found min {rating_labels.min()} / max {rating_labels.max()}, expected 0 to {num_ratings-1}")
             
             with autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 pmask = batch.get('padding_mask', None)
                 if pmask is not None: pmask = pmask.to(device)
                 outputs = model(images, padding_mask=pmask)
+
+                # Assert that model outputs are finite before loss calculation
+                assert_finite(outputs['tag_logits'], outputs['rating_logits'], names=['tag_logits', 'rating_logits'])
+
                 loss, losses = criterion(outputs['tag_logits'], outputs['rating_logits'], tag_labels, rating_labels)
 
-            # --- make sure the loss is finite before backward ---
-            loss = ensure_finite_tensor(loss)
+            # Optional: automatic LR backoff when loss is non-finite (place right after computing loss)
+            if not torch.isfinite(loss):
+                logger.warning(f"Non-finite loss detected at step {global_step}: {loss.item()}; reducing LR 10x and skipping step")
+                for g in optimizer.param_groups:
+                    g["lr"] *= 0.1
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             scaler.scale(loss).backward()
 
@@ -391,8 +423,7 @@ def train_with_orientation_tracking(config: FullConfig):
                     pass
                 scaler.unscale_(optimizer)
 
-                # Clip gradients to prevent exploding gradients, a common cause of NaN loss.
-                # A max_grad_norm of 1.0 to 5.0 is a common best practice.
+                # Clip gradients to prevent exploding gradients.
                 if config.training.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
 
