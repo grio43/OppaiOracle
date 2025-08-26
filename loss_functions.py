@@ -77,6 +77,9 @@ class AsymmetricFocalLoss(nn.Module):
         if self.label_smoothing > 0:
             targets = targets * (1 - self.label_smoothing) + self.label_smoothing / 2
 
+        # Clamp logits to prevent numerical instability with mixed precision.
+        logits = torch.clamp(logits, min=-15.0, max=15.0)
+
         # Use BCEWithLogitsLoss for numerical stability.
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
 

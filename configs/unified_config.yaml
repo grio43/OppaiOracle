@@ -100,6 +100,11 @@ data:
   preload_files: 2
   use_memory_cache: true
   
+  # L2 Caching
+  l2_cache_enabled: true
+  l2_cache_path: "./l2_cache"
+  l2_max_size_gb: 48.0
+
   # Augmentation (from augmentation.yaml)
   augmentation_enabled: true
   random_flip_prob: 0.5
