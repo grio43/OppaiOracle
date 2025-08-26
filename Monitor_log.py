@@ -856,6 +856,10 @@ class TrainingMonitor:
 
     def log_model_graph(self, model: torch.nn.Module, example_images: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Write the model graph to TensorBoard once (safe in DDP)."""
+        if not hasattr(self, "_graph_logged"):
+            # Older monitor instances may not define this flag
+            self._graph_logged = False
+
         if not self.writer or self._graph_logged:
             return
         try:
@@ -913,7 +917,11 @@ class TrainingMonitor:
     ):
         """Log training step metrics with comprehensive monitoring"""
         metrics = metrics or {}
-        
+
+        # Ensure metrics tracker exists (older versions may lack it)
+        if not hasattr(self, "metrics"):
+            self.metrics = ThreadSafeMetricsTracker(self.config)
+
         # Update metrics
         self.metrics.add_metric('loss', loss, step)
         self.metrics.add_metric('learning_rate', learning_rate, step)
