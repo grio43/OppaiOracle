@@ -21,31 +21,31 @@ default_output_dir: "./outputs"
 
 # Model Configuration
 model:
-  architecture_type: "vit_large_extended"
-  hidden_size: 1536
-  num_hidden_layers: 28
-  num_attention_heads: 24
-  intermediate_size: 6144
-  image_size: 640
-  patch_size: 16
-  num_channels: 3
-  use_cls_token: true
-  use_style_token: true
-  use_line_token: true
-  use_color_token: true
-  num_special_tokens: 4
-  hidden_dropout_prob: 0.1
-  attention_probs_dropout_prob: 0.1
-  drop_path_rate: 0.1
-  initializer_range: 0.02
-  layer_norm_eps: 1.0e-6
-  use_flash_attention: true
-  attention_bias: true
-  token_ignore_threshold: 0.9
-  num_labels: 200000
-  num_groups: 20
-  tags_per_group: 10000
-  gradient_checkpointing: true
+    architecture_type: "vit_large_extended"
+    hidden_size: 1536
+    num_hidden_layers: 28
+    num_attention_heads: 24
+    intermediate_size: 6144
+    image_size: 640
+    patch_size: 16
+    num_channels: 3
+    use_cls_token: true
+    use_style_token: true
+    use_line_token: true
+    use_color_token: true
+    num_special_tokens: 4
+    hidden_dropout_prob: 0.1
+    attention_probs_dropout_prob: 0.1
+    drop_path_rate: 0.1   # recommended range 0.08–0.3 (must be < 1.0)
+    initializer_range: 0.02
+    layer_norm_eps: 1.0e-6
+    use_flash_attention: true
+    attention_bias: true
+    token_ignore_threshold: 0.9
+    num_labels: 200000
+    num_groups: 20
+    tags_per_group: 10000
+    gradient_checkpointing: true
 
 # Data Configuration (consolidates dataloader.yaml, train_config.yaml, augmentation.yaml)
 data:
@@ -158,11 +158,19 @@ training:
   # bfloat16 is preferred for its numerical stability and range, similar to float32.
   use_amp: true
   amp_opt_level: "O1"
-  amp_dtype: "bfloat16"
-  
+  amp_dtype: bfloat16           # one of: bfloat16, float16
+  enable_anomaly_detection: false  # set true for debugging only
+
   # Gradient clipping
-  max_grad_norm: 1.0
-  
+  gradient_clipping:
+    enabled: true
+    max_norm: 1.0
+
+  # Optionally reduce LR after a non-finite loss to help recovery.
+  overflow_backoff_on_nan:
+    enabled: true
+    factor: 0.1   # multiply each param group lr by this factor on NaN/Inf loss
+
   # Checkpointing
   save_steps: 10000
   save_total_limit: 3
