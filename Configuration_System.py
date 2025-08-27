@@ -889,6 +889,15 @@ class ValidationConfig(BaseConfig):
 
 
 @dataclass
+class TBImageLoggingConfig(BaseConfig):
+    """Configuration for TensorBoard image and text sample logging."""
+    max_samples: int = 4
+    topk: int = 15
+    log_native_resolution: bool = True
+    dpi_for_figures: int = 220
+
+
+@dataclass
 class MonitorConfig(BaseConfig):
     """Configuration for monitoring system"""
     # Logging
@@ -948,6 +957,9 @@ class MonitorConfig(BaseConfig):
     # Remote monitoring
     enable_prometheus: bool = False
     prometheus_port: int = 8080
+
+    # TensorBoard image logging helpers
+    tb_image_logging: TBImageLoggingConfig = field(default_factory=TBImageLoggingConfig)
 
     # History
     max_history_size: int = 10000
