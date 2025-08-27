@@ -20,6 +20,12 @@ from collections import defaultdict
 import re
 import warnings
 
+# Import sensitive defaults
+try:
+    from sensitive_config import ALERT_WEBHOOK_URL
+except ImportError:  # pragma: no cover - fallback when file missing
+    ALERT_WEBHOOK_URL = None
+
 logger = logging.getLogger(__name__)
 
 # Type variable for generic config classes
@@ -944,7 +950,8 @@ class MonitorConfig(BaseConfig):
     alert_on_training_stuck_minutes: int = 30
     alert_on_loss_explosion: float = 10.0
     alert_on_nan_loss: bool = True
-    alert_webhook_url: Optional[str] = None  # For Slack/Discord alerts
+    # Webhook URL is loaded from sensitive_config to avoid hardcoding secrets
+    alert_webhook_url: Optional[str] = ALERT_WEBHOOK_URL
 
     # Performance profiling
     enable_profiling: bool = False
