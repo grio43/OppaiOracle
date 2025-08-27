@@ -14,6 +14,7 @@ from typing import Dict, Any, Optional
 import multiprocessing as mp
 import sys
 import random
+import queue
 from datetime import datetime
 import torch.distributed as dist
 from dataclasses import dataclass
@@ -702,7 +703,7 @@ def main():
     parser = create_config_parser()
     args = parser.parse_args()
     
-    config = load_config(args.config, args=args)
+    config = load_config(args.config)
 
     # Setup logging
     listener = setup_logging(
