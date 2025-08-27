@@ -982,33 +982,33 @@ class DebugConfig(BaseConfig):
     """Configuration for debugging and diagnosing training issues."""
     # When enabled, additional checks and logging are activated.
     # This may impact performance and should be disabled for regular training.
-    enabled: bool = True
+    enabled: bool = False
 
     # If true, dump the input tensors and model outputs to a .pt file
     # when a non-finite value is detected in the model's output logits.
-    dump_tensors_on_error: bool = True
+    dump_tensors_on_error: bool = False
 
     # If true, log detailed information about the batch that caused a
     # non-finite error. This includes file paths or other identifiers.
-    log_batch_info_on_error: bool = True
+    log_batch_info_on_error: bool = False
 
     # Enable PyTorch's anomaly detection for debugging gradients.
-    detect_anomaly: bool = True
+    detect_anomaly: bool = False
 
     # If true, log the gradient norm of the model's parameters to TensorBoard.
-    log_gradient_norm: bool = True
+    log_gradient_norm: bool = False
 
     # If true, perform a pre-training validation step to check the integrity of the input data.
-    validate_input_data: bool = True
+    validate_input_data: bool = False
 
     # If true, save intermediate images during the data augmentation process for visual inspection.
-    visualize_augmentations: bool = True
+    visualize_augmentations: bool = False
 
     # If true, log statistics (min/mean/max) of input batches.
-    log_input_stats: bool = True
+    log_input_stats: bool = False
 
     # If true, log statistics (min/mean/max) of model activations such as logits.
-    log_activation_stats: bool = True
+    log_activation_stats: bool = False
 
     # Directory to save the visualized augmentation images.
     augmentation_visualization_path: str = "./aug_visualizations"

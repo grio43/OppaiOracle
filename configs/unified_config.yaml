@@ -103,7 +103,7 @@ data:
   # L2 Caching
   l2_cache_enabled: true
   l2_cache_path: "./l2_cache"
-  l2_max_size_gb: 48.0
+  l2_max_size_gb: 60.0
 
   # Augmentation (from augmentation.yaml)
   augmentation_enabled: true
@@ -365,39 +365,39 @@ monitor:
 debug:
   # Enable debug mode. This will activate additional checks and logging,
   # which may impact performance.
-  enabled: true
+  enabled: false
 
   # If true, dump the input tensors and model outputs to a .pt file
   # when a non-finite value is detected in the model's output logits.
   # This is useful for offline analysis of the exact data causing the issue.
-  dump_tensors_on_error: true
+  dump_tensors_on_error: false
 
   # If true, log detailed information about the batch that caused a
   # non-finite error. This includes file paths or other identifiers from the
   # dataloader, which can help in reproducing the error.
-  log_batch_info_on_error: true
+  log_batch_info_on_error: false
 
   # Enable PyTorch's anomaly detection for debugging gradients.
   # This will slow down training significantly.
-  detect_anomaly: true
+  detect_anomaly: false
 
   # If true, log the gradient norm of the model's parameters to TensorBoard.
   # This is useful for monitoring training stability.
-  log_gradient_norm: true
+  log_gradient_norm: false
 
   # If true, perform a pre-training validation step to check the integrity
   # of the input data. This can help catch issues early.
-  validate_input_data: true
+  validate_input_data: false
 
   # If true, save intermediate images during the data augmentation process
   # for visual inspection.
-  visualize_augmentations: true
+  visualize_augmentations: false
 
   # If true, log statistics (min/mean/max) of input batches.
-  log_input_stats: true
+  log_input_stats: false
 
   # If true, log statistics (min/mean/max) of model activations such as logits.
-  log_activation_stats: true
+  log_activation_stats: false
 
   # Directory to save the visualized augmentation images.
   augmentation_visualization_path: "./aug_visualizations"
