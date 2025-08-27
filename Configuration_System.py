@@ -18,6 +18,7 @@ import copy
 import time
 from collections import defaultdict
 import re
+import warnings
 
 logger = logging.getLogger(__name__)
 
@@ -305,10 +306,18 @@ class ModelConfig(BaseConfig):
             )
         
         # Validate dropout probabilities
-        for prob_name in ['hidden_dropout_prob', 'attention_probs_dropout_prob', 'drop_path_rate']:
+        for prob_name in ['hidden_dropout_prob', 'attention_probs_dropout_prob']:
             prob_value = getattr(self, prob_name)
             if not 0 <= prob_value <= 1:
                 errors.append(f"{prob_name} must be in [0, 1], got {prob_value}")
+
+        if not 0 <= self.drop_path_rate < 1:
+            errors.append(f"drop_path_rate must be in [0, 1), got {self.drop_path_rate}")
+        elif self.drop_path_rate > 0.5:
+            warnings.warn(
+                f"drop_path_rate={self.drop_path_rate} is unusually high; "
+                "values between 0.08 and 0.3 are typical for ViT."
+            )
         
         if errors:
             raise ConfigValidationError("Model config validation failed:\n" + "\n".join(errors))
@@ -516,6 +525,18 @@ class DataConfig(BaseConfig):
 
 
 @dataclass
+class GradientClippingConfig(BaseConfig):
+    enabled: bool = True
+    max_norm: float = 1.0
+
+
+@dataclass
+class OverflowBackoffConfig(BaseConfig):
+    enabled: bool = False
+    factor: float = 0.1
+
+
+@dataclass
 class TrainingConfig(BaseConfig):
     """Training configuration"""
     # Basic settings
@@ -542,9 +563,14 @@ class TrainingConfig(BaseConfig):
     use_amp: bool = True
     amp_opt_level: str = "O1"
     amp_dtype: str = "float16"  # float16 or bfloat16
-    
+    enable_anomaly_detection: bool = False
+
     # Gradient clipping
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 1.0  # deprecated, use gradient_clipping.max_norm
+    gradient_clipping: GradientClippingConfig = field(default_factory=GradientClippingConfig)
+
+    # Optional LR backoff when loss becomes non-finite
+    overflow_backoff_on_nan: OverflowBackoffConfig = field(default_factory=OverflowBackoffConfig)
     
     # Checkpointing
     save_steps: int = 5000

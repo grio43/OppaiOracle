@@ -17,6 +17,7 @@ import random
 from datetime import datetime
 import torch.distributed as dist
 from dataclasses import dataclass
+from contextlib import nullcontext
 
 import shutil
 import torch
@@ -227,10 +228,11 @@ def train_with_orientation_tracking(config: FullConfig):
     # Seeding & determinism
     seed, deterministic_mode = setup_seed(config.training.seed, config.training.deterministic)
 
-    # Enable anomaly detection if configured (for debugging NaN gradients)
-    if getattr(config.debug, 'detect_anomaly', False):
-        logger.warning("PyTorch anomaly detection is enabled. This will slow down training.")
-        torch.autograd.set_detect_anomaly(True)
+    use_anomaly = (
+        getattr(config.training, "enable_anomaly_detection", False)
+        or getattr(config.debug, "detect_anomaly", False)
+    )
+    anomaly_ctx = torch.autograd.detect_anomaly(check_nan=True) if use_anomaly else nullcontext()
 
     try:
         torch.use_deterministic_algorithms(deterministic_mode)
@@ -266,6 +268,7 @@ def train_with_orientation_tracking(config: FullConfig):
 
     stats_queue = mp.Queue(maxsize=1000) if config.training.use_tensorboard else None
     device = torch.device(config.training.device)
+    device_type = device.type
 
     if stats_queue:
         config.data.stats_queue = stats_queue
@@ -365,7 +368,11 @@ def train_with_orientation_tracking(config: FullConfig):
     )
 
     amp_enabled = config.training.use_amp and device.type == 'cuda'
-    amp_dtype = torch.bfloat16 if amp_enabled and torch.cuda.is_bf16_supported() else torch.float16
+    amp_pref = getattr(config.training, "amp_dtype", "bfloat16")
+    if amp_pref == "bfloat16" and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+    else:
+        amp_dtype = torch.float16
 
     # GradScaler is only needed for float16 AMP.
     use_scaler = amp_enabled and amp_dtype == torch.float16
@@ -391,107 +398,119 @@ def train_with_orientation_tracking(config: FullConfig):
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
-        
-        for step, batch in enumerate(train_loader):
-            images = batch['images'].to(device)
-            tag_labels = batch['tag_labels'].to(device)
-            rating_labels = batch['rating_labels'].to(device)
 
-            # Assert that input data is finite and labels are in range
-            assert_finite(images, tag_labels, names=['images', 'tag_labels'], batch=batch, config=config)
-            if rating_labels.dtype in (torch.long, torch.int64):
-                if not ((rating_labels >= 0) & (rating_labels < num_ratings)).all():
-                    raise RuntimeError(f"Rating label out of range. Found min {rating_labels.min()} / max {rating_labels.max()}, expected 0 to {num_ratings-1}")
-            
-            if getattr(config.debug, 'log_input_stats', False) and (global_step % config.training.logging_steps == 0):
-                monitor.log_scalar('train/image_min', images.min().item(), global_step)
-                monitor.log_scalar('train/image_max', images.max().item(), global_step)
-                monitor.log_scalar('train/image_mean', images.mean().item(), global_step)
-                logger.debug(
-                    f"Input stats - min: {images.min().item():.6f}, "
-                    f"mean: {images.mean().item():.6f}, max: {images.max().item():.6f}"
-                )
+        with anomaly_ctx:
+            for step, batch in enumerate(train_loader):
+                images = batch['images'].to(device)
+                tag_labels = batch['tag_labels'].to(device)
+                rating_labels = batch['rating_labels'].to(device)
 
-            with autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                pmask = batch.get('padding_mask', None)
-                if pmask is not None: pmask = pmask.to(device)
-                outputs = model(images, padding_mask=pmask)
+                # Assert that input data is finite and labels are in range
+                assert_finite(images, tag_labels, names=['images', 'tag_labels'], batch=batch, config=config)
+                if rating_labels.dtype in (torch.long, torch.int64):
+                    if not ((rating_labels >= 0) & (rating_labels < num_ratings)).all():
+                        raise RuntimeError(f"Rating label out of range. Found min {rating_labels.min()} / max {rating_labels.max()}, expected 0 to {num_ratings-1}")
 
-                if getattr(config.debug, 'log_activation_stats', False) and (global_step % config.training.logging_steps == 0):
-                    tag_logits = outputs.get('tag_logits')
-                    rating_logits = outputs.get('rating_logits')
-                    if tag_logits is not None:
-                        monitor.log_scalar('train/tag_logits_min', tag_logits.min().item(), global_step)
-                        monitor.log_scalar('train/tag_logits_max', tag_logits.max().item(), global_step)
-                        monitor.log_scalar('train/tag_logits_mean', tag_logits.mean().item(), global_step)
-                        logger.debug(
-                            f"Tag logits stats - min: {tag_logits.min().item():.6f}, "
-                            f"mean: {tag_logits.mean().item():.6f}, max: {tag_logits.max().item():.6f}"
-                        )
-                    if rating_logits is not None:
-                        monitor.log_scalar('train/rating_logits_min', rating_logits.min().item(), global_step)
-                        monitor.log_scalar('train/rating_logits_max', rating_logits.max().item(), global_step)
-                        monitor.log_scalar('train/rating_logits_mean', rating_logits.mean().item(), global_step)
-                        logger.debug(
-                            f"Rating logits stats - min: {rating_logits.min().item():.6f}, "
-                            f"mean: {rating_logits.mean().item():.6f}, max: {rating_logits.max().item():.6f}"
-                        )
+                if getattr(config.debug, 'log_input_stats', False) and (global_step % config.training.logging_steps == 0):
+                    monitor.log_scalar('train/image_min', images.min().item(), global_step)
+                    monitor.log_scalar('train/image_max', images.max().item(), global_step)
+                    monitor.log_scalar('train/image_mean', images.mean().item(), global_step)
+                    logger.debug(
+                        f"Input stats - min: {images.min().item():.6f}, "
+                        f"mean: {images.mean().item():.6f}, max: {images.max().item():.6f}"
+                    )
 
-                # Assert that model outputs are finite before loss calculation
-                assert_finite(
-                    outputs['tag_logits'],
-                    outputs['rating_logits'],
-                    names=['tag_logits', 'rating_logits'],
-                    batch=batch,
-                    outputs=outputs,
-                    config=config
-                )
+                with autocast(device_type=device_type, enabled=amp_enabled, dtype=amp_dtype):
+                    pmask = batch.get('padding_mask', None)
+                    if pmask is not None: pmask = pmask.to(device)
+                    outputs = model(images, padding_mask=pmask)
 
-                loss, losses = criterion(outputs['tag_logits'], outputs['rating_logits'], tag_labels, rating_labels)
+                    if getattr(config.debug, 'log_activation_stats', False) and (global_step % config.training.logging_steps == 0):
+                        tag_logits = outputs.get('tag_logits')
+                        rating_logits = outputs.get('rating_logits')
+                        if tag_logits is not None:
+                            monitor.log_scalar('train/tag_logits_min', tag_logits.min().item(), global_step)
+                            monitor.log_scalar('train/tag_logits_max', tag_logits.max().item(), global_step)
+                            monitor.log_scalar('train/tag_logits_mean', tag_logits.mean().item(), global_step)
+                            logger.debug(
+                                f"Tag logits stats - min: {tag_logits.min().item():.6f}, "
+                                f"mean: {tag_logits.mean().item():.6f}, max: {tag_logits.max().item():.6f}"
+                            )
+                        if rating_logits is not None:
+                            monitor.log_scalar('train/rating_logits_min', rating_logits.min().item(), global_step)
+                            monitor.log_scalar('train/rating_logits_max', rating_logits.max().item(), global_step)
+                            monitor.log_scalar('train/rating_logits_mean', rating_logits.mean().item(), global_step)
+                            logger.debug(
+                                f"Rating logits stats - min: {rating_logits.min().item():.6f}, "
+                                f"mean: {rating_logits.mean().item():.6f}, max: {rating_logits.max().item():.6f}"
+                            )
 
-            # Optional: automatic LR backoff when loss is non-finite (place right after computing loss)
-            if not torch.isfinite(loss):
-                logger.warning(f"Non-finite loss detected at step {global_step}: {loss.item()}; reducing LR 10x and skipping step")
-                for g in optimizer.param_groups:
-                    g["lr"] *= 0.1
-                optimizer.zero_grad(set_to_none=True)
-                continue
+                    # Assert that model outputs are finite before loss calculation
+                    assert_finite(
+                        outputs['tag_logits'],
+                        outputs['rating_logits'],
+                        names=['tag_logits', 'rating_logits'],
+                        batch=batch,
+                        outputs=outputs,
+                        config=config
+                    )
 
-            scaler.scale(loss).backward()
+                    loss, losses = criterion(outputs['tag_logits'], outputs['rating_logits'], tag_labels, rating_labels)
 
-            if (step + 1) % config.training.gradient_accumulation_steps == 0:
-                # --- TensorBoard: param/grad histograms (throttled) ---
-                try:
-                    interval = getattr(config, "param_hist_interval_steps", None)
-                    if interval is None:
-                        training_cfg = getattr(config, "training", None)
-                        interval = getattr(training_cfg, "param_hist_interval_steps", None) if training_cfg else None
-                    if interval and (global_step % int(interval) == 0):
-                        monitor.log_param_and_grad_histograms(model, global_step)
-                except Exception:
-                    pass
-                scaler.unscale_(optimizer)
+                if not torch.isfinite(loss):
+                    logger.warning(f"Found non-finite loss at step {global_step}: {loss.item()}; skipping step")
+                    if getattr(config.training.overflow_backoff_on_nan, "enabled", False):
+                        factor = getattr(config.training.overflow_backoff_on_nan, "factor", 0.1)
+                        for g in optimizer.param_groups:
+                            g["lr"] *= factor
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
-                # --- Gradient Norm Monitoring ---
-                if getattr(config.debug, 'log_gradient_norm', False) and (global_step % config.training.logging_steps == 0):
-                    total_norm = 0
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            param_norm = p.grad.data.norm(2)
-                            total_norm += param_norm.item() ** 2
-                    total_norm = total_norm ** 0.5
-                    monitor.log_scalar('train/grad_norm', total_norm, global_step)
+                scaler.scale(loss).backward()
 
-                # Clip gradients to prevent exploding gradients.
-                if config.training.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
+                if (step + 1) % config.training.gradient_accumulation_steps == 0:
+                    # --- TensorBoard: param/grad histograms (throttled) ---
+                    try:
+                        interval = getattr(config, "param_hist_interval_steps", None)
+                        if interval is None:
+                            training_cfg = getattr(config, "training", None)
+                            interval = getattr(training_cfg, "param_hist_interval_steps", None) if training_cfg else None
+                        if interval and (global_step % int(interval) == 0):
+                            monitor.log_param_and_grad_histograms(model, global_step)
+                    except Exception:
+                        pass
+                    scaler.unscale_(optimizer)
 
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-            
-            running_loss += loss.item()
-            global_step += 1
+                    if getattr(config.debug, 'log_gradient_norm', False) and (global_step % config.training.logging_steps == 0):
+                        total_norm = 0
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                param_norm = p.grad.data.norm(2)
+                                total_norm += param_norm.item() ** 2
+                        total_norm = total_norm ** 0.5
+                        monitor.log_scalar('train/grad_norm', total_norm, global_step)
+
+                    if getattr(config.training.gradient_clipping, 'enabled', True):
+                        max_norm = getattr(config.training.gradient_clipping, 'max_norm', 1.0)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+                    grads_finite = all(
+                        (p.grad is None) or torch.isfinite(p.grad).all()
+                        for p in model.parameters()
+                    )
+                    if not grads_finite:
+                        logger.warning("Skipping optimizer step due to non-finite gradients")
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+
+                running_loss += loss.item()
+                global_step += 1
 
             if stats_queue:
                 while not stats_queue.empty():
@@ -518,7 +537,7 @@ def train_with_orientation_tracking(config: FullConfig):
                 tag_labels = batch['tag_labels'].to(device)
                 rating_labels = batch['rating_labels'].to(device)
                 
-                with autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                with autocast(device_type=device_type, enabled=amp_enabled, dtype=amp_dtype):
                     pmask = batch.get('padding_mask', None)
                     if pmask is not None: pmask = pmask.to(device)
                     outputs = model(images, padding_mask=pmask)
