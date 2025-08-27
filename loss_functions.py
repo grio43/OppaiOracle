@@ -154,9 +154,12 @@ class MultiTaskLoss(nn.Module):
         """
         tag_loss = self.tag_loss_fn(tag_logits, tag_targets, sample_weights)
         # Compute rating loss
-        if rating_targets.dim() == 2:
-            rating_targets = rating_targets.argmax(dim=1)
-        rating_loss = self.rating_loss_fn(rating_logits, rating_targets)
+        if isinstance(self.rating_loss_fn, AsymmetricFocalLoss):
+            rating_loss = self.rating_loss_fn(rating_logits, rating_targets)
+        else:
+            if rating_targets.dim() == 2:
+                rating_targets = rating_targets.argmax(dim=1)
+            rating_loss = self.rating_loss_fn(rating_logits, rating_targets)
         total_loss = (
             self.tag_loss_weight * tag_loss +
             self.rating_loss_weight * rating_loss
