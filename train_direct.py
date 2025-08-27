@@ -579,6 +579,7 @@ def train_with_orientation_tracking(config: FullConfig):
                 epoch=epoch + 1,
                 step=global_step,
                 metrics={'train_loss': avg_train_loss, 'val_loss': avg_val_loss},
+                training_state=training_state,
                 is_best=is_best,
                 config=config.to_dict()
             )
