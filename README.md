@@ -1,6 +1,6 @@
-# OppaiOracle (MAID)
+# OppaiOracle
 
-OppaiOracle, also known as MAID (Model for AI-based Detection), is a deep learning project for AI-based image tagging. It is built with PyTorch and is designed to be a comprehensive solution for training, evaluating, and deploying image tagging models.
+OppaiOracle, is a deep learning project for AI-based image tagging. It is built with PyTorch and is designed to be a comprehensive solution for training, evaluating, and deploying image tagging models.
 
 ## Features
 
