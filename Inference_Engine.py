@@ -36,6 +36,7 @@ from PIL import Image
 from model_metadata import ModelMetadata
 from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
 from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
+from Configuration_System import load_config, InferenceConfig as BaseInferenceConfig
 
 # Make cv2 optional - not needed for basic inference
 try:
@@ -79,102 +80,80 @@ DEFAULT_VOCAB_PATH = _load_vocab_path()
 
 
 @dataclass
-class InferenceConfig:
-    """
-    Thin shim preserving existing attributes.
-    Values are overridden from configs/inference_config.yaml if present.
-    """
-    # Model settings
-    vocab_path: Optional[str] = str(DEFAULT_VOCAB_PATH)  # Explicit vocabulary path
-    model_path: str = "./checkpoints/best_model.pt"  # Standardize to .pt
+class InferenceConfig(BaseInferenceConfig):
+    """Inference settings derived from the central configuration system."""
+
+    vocab_path: Optional[str] = str(DEFAULT_VOCAB_PATH)
+    model_path: str = "./checkpoints/best_model.pt"
     config_path: str = "./checkpoints/model_config.json"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Batch processing
     batch_size: int = 32
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
-
-    # Image preprocessing
     image_size: int = 640
-    # Use same normalization as training (anime-optimized, not ImageNet)
     normalize_mean: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
     normalize_std: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
-
-    # Inference settings
-    threshold: float = 0.5
-    top_k: int = 10
-    precision: str = "bf16"  # Add precision setting: "fp32", "fp16", "bf16"
     use_torch_compile: bool = False
     thresholds_path: Optional[str] = None
     eye_color_exclusive: bool = False
     tta_flip: bool = False
-
-    # Performance
     max_queue_size: int = 100
     timeout: float = 30.0
-    enable_profiling: bool = False
-
-    # Monitoring
     enable_monitoring: bool = True
     monitor_config: Optional[MonitorConfig] = None
-
-    # Caching
     enable_cache: bool = True
     cache_size: int = 1000
-    cache_ttl_seconds: int = 3600  # 1 hour default TTL
-
-    # Output
-    output_format: str = "json"  # json, csv, txt
+    cache_ttl_seconds: int = 3600
     save_visualizations: bool = False
     visualization_dir: str = "./visualizations"
     input_image_extensions: List[str] = field(default_factory=lambda: [".jpg", ".jpeg", ".png", ".webp"])
 
-    @classmethod
-    def apply_yaml_overrides(cls, path: Path = PROJECT_ROOT / "configs" / "inference_config.yaml"):
-        try:
-            cfg = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-        except Exception:
-            return
-        pp = (cfg.get("preprocessing") or {})
-        rt = (cfg.get("runtime") or {})
-        post = (cfg.get("postprocessing") or {})
-        io = (cfg.get("io") or {})
-        inp = (cfg.get("input") or {})
-        updates = {
-            "image_size": pp.get("image_size"),
-            "normalize_mean": pp.get("normalize_mean"),
-            "normalize_std": pp.get("normalize_std"),
-            "device": rt.get("device"),
-            "tta_flip": rt.get("tta_flip"),
-            "threshold": post.get("threshold"),
-            "top_k": post.get("top_k"),
-            "output_format": io.get("output_format"),
-            "save_visualizations": io.get("save_visualizations"),
-            "visualization_dir": io.get("visualization_dir"),
-            "input_image_extensions": inp.get("image_extensions"),
-        }
-        for key, value in updates.items():
-            if value is not None:
-                setattr(cls, key, value)
-                if key in cls.__dataclass_fields__:
-                    field = cls.__dataclass_fields__[key]
-                    field.default = value
-                    field.default_factory = lambda v=value: v
+    @property
+    def threshold(self) -> float:
+        return self.prediction_threshold
 
-# Apply YAML overrides on import
-InferenceConfig.apply_yaml_overrides()
+    @threshold.setter
+    def threshold(self, value: float) -> None:
+        self.prediction_threshold = value
 
-# Also try to load from unified config for key settings
-try:
-    from Configuration_System import load_config
-    unified_config = load_config(PROJECT_ROOT / "configs" / "unified_config.yaml")
-    if unified_config and unified_config.inference:
-        InferenceConfig.precision = unified_config.inference.get("precision", InferenceConfig.precision)
-        logger.info(f"Loaded precision '{InferenceConfig.precision}' from unified_config.yaml")
-except Exception as e:
-    logger.warning(f"Could not load settings from unified_config.yaml: {e}")
+
+def load_inference_config(path: Path = PROJECT_ROOT / "configs" / "inference_config.yaml") -> InferenceConfig:
+    config = InferenceConfig()
+    try:
+        cfg = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except Exception:
+        cfg = {}
+    pp = cfg.get("preprocessing") or {}
+    rt = cfg.get("runtime") or {}
+    post = cfg.get("postprocessing") or {}
+    io = cfg.get("io") or {}
+    inp = cfg.get("input") or {}
+    updates = {
+        "image_size": pp.get("image_size"),
+        "normalize_mean": pp.get("normalize_mean"),
+        "normalize_std": pp.get("normalize_std"),
+        "device": rt.get("device"),
+        "tta_flip": rt.get("tta_flip"),
+        "prediction_threshold": post.get("threshold"),
+        "top_k": post.get("top_k"),
+        "output_format": io.get("output_format"),
+        "save_visualizations": io.get("save_visualizations"),
+        "visualization_dir": io.get("visualization_dir"),
+        "input_image_extensions": inp.get("image_extensions"),
+    }
+    for key, value in updates.items():
+        if value is not None:
+            setattr(config, key, value)
+
+    try:
+        unified_config = load_config(PROJECT_ROOT / "configs" / "unified_config.yaml")
+        if unified_config and unified_config.inference:
+            config.precision = unified_config.inference.precision
+    except Exception as e:
+        logger.warning(f"Could not load settings from unified_config.yaml: {e}")
+
+    return config
 
 
 class ImagePreprocessor:
@@ -679,7 +658,6 @@ class InferenceEngine:
         if self.config.enable_monitoring and MONITORING_AVAILABLE:
             monitor_config = None
             try:
-                from Configuration_System import load_config
                 # Assuming unified_config.yaml is the single source of truth
                 unified_config_path = PROJECT_ROOT / "configs" / "unified_config.yaml"
                 if unified_config_path.exists():
@@ -989,18 +967,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Configure inference
-    # Note: image_size should match the training configuration (640 for ViT, not 448)
-    config = InferenceConfig(
-        model_path=args.model,
-        vocab_path=args.vocab,
-        config_path=args.config,
-        batch_size=32,
-        threshold=0.5,
-        top_k=10,
-        enable_monitoring=True,
-        enable_cache=True,
-        image_size=640,  # Match training image size for ViT
-    )
+    # Load defaults from configuration files and override with CLI args
+    config = load_inference_config()
+    config.model_path = args.model
+    config.vocab_path = args.vocab
+    config.config_path = args.config
 
     # Example of what should be saved during training (add to training script):
     # When saving checkpoint in training script, include normalization params:
