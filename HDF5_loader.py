@@ -1324,6 +1324,11 @@ class SimplifiedDataset(Dataset):
             # Track permanently failed images
             self._failed_images: set[str] = set()
 
+            # Initialize known-good sample pool for fallback
+            self._known_good_indices: List[int] = []
+            self._known_good_lock = threading.Lock()
+            self._populate_known_good_pool()
+
             # Max retry attempts - scale with dataset size
             self._max_retry_attempts = min(16, max(8, len(self.annotations) // 1000))
             logger.info(f"Max retry attempts set to {self._max_retry_attempts} for {len(self.annotations)} samples")
@@ -1386,6 +1391,30 @@ class SimplifiedDataset(Dataset):
 
             # Monitor memory at initialization
             self._log_memory_status("Dataset initialization")
+
+    def _populate_known_good_pool(self, sample_size: int = 100):
+        """Populate a pool of known-good sample indices for fallback"""
+        if len(self.annotations) == 0:
+            return
+
+        sample_size = min(sample_size, len(self.annotations))
+        test_indices = np.random.choice(len(self.annotations), size=sample_size, replace=False)
+
+        good_indices = []
+        for idx in test_indices:
+            image_path = self.annotations[idx]['image_path']
+            try:
+                # Quick validation - just try to open
+                with Image.open(image_path) as img:
+                    _ = img.size
+                good_indices.append(idx)
+            except Exception:
+                continue
+
+        with self._known_good_lock:
+            self._known_good_indices = good_indices
+
+        logger.info(f"Known-good pool populated with {len(good_indices)}/{sample_size} valid samples")
 
     def _load_annotations(self, json_files: List[Path]) -> None:
         """Parse annotation files and populate ``self.annotations``.
@@ -1940,8 +1969,16 @@ class SimplifiedDataset(Dataset):
 
             # Avoid infinite loops by checking visited indices
             if idx in visited_indices:
-                logger.warning(f"Repeated index {idx} encountered during loading")
-                break
+                # Try to get a known-good sample
+                with self._known_good_lock:
+                    if self._known_good_indices:
+                        idx = random.choice(self._known_good_indices)
+                        if idx in visited_indices:
+                            # Even our good samples have been tried, give up
+                            break
+                    else:
+                        # No good samples available, increment and continue
+                        idx = (idx + 1) % len(self.annotations)
 
             visited_indices.add(idx)
 
@@ -2168,10 +2205,19 @@ class SimplifiedDataset(Dataset):
                 tag_labels = self.vocab.encode_tags(tags)
                 rating_label = self.vocab.rating_to_index.get(anno['rating'], self.vocab.rating_to_index['unknown'])
 
-                # Success! Reset error count
+                # Success! Reset error count and add to known-good pool
                 with self._error_counts_lock:
                     if image_path in self._error_counts:
                         del self._error_counts[image_path]
+
+                # Add successful index to known-good pool (with probability to avoid bias)
+                if random.random() < 0.1:  # 10% chance
+                    with self._known_good_lock:
+                        if actual_idx not in self._known_good_indices:
+                            self._known_good_indices.append(actual_idx)
+                            # Keep pool size bounded
+                            if len(self._known_good_indices) > 200:
+                                self._known_good_indices.pop(0)
 
                 # Save metadata for augmentation visualization
                 if vis_dir:
@@ -2311,17 +2357,8 @@ class SimplifiedDataset(Dataset):
 
     def __del__(self):
         """Cleanup when dataset is destroyed."""
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def close(self):
-        """Release any external resources held by the dataset."""
         if hasattr(self, 'background_validator'):
             self.background_validator.stop()
-        if getattr(self, 'validation_index', None) is not None:
-            self.validation_index.close()
 
 def validate_dataset(dataloader: DataLoader, vocab: TagVocabulary, config: Any, num_batches_to_check: int):
     """

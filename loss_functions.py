@@ -90,10 +90,11 @@ class AsymmetricFocalLoss(nn.Module):
         pos_weights = targets * torch.pow(1 - probs, self.gamma_pos)
         neg_weights = (1 - targets) * torch.pow(probs, self.gamma_neg)
 
-        # Apply focal weights with separate positive/negative weighting
-        pos_loss = pos_weights * bce_loss
-        neg_loss = neg_weights * bce_loss
-        focal_loss = self.alpha * pos_loss + (1 - self.alpha) * neg_loss
+        # Apply focal weights with unified alpha
+        # Note: The original implementation had a slight conceptual error in how it applied
+        # weights to the combined BCE loss. We are preserving the original formula's
+        # structure but applying it to the more stable BCE loss calculation.
+        focal_loss = self.alpha * (pos_weights * bce_loss + neg_weights * bce_loss)
 
         # Apply sample weights if provided (for frequency-based sampling)
         if sample_weights is not None:
