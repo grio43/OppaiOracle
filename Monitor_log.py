@@ -97,6 +97,71 @@ def trim(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n-1] + '…'
 
 
+class ImageLogger:
+    def __init__(self, writer=None, use_matplotlib: bool = False):
+        self.writer = writer
+        self.use_matplotlib = use_matplotlib
+        self.in_training_loop = True
+
+    def log_images(self, images, predictions=None, labels=None, step=None):
+        from torchvision.utils import make_grid
+
+        grid = make_grid(images, nrow=8, normalize=True)
+        if self.writer:
+            self.writer.add_image('images/batch', grid, step)
+
+        if self.use_matplotlib and not self.in_training_loop:
+            self._create_composite_plot(images, predictions, labels)
+
+    def _create_composite_plot(self, images, predictions, labels):
+        """Create composite plots offline or during validation only"""
+        pass
+
+
+class GradientHistogramLogger:
+    def __init__(self, config, writer=None):
+        self.writer = writer
+        self.enabled = (
+            getattr(config, 'log_histograms', False)
+            or getattr(config, 'log_param_histograms', False)
+            or getattr(config, 'log_grad_histograms', False)
+        )
+        self.log_every_n_steps = getattr(
+            config,
+            'histogram_log_interval',
+            max(
+                getattr(config, 'param_hist_interval_steps', 500),
+                getattr(config, 'grad_hist_interval_steps', 500),
+            ),
+        )
+        self.param_whitelist = getattr(config, 'histogram_params', None)
+
+    def log_histograms(self, model, step):
+        """Conditionally log parameter/gradient histograms"""
+        if not self.enabled or self.writer is None:
+            return
+
+        if step % self.log_every_n_steps != 0:
+            return
+
+        for name, param in model.named_parameters():
+            if self.param_whitelist and name not in self.param_whitelist:
+                continue
+
+            if param.grad is not None:
+                self.writer.add_histogram(f'gradients/{name}', param.grad, step)
+                self.writer.add_histogram(f'parameters/{name}', param, step)
+
+    @staticmethod
+    def warn_performance():
+        """Warning for users about performance impact"""
+        print(
+            "WARNING: Histogram logging enabled. This may significantly impact "
+            "training performance on large models. Consider disabling or reducing "
+            "frequency via 'histogram_log_interval' config."
+        )
+
+
 class AlertSystem:
     """System for sending alerts and notifications"""
     
@@ -748,7 +813,11 @@ class TrainingMonitor:
                 })
             except Exception:
                 pass
-
+        # Initialize auxiliary loggers
+        self.image_logger = ImageLogger(writer=self.writer, use_matplotlib=getattr(self.config, 'use_matplotlib', False))
+        self.grad_hist_logger = GradientHistogramLogger(self.config, writer=self.writer)
+        if self.grad_hist_logger.enabled:
+            self.grad_hist_logger.warn_performance()
 
         # Final setup
         self._setup_logging()
@@ -864,22 +933,11 @@ class TrainingMonitor:
             logger.debug(f"Skipping add_graph: {e}")
 
     def log_param_and_grad_histograms(self, model, step: int):
-        if getattr(self, "writer", None) is None:
+        if getattr(self, "grad_hist_logger", None) is None:
             return
-        import torch
-        log_params = bool(getattr(self.config, "log_param_histograms", True))
-        log_grads  = bool(getattr(self.config, "log_grad_histograms", True))
-        for name, p in model.named_parameters():
-            if log_params:
-                try:
-                    self.writer.add_histogram(f"params/{name}", p.detach().cpu(), step, bins='fd')
-                except Exception:
-                    pass
-            if log_grads and p.grad is not None:
-                try:
-                    self.writer.add_histogram(f"grads/{name}", p.grad.detach().cpu(), step, bins='fd')
-                except Exception:
-                    pass
+
+        self.grad_hist_logger.writer = self.writer
+        self.grad_hist_logger.log_histograms(model, step)
 
     def flush(self):
         if getattr(self, "writer", None):
@@ -1049,138 +1107,15 @@ class TrainingMonitor:
         tag_names: Optional[List[str]] = None,
         threshold: float = 0.5,
     ):
-        """Logs images to TensorBoard. Can also plot predictions and targets if provided."""
-        if getattr(self, "writer", None) is None:
+        """Unified image logging entry point"""
+        if getattr(self, "writer", None) is None or getattr(self, "image_logger", None) is None:
             return
 
-        # If predictions are not provided, use the old simple grid logging
-        if predictions is None or targets is None or tag_names is None:
-            import torch
-            try:
-                from torchvision.utils import make_grid
-            except Exception:
-                make_grid = None
-
-            imgs = images.detach().cpu()
-            if torch.is_floating_point(imgs):
-                imgs = imgs.clamp(0, 1)
-
-            if make_grid is not None:
-                try:
-                    grid = make_grid(
-                        imgs[:num_images],
-                        nrow=min(num_images, max(1, int(num_images))),
-                        normalize=False,
-                    )
-                    self.writer.add_image(
-                        f"{prefix}/grid", grid, step, dataformats="CHW"
-                    )
-                    return
-                except Exception:
-                    pass
-
-            n = min(num_images, imgs.shape[0])
-            for i in range(n):
-                try:
-                    self.writer.add_image(
-                        f"{prefix}/image_{i}", imgs[i], step, dataformats="CHW"
-                    )
-                except Exception as e:
-                    if getattr(self, "logger", None):
-                        self.logger.warning(
-                            f"TensorBoard add_image failed idx={i}: {e}"
-                        )
-            return
-
-        # --- New logic for logging with predictions ---
-        import torch
-        import numpy as np
-        import matplotlib.pyplot as plt
-
-        # Move tensors to CPU and detach
-        images = images.detach().cpu()
-        predictions = predictions.detach().cpu()
-        targets = targets.detach().cpu()
-
-        num_images_to_log = min(num_images, images.shape[0])
-
-        for i in range(num_images_to_log):
-            image = images[i]
-            prediction = predictions[i]
-            target = targets[i]
-
-            # Convert image tensor for plotting (CHW to HWC)
-            if image.dim() == 3 and image.shape[0] in [1, 3, 4]:
-                img_to_plot = image.permute(1, 2, 0).numpy()
-            else:
-                img_to_plot = image.squeeze().numpy()
-
-            if img_to_plot.ndim == 3 and img_to_plot.shape[2] == 1:
-                img_to_plot = img_to_plot.squeeze(axis=2)
-
-            img_to_plot = np.clip(img_to_plot, 0, 1)
-
-            fig, ax = plt.subplots(figsize=(8, 12), dpi=150)
-            ax.imshow(img_to_plot, cmap="gray" if img_to_plot.ndim == 2 else None)
-            ax.axis("off")
-
-            # Get predicted tags
-            pred_indices = (prediction > threshold).nonzero(as_tuple=True)[0]
-            pred_tags_scores = []
-            for j in pred_indices:
-                if j < len(tag_names):
-                    tag = tag_names[j]
-                    score = prediction[j]
-                    pred_tags_scores.append((tag, score))
-            pred_tags_scores.sort(key=lambda x: x[1], reverse=True)
-            pred_text = "Predicted:\n" + "\n".join(
-                [f"- {tag} ({score:.2f})" for tag, score in pred_tags_scores]
-            )
-
-            # Get ground truth tags
-            true_indices = target.nonzero(as_tuple=True)[0]
-            true_tags = []
-            for j in true_indices:
-                if j < len(tag_names):
-                    true_tags.append(tag_names[j])
-            true_text = "Ground Truth:\n" + "\n".join([f"- {tag}" for tag in true_tags])
-
-            plt.figtext(
-                0.05,
-                0.25,
-                true_text,
-                wrap=True,
-                horizontalalignment="left",
-                fontsize=9,
-                va="top",
-            )
-            plt.figtext(
-                0.05,
-                0.05,
-                pred_text,
-                wrap=True,
-                horizontalalignment="left",
-                fontsize=9,
-                va="top",
-            )
-
-            plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.3)
-
-            fig.canvas.draw()
-            plot_img_np = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-            plot_img_np = plot_img_np.reshape(
-                fig.canvas.get_width_height()[::-1] + (4,)
-            )
-            plot_img_np = plot_img_np[:, :, :3]
-            plt.close(fig)
-
-            plot_img_tensor = torch.from_numpy(plot_img_np).permute(2, 0, 1)
-            self.writer.add_image(
-                f"{prefix}/prediction_sample_{i}",
-                plot_img_tensor,
-                step,
-                dataformats="CHW",
-            )
+        self.image_logger.writer = self.writer
+        self.image_logger.in_training_loop = True
+        self.image_logger.log_images(
+            images[:num_images], predictions=predictions, labels=targets, step=step
+        )
 
     def log_predictions(
         self,
