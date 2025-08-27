@@ -403,10 +403,39 @@ def train_with_orientation_tracking(config: FullConfig):
                 if not ((rating_labels >= 0) & (rating_labels < num_ratings)).all():
                     raise RuntimeError(f"Rating label out of range. Found min {rating_labels.min()} / max {rating_labels.max()}, expected 0 to {num_ratings-1}")
             
+            if getattr(config.debug, 'log_input_stats', False) and (global_step % config.training.logging_steps == 0):
+                monitor.log_scalar('train/image_min', images.min().item(), global_step)
+                monitor.log_scalar('train/image_max', images.max().item(), global_step)
+                monitor.log_scalar('train/image_mean', images.mean().item(), global_step)
+                logger.debug(
+                    f"Input stats - min: {images.min().item():.6f}, "
+                    f"mean: {images.mean().item():.6f}, max: {images.max().item():.6f}"
+                )
+
             with autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 pmask = batch.get('padding_mask', None)
                 if pmask is not None: pmask = pmask.to(device)
                 outputs = model(images, padding_mask=pmask)
+
+                if getattr(config.debug, 'log_activation_stats', False) and (global_step % config.training.logging_steps == 0):
+                    tag_logits = outputs.get('tag_logits')
+                    rating_logits = outputs.get('rating_logits')
+                    if tag_logits is not None:
+                        monitor.log_scalar('train/tag_logits_min', tag_logits.min().item(), global_step)
+                        monitor.log_scalar('train/tag_logits_max', tag_logits.max().item(), global_step)
+                        monitor.log_scalar('train/tag_logits_mean', tag_logits.mean().item(), global_step)
+                        logger.debug(
+                            f"Tag logits stats - min: {tag_logits.min().item():.6f}, "
+                            f"mean: {tag_logits.mean().item():.6f}, max: {tag_logits.max().item():.6f}"
+                        )
+                    if rating_logits is not None:
+                        monitor.log_scalar('train/rating_logits_min', rating_logits.min().item(), global_step)
+                        monitor.log_scalar('train/rating_logits_max', rating_logits.max().item(), global_step)
+                        monitor.log_scalar('train/rating_logits_mean', rating_logits.mean().item(), global_step)
+                        logger.debug(
+                            f"Rating logits stats - min: {rating_logits.min().item():.6f}, "
+                            f"mean: {rating_logits.mean().item():.6f}, max: {rating_logits.max().item():.6f}"
+                        )
 
                 # Assert that model outputs are finite before loss calculation
                 assert_finite(
