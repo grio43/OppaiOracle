@@ -308,9 +308,8 @@ validation:
     prefetch_factor: 2
     persistent_workers: true
   preprocessing:
-    # Keep in sync with training/inference unless intentionally different.
-    normalize_mean: [0.485, 0.456, 0.406]
-    normalize_std:  [0.229, 0.224, 0.225]
+    # Uses data.normalize_mean/std by default; keep in sync with
+    # training/inference unless intentionally different.
     image_size: 640
     patch_size: 16
 
