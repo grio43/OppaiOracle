@@ -107,14 +107,13 @@ class TransformerBlock(nn.Module):
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             
-            # Build attention mask with SDPA semantics (True = keep)
+            # Build attention mask with SDPA semantics (True = masked)
             attn_mask = None
             if key_padding_mask is not None:
                 # If any sample masks all positions, fail fast
                 if torch.all(key_padding_mask, dim=1).any():
                     raise RuntimeError("key_padding_mask masks all keys for at least one sample.")
-                # Invert mask for SDPA: original True means ignore
-                attn_mask = (~key_padding_mask).unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
+                attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
 
             # Use scaled_dot_product_attention with flash backend when available
             attn_out = F.scaled_dot_product_attention(
