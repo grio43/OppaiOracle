@@ -68,7 +68,7 @@ def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:
 class TagVocabulary:
     """Unified tag vocabulary manager with support for both training and inference.
     
-    This class combines functionality from both HDF5_loader.py and Inference_Engine.py
+    This class combines functionality from both dataset_loader.py and Inference_Engine.py
     to provide a single, comprehensive vocabulary implementation.
     
     Note: When using with PyTorch DataLoader in multiprocessing mode, ignored_tag_indices
