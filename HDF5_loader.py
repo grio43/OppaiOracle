@@ -1767,7 +1767,12 @@ class SimplifiedDataset(Dataset):
                 if not os.path.isdir(directory):
                     raise # Directory itself doesn't exist, re-raise original error.
 
-                found_files = [f for f in os.listdir(directory) if f.endswith(filename)]
+                filename_stem = Path(filename).stem
+                found_files = [
+                    f
+                    for f in os.listdir(directory)
+                    if Path(f).stem == filename_stem
+                ]
 
                 if len(found_files) == 1:
                     new_path = os.path.join(directory, found_files[0])

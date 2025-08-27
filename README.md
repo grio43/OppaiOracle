@@ -71,8 +71,9 @@ You can run inference using either the PyTorch model or the ONNX model.
 
 -   **PyTorch Inference:**
     ```bash
-    python Inference_Engine.py --config configs/unified_config.yaml --image /path/to/your/image.jpg
+    python Inference_Engine.py --config configs/unified_config.yaml --vocab vocabulary.json --image /path/to/your/image.jpg
     ```
+    The `--vocab` argument defaults to `vocabulary.json` in the project root if not specified.
 
 -   **ONNX Inference:**
     ```bash
