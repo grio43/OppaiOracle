@@ -1097,6 +1097,18 @@ class TrainingUtils:
 
         else:
             raise ValueError(f"Unknown optimizer type: {optimizer_type}")
+
+    @staticmethod
+    def get_cosine_scheduler(optimizer: optim.Optimizer, training_cfg) -> _LRScheduler:
+        """Create CosineAnnealingWarmupRestarts scheduler from training config."""
+        return CosineAnnealingWarmupRestarts(
+            optimizer,
+            first_cycle_steps=training_cfg.num_epochs,
+            cycle_mult=1.0,
+            max_lr=training_cfg.learning_rate,
+            min_lr=getattr(training_cfg, "lr_end", 1e-6),
+            warmup_steps=training_cfg.warmup_steps,
+        )
     
     @staticmethod
     def get_parameter_groups(
