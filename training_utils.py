@@ -543,9 +543,22 @@ class CheckpointManager:
                 "This ensures checkpoints contain the exact preprocessing used during training."
             )
 
-        # Validate required preprocessing parameters are present
+        # Validate required preprocessing parameters are present.
+        # These keys might be nested under sections like "data" or "model" when
+        # a full configuration dictionary is provided. Perform a nested lookup so
+        # callers can pass ``FullConfig.to_dict()`` directly.
         required_params = ['normalize_mean', 'normalize_std', 'image_size', 'patch_size']
-        missing_params = [p for p in required_params if p not in config]
+
+        def get_param(cfg: Dict[str, Any], key: str):
+            if key in cfg:
+                return cfg[key]
+            for section in ('data', 'model', 'inference', 'export', 'training'):
+                sub = cfg.get(section)
+                if isinstance(sub, dict) and key in sub:
+                    return sub[key]
+            return None
+
+        missing_params = [p for p in required_params if get_param(config, p) is None]
         if missing_params:
             raise RuntimeError(
                 f"Missing required preprocessing parameters in config: {', '.join(missing_params)}. "
@@ -554,13 +567,13 @@ class CheckpointManager:
 
         # Validate and extract preprocessing parameters
         try:
-            normalize_mean = tuple(config['normalize_mean'])
-            normalize_std = tuple(config['normalize_std'])
+            normalize_mean = tuple(get_param(config, 'normalize_mean'))
+            normalize_std = tuple(get_param(config, 'normalize_std'))
             if len(normalize_mean) != 3 or len(normalize_std) != 3:
                 raise ValueError("normalize_mean and normalize_std must have exactly 3 values")
 
-            image_size = int(config['image_size'])
-            patch_size = int(config['patch_size'])
+            image_size = int(get_param(config, 'image_size'))
+            patch_size = int(get_param(config, 'patch_size'))
 
             checkpoint = ModelMetadata.embed_preprocessing_params(
                 checkpoint,
