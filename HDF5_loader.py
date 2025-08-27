@@ -523,13 +523,13 @@ class LMDBCache:
             self._open_env()
 
     def _handle_map_resized(self):
-        """Handle MDB_MAP_RESIZED error by reopening with larger size"""
+        """Handle MDB_MAP_RESIZED error by reopening the environment"""
         if self.resize_attempted:
             # Already tried once, don't retry indefinitely
             return False
 
         self.resize_attempted = True
-        logger.warning("MDB_MAP_RESIZED encountered, reopening environment with larger map size")
+        logger.warning("MDB_MAP_RESIZED encountered, reopening environment")
 
         # Close current environment
         if hasattr(self, 'env') and self.env is not None:
@@ -538,8 +538,7 @@ class LMDBCache:
             except Exception:
                 pass
 
-        # Reopen with increased size
-        self.current_map_size = self.max_size_bytes
+        # Reopen without forcing max map size; allow _grow_map to manage increases
         self._open_env()
         return True
 
@@ -566,28 +565,33 @@ class LMDBCache:
             if txn is not None:
                 txn.abort()
 
+        if data is None:
+            self.misses += 1
+            return None
+
+        self.hits += 1
         try:
-            if data is not None:
-                self.hits += 1
-                # Deserialize tensor and metadata
-                metadata_len = int.from_bytes(data[:4], 'big')
-                metadata_bytes = data[4:4 + metadata_len]
-                tensor_bytes = data[4 + metadata_len:]
+            # Deserialize tensor and metadata
+            metadata_len = int.from_bytes(data[:4], 'big')
+            metadata_bytes = data[4:4 + metadata_len]
+            tensor_bytes = data[4 + metadata_len:]
 
-                metadata = json.loads(bytes(metadata_bytes).decode('utf-8'))
+            metadata = json.loads(bytes(metadata_bytes).decode('utf-8'))
 
-                # ``np.frombuffer`` returns a read-only array which subsequently
-                # triggers a PyTorch warning when wrapping it with ``torch.from_numpy``.
-                # Copy the buffer to ensure writability and avoid the warning.
-                buffer = np.frombuffer(tensor_bytes, dtype=np.uint8).copy()
-                tensor = torch.from_numpy(buffer)
+            # ``np.frombuffer`` returns a read-only array which subsequently
+            # triggers a PyTorch warning when wrapping it with ``torch.from_numpy``.
+            # Copy the buffer to ensure writability and avoid the warning.
+            buffer = np.frombuffer(tensor_bytes, dtype=np.uint8).copy()
+            tensor = torch.from_numpy(buffer)
 
-                return tensor, metadata
-            else:
-                self.misses += 1
-                return None
+            return tensor, metadata
         except Exception as e:
-            logger.error(f"Error deserializing cached item for key {key}: {e}")
+            logger.warning(f"Corrupted cache entry for key {key}: {e}, removing")
+            try:
+                with self.env.begin(write=True) as wtxn:
+                    wtxn.delete(key.encode())
+            except Exception as del_err:
+                logger.error(f"Failed to delete corrupted entry for key {key}: {del_err}")
             return None
     
     def put(self, key: str, value: Tuple[torch.Tensor, Dict], check_memory: bool = True) -> bool:
@@ -882,16 +886,25 @@ class BackgroundValidator(threading.Thread):
         self.data_dir = data_dir
         self.running = False
         self.stop_event = threading.Event()
-        
+
     def run(self):
-        """Run background validation loop."""
+        """Validation loop implementation."""
         self.running = True
         while self.running and not self.stop_event.is_set():
-            # Get a batch of unvalidated or retry-eligible images
-            # (Implementation would query the validation index for candidates)
-            
-            # Sleep between validation attempts
-            self.stop_event.wait(timeout=30)
+            try:
+                item = getattr(self.validation_index, "get_next_unvalidated", lambda: None)()
+                if item:
+                    self.validate_item(item)
+                else:
+                    # Short sleep to avoid busy waiting when nothing to validate
+                    self.stop_event.wait(timeout=0.1)
+            except Exception as e:
+                logger.error(f"Validation error: {e}")
+
+    def validate_item(self, item: Any) -> None:
+        """Validate a single item."""
+        # Implement validation logic here
+        pass
     
     def stop(self):
         """Stop the background validator."""
