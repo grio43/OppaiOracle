@@ -777,7 +777,21 @@ class InferenceConfig(BaseConfig):
     enable_cache: bool = True
     cache_ttl_seconds: int = 3600
     max_cache_size: int = 1000
-    
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "InferenceConfig":
+        """Create config from dictionary with backward compatibility."""
+        data = dict(data)
+        if 'use_fp16' in data:
+            warnings.warn(
+                "The 'use_fp16' field is deprecated. Use 'precision' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if data.pop('use_fp16'):
+                data['precision'] = 'fp16'
+        return super().from_dict(data)
+
     def validate(self):
         """Validate inference configuration"""
         errors = []
@@ -1601,7 +1615,7 @@ def generate_example_configs(output_dir: Path = Path("./config_examples")):
     
     # High performance inference config
     hp_inference = InferenceConfig(
-        use_fp16=True,
+        precision="fp16",
         use_tensorrt=True,
         optimize_for_speed=True,
         compile_model=True,
