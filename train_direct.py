@@ -407,12 +407,12 @@ def train_with_orientation_tracking(config: FullConfig):
         warmup_steps=config.training.warmup_steps,
     )
 
-    amp_enabled = config.training.use_amp and device.type == 'cuda'
+    amp_enabled = config.training.use_amp and device_type == 'cuda'
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     # GradScaler is only needed for float16 AMP.
-    use_scaler = amp_enabled and amp_dtype == torch.float16
-    scaler = GradScaler(device_type="cuda", enabled=use_scaler)
+    use_scaler = amp_enabled and amp_dtype == torch.float16 and torch.cuda.get_device_capability()[0] >= 7
+    scaler = GradScaler(device_type=device_type, enabled=use_scaler)
     if amp_enabled:
         logger.info(f"AMP enabled with dtype={amp_dtype} and GradScaler={'enabled' if use_scaler else 'disabled'}.")
     else:
@@ -427,8 +427,6 @@ def train_with_orientation_tracking(config: FullConfig):
     )
 
     training_state = TrainingState()
-    best_val_f1 = 0.0
-    epochs_without_improvement = 0
     patience = getattr(config.training, "early_stopping_patience", None)
     es_threshold = getattr(config.training, "early_stopping_threshold", 0.0)
     global_step = 0
@@ -446,7 +444,7 @@ def train_with_orientation_tracking(config: FullConfig):
         training_state = TrainingState.from_dict(ckpt.get('training_state', {}))
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('step', 0)
-        best_val_f1 = ckpt.get('metrics', {}).get('val_f1_macro', 0.0)
+        training_state.best_metric = ckpt.get('metrics', {}).get('val_f1_macro', training_state.best_metric)
         logger.info(f"Resumed from checkpoint: epoch={start_epoch}, step={global_step}")
 
     for epoch in range(start_epoch, config.training.num_epochs):
@@ -650,14 +648,14 @@ def train_with_orientation_tracking(config: FullConfig):
             pass
 
         # Checkpointing and early stopping based on macro F1
-        if val_f1_macro > best_val_f1 + es_threshold:
-            best_val_f1 = val_f1_macro
-            epochs_without_improvement = 0
+        if val_f1_macro > training_state.best_metric + es_threshold:
+            training_state.best_metric = val_f1_macro
+            training_state.patience_counter = 0
+            training_state.best_epoch = epoch + 1
             is_best = True
         else:
-            epochs_without_improvement += 1
+            training_state.patience_counter += 1
             is_best = False
-        training_state.best_metric = best_val_f1
 
         if global_step % config.training.save_steps == 0 or is_best:
             checkpoint_manager.save_checkpoint(
@@ -672,7 +670,7 @@ def train_with_orientation_tracking(config: FullConfig):
                 config=config.to_dict()
             )
 
-        if patience and epochs_without_improvement >= patience:
+        if patience and training_state.patience_counter >= patience:
             logger.info("Early stopping triggered: no improvement in val_f1_macro for %s epochs", patience)
             break
 
@@ -685,7 +683,7 @@ def train_with_orientation_tracking(config: FullConfig):
             final_metrics["final/val_loss"] = float(avg_val_loss)
         if 'avg_train_loss' in locals():
             final_metrics["final/train_loss"] = float(avg_train_loss)
-        final_metrics["final/best_val_f1_macro"] = float(best_val_f1)
+        final_metrics["final/best_val_f1_macro"] = float(training_state.best_metric)
         monitor.log_hyperparameters(hparams, final_metrics if final_metrics else {"final/placeholder": 1})
     except Exception:
         pass
