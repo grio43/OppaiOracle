@@ -1158,6 +1158,124 @@ class TrainingMonitor:
                 step,
                 dataformats="CHW",
             )
+
+    def log_predictions(
+        self,
+        *,
+        step: int,
+        images: torch.Tensor,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        tag_names: List[str],
+        prefix: str = "val",
+        max_images: int = 4,
+        topk: int = 15,
+    ):
+        """Log per-sample images and top-k predictions/targets as TensorBoard entries."""
+        if getattr(self, "writer", None) is None:
+            return
+
+        images = images.detach().cpu()
+        predictions = predictions.detach().cpu()
+        targets = targets.detach().cpu()
+
+        num_samples = min(images.shape[0], max_images)
+        for i in range(num_samples):
+            img = images[i]
+            if torch.is_floating_point(img):
+                img = img.clamp(0, 1)
+                img = (img * 255).round().to(torch.uint8)
+            else:
+                img = img.to(torch.uint8)
+
+            if img.dim() == 3:
+                if img.shape[0] in [1, 3, 4]:
+                    img = img.permute(1, 2, 0)
+                else:
+                    img = img.squeeze()
+            elif img.dim() == 2:
+                pass  # already HxW
+
+            img_np = img.numpy()
+            self.writer.add_image(
+                f"{prefix}/sample_{i}/image",
+                img_np,
+                step,
+                dataformats="HWC",
+            )
+
+            probs = predictions[i]
+            tgt = targets[i]
+            k = min(topk, probs.numel())
+            topk_indices = torch.topk(probs, k=k).indices.tolist()
+
+            lines = ["| tag | prob | target |", "| --- | --- | --- |"]
+            for idx in topk_indices:
+                tag = tag_names[idx] if idx < len(tag_names) else str(idx)
+                prob = probs[idx].item()
+                target_val = tgt[idx].item()
+                lines.append(f"| {tag} | {prob:.4f} | {int(target_val)} |")
+
+            markdown = "\n".join(lines)
+            self.writer.add_text(
+                f"{prefix}/sample_{i}/topk",
+                markdown,
+                step,
+            )
+
+    def log_composite_grid(
+        self,
+        *,
+        step: int,
+        images: torch.Tensor,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        tag_names: List[str],
+        prefix: str = "val",
+        max_images: int = 4,
+        topk: int = 15,
+        dpi: int = 220,
+    ):
+        """Optional helper to log a composite matplotlib panel."""
+        if getattr(self, "writer", None) is None:
+            return
+
+        images = images.detach().cpu()
+        predictions = predictions.detach().cpu()
+        targets = targets.detach().cpu()
+
+        num_samples = min(images.shape[0], max_images)
+        for i in range(num_samples):
+            img = images[i]
+            if torch.is_floating_point(img):
+                img = img.clamp(0, 1)
+                img = img.permute(1, 2, 0).numpy()
+            else:
+                img = img.permute(1, 2, 0).numpy()
+
+            fig, ax = plt.subplots(figsize=(10, 12), dpi=dpi)
+            ax.imshow(img)
+            ax.axis("off")
+
+            probs = predictions[i]
+            tgt = targets[i]
+            k = min(topk, probs.numel())
+            topk_indices = torch.topk(probs, k=k).indices.tolist()
+            lines = [f"{tag_names[idx]}: {probs[idx]:.3f} ({int(tgt[idx])})" for idx in topk_indices]
+            fig.text(0.01, 0.01, "\n".join(lines), fontsize=8, va="bottom")
+
+            fig.tight_layout()
+            fig.canvas.draw()
+            plot_img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            plot_img = plot_img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            plt.close(fig)
+
+            self.writer.add_image(
+                f"{prefix}/sample_{i}/composite",
+                plot_img,
+                step,
+                dataformats="HWC",
+            )
     
     def log_data_pipeline_stats(self, load_time: float, batch_size: int, augmentation_time: float = 0):
         """Log data pipeline statistics"""

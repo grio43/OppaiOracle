@@ -353,6 +353,12 @@ monitor:
   alert_webhook_url: "https://discord.com/api/webhooks/1349139188804485201/1YQ3LmlLVndj7dHSEIPc13fep_EYI3hqEyKtMUuUOnP8YGWMnPDMAR7x-wgkgkvzw35I"
   # --------------------------------------------------------------------
 
+  tb_image_logging:
+    max_samples: 4          # how many examples to log per val step
+    topk: 15                # how many tags per sample in Text tab
+    log_native_resolution: true  # keep images crisp in TB
+    dpi_for_figures: 220          # only used if you later add composite figures
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Debug
 # Options for debugging training runs.

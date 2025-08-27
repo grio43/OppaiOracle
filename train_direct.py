@@ -547,13 +547,15 @@ def train_with_orientation_tracking(config: FullConfig):
                 if val_step == 0 and config.training.use_tensorboard:
                     tag_preds = torch.sigmoid(outputs['tag_logits'])
                     tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
-                    monitor.log_images(
+                    monitor.log_predictions(
                         step=global_step,
                         images=images,
                         predictions=tag_preds,
                         targets=tag_labels,
                         tag_names=tag_names,
-                        prefix="val"
+                        prefix="val",
+                        max_images=config.monitor.tb_image_logging.max_samples,
+                        topk=config.monitor.tb_image_logging.topk,
                     )
         
         avg_val_loss = val_loss / len(val_loader)
