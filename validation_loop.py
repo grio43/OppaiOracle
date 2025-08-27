@@ -51,7 +51,7 @@ except Exception:  # pragma: no cover
 # Import our modules
 from evaluation_metrics import MetricComputer
 from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
-from HDF5_loader import create_dataloaders
+from dataset_loader import create_dataloaders
 from Configuration_System import (
     DataConfig as CSDataConfig,
     ValidationConfig as CSValConfig,
@@ -314,7 +314,7 @@ class ValidationRunner:
             except Exception:
                 # Fallback to direct file handler if QueueListener unavailable
                 logger.addHandler(fh)
-        # else: workers only attach QueueHandler in worker_init_fn (see HDF5_loader)
+        # else: workers only attach QueueHandler in worker_init_fn (see dataset_loader)
     
     def _load_model(self) -> Tuple[nn.Module, Optional[Dict]]:
         """Load model from checkpoint"""

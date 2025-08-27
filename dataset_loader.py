@@ -1321,13 +1321,9 @@ class SimplifiedDataset(Dataset):
             # accessed under `_error_counts_lock` to ensure thread safety.
             self._error_counts_lock = threading.Lock()
             self._error_counts: Dict[str, int] = {}
-            # Track permanently failed images
+            # Track permanently failed images and skipped samples
             self._failed_images: set[str] = set()
-
-            # Initialize known-good sample pool for fallback
-            self._known_good_indices: List[int] = []
-            self._known_good_lock = threading.Lock()
-            self._populate_known_good_pool()
+            self._skipped_samples = 0
 
             # Max retry attempts - scale with dataset size
             self._max_retry_attempts = min(16, max(8, len(self.annotations) // 1000))
@@ -1391,30 +1387,6 @@ class SimplifiedDataset(Dataset):
 
             # Monitor memory at initialization
             self._log_memory_status("Dataset initialization")
-
-    def _populate_known_good_pool(self, sample_size: int = 100):
-        """Populate a pool of known-good sample indices for fallback"""
-        if len(self.annotations) == 0:
-            return
-
-        sample_size = min(sample_size, len(self.annotations))
-        test_indices = np.random.choice(len(self.annotations), size=sample_size, replace=False)
-
-        good_indices = []
-        for idx in test_indices:
-            image_path = self.annotations[idx]['image_path']
-            try:
-                # Quick validation - just try to open
-                with Image.open(image_path) as img:
-                    _ = img.size
-                good_indices.append(idx)
-            except Exception:
-                continue
-
-        with self._known_good_lock:
-            self._known_good_indices = good_indices
-
-        logger.info(f"Known-good pool populated with {len(good_indices)}/{sample_size} valid samples")
 
     def _load_annotations(self, json_files: List[Path]) -> None:
         """Parse annotation files and populate ``self.annotations``.
@@ -1959,45 +1931,28 @@ class SimplifiedDataset(Dataset):
         preserve aspect ratio.  Augmentation and normalisation are then
         applied."""
 
-        # Iterative retry logic with visited tracking
-        visited_indices = set()
+        # Iterative retry logic without silent fallback
         attempts = 0
         original_idx = idx
+        last_path = None
 
         while attempts < self._max_retry_attempts:
             attempts += 1
-
-            # Avoid infinite loops by checking visited indices
-            if idx in visited_indices:
-                # Try to get a known-good sample
-                with self._known_good_lock:
-                    if self._known_good_indices:
-                        idx = random.choice(self._known_good_indices)
-                        if idx in visited_indices:
-                            # Even our good samples have been tried, give up
-                            break
-                    else:
-                        # No good samples available, increment and continue
-                        idx = (idx + 1) % len(self.annotations)
-
-            visited_indices.add(idx)
 
             # Map index through working set if active
             actual_idx = self._get_actual_index(idx)
 
             if actual_idx < 0 or actual_idx >= len(self.annotations):
-                # Invalid index, try next
-                idx = (idx + 1) % len(self.annotations)
-                continue
+                break
 
             # Use actual_idx instead of idx when accessing annotations
             anno = self.annotations[actual_idx]
             image_path = anno['image_path']
+            last_path = image_path
 
             # Skip if this is a known failed image
             if image_path in self._failed_images:
-                idx = (idx + 1) % len(self.annotations)
-                continue
+                break
 
             # Track error count for this specific image
             with self._error_counts_lock:
@@ -2210,15 +2165,6 @@ class SimplifiedDataset(Dataset):
                     if image_path in self._error_counts:
                         del self._error_counts[image_path]
 
-                # Add successful index to known-good pool (with probability to avoid bias)
-                if random.random() < 0.1:  # 10% chance
-                    with self._known_good_lock:
-                        if actual_idx not in self._known_good_indices:
-                            self._known_good_indices.append(actual_idx)
-                            # Keep pool size bounded
-                            if len(self._known_good_indices) > 200:
-                                self._known_good_indices.pop(0)
-
                 # Save metadata for augmentation visualization
                 if vis_dir:
                     with open(vis_dir / "metadata.json", 'w') as f:
@@ -2255,8 +2201,6 @@ class SimplifiedDataset(Dataset):
                 if error_count == 0:
                     logger.warning(f"Error loading {image_path}: {e}")
 
-                # Try next index
-                idx = (idx + 1) % len(self.annotations)
                 continue
 
             except Exception as e:
@@ -2264,14 +2208,14 @@ class SimplifiedDataset(Dataset):
                 if image_path not in self._failed_images:
                     logger.error(f"Unexpected error loading {image_path}: {e}")
                     self._failed_images.add(image_path)
-
-                # Try next index
-                idx = (idx + 1) % len(self.annotations)
-                continue
+                break
 
         # Exhausted all attempts - return error sample
-        logger.warning(f"Failed to load sample after {attempts} attempts, returning error sample for index {original_idx}")
-        return self._create_error_sample(original_idx, "exhausted_retries", "max_retries_exceeded")
+        logger.warning(
+            f"Failed to load sample after {attempts} attempts, returning error sample for index {original_idx}"
+        )
+        self._skipped_samples += 1
+        return self._create_error_sample(original_idx, last_path or "unknown", "max_retries_exceeded")
         
     def _send_stats_to_queue(self):
         """Send augmentation stats to main process via queue."""
@@ -2355,10 +2299,16 @@ class SimplifiedDataset(Dataset):
             'worker_local': True  # Flag to indicate these are worker-local stats
         }
 
-    def __del__(self):
-        """Cleanup when dataset is destroyed."""
+    def close(self):
+        """Release any open resources."""
         if hasattr(self, 'background_validator'):
             self.background_validator.stop()
+        if getattr(self, 'validation_index', None):
+            self.validation_index.close()
+
+    def __del__(self):
+        """Cleanup when dataset is destroyed."""
+        self.close()
 
 def validate_dataset(dataloader: DataLoader, vocab: TagVocabulary, config: Any, num_batches_to_check: int):
     """
@@ -2410,7 +2360,7 @@ def create_dataloaders(
 ) -> Tuple[DataLoader, DataLoader, TagVocabulary]:
     """Construct training and validation dataloaders with enhanced memory control."""
     
-    logger.info(f"HDF5_loader received active data path: {active_data_path}")
+    logger.info(f"dataset_loader received active data path: {active_data_path}")
 
     json_files = list(active_data_path.glob("*.json"))
     if not json_files:

@@ -29,7 +29,7 @@ The repository is organized as follows:
 ├── Inference_Engine.py   # Handles model inference
 ├── ONNX_Export.py        # Exports the trained model to ONNX format
 ├── onnx_infer.py         # Runs inference with exported ONNX models
-├── HDF5_loader.py        # Loads data from HDF5 files
+├── dataset_loader.py     # Loads data from HDF5 files
 └── requirements.txt      # Project dependencies
 ```
 

@@ -40,11 +40,11 @@ from orientation_handler import OrientationHandler
 
 # Import base modules with error handling
 try:
-    from HDF5_loader import create_dataloaders
+    from dataset_loader import create_dataloaders
 except ImportError as e:
     error_msg = (
-        f"""MISSING REQUIRED FILE: HDF5_loader.py
-Please ensure HDF5_loader.py exists in the current directory with create_dataloaders function.
+        f"""MISSING REQUIRED FILE: dataset_loader.py
+Please ensure dataset_loader.py exists in the current directory with create_dataloaders function.
 Import error: {e}"""
     )
     raise ImportError(error_msg)
@@ -67,7 +67,7 @@ from training_utils import (
     log_sample_order_hash,
     CosineAnnealingWarmupRestarts,
 )
-from HDF5_loader import AugmentationStats, validate_dataset
+from dataset_loader import AugmentationStats, validate_dataset
 from utils.logging_sanitize import ensure_finite_tensor
 
 # Add after other imports
@@ -411,10 +411,7 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # GradScaler is only needed for float16 AMP.
     use_scaler = amp_enabled and amp_dtype == torch.float16
-    try:
-        scaler = GradScaler("cuda", enabled=use_scaler)
-    except TypeError:
-        scaler = GradScaler(enabled=use_scaler)
+    scaler = GradScaler(enabled=use_scaler)
     if amp_enabled:
         logger.info(f"AMP enabled with dtype={amp_dtype} and GradScaler={'enabled' if use_scaler else 'disabled'}.")
     else:

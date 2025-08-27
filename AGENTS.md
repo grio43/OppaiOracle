@@ -19,7 +19,7 @@ OppaiOracle, also known as **MAID (Model for AI-based Detection)**, is a PyTorch
 - `model_architecture.py`: Defines the neural network.
 - `adan_optimizer.py` and `custom_drop_path.py`: Optional optimization and regularization components.
 - `orientation_handler.py`: Handles image orientation metadata.
-- `HDF5_loader.py`: Utilities for loading datasets stored in HDF5 format.
+- `dataset_loader.py`: Utilities for loading datasets stored in HDF5 format.
 - `Dataset_Analysis.py`: Tools for inspecting datasets.
 - `Inference_Engine.py`: PyTorch inference logic.
 - `ONNX_Export.py`: Exports trained models to ONNX format.

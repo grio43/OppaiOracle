@@ -1011,8 +1011,17 @@ class TrainingMonitor:
         if getattr(self, "writer", None) is None:
             return
         try:
-            # Ensure values are serializable
-            hp_clean = {k: (v if isinstance(v, (str, int, float, bool)) else str(v)) for k, v in hparams.items()}
+            def _flatten(d, parent=""):
+                items = {}
+                for k, v in d.items():
+                    key = f"{parent}.{k}" if parent else k
+                    if isinstance(v, dict):
+                        items.update(_flatten(v, key))
+                    elif isinstance(v, (str, int, float, bool)):
+                        items[key] = v
+                return items
+
+            hp_clean = _flatten(hparams)
             self.writer.add_hparams(hp_clean, metrics)
         except Exception as e:
             if getattr(self, "logger", None):
