@@ -975,6 +975,11 @@ class MonitorConfig(BaseConfig):
     param_hist_interval_steps: int = 200
     grad_hist_interval_steps: int = 200
 
+    # Unified histogram logging
+    log_histograms: bool = False
+    histogram_log_interval: int = 500
+    histogram_params: Optional[List[str]] = None
+
     # Remote monitoring
     enable_prometheus: bool = False
     prometheus_port: int = 8080
