@@ -358,8 +358,11 @@ class DataConfig(BaseConfig):
     
     # Image processing
     image_size: int = 640
-    normalize_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
-    normalize_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+    # Default to inception-style normalization which expects pixel values in
+    # [0, 1] range. Using 0.5/0.5/0.5 keeps training, validation and inference
+    # in sync unless explicitly overridden in the unified config.
+    normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)
+    normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5)
     pad_color: Tuple[int, int, int] = (114, 114, 114)
     
     # Data loading
@@ -877,8 +880,9 @@ class ValidationDataloaderConfig(BaseConfig):
 
 @dataclass
 class ValidationPreprocessingConfig(BaseConfig):
-    normalize_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
-    normalize_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+    # Match training defaults; these should be kept in sync with DataConfig
+    normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)
+    normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5)
     image_size: int = 640
     patch_size: int = 16
 

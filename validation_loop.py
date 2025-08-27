@@ -65,9 +65,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
 UNIFIED_CONFIG_PATH = PROJECT_ROOT / "configs" / "unified_config.yaml"
 
-# Default validation preprocessing (will be overridden from unified_config.yaml if present)
-_DEFAULT_VAL_MEAN = (0.485, 0.456, 0.406)
-_DEFAULT_VAL_STD  = (0.229, 0.224, 0.225)
+# Default validation preprocessing (image size/patch may be overridden from
+# unified_config.yaml if present)
 _DEFAULT_VAL_IMAGE_SIZE = 640
 
 
@@ -137,35 +136,45 @@ class ValidationRunner:
         self._log_queue: Optional[mp.Queue] = mp.Queue()
         self._listener = None  # Initialize listener attribute
 
-        # Load validation overrides from unified_config.yaml (if available)
-        self._val_mean = _DEFAULT_VAL_MEAN
-        self._val_std  = _DEFAULT_VAL_STD
+        # Load validation overrides from unified_config.yaml
+        self._val_mean: Optional[Tuple[float, float, float]] = None
+        self._val_std: Optional[Tuple[float, float, float]] = None
         self._val_image_size = _DEFAULT_VAL_IMAGE_SIZE
         self._val_patch_size = 16
+        if not UNIFIED_CONFIG_PATH.exists():
+            raise FileNotFoundError(f"Unified config not found at {UNIFIED_CONFIG_PATH}")
+
         try:
-            if UNIFIED_CONFIG_PATH.exists():
-                unified = yaml.safe_load(UNIFIED_CONFIG_PATH.read_text(encoding="utf-8")) or {}
-                v = (unified.get("validation") or {})
-                dl = (v.get("dataloader") or {})
-                pp = (v.get("preprocessing") or {})
+            unified = yaml.safe_load(UNIFIED_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+            v = (unified.get("validation") or {})
+            dl = (v.get("dataloader") or {})
+            pp = (v.get("preprocessing") or {})
+            data_cfg = unified.get("data") or {}
 
-                # Map dataloader settings → ValidationConfig
-                self.config.batch_size  = int(dl.get("batch_size",  self.config.batch_size))
-                self.config.num_workers = int(dl.get("num_workers", self.config.num_workers))
+            # Map dataloader settings → ValidationConfig
+            self.config.batch_size = int(dl.get("batch_size", self.config.batch_size))
+            self.config.num_workers = int(dl.get("num_workers", self.config.num_workers))
 
-                # Preprocessing overrides (normalization, sizes)
-                mean = pp.get("normalize_mean")
-                std  = pp.get("normalize_std")
-                if isinstance(mean, (list, tuple)) and len(mean) == 3:
-                    self._val_mean = tuple(float(x) for x in mean)
-                if isinstance(std, (list, tuple)) and len(std) == 3:
-                    self._val_std = tuple(float(x) for x in std)
-                self._val_image_size = int(pp.get("image_size", self._val_image_size))
-                self._val_patch_size = int(pp.get("patch_size", self._val_patch_size))
+            # Preprocessing overrides (normalization, sizes)
+            mean = pp.get("normalize_mean") or data_cfg.get("normalize_mean")
+            std = pp.get("normalize_std") or data_cfg.get("normalize_std")
+            if not (mean and std):
+                raise ValueError("normalize_mean and normalize_std must be provided in unified_config.yaml")
+
+            if isinstance(mean, (list, tuple)) and len(mean) == 3:
+                self._val_mean = tuple(float(x) for x in mean)
             else:
-                logger.info(f"Unified config not found at {UNIFIED_CONFIG_PATH}; using built-in defaults")
+                raise ValueError("normalize_mean must be a sequence of three floats")
+
+            if isinstance(std, (list, tuple)) and len(std) == 3:
+                self._val_std = tuple(float(x) for x in std)
+            else:
+                raise ValueError("normalize_std must be a sequence of three floats")
+
+            self._val_image_size = int(pp.get("image_size", data_cfg.get("image_size", self._val_image_size)))
+            self._val_patch_size = int(pp.get("patch_size", data_cfg.get("patch_size", self._val_patch_size)))
         except Exception as e:
-            logger.warning(f"Failed to load unified validation config: {e}")
+            raise RuntimeError(f"Failed to load unified validation config: {e}")
 
         # Warn if legacy validation_config.yaml still exists (migration)
         legacy_val = PROJECT_ROOT / "configs" / "validation_config.yaml"
