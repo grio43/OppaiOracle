@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from collections import defaultdict, deque
 import threading
 import queue
+import argparse
 
 import gzip
 import base64
@@ -969,19 +970,36 @@ class InferenceEngine:
 
 # Example usage
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run inference using a trained model")
+    parser.add_argument(
+        "--model",
+        default="./checkpoints/best_model.pt",
+        help="Path to model checkpoint (.pt)",
+    )
+    parser.add_argument(
+        "--config",
+        default="./checkpoints/model_config.json",
+        help="Path to model config JSON",
+    )
+    parser.add_argument(
+        "--vocab",
+        default=str(DEFAULT_VOCAB_PATH),
+        help="Path to vocabulary JSON file",
+    )
+    args = parser.parse_args()
+
     # Configure inference
     # Note: image_size should match the training configuration (640 for ViT, not 448)
     config = InferenceConfig(
-        model_path="./checkpoints/best_model.pt",  # Standardize to .pt
-        # Explicitly set the vocabulary path
-        vocab_path="/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json",
-        config_path="./checkpoints/model_config.json",
+        model_path=args.model,
+        vocab_path=args.vocab,
+        config_path=args.config,
         batch_size=32,
         threshold=0.5,
         top_k=10,
         enable_monitoring=True,
         enable_cache=True,
-        image_size=640  # Match training image size for ViT
+        image_size=640,  # Match training image size for ViT
     )
 
     # Example of what should be saved during training (add to training script):
