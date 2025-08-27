@@ -411,7 +411,10 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # GradScaler is only needed for float16 AMP.
     use_scaler = amp_enabled and amp_dtype == torch.float16
-    scaler = GradScaler(device='cuda', enabled=use_scaler)
+    try:
+        scaler = GradScaler("cuda", enabled=use_scaler)
+    except TypeError:
+        scaler = GradScaler(enabled=use_scaler)
     if amp_enabled:
         logger.info(f"AMP enabled with dtype={amp_dtype} and GradScaler={'enabled' if use_scaler else 'disabled'}.")
     else:
