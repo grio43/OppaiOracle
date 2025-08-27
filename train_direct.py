@@ -24,6 +24,7 @@ import torch
 from torch.amp import GradScaler, autocast
 import numpy as np
 from Monitor_log import MonitorConfig, TrainingMonitor
+from evaluation_metrics import MetricComputer
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -303,6 +304,8 @@ def train_with_orientation_tracking(config: FullConfig):
     num_ratings = len(vocab.rating_to_index)
     logger.info(f"Creating model with {num_tags} tags and {num_ratings} ratings")
 
+    metric_computer = MetricComputer(num_labels=num_tags)
+
     model_config = config.model.to_dict()
     model_config["num_tags"] = num_tags
     # Assuming num_ratings is not part of the model config and needs to be added.
@@ -401,7 +404,10 @@ def train_with_orientation_tracking(config: FullConfig):
     )
 
     training_state = TrainingState()
-    best_val_loss = float('inf')
+    best_val_f1 = 0.0
+    epochs_without_improvement = 0
+    patience = getattr(config.training, "early_stopping_patience", None)
+    es_threshold = getattr(config.training, "early_stopping_threshold", 0.0)
     global_step = 0
     start_epoch = 0
 
@@ -417,7 +423,7 @@ def train_with_orientation_tracking(config: FullConfig):
         training_state = TrainingState.from_dict(ckpt.get('training_state', {}))
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('step', 0)
-        best_val_loss = ckpt.get('metrics', {}).get('val_loss', float('inf'))
+        best_val_f1 = ckpt.get('metrics', {}).get('val_f1_macro', 0.0)
         logger.info(f"Resumed from checkpoint: epoch={start_epoch}, step={global_step}")
 
     for epoch in range(start_epoch, config.training.num_epochs):
@@ -557,36 +563,50 @@ def train_with_orientation_tracking(config: FullConfig):
         # Validation loop
         model.eval()
         val_loss = 0.0
+        all_val_preds: list[torch.Tensor] = []
+        all_val_targets: list[torch.Tensor] = []
         with torch.no_grad():
             for val_step, batch in enumerate(val_loader):
                 images = batch['images'].to(device)
                 tag_labels = batch['tag_labels'].to(device)
                 rating_labels = batch['rating_labels'].to(device)
-                
+
                 with autocast(device_type=device_type, enabled=amp_enabled, dtype=amp_dtype):
                     pmask = batch.get('padding_mask', None)
-                    if pmask is not None: pmask = pmask.to(device)
+                    if pmask is not None:
+                        pmask = pmask.to(device)
                     outputs = model(images, padding_mask=pmask)
                     loss, _ = criterion(outputs['tag_logits'], outputs['rating_logits'], tag_labels, rating_labels)
                 val_loss += loss.item()
 
+                tag_probs = torch.sigmoid(outputs['tag_logits']).detach().cpu()
+                all_val_preds.append(tag_probs)
+                all_val_targets.append(tag_labels.detach().cpu())
+
                 if val_step == 0 and config.training.use_tensorboard:
-                    tag_preds = torch.sigmoid(outputs['tag_logits'])
                     tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
                     monitor.log_predictions(
                         step=global_step,
                         images=images,
-                        predictions=tag_preds,
+                        predictions=tag_probs.to(device),
                         targets=tag_labels,
                         tag_names=tag_names,
                         prefix="val",
                         max_images=config.monitor.tb_image_logging.max_samples,
                         topk=config.monitor.tb_image_logging.topk,
                     )
-        
+
         avg_val_loss = val_loss / len(val_loader)
-        logger.info(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
-        monitor.log_validation(global_step, {'loss': avg_val_loss})
+        all_val_preds = torch.cat(all_val_preds, dim=0)
+        all_val_targets = torch.cat(all_val_targets, dim=0)
+        val_metrics = metric_computer.compute_all_metrics(all_val_preds, all_val_targets)
+        val_f1_macro = val_metrics.get('f1_macro', 0.0)
+        val_mAP = val_metrics.get('mAP', 0.0)
+        logger.info(
+            f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, "
+            f"Val F1(macro): {val_f1_macro:.4f}, Val mAP: {val_mAP:.4f}"
+        )
+        monitor.log_validation(global_step, {'loss': avg_val_loss, 'f1_macro': val_f1_macro, 'mAP': val_mAP})
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
@@ -596,6 +616,8 @@ def train_with_orientation_tracking(config: FullConfig):
         training_state.global_step = global_step
         training_state.train_loss = avg_train_loss
         training_state.val_loss = avg_val_loss
+        training_state.val_f1_macro = val_f1_macro
+        training_state.val_mAP = val_mAP
         training_state.learning_rates.append(current_lr)
 
         # --- TensorBoard: periodic flush ---
@@ -604,11 +626,15 @@ def train_with_orientation_tracking(config: FullConfig):
         except Exception:
             pass
 
-        # Checkpointing
-        is_best = avg_val_loss < best_val_loss
-        if is_best:
-            best_val_loss = avg_val_loss
-        training_state.best_metric = best_val_loss
+        # Checkpointing and early stopping based on macro F1
+        if val_f1_macro > best_val_f1 + es_threshold:
+            best_val_f1 = val_f1_macro
+            epochs_without_improvement = 0
+            is_best = True
+        else:
+            epochs_without_improvement += 1
+            is_best = False
+        training_state.best_metric = best_val_f1
 
         if global_step % config.training.save_steps == 0 or is_best:
             checkpoint_manager.save_checkpoint(
@@ -617,20 +643,26 @@ def train_with_orientation_tracking(config: FullConfig):
                 scheduler=scheduler,
                 epoch=epoch + 1,
                 step=global_step,
-                metrics={'train_loss': avg_train_loss, 'val_loss': avg_val_loss},
+                metrics={'train_loss': avg_train_loss, 'val_loss': avg_val_loss, 'val_f1_macro': val_f1_macro, 'val_mAP': val_mAP},
                 training_state=training_state,
                 is_best=is_best,
                 config=config.to_dict()
             )
+
+        if patience and epochs_without_improvement >= patience:
+            logger.info("Early stopping triggered: no improvement in val_f1_macro for %s epochs", patience)
+            break
 
     # --- TensorBoard: final hparams snapshot ---
     try:
         to_dict = getattr(config, "to_dict", None)
         hparams = to_dict() if callable(to_dict) else (vars(config) if hasattr(config, "__dict__") else {})
         final_metrics = {}
-        if 'avg_val_loss' in locals(): final_metrics["final/val_loss"] = float(avg_val_loss)
-        if 'avg_train_loss' in locals(): final_metrics["final/train_loss"] = float(avg_train_loss)
-        if 'best_val_metric' in locals(): final_metrics["final/best_val_metric"] = float(best_val_metric)
+        if 'avg_val_loss' in locals():
+            final_metrics["final/val_loss"] = float(avg_val_loss)
+        if 'avg_train_loss' in locals():
+            final_metrics["final/train_loss"] = float(avg_train_loss)
+        final_metrics["final/best_val_f1_macro"] = float(best_val_f1)
         monitor.log_hyperparameters(hparams, final_metrics if final_metrics else {"final/placeholder": 1})
     except Exception:
         pass
