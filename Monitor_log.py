@@ -40,9 +40,14 @@ from tqdm import tqdm
 
 # Load sensitive configuration values
 try:
-    from sensitive_config import ALERT_WEBHOOK_URL
+    from sensitive_config import ALERT_WEBHOOK_URL as _DEFAULT_WEBHOOK
 except ImportError:  # pragma: no cover - fallback when file missing
-    ALERT_WEBHOOK_URL = None
+    _DEFAULT_WEBHOOK = None
+import os
+
+
+def _resolve_webhook_url(cfg_value: Optional[str]) -> Optional[str]:
+    return cfg_value or os.getenv("OPPAI_ALERT_WEBHOOK") or _DEFAULT_WEBHOOK
 
 # Optional imports with proper handling
 try:
@@ -130,7 +135,7 @@ class AlertSystem:
         log_method(f"ALERT: {title} - {message}")
         
         # Send to webhook if configured
-        webhook_url = self.config.alert_webhook_url or ALERT_WEBHOOK_URL
+        webhook_url = _resolve_webhook_url(self.config.alert_webhook_url)
         if webhook_url:
             self._send_webhook_alert(alert, webhook_url)
         
