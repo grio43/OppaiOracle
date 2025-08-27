@@ -365,19 +365,25 @@ debug:
 
   # Enable PyTorch's anomaly detection for debugging gradients.
   # This will slow down training significantly.
-  detect_anomaly: false
+  detect_anomaly: true
 
   # If true, log the gradient norm of the model's parameters to TensorBoard.
   # This is useful for monitoring training stability.
-  log_gradient_norm: false
+  log_gradient_norm: true
 
   # If true, perform a pre-training validation step to check the integrity
   # of the input data. This can help catch issues early.
-  validate_input_data: false
+  validate_input_data: true
 
   # If true, save intermediate images during the data augmentation process
   # for visual inspection.
-  visualize_augmentations: false
+  visualize_augmentations: true
+
+  # If true, log statistics (min/mean/max) of input batches.
+  log_input_stats: true
+
+  # If true, log statistics (min/mean/max) of model activations such as logits.
+  log_activation_stats: true
 
   # Directory to save the visualized augmentation images.
   augmentation_visualization_path: "./aug_visualizations"
