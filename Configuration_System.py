@@ -944,27 +944,33 @@ class DebugConfig(BaseConfig):
     """Configuration for debugging and diagnosing training issues."""
     # When enabled, additional checks and logging are activated.
     # This may impact performance and should be disabled for regular training.
-    enabled: bool = False
+    enabled: bool = True
 
     # If true, dump the input tensors and model outputs to a .pt file
     # when a non-finite value is detected in the model's output logits.
-    dump_tensors_on_error: bool = False
+    dump_tensors_on_error: bool = True
 
     # If true, log detailed information about the batch that caused a
     # non-finite error. This includes file paths or other identifiers.
-    log_batch_info_on_error: bool = False
+    log_batch_info_on_error: bool = True
 
     # Enable PyTorch's anomaly detection for debugging gradients.
-    detect_anomaly: bool = False
+    detect_anomaly: bool = True
 
     # If true, log the gradient norm of the model's parameters to TensorBoard.
-    log_gradient_norm: bool = False
+    log_gradient_norm: bool = True
 
     # If true, perform a pre-training validation step to check the integrity of the input data.
-    validate_input_data: bool = False
+    validate_input_data: bool = True
 
     # If true, save intermediate images during the data augmentation process for visual inspection.
-    visualize_augmentations: bool = False
+    visualize_augmentations: bool = True
+
+    # If true, log statistics (min/mean/max) of input batches.
+    log_input_stats: bool = True
+
+    # If true, log statistics (min/mean/max) of model activations such as logits.
+    log_activation_stats: bool = True
 
     # Directory to save the visualized augmentation images.
     augmentation_visualization_path: str = "./aug_visualizations"
@@ -977,6 +983,10 @@ class DebugConfig(BaseConfig):
             logger.warning("`dump_tensors_on_error` is true but debug mode is disabled.")
         if self.log_batch_info_on_error and not self.enabled:
             logger.warning("`log_batch_info_on_error` is true but debug mode is disabled.")
+        if self.log_input_stats and not self.enabled:
+            logger.warning("`log_input_stats` is true but debug mode is disabled.")
+        if self.log_activation_stats and not self.enabled:
+            logger.warning("`log_activation_stats` is true but debug mode is disabled.")
 
 
 @dataclass
