@@ -51,7 +51,12 @@ except Exception:  # pragma: no cover
 # Import our modules
 from evaluation_metrics import MetricComputer
 from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
-from HDF5_loader import create_dataloaders, SimplifiedDataConfig
+from HDF5_loader import create_dataloaders
+from Configuration_System import (
+    DataConfig as CSDataConfig,
+    ValidationConfig as CSValConfig,
+    ValidationDataloaderConfig as CSDataloaderConfig,
+)
 from training_utils import DistributedTrainingHelper
 from model_architecture import create_model, VisionTransformerConfig
 from model_metadata import ModelMetadata
@@ -390,28 +395,32 @@ class ValidationRunner:
     
     def create_dataloader(self) -> DataLoader:
         """Create validation dataloader"""
-        # Data config
-        data_config = SimplifiedDataConfig(
-            data_dir=Path(self.config.data_dir),
-            json_dir=Path(self.config.json_dir),
-            vocab_path=Path(self.config.vocab_path),
-            normalize_mean=self._val_mean,
-            normalize_std=self._val_std,
-            image_size=self._val_image_size,
-            patch_size=self._val_patch_size,
-            augmentation_enabled=False  # No augmentation for validation
+        # Build configs from preprocessing params (already extracted from checkpoint)
+        data_cfg = CSDataConfig(
+            data_dir=self.config.data_dir,
+            vocab_dir=str(Path(self.config.vocab_path).parent),
+            image_size=self.preprocessing_params.get('image_size', 640),
+            normalize_mean=tuple(self.preprocessing_params.get('normalize_mean', [0.5, 0.5, 0.5])),
+            normalize_std=tuple(self.preprocessing_params.get('normalize_std', [0.5, 0.5, 0.5])),
+            random_flip_prob=0.0,
+            pin_memory=True,
+            batch_size=8,  # ignored by val loader below
         )
-
-        # Create dataloader
+        val_cfg = CSValConfig(
+            dataloader=CSDataloaderConfig(
+                batch_size=self.config.batch_size,
+                num_workers=self.config.num_workers,
+                prefetch_factor=2,
+            )
+        )
         _, val_loader, _ = create_dataloaders(
-            data_dir=data_config.data_dir,
-            json_dir=data_config.json_dir,
-            vocab_path=data_config.vocab_path,
-            batch_size=self.config.batch_size,
-            num_workers=self.config.num_workers,
+            data_config=data_cfg,
+            validation_config=val_cfg,
+            vocab_path=Path(self.config.vocab_path),
+            active_data_path=Path(self.config.json_dir),
             distributed=self.config.distributed,
             log_queue=self._log_queue,
-            force_val_persistent_workers=False
+            frequency_sampling=False,
         )
         
         # Limit samples if requested
