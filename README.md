@@ -1,15 +1,15 @@
 # OppaiOracle
 
-OppaiOracle, is a deep learning project for AI-based image tagging. It is built with PyTorch and is designed to be a comprehensive solution for training, evaluating, and deploying image tagging models.
+OppaiOracle, also known as **MAID (Model for AI-based Detection)**, is a PyTorch-based system for training, evaluating, and deploying image-tagging models. It supports configuration-driven experimentation, ONNX export, and a suite of utilities for data handling and evaluation.
 
 ## Features
 
 -   **Training:** Train custom image tagging models using your own datasets.
 -   **Inference:** Run inference with trained models on new images.
 -   **ONNX Export:** Export trained models to ONNX format for optimized inference.
--   **FastAPI API:** Serve the model through a REST API using FastAPI.
 -   **Configuration System:** A unified configuration system to manage all aspects of the project.
 -   **HDF5 Data Loading:** Efficient data loading using HDF5 files.
+-   **Evaluation Tools:** Batch evaluation, live monitoring, and visualization scripts.
 
 ## Project Structure
 
@@ -19,15 +19,16 @@ The repository is organized as follows:
 .
 ├── configs/              # Configuration files for the model and training process
 ├── logs/                 # Logs from training and other processes
-├── maid/                 # Project source code
 ├── scripts/              # Various utility scripts
 ├── tools/                # Tools for calibration and other tasks
 ├── TEst and review/      # Scripts for testing and visualizing results
 ├── utils/                # Utility functions used across the project
+├── Configuration_System.py   # Validates and manages configuration files
 ├── model_architecture.py # Defines the neural network architecture
-├── train_direct.py       # The main script for training the model
+├── train_direct.py       # Main training script
 ├── Inference_Engine.py   # Handles model inference
 ├── ONNX_Export.py        # Exports the trained model to ONNX format
+├── onnx_infer.py         # Runs inference with exported ONNX models
 ├── HDF5_loader.py        # Loads data from HDF5 files
 └── requirements.txt      # Project dependencies
 ```
@@ -78,15 +79,30 @@ You can run inference using either the PyTorch model or the ONNX model.
     python onnx_infer.py --config configs/unified_config.yaml --image /path/to/your/image.jpg
     ```
 
-### API
+## Evaluation
 
-The project includes a FastAPI-based API for serving the model. To run the API, use `uvicorn`:
+The `TEst and review` directory contains scripts for assessing model performance.
 
-```bash
-uvicorn Inference_Engine:app --host 0.0.0.0 --port 8000
-```
+1.  **Run batch evaluation** to generate a JSONL file with results:
+    ```bash
+    python TEst\ and\ review/batch_evaluate.py \
+        --model-path /path/to/your/model.pt \
+        --image-dir /path/to/images \
+        --json-dir /path/to/json_tags \
+        --output /path/to/results.jsonl
+    ```
 
-*(Note: The exact command might vary depending on the API implementation in `Inference_Engine.py`)*
+2.  **Monitor progress** while evaluation runs (optional):
+    ```bash
+    python TEst\ and\ review/live_viewer.py /path/to/results.jsonl
+    ```
+
+3.  **Visualize final results** to analyze model performance:
+    ```bash
+    python TEst\ and\ review/visualize_results.py \
+        --results /path/to/results.jsonl \
+        --outdir /path/to/visualization_output
+    ```
 
 ## Workflow
 
