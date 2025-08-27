@@ -38,6 +38,12 @@ from utils.logging_sanitize import sanitize_metrics
 import seaborn as sns
 from tqdm import tqdm
 
+# Load sensitive configuration values
+try:
+    from sensitive_config import ALERT_WEBHOOK_URL
+except ImportError:  # pragma: no cover - fallback when file missing
+    ALERT_WEBHOOK_URL = None
+
 # Optional imports with proper handling
 try:
     import GPUtil
@@ -124,22 +130,23 @@ class AlertSystem:
         log_method(f"ALERT: {title} - {message}")
         
         # Send to webhook if configured
-        if self.config.alert_webhook_url:
-            self._send_webhook_alert(alert)
+        webhook_url = self.config.alert_webhook_url or ALERT_WEBHOOK_URL
+        if webhook_url:
+            self._send_webhook_alert(alert, webhook_url)
         
         # Send to console with color
         self._print_colored_alert(alert)
     
-    def _send_webhook_alert(self, alert: dict):
+    def _send_webhook_alert(self, alert: dict, webhook_url: str):
         """Spawns a background thread to send a webhook alert to avoid blocking."""
         thread = threading.Thread(
             target=self._execute_webhook_in_thread,
-            args=(alert,),
+            args=(alert, webhook_url),
             daemon=True
         )
         thread.start()
 
-    def _execute_webhook_in_thread(self, alert: dict):
+    def _execute_webhook_in_thread(self, alert: dict, webhook_url: str):
         """Send alert to webhook (Discord optimized) in a thread."""
         try:
             import requests
@@ -171,8 +178,8 @@ class AlertSystem:
                 "content": trim(f"Training Alert: {alert['title']}", MAX_CONTENT),
                 "embeds": [embed],
             }
-            
-            response = requests.post(self.config.alert_webhook_url, json=payload, timeout=10)
+
+            response = requests.post(webhook_url, json=payload, timeout=10)
             response.raise_for_status()
         except Exception as e:
             logger.error(f"Failed to send webhook alert for '{alert['title']}': {e}")
