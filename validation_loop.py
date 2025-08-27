@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover
     _HAVE_SEABORN = False
 
 # Import our modules
-from Evaluation_Metrics import MetricComputer, MetricConfig
+from evaluation_metrics import MetricComputer
 from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
 from HDF5_loader import create_dataloaders, SimplifiedDataConfig
 from training_utils import DistributedTrainingHelper
@@ -239,18 +239,10 @@ class ValidationRunner:
         logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
 
         self.num_tags = len(self.vocab.tag_to_index)
-        
-        # Create metric config
-        if config.metric_config:
-            self.metric_config = MetricConfig(**config.metric_config)
-        else:
-            self.metric_config = MetricConfig(
-                compute_per_tag_metrics=config.compute_expensive_metrics,
-                compute_auc=config.compute_expensive_metrics,
-                save_plots=config.create_visualizations,
-                plot_dir=config.plot_dir
-            )
-        
+
+        # Initialize metric computer for F1 and mAP tracking
+        self.metric_computer = MetricComputer(num_labels=self.num_tags)
+
         # Track validation history
         self.validation_history = []
         
@@ -563,12 +555,15 @@ class ValidationRunner:
         
         # Compute metrics
         logger.info("Computing metrics...")
-        metric_computer = MetricComputer(self.metric_config)
-        
-        # Get tag names and frequencies
+
+        metrics = self.metric_computer.compute_all_metrics(
+            all_predictions,
+            all_targets
+        )
+
+        # Get tag names and frequencies for optional analysis
         tag_names = []
         for i in range(len(self.vocab.tag_to_index)):
-            # This will raise ValueError if placeholder detected
             try:
                 tag_name = self.vocab.get_tag_from_index(i)
             except ValueError as e:
@@ -576,13 +571,6 @@ class ValidationRunner:
                 raise
             tag_names.append(tag_name)
         tag_frequencies = self._compute_tag_frequencies(all_targets) if self.config.analyze_by_frequency else None
-        
-        metrics = metric_computer.compute_all_metrics(
-            all_predictions,
-            all_targets,
-            tag_names=tag_names,
-            tag_frequencies=tag_frequencies
-        )
         
         # Add timing information
         if self.config.measure_inference_time and inference_times:
@@ -611,16 +599,7 @@ class ValidationRunner:
     def validate_fast(self, dataloader: DataLoader) -> Dict[str, Any]:
         """Fast validation with basic metrics only"""
         logger.info("Running fast validation...")
-        
-        # Temporarily disable expensive metrics
-        original_config = self.metric_config
-        self.metric_config = MetricConfig(
-            compute_per_tag_metrics=False,
-            compute_confusion_matrix=False,
-            compute_auc=False,
-            save_plots=False
-        )
-        
+
         # Limit samples for speed
         max_batches = 50
         limited_data = []
@@ -647,10 +626,7 @@ class ValidationRunner:
         
         # Run validation
         results = self.validate_full(fast_loader)
-        
-        # Restore config
-        self.metric_config = original_config
-        
+
         return results
     
     def validate_specific_tags(self, dataloader: DataLoader) -> Dict[str, Any]:
@@ -888,7 +864,7 @@ class ValidationRunner:
         
         # 1. Overall metrics bar plot
         plt.figure(figsize=(10, 6))
-        overall_metrics = ['precision', 'recall', 'f1', 'mAP']
+        overall_metrics = [m for m in ('f1_macro', 'f1_micro', 'mAP') if m in metrics]
         values = [metrics.get(m, 0) for m in overall_metrics]
         plt.bar(overall_metrics, values)
         plt.title('Overall Validation Metrics')
@@ -1171,7 +1147,7 @@ class ValidationRunner:
                     f.write(f"  {key}: {value:.4f}\n")
             
             # Overall metrics if available
-            for key in ['precision', 'recall', 'f1', 'mAP']:
+            for key in ['f1_macro', 'f1_micro', 'mAP']:
                 if key in serializable_results:
                     f.write(f"{key}: {serializable_results[key]:.4f}\n")
         
@@ -1243,9 +1219,9 @@ def main():
         for key, value in results['summary'].items():
             print(f"{key}: {value:.4f}")
     
-    for key in ['precision', 'recall', 'f1', 'mAP']:
+    for key in ['f1_macro', 'f1_micro', 'mAP']:
         if key in results:
-            print(f"{results[key]:.4f}")
+            print(f"{key}: {results[key]:.4f}")
 
     # Ensure cleanup happens even if there's an exception
     try:
