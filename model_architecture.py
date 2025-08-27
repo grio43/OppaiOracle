@@ -107,10 +107,19 @@ class TransformerBlock(nn.Module):
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             
+            # Build attention mask with SDPA semantics (True = keep)
+            attn_mask = None
+            if key_padding_mask is not None:
+                # If any sample masks all positions, fail fast
+                if torch.all(key_padding_mask, dim=1).any():
+                    raise RuntimeError("key_padding_mask masks all keys for at least one sample.")
+                # Invert mask for SDPA: original True means ignore
+                attn_mask = (~key_padding_mask).unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
+
             # Use scaled_dot_product_attention with flash backend when available
             attn_out = F.scaled_dot_product_attention(
-                q, k, v, 
-                attn_mask=key_padding_mask.unsqueeze(1).unsqueeze(2) if key_padding_mask is not None else None,
+                q, k, v,
+                attn_mask=attn_mask,
                 dropout_p=self.attn_dropout if self.training else 0.0
             )
             attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
@@ -208,6 +217,11 @@ class SimplifiedTagger(nn.Module):
             # Prepend CLS token (never ignored)
             cls_keep = torch.zeros(B, 1, dtype=torch.bool, device=token_ignore.device)
             attn_kpm = torch.cat([cls_keep, token_ignore], dim=1) # (B, 1+Lp) True=IGNORE
+
+        if attn_kpm is not None:
+            # If any sample masks all positions, fail fast
+            if torch.all(attn_kpm, dim=1).any():
+                raise RuntimeError("attn_kpm masks all keys for at least one sample.")
 
         # Transformer blocks with optional gradient checkpointing
         for block in self.blocks:
