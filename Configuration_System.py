@@ -54,6 +54,33 @@ class ConfigType(Enum):
     FULL = "full"
 
 
+def _object_to_dict(obj: Any, exclude_private: bool = True) -> Any:
+    """Recursively convert an object to a serializable structure.
+
+    Unlike ``dataclasses.asdict`` this helper preserves tuple types by
+    converting tuple items individually rather than coercing the tuple to a
+    list. It also respects ``exclude_private`` when encountering nested
+    dataclass instances.
+
+    Args:
+        obj: The object to convert.
+        exclude_private: Whether to omit private fields from nested dataclasses.
+
+    Returns:
+        A structure composed of ``dict``, ``list``, ``tuple`` and primitive
+        types suitable for serialization.
+    """
+    if is_dataclass(obj):
+        return obj.to_dict(exclude_private)  # type: ignore[attr-defined]
+    if isinstance(obj, dict):
+        return {k: _object_to_dict(v, exclude_private) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_object_to_dict(v, exclude_private) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_object_to_dict(v, exclude_private) for v in obj)
+    return obj
+
+
 @dataclass
 class BaseConfig:
     """Base configuration class with common functionality"""
@@ -68,24 +95,14 @@ class BaseConfig:
         Args:
             exclude_private: Whether to exclude private fields (starting with _)
         """
-        result = {}
+        result: Dict[str, Any] = {}
         for field_obj in fields(self):
             if exclude_private and field_obj.name.startswith('_'):
                 continue
-            
+
             value = getattr(self, field_obj.name)
-            if is_dataclass(value):
-                value = value.to_dict(exclude_private)
-            elif isinstance(value, list):
-                value = [v.to_dict(exclude_private) if is_dataclass(v) else v for v in value]
-            elif isinstance(value, tuple):
-                value = list(value)
-            elif isinstance(value, dict):
-                value = {k: v.to_dict(exclude_private) if is_dataclass(v) else v 
-                        for k, v in value.items()}
-            
-            result[field_obj.name] = value
-        
+            result[field_obj.name] = _object_to_dict(value, exclude_private)
+
         return result
     
     def to_yaml(self, path: Union[str, Path], **kwargs):
