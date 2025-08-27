@@ -178,13 +178,20 @@ training:
   eval_steps: 1000
   logging_steps: 100
   
-  # Loss configuration
-  focal_gamma_pos: 0.0
-  focal_gamma_neg: 4.0
-  focal_alpha: 0.75  # Unified alpha weight
-  focal_clip: 0.05
-  label_smoothing: 0.1
-  use_class_weights: true
+    # Loss configuration
+    tag_loss:
+      alpha: 0.5            # Balancing factor between positive/negative examples
+      gamma_neg: 1.0        # Focusing parameter for negatives
+      gamma_pos: 1.0        # Focusing parameter for positives
+      label_smoothing: 0.0  # Smoothing for tag targets
+      clip: 0.05            # Prevent extreme logits
+    rating_loss:
+      alpha: 0.5
+      gamma_neg: 1.0
+      gamma_pos: 1.0
+      label_smoothing: 0.0
+      clip: 0.05
+    use_class_weights: true
   
   # Curriculum learning
   use_curriculum: true

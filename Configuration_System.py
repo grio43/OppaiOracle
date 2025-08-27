@@ -540,6 +540,31 @@ class OverflowBackoffConfig(BaseConfig):
 
 
 @dataclass
+class LossConfig(BaseConfig):
+    """Hyperparameters for loss functions."""
+    alpha: float = 0.5
+    gamma_neg: float = 1.0
+    gamma_pos: float = 1.0
+    label_smoothing: float = 0.0
+    clip: float = 0.05
+
+    def validate(self):
+        errors = []
+        if not 0.0 <= self.alpha <= 1.0:
+            errors.append(f"alpha must be in [0, 1], got {self.alpha}")
+        if self.gamma_neg < 0 or self.gamma_pos < 0:
+            errors.append("gamma_neg and gamma_pos must be >= 0")
+        if not 0.0 <= self.label_smoothing <= 1.0:
+            errors.append(
+                f"label_smoothing must be in [0, 1], got {self.label_smoothing}"
+            )
+        if not 0.0 <= self.clip < 0.5:
+            errors.append(f"clip must be in [0, 0.5), got {self.clip}")
+        if errors:
+            raise ConfigValidationError("Loss config validation failed:\n" + "\n".join(errors))
+
+
+@dataclass
 class TrainingConfig(BaseConfig):
     """Training configuration"""
     # Basic settings
@@ -583,16 +608,9 @@ class TrainingConfig(BaseConfig):
     logging_steps: int = 100
     
     # Loss configuration
-    focal_gamma_pos: float = 0.0
-    focal_gamma_neg: float = 4.0
-    focal_alpha: float = 0.75  # Unified weight for focal loss
-    focal_clip: float = 0.05  # Clipping parameter for focal loss to prevent pow(0, gamma)
-    label_smoothing: float = 0.1
+    tag_loss: LossConfig = field(default_factory=LossConfig)
+    rating_loss: LossConfig = field(default_factory=LossConfig)
     use_class_weights: bool = True
-
-    # Additional focal loss params for compatibility
-    focal_alpha_pos: Optional[float] = None  # Deprecated, use focal_alpha
-    focal_alpha_neg: Optional[float] = None  # Deprecated, use focal_alpha
     
     # Curriculum learning
     use_curriculum: bool = True
@@ -665,23 +683,15 @@ class TrainingConfig(BaseConfig):
             if not 0 <= self.adam_beta2 < 1:
                 errors.append(f"adam_beta2 must be in [0, 1), got {self.adam_beta2}")
         
-        # Validate focal loss parameters
-        if not 0 <= self.focal_alpha <= 1:
-            errors.append(f"focal_alpha must be in [0, 1], got {self.focal_alpha}")
-
-        if not 0 <= self.focal_clip < 0.5:
-            errors.append(f"focal_clip must be in [0, 0.5), got {self.focal_clip}")
-
-        # Validate focal loss gamma parameters
-        if self.focal_gamma_pos < 0:
-            errors.append(f"focal_gamma_pos must be >= 0, got {self.focal_gamma_pos}")
-
-        if self.focal_gamma_neg < 0:
-            errors.append(f"focal_gamma_neg must be >= 0, got {self.focal_gamma_neg}")
-
-        # Validate label smoothing
-        if not 0 <= self.label_smoothing <= 1:
-            errors.append(f"label_smoothing must be in [0, 1], got {self.label_smoothing}")
+        # Validate loss configurations
+        try:
+            self.tag_loss.validate()
+        except ConfigValidationError as e:
+            errors.append(f"tag_loss: {e}")
+        try:
+            self.rating_loss.validate()
+        except ConfigValidationError as e:
+            errors.append(f"rating_loss: {e}")
         
         # Validate device
         valid_devices = ["cuda", "cpu", "mps"]
