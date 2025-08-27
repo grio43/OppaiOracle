@@ -331,8 +331,23 @@ def train_with_orientation_tracking(config: FullConfig):
     # --- TensorBoard: initial hparams snapshot ---
     try:
         to_dict = getattr(config, "to_dict", None)
-        hparams = to_dict() if callable(to_dict) else (vars(config) if hasattr(config, "__dict__") else {})
+        hparams = to_dict() if callable(to_dict) else (
+            vars(config) if hasattr(config, "__dict__") else {}
+        )
         monitor.log_hyperparameters(hparams, {"init/placeholder": 0})
+    except Exception:
+        pass
+
+    # Log loss hyperparameters
+    tag_loss_cfg = config.training.tag_loss
+    rating_loss_cfg = config.training.rating_loss
+    loss_hparams = {
+        "tag_loss": tag_loss_cfg.to_dict() if hasattr(tag_loss_cfg, "to_dict") else vars(tag_loss_cfg),
+        "rating_loss": rating_loss_cfg.to_dict() if hasattr(rating_loss_cfg, "to_dict") else vars(rating_loss_cfg),
+    }
+    logger.info(f"Loss hyperparameters: {loss_hparams}")
+    try:
+        monitor.log_hyperparameters(loss_hparams, {"loss/init": 0})
     except Exception:
         pass
 
@@ -352,12 +367,19 @@ def train_with_orientation_tracking(config: FullConfig):
         tag_loss_weight=0.9,
         rating_loss_weight=0.1,
         tag_loss_fn=AsymmetricFocalLoss(
-            alpha=config.training.focal_alpha,
-            clip=config.training.focal_clip,
-            gamma_neg=config.training.focal_gamma_neg,
-            gamma_pos=config.training.focal_gamma_pos,
-            label_smoothing=config.training.label_smoothing
-        )
+            alpha=tag_loss_cfg.alpha,
+            clip=tag_loss_cfg.clip,
+            gamma_neg=tag_loss_cfg.gamma_neg,
+            gamma_pos=tag_loss_cfg.gamma_pos,
+            label_smoothing=tag_loss_cfg.label_smoothing,
+        ),
+        rating_loss_fn=AsymmetricFocalLoss(
+            alpha=rating_loss_cfg.alpha,
+            clip=rating_loss_cfg.clip,
+            gamma_neg=rating_loss_cfg.gamma_neg,
+            gamma_pos=rating_loss_cfg.gamma_pos,
+            label_smoothing=rating_loss_cfg.label_smoothing,
+        ),
     )
     from training_utils import TrainingUtils
     # Construct betas tuple based on the selected optimizer
