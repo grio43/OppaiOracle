@@ -5,14 +5,15 @@ Vision Transformer adjusted for orientation-aware tagger
 """
 
 import math
+import warnings
 from dataclasses import dataclass, fields
 from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import StochasticDepth
 from mask_utils import ensure_pixel_padding_mask, pixel_to_token_ignore
+from custom_drop_path import SafeDropPath
 
 
 class LayerNormFp32(nn.LayerNorm):
@@ -46,6 +47,16 @@ class VisionTransformerConfig:
     gradient_checkpointing: bool = True
     drop_path_rate: float = 0.0
 
+    def __post_init__(self):
+        assert 0.0 <= self.drop_path_rate < 1.0, (
+            f"drop_path_rate must be in [0, 1), got {self.drop_path_rate}"
+        )
+        if self.drop_path_rate > 0.5:
+            warnings.warn(
+                f"drop_path_rate={self.drop_path_rate} is unusually high; "
+                "values between 0.08 and 0.3 are typical for ViT."
+            )
+
 
 class TransformerBlock(nn.Module):
     """Single transformer block"""
@@ -73,7 +84,7 @@ class TransformerBlock(nn.Module):
                 batch_first=True
             )
 
-        self.drop_path = StochasticDepth(p=drop_path, mode="row") if drop_path > 0. else nn.Identity()
+        self.drop_path = SafeDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = nn.Sequential(
             nn.Linear(config.hidden_size, config.intermediate_size),
@@ -139,9 +150,15 @@ class SimplifiedTagger(nn.Module):
         )
         self.pos_drop = nn.Dropout(p=config.dropout)
         # Transformer blocks
-        dpr = [x.item() for x in torch.linspace(0, getattr(config, 'drop_path_rate', 0.1), config.num_hidden_layers)]  # stochastic depth decay rule
+        rate = getattr(config, 'drop_path_rate', 0.0)
+        try:
+            dpr = torch.linspace(0.0, rate, config.num_hidden_layers, endpoint=False)
+        except TypeError:
+            dpr = torch.linspace(0.0, rate, config.num_hidden_layers + 1)[:-1]
+        dpr = dpr.clamp_max(1.0 - 1e-6).tolist()
         self.blocks = nn.ModuleList([
-            TransformerBlock(config, drop_path=dpr[i]) for i in range(config.num_hidden_layers)
+            TransformerBlock(config, drop_path=float(p))
+            for p in dpr
         ])
         # Final layer norm
         self.norm = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps)
