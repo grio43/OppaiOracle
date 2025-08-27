@@ -636,7 +636,7 @@ class TrainingConfig(BaseConfig):
         
         # AMP backend note
         if self.use_amp and self.amp_opt_level:
-            logger.warning("amp_opt_level appears to target NVIDIA Apex; if using torch.cuda.amp, prefer configuring amp_dtype and ignore amp_opt_level")
+            logger.warning("amp_opt_level appears to target NVIDIA Apex; if using torch.amp, prefer configuring amp_dtype and ignore amp_opt_level")
         
         if self.learning_rate <= 0:
             errors.append(f"learning_rate must be positive, got {self.learning_rate}")

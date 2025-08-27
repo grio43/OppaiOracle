@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 import torch.distributed as dist
+from torch.amp import autocast
 from tqdm import tqdm
 
 # Scientific computing imports
@@ -128,6 +129,10 @@ class ValidationRunner:
     def __init__(self, config: ValidationConfig):
         self.config = config
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+        self.amp_enabled = self.config.use_amp and self.device.type == "cuda"
+        self.amp_dtype = torch.bfloat16 if (self.amp_enabled and torch.cuda.is_bf16_supported()) else torch.float16
+        if self.amp_enabled:
+            logger.info(f"Validation AMP dtype set to {self.amp_dtype}.")
         # Logging queue used by workers
         self._log_queue: Optional[mp.Queue] = mp.Queue()
         self._listener = None  # Initialize listener attribute
@@ -513,7 +518,7 @@ class ValidationRunner:
                 pmask = batch.get('padding_mask', None)
                 if pmask is not None:
                     pmask = pmask.to(self.device)
-                with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
+                with autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.amp_enabled):
                     outputs = self.model(images, padding_mask=pmask)
                     logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
@@ -682,7 +687,7 @@ class ValidationRunner:
                 pmask = batch.get('padding_mask', None)
                 if pmask is not None:
                     pmask = pmask.to(self.device)
-                with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
+                with autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.amp_enabled):
                     outputs = self.model(images, padding_mask=pmask)
                     logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
@@ -780,7 +785,7 @@ class ValidationRunner:
                 pmask = batch.get('padding_mask', None)
                 if pmask is not None:
                     pmask = pmask.to(self.device)
-                with torch.cuda.amp.autocast(enabled=self.config.use_amp and torch.cuda.is_available()):
+                with autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.amp_enabled):
                     outputs = self.model(images, padding_mask=pmask)
                     tag_logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
                 
