@@ -33,6 +33,9 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import _LRScheduler
+from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
+# Alternative if not using Lightning Bolts:
+# from torch.optim.lr_scheduler import CosineAnnealingLR  # Use standard PyTorch scheduler
 from torch.amp import GradScaler, autocast
 import torch.backends.cudnn as cudnn
 
@@ -866,10 +869,10 @@ class MixedPrecisionTrainer:
         
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
-        
+
         # Create gradient scaler for FP16 with new API
         if self.use_amp and self.amp_dtype == torch.float16:
-            self.scaler = GradScaler(device='cuda')
+            self.scaler = GradScaler()
         else:
             self.scaler = None
     
