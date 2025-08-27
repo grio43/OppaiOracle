@@ -483,9 +483,11 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
 
     use_amp = device.type == 'cuda'
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    if use_amp:
+        print(f"AMP enabled with dtype={amp_dtype}.")
 
     with open(results_file, 'w') as rf, torch.no_grad():
-        autocast_ctx = torch.cuda.amp.autocast(dtype=amp_dtype) if use_amp else contextlib.nullcontext()
+        autocast_ctx = torch.amp.autocast(device_type='cuda', dtype=amp_dtype) if use_amp else contextlib.nullcontext()
         with autocast_ctx:
             for batch in tqdm(dataloader, desc="Processing batches"):
                 image_paths = [s['image_path'] for s in batch]

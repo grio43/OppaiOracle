@@ -367,11 +367,7 @@ def train_with_orientation_tracking(config: FullConfig):
     )
 
     amp_enabled = config.training.use_amp and device.type == 'cuda'
-    amp_pref = getattr(config.training, "amp_dtype", "bfloat16")
-    if amp_pref == "bfloat16" and torch.cuda.is_bf16_supported():
-        amp_dtype = torch.bfloat16
-    else:
-        amp_dtype = torch.float16
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     # GradScaler is only needed for float16 AMP.
     use_scaler = amp_enabled and amp_dtype == torch.float16
