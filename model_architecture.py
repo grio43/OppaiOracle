@@ -198,8 +198,13 @@ class SimplifiedTagger(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,  # (B,H,W) or (B,1,H,W), auto-detected semantics
     ) -> Dict[str, torch.Tensor]:
         B = pixel_values.shape[0]
-        # Patch embedding
-        x = self.patch_embed(pixel_values)
+        # Patch embedding (force fp32 for numerical stability under AMP)
+        if pixel_values.dtype in (torch.float16, torch.bfloat16):
+            with torch.autocast(device_type='cuda', enabled=False):
+                x = self.patch_embed(pixel_values.float())
+            x = x.to(pixel_values.dtype)
+        else:
+            x = self.patch_embed(pixel_values)
         x = x.flatten(2).transpose(1, 2)
         # Add CLS token
         cls_tokens = self.cls_token.expand(B, -1, -1)
