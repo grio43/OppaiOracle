@@ -59,7 +59,13 @@ Import error: {e}"""
     raise ImportError(error_msg)
 
 # Import training utilities for checkpointing
-from training_utils import CheckpointManager, TrainingState, setup_seed, log_sample_order_hash
+from training_utils import (
+    CheckpointManager,
+    TrainingState,
+    setup_seed,
+    log_sample_order_hash,
+    CosineAnnealingWarmupRestarts,
+)
 from HDF5_loader import AugmentationStats, validate_dataset
 from utils.logging_sanitize import ensure_finite_tensor
 
@@ -366,6 +372,15 @@ def train_with_orientation_tracking(config: FullConfig):
         eps=config.training.adam_epsilon
     )
 
+    scheduler = CosineAnnealingWarmupRestarts(
+        optimizer,
+        first_cycle_steps=config.training.num_epochs,
+        cycle_mult=1.0,
+        max_lr=config.training.learning_rate,
+        min_lr=getattr(config.training, "lr_end", 1e-6),
+        warmup_steps=config.training.warmup_steps,
+    )
+
     amp_enabled = config.training.use_amp and device.type == 'cuda'
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
@@ -384,12 +399,28 @@ def train_with_orientation_tracking(config: FullConfig):
         max_checkpoints=config.training.save_total_limit,
         keep_best=config.training.save_best_only
     )
-    
+
     training_state = TrainingState()
     best_val_loss = float('inf')
-
     global_step = 0
-    for epoch in range(config.training.num_epochs):
+    start_epoch = 0
+
+    latest_ckpt = checkpoint_manager.get_latest_checkpoint()
+    if latest_ckpt:
+        ckpt = checkpoint_manager.load_checkpoint(
+            checkpoint_path=latest_ckpt,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+        )
+        training_state = TrainingState.from_dict(ckpt.get('training_state', {}))
+        start_epoch = ckpt.get('epoch', 0)
+        global_step = ckpt.get('step', 0)
+        best_val_loss = ckpt.get('metrics', {}).get('val_loss', float('inf'))
+        logger.info(f"Resumed from checkpoint: epoch={start_epoch}, step={global_step}")
+
+    for epoch in range(start_epoch, config.training.num_epochs):
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
@@ -557,6 +588,16 @@ def train_with_orientation_tracking(config: FullConfig):
         logger.info(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         monitor.log_validation(global_step, {'loss': avg_val_loss})
 
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        monitor.log_scalar('lr', current_lr, global_step)
+
+        training_state.epoch = epoch + 1
+        training_state.global_step = global_step
+        training_state.train_loss = avg_train_loss
+        training_state.val_loss = avg_val_loss
+        training_state.learning_rates.append(current_lr)
+
         # --- TensorBoard: periodic flush ---
         try:
             monitor.flush()
@@ -567,12 +608,13 @@ def train_with_orientation_tracking(config: FullConfig):
         is_best = avg_val_loss < best_val_loss
         if is_best:
             best_val_loss = avg_val_loss
+        training_state.best_metric = best_val_loss
 
         if global_step % config.training.save_steps == 0 or is_best:
             checkpoint_manager.save_checkpoint(
                 model=model,
                 optimizer=optimizer,
-                scheduler=None,
+                scheduler=scheduler,
                 epoch=epoch + 1,
                 step=global_step,
                 metrics={'train_loss': avg_train_loss, 'val_loss': avg_val_loss},
