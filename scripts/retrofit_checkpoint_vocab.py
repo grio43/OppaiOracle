@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 sys.path.append(str(Path(__file__).parent.parent))
 
 from model_metadata import ModelMetadata
+from safe_checkpoint import safe_load_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,8 @@ def retrofit_checkpoint(
 
     # Load checkpoint
     logger.info(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    state_dict, meta = safe_load_checkpoint(checkpoint_path)
+    checkpoint = {'state_dict': state_dict, **meta}  # build a pure dict
 
     # Check if already has embedded vocabulary
     if 'vocab_b64_gzip' in checkpoint and not force:
@@ -69,14 +71,14 @@ def retrofit_checkpoint(
 
     # Verify the retrofit
     logger.info("Verifying retrofitted checkpoint...")
-    test_checkpoint = torch.load(output_path, map_location='cpu')
+    _sd, _meta = safe_load_checkpoint(output_path)
 
-    vocab_data = ModelMetadata.extract_vocabulary(test_checkpoint)
+    vocab_data = ModelMetadata.extract_vocabulary(_meta)
     if vocab_data is None:
         logger.error("Failed to extract vocabulary from retrofitted checkpoint!")
         return False
 
-    preprocessing = ModelMetadata.extract_preprocessing_params(test_checkpoint)
+    preprocessing = ModelMetadata.extract_preprocessing_params(_meta)
     if preprocessing is None:
         logger.error("Failed to extract preprocessing params from retrofitted checkpoint!")
         return False

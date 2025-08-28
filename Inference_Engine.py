@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safe_checkpoint import safe_load_checkpoint
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
@@ -244,12 +245,12 @@ class ModelWrapper:
         """Load the trained model"""
         try:
             # Load checkpoint first
-            checkpoint = torch.load(self.config.model_path, map_location=self.device)
+            state_dict, meta = safe_load_checkpoint(self.config.model_path)
 
             # Priority 1: Check for embedded vocabulary in checkpoint
-            if 'vocab_b64_gzip' in checkpoint:
+            if 'vocab_b64_gzip' in meta:
                 logger.info("Loading embedded vocabulary from checkpoint")
-                vocab_data = ModelMetadata.extract_vocabulary(checkpoint)
+                vocab_data = ModelMetadata.extract_vocabulary(meta)
                 if vocab_data:
                     self.vocabulary = TagVocabulary()
                     self.vocabulary.tag_to_index = vocab_data['tag_to_index']
@@ -276,17 +277,17 @@ class ModelWrapper:
             self._verify_vocabulary()
 
             # Load preprocessing parameters from checkpoint
-            if 'preprocessing_params' in checkpoint:
-                preprocessing = ModelMetadata.extract_preprocessing_params(checkpoint)
+            if 'preprocessing_params' in meta:
+                preprocessing = ModelMetadata.extract_preprocessing_params(meta)
                 if preprocessing:
                     self.config.normalize_mean = preprocessing.get('normalize_mean', [0.5, 0.5, 0.5])
                     self.config.normalize_std = preprocessing.get('normalize_std', [0.5, 0.5, 0.5])
                     self.config.image_size = preprocessing.get('image_size', 640)
                     self.normalization_params = preprocessing
                     logger.info(f"Loaded preprocessing params from checkpoint: {preprocessing}")
-            elif 'normalization_params' in checkpoint:
+            elif 'normalization_params' in meta:
                 # Legacy format
-                self.normalization_params = checkpoint['normalization_params']
+                self.normalization_params = meta['normalization_params']
                 self.config.normalize_mean = self.normalization_params['mean']
                 self.config.normalize_std = self.normalization_params['std']
                 logger.info("Loaded normalization params from checkpoint (legacy format)")
@@ -302,7 +303,7 @@ class ModelWrapper:
                 model_config = {}
             
             # Extract model configuration from checkpoint or use defaults
-            vit_config_dict = checkpoint.get('model_config', {})
+            vit_config_dict = meta.get('model_config', {})
             
             # Merge with config file if available
             if 'vit_config' in model_config:
@@ -313,12 +314,12 @@ class ModelWrapper:
                 if self.tag_names:
                     vit_config_dict['num_tags'] = len(self.tag_names)
                     logger.info(f"Setting num_tags={len(self.tag_names)} from tag_names")
-                elif 'num_classes' in checkpoint:
-                    vit_config_dict['num_tags'] = checkpoint['num_classes']
-                    logger.info(f"Setting num_tags={checkpoint['num_classes']} from checkpoint")
-                elif 'model_state_dict' in checkpoint:
-                    # Try to infer from tag_head dimensions
-                    for key, value in checkpoint['model_state_dict'].items():
+                elif 'num_classes' in meta:
+                    vit_config_dict['num_tags'] = meta['num_classes']
+                    logger.info(f"Setting num_tags={meta['num_classes']} from checkpoint")
+                else:
+                    # Try to infer from tag_head dimensions in state_dict
+                    for key, value in state_dict.items():
                         if 'tag_head.weight' in key:
                             vit_config_dict['num_tags'] = value.shape[0]
                             logger.info(f"Inferred num_tags={value.shape[0]} from tag_head.weight")
@@ -327,8 +328,8 @@ class ModelWrapper:
                             vit_config_dict['num_tags'] = value.shape[0]
                             logger.info(f"Inferred num_tags={value.shape[0]} from tag_head.bias")
                             break
-                else:
-                    raise ValueError("Cannot determine num_tags from checkpoint or config")
+                    else:
+                        raise ValueError("Cannot determine num_tags from checkpoint or config")
             
             # Ensure critical parameters are present with sensible defaults
             vit_config_defaults = {
@@ -358,12 +359,9 @@ class ModelWrapper:
             # Create Vision Transformer model with correct architecture
             vit_config = VisionTransformerConfig(**vit_config_dict)
             self.model = SimplifiedTagger(vit_config)
-            
+
             # Load weights
-            if 'model_state_dict' in checkpoint:
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                self.model.load_state_dict(checkpoint)
+            self.model.load_state_dict(state_dict)
             
             self.model = self.model.to(self.device)
             if getattr(self.config, "memory_format", "contiguous") == "channels_last":
