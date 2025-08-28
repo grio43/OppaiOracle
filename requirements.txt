@@ -9,7 +9,7 @@ numpy>=1.26
 onnxruntime==1.22.1
 onnx>=1.16.0,<2
 onnxruntime-gpu>=1.22.0
-onnxsim>=0.4.40
+onnxsim>=0.4.36
 opencv-python>=4.8
 pandas>=2.1
 pillow>=10.0.0
@@ -26,10 +26,8 @@ safetensors>=0.4.2
 seaborn>=0.13.2
 tensorboard>=2.14,<2.21
 # Upgrade PyTorch stack for modern APIs and CUDA 12.8+ / SM_120 support
-torch>=2.3
-torchvision>=0.23
-# Ensure matching CUDA runtime when installing via pip
-pytorch-cuda>=12.8; platform_system=='Linux' and platform_machine=='x86_64'
+torch>=2.8.0
+torchvision>=0.23.0
 tqdm>=4.66.4
 uvicorn>=0.35.0  # for API
 wandb>=0.16.4  # optional
