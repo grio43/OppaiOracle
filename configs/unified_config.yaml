@@ -95,13 +95,15 @@ data:
   drop_last: false
   
   # Caching
-  cache_size_gb: 1024.0
-  l1_per_worker_mb: 15360
+  cache_size_gb: 120.0
+  l1_per_worker_mb: 10240
   preload_files: 2
   use_memory_cache: true
+  cache_precision: "bfloat16"
+  canonical_cache_dtype: "bfloat16"
   
   # L2 Caching
-  l2_cache_enabled: true
+  l2_cache_enabled: false
   l2_cache_path: "./l2_cache"
   l2_max_size_gb: 60.0
 
@@ -134,50 +136,51 @@ data:
 
 # Training Configuration (from training_config.yaml)
 training:
-  num_epochs: 100
-  learning_rate: 1.0e-4
-  weight_decay: 0.01
-  gradient_accumulation_steps: 4
-  
-  # Optimizer
-  optimizer: "adan"
-  adam_beta1: 0.9
-  adam_beta2: 0.999
-  adan_beta3: 0.99
-  adam_epsilon: 1.0e-8
-  
-  # Scheduler
-  scheduler: "cosine_restarts"
-  warmup_steps: 10000
-  warmup_ratio: 0.0
-  num_cycles: 1.0
-  lr_end: 1.0e-6
-  
-  # Mixed precision
-  # Enabled by default to reduce VRAM usage and improve performance.
-  # bfloat16 is preferred for its numerical stability and range, similar to float32.
-  use_amp: true
-  amp_opt_level: "O1"
-  amp_dtype: bfloat16           # one of: bfloat16, float16
-  enable_anomaly_detection: false  # set true for debugging only
+    memory_format: "channels_last"
+    num_epochs: 100
+    learning_rate: 1.0e-4
+    weight_decay: 0.01
+    gradient_accumulation_steps: 4
 
-  # Gradient clipping
-  gradient_clipping:
-    enabled: true
-    max_norm: 1.0
+    # Optimizer
+    optimizer: "adan"
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adan_beta3: 0.99
+    adam_epsilon: 1.0e-8
 
-  # Optionally reduce LR after a non-finite loss to help recovery.
-  overflow_backoff_on_nan:
-    enabled: true
-    factor: 0.1   # multiply each param group lr by this factor on NaN/Inf loss
+    # Scheduler
+    scheduler: "cosine_restarts"
+    warmup_steps: 10000
+    warmup_ratio: 0.0
+    num_cycles: 1.0
+    lr_end: 1.0e-6
 
-  # Checkpointing
-  save_steps: 10000
-  save_total_limit: 3
-  save_best_only: false
-  eval_steps: 1000
-  logging_steps: 100
-  
+    # Mixed precision
+    # Enabled by default to reduce VRAM usage and improve performance.
+    # bfloat16 is preferred for its numerical stability and range, similar to float32.
+    use_amp: true
+    amp_opt_level: "O1"
+    amp_dtype: bfloat16           # one of: bfloat16, float16
+    enable_anomaly_detection: false  # set true for debugging only
+
+    # Gradient clipping
+    gradient_clipping:
+      enabled: true
+      max_norm: 1.0
+
+    # Optionally reduce LR after a non-finite loss to help recovery.
+    overflow_backoff_on_nan:
+      enabled: true
+      factor: 0.1   # multiply each param group lr by this factor on NaN/Inf loss
+
+    # Checkpointing
+    save_steps: 10000
+    save_total_limit: 3
+    save_best_only: false
+    eval_steps: 1000
+    logging_steps: 100
+
     # Loss configuration
     tag_loss:
       alpha: 0.5            # Balancing factor between positive/negative examples
@@ -193,34 +196,34 @@ training:
       clip: 0.05
     use_class_weights: true
   
-  # Curriculum learning
-  use_curriculum: true
-  start_region_training_epoch: 20
-  region_training_interval: 5
-  curriculum_difficulty_schedule: "linear"
-  
-  # Hardware
-  device: "cuda"
-  distributed: false
-  local_rank: -1
-  world_size: 1
-  ddp_backend: "nccl"
-  
-  # Tracking
-  use_tensorboard: true
-  use_wandb: false
-  wandb_project: "anime-tagger"
-  wandb_run_name: null
-  wandb_entity: null
-  
-  # Training stability (from runtime.yaml)
-  seed: 42
-  deterministic: false
-  benchmark: true
-  
-  # Early stopping
-  early_stopping_patience: 10
-  early_stopping_threshold: 0.0001
+    # Curriculum learning
+    use_curriculum: true
+    start_region_training_epoch: 20
+    region_training_interval: 5
+    curriculum_difficulty_schedule: "linear"
+
+    # Hardware
+    device: "cuda"
+    distributed: false
+    local_rank: -1
+    world_size: 1
+    ddp_backend: "nccl"
+
+    # Tracking
+    use_tensorboard: true
+    use_wandb: false
+    wandb_project: "anime-tagger"
+    wandb_run_name: null
+    wandb_entity: null
+
+    # Training stability (from runtime.yaml)
+    seed: 42
+    deterministic: false
+    benchmark: true
+
+    # Early stopping
+    early_stopping_patience: 10
+    early_stopping_threshold: 0.0001
 
 # Inference Configuration (from inference_config.yaml)
 inference:
