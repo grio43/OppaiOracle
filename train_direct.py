@@ -379,6 +379,7 @@ def train_with_orientation_tracking(config: FullConfig):
             gamma_neg=tag_loss_cfg.gamma_neg,
             gamma_pos=tag_loss_cfg.gamma_pos,
             label_smoothing=tag_loss_cfg.label_smoothing,
+            ignore_index=0,  # Ignore <PAD> for tags
         ),
         rating_loss_fn=AsymmetricFocalLoss(
             alpha=rating_loss_cfg.alpha,
@@ -386,6 +387,7 @@ def train_with_orientation_tracking(config: FullConfig):
             gamma_neg=rating_loss_cfg.gamma_neg,
             gamma_pos=rating_loss_cfg.gamma_pos,
             label_smoothing=rating_loss_cfg.label_smoothing,
+            ignore_index=None,  # Keep all rating classes (no pad)
         ),
     )
     from training_utils import TrainingUtils

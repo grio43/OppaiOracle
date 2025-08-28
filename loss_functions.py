@@ -37,6 +37,7 @@ class AsymmetricFocalLoss(nn.Module):
         clip: float = 0.05,
         reduction: str = 'mean',
         label_smoothing: float = 0.05,
+        ignore_index: Optional[int] = 0,
     ):
         super().__init__()
         self.gamma_pos = gamma_pos
@@ -45,6 +46,10 @@ class AsymmetricFocalLoss(nn.Module):
         self.clip = clip
         self.reduction = reduction
         self.label_smoothing = label_smoothing
+        # If not None, drop this class index from both logits and targets.
+        # By default we ignore index 0 for TAGS to avoid penalising the <PAD> token.
+        # For single-label ratings, pass ignore_index=None to keep all classes.
+        self.ignore_index = ignore_index
 
     def forward(
         self,
@@ -66,12 +71,35 @@ class AsymmetricFocalLoss(nn.Module):
         # Detach targets to prevent gradient flow
         targets = targets.detach()
 
-        # Ignore pad class at index 0 by slicing (with bounds checking)
-        if logits.size(1) > 1:  # Only slice if we have more than 1 column
-            # Validate dimensions before slicing
-            if targets.size(1) == logits.size(1):
-                logits = logits[:, 1:]
-                targets = targets[:, 1:]
+        # Ensure targets have shape (B, C). If provided as class indices (B,),
+        # convert to one-hot suitable for BCE-with-logits.
+        if targets.dim() == 1:
+            # Treat as single-label class indices
+            num_classes = logits.size(1)
+            if targets.dtype not in (torch.long, torch.int64, torch.int32):
+                # Attempt safe cast to long for one-hot encoding
+                targets = targets.to(torch.long)
+            if torch.any(targets < 0) or torch.any(targets >= num_classes):
+                raise ValueError(
+                    f"AsymmetricFocalLoss: target indices out of range 0..{num_classes-1}"
+                )
+            targets = F.one_hot(targets, num_classes=num_classes).to(dtype=logits.dtype)
+        elif targets.dim() == 2:
+            # If provided as floating multi-hot/probabilities, ensure dtype matches
+            targets = targets.to(dtype=logits.dtype)
+        else:
+            raise ValueError(
+                f"AsymmetricFocalLoss expects targets with dim 1 or 2, got {targets.dim()}"
+            )
+
+        # Optionally ignore one class (e.g., pad index for tags)
+        if self.ignore_index is not None:
+            c = logits.size(1)
+            if 0 <= self.ignore_index < c:
+                keep = torch.ones(c, dtype=torch.bool, device=logits.device)
+                keep[self.ignore_index] = False
+                logits = logits[:, keep]
+                targets = targets[:, keep]
 
         # Apply label smoothing if specified
         if self.label_smoothing > 0:
