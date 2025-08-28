@@ -12,7 +12,7 @@ from typing import Optional, List, Dict, Any, Tuple, Set
 import hashlib
 
 import torch
-from torch.utils.data import Dataset, get_worker_info, DataLoader
+from torch.utils.data import Dataset, get_worker_info, DataLoader as _TorchDataLoader
 from PIL import Image
 from torchvision import transforms
 # Torchvision v2 joint transforms (optional)
@@ -33,6 +33,19 @@ from utils.path_utils import sanitize_identifier, validate_image_path, resolve_a
 from utils.metadata_ingestion import parse_tags_field
 
 from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
+
+
+# Guarded DataLoader wrapper:
+# - If num_workers == 0, drop prefetch_factor and force persistent_workers=False.
+#   This avoids ValueError in PyTorch when setting multiprocessing-only args with zero workers.
+class DataLoader(_TorchDataLoader):  # keep public name the same
+    def __init__(self, *args, **kwargs):
+        num_workers = int(kwargs.get("num_workers", 0) or 0)
+        if num_workers == 0:
+            # Disallow multiprocessing-only knobs in single-process mode
+            kwargs.pop("prefetch_factor", None)
+            kwargs["persistent_workers"] = False
+        super().__init__(*args, **kwargs)
 
 
 class DatasetLoader(Dataset):
@@ -868,15 +881,24 @@ def create_dataloaders(
         )
 
     # DataLoaders
+    def _dl_kwargs(cfg, *, shuffle: bool, drop_last: bool):
+        kw = dict(
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+            pin_memory=getattr(cfg, "pin_memory", False),
+            drop_last=drop_last,
+            shuffle=shuffle,
+        )
+        # Only use multiprocessing knobs when workers > 0
+        if int(getattr(cfg, "num_workers", 0) or 0) > 0:
+            if getattr(cfg, "prefetch_factor", None) is not None:
+                kw["prefetch_factor"] = cfg.prefetch_factor
+            kw["persistent_workers"] = bool(getattr(cfg, "persistent_workers", False))
+        return kw
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=data_config.batch_size,
-        num_workers=data_config.num_workers,
-        pin_memory=data_config.pin_memory,
-        prefetch_factor=data_config.prefetch_factor,
-        persistent_workers=data_config.persistent_workers,
-        drop_last=data_config.drop_last,
-        shuffle=True,
+        **_dl_kwargs(data_config, shuffle=True, drop_last=bool(getattr(data_config, "drop_last", False))),
     )
 
     val_batch = (
@@ -884,15 +906,12 @@ def create_dataloaders(
         if hasattr(validation_config, "dataloader")
         else data_config.batch_size
     )
+    # Build kwargs for val loader separately to honor val batch size
+    _val_kw = _dl_kwargs(data_config, shuffle=False, drop_last=False)
+    _val_kw["batch_size"] = val_batch
     val_loader = DataLoader(
         val_ds,
-        batch_size=val_batch,
-        num_workers=data_config.num_workers,
-        pin_memory=data_config.pin_memory,
-        prefetch_factor=data_config.prefetch_factor,
-        persistent_workers=data_config.persistent_workers,
-        drop_last=False,
-        shuffle=False,
+        **_val_kw,
     )
 
     return train_loader, val_loader, vocab

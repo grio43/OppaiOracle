@@ -838,12 +838,26 @@ class InferenceEngine:
         
         # Create dataset and dataloader
         dataset = InferenceDataset(image_paths, self.preprocessor)
+        # Build worker kwargs safely: only enable multiprocessing knobs when workers > 0
+        _worker_kwargs = {
+            "num_workers": self.config.num_workers,
+            "pin_memory": getattr(self.config, "pin_memory", False),
+            # persistent_workers is multiprocessing-only; disable when workers == 0
+            "persistent_workers": (
+                getattr(self.config, "persistent_workers", False)
+                if getattr(self.config, "num_workers", 0) > 0
+                else False
+            ),
+        }
+        if getattr(self.config, "num_workers", 0) > 0:
+            pf = getattr(self.config, "prefetch_factor", None)
+            if pf is not None:
+                _worker_kwargs["prefetch_factor"] = pf
+
         dataloader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory,
-            prefetch_factor=self.config.prefetch_factor
+            **_worker_kwargs,
         )
         
         # Process batches

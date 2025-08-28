@@ -496,7 +496,25 @@ class DataConfig(BaseConfig):
             errors.append(f"cache_size_gb must be non-negative, got {self.cache_size_gb}")
 
         # New bounds checks
-        if self.prefetch_factor < 1:
+        # Multiprocessing-only knobs: when workers == 0, guard and warn
+        if self.num_workers == 0:
+            if getattr(self, "persistent_workers", False):
+                warnings.warn(
+                    "persistent_workers=True is invalid when num_workers=0; forcing False."
+                )
+                self.persistent_workers = False
+            # prefetch_factor is ignored when workers==0; keep default but warn if customized
+            try:
+                # Treat 2 as default; warn if user tried a different value
+                if getattr(self, "prefetch_factor", None) not in (None, 2):
+                    warnings.warn(
+                        "prefetch_factor is ignored when num_workers=0; it will not be passed to DataLoader."
+                    )
+            except Exception:
+                pass
+
+        # Only enforce prefetch_factor bounds when workers > 0
+        if self.num_workers > 0 and self.prefetch_factor < 1:
             errors.append(f"prefetch_factor must be >= 1, got {self.prefetch_factor}")
         if self.preload_files < 0:
             errors.append(f"preload_files must be >= 0, got {self.preload_files}")

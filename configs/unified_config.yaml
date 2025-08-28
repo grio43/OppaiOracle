@@ -90,8 +90,8 @@ data:
   batch_size: 8  # Increased further after enabling gradient checkpointing
   num_workers: 8
   pin_memory: true
-  prefetch_factor: 2
-  persistent_workers: true
+  prefetch_factor: 2   # NOTE: effective only when num_workers > 0
+  persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   drop_last: false
   
   # Caching
@@ -315,8 +315,8 @@ validation:
   dataloader:
     batch_size: 8  # Lowered to reduce VRAM usage during validation
     num_workers: 8
-    prefetch_factor: 2
-    persistent_workers: true
+    prefetch_factor: 2   # NOTE: effective only when num_workers > 0
+    persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   preprocessing:
     # Uses data.normalize_mean/std by default; keep in sync with
     # training/inference unless intentionally different.
