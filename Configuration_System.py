@@ -769,6 +769,12 @@ class TrainingConfig(BaseConfig):
     save_steps: int = 5000
     save_total_limit: int = 5
     save_best_only: bool = False
+    # Resume behavior:
+    #   "none"   -> start fresh
+    #   "latest" -> resume most recent checkpoint under <output_root>/<experiment>/checkpoints
+    #   "best"   -> resume checkpoints/best_model.pt if present
+    #   any other non-empty string is treated as an absolute/relative path to a .pt file
+    resume_from: str = "latest"
     eval_steps: int = 1000
     logging_steps: int = 100
     
