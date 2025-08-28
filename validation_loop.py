@@ -413,7 +413,6 @@ class ValidationRunner:
             dataloader=CSDataloaderConfig(
                 batch_size=self.config.batch_size,
                 num_workers=self.config.num_workers,
-                prefetch_factor=2,
             )
         )
         _, val_loader, _ = create_dataloaders(
