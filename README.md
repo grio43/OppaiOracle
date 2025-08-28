@@ -43,6 +43,11 @@ The repository is organized as follows:
 
 2.  Install the required dependencies using pip:
     ```bash
+    # Create a Python 3.12 virtual environment (recommended)
+    python3.12 -m venv .venv
+    source .venv/bin/activate
+
+    # Install required dependencies
     pip install -r requirements.txt
     ```
 
@@ -52,7 +57,7 @@ The project uses a unified configuration file, `configs/unified_config.yaml`, to
 
 You can validate your configuration using the `Configuration_System.py` script:
 ```bash
-python Configuration_System.py validate configs/unified_config.yaml
+python3.12 Configuration_System.py validate configs/unified_config.yaml
 ```
 
 ## Usage
@@ -62,7 +67,7 @@ python Configuration_System.py validate configs/unified_config.yaml
 To train the model, run the `train_direct.py` script with the path to your configuration file:
 
 ```bash
-python train_direct.py --config configs/unified_config.yaml
+python3.12 train_direct.py --config configs/unified_config.yaml
 ```
 
 ### Inference
@@ -71,13 +76,13 @@ You can run inference using either the PyTorch model or the ONNX model.
 
 -   **PyTorch Inference:**
     ```bash
-    python Inference_Engine.py --config configs/unified_config.yaml --vocab vocabulary.json --image /path/to/your/image.jpg
+    python3.12 Inference_Engine.py --config configs/unified_config.yaml --vocab vocabulary.json --image /path/to/your/image.jpg
     ```
     The `--vocab` argument defaults to `vocabulary.json` in the project root if not specified.
 
 -   **ONNX Inference:**
     ```bash
-    python onnx_infer.py --config configs/unified_config.yaml --image /path/to/your/image.jpg
+    python3.12 onnx_infer.py --config configs/unified_config.yaml --image /path/to/your/image.jpg
     ```
 
 ## Evaluation
@@ -86,7 +91,7 @@ The `TEst and review` directory contains scripts for assessing model performance
 
 1.  **Run batch evaluation** to generate a JSONL file with results:
     ```bash
-    python TEst\ and\ review/batch_evaluate.py \
+    python3.12 TEst\ and\ review/batch_evaluate.py \
         --model-path /path/to/your/model.pt \
         --image-dir /path/to/images \
         --json-dir /path/to/json_tags \
@@ -95,12 +100,12 @@ The `TEst and review` directory contains scripts for assessing model performance
 
 2.  **Monitor progress** while evaluation runs (optional):
     ```bash
-    python TEst\ and\ review/live_viewer.py /path/to/results.jsonl
+    python3.12 TEst\ and\ review/live_viewer.py /path/to/results.jsonl
     ```
 
 3.  **Visualize final results** to analyze model performance:
     ```bash
-    python TEst\ and\ review/visualize_results.py \
+    python3.12 TEst\ and\ review/visualize_results.py \
         --results /path/to/results.jsonl \
         --outdir /path/to/visualization_output
     ```
