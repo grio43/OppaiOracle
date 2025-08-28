@@ -82,6 +82,8 @@ DEFAULT_VOCAB_PATH = _load_vocab_path()
 @dataclass
 class InferenceConfig(BaseInferenceConfig):
     """Inference settings derived from the central configuration system."""
+    # Match TrainingConfig for memory layout
+    memory_format: str = "contiguous"  # or "channels_last"
 
     vocab_path: Optional[str] = str(DEFAULT_VOCAB_PATH)
     model_path: str = "./checkpoints/best_model.pt"
@@ -364,6 +366,8 @@ class ModelWrapper:
                 self.model.load_state_dict(checkpoint)
             
             self.model = self.model.to(self.device)
+            if getattr(self.config, "memory_format", "contiguous") == "channels_last":
+                self.model = self.model.to(memory_format=torch.channels_last)
             self.model.eval()
             
             # Optimize model
@@ -434,7 +438,9 @@ class ModelWrapper:
     @torch.no_grad()
     def predict(self, images: torch.Tensor) -> torch.Tensor:
         """Run inference on batch of images"""
-        images = images.to(self.device)
+        images = images.to(self.device, non_blocking=True)
+        if getattr(self.config, "memory_format", "contiguous") == "channels_last":
+            images = images.contiguous(memory_format=torch.channels_last)
         
         # Match model precision
         model_dtype = next(self.model.parameters()).dtype
