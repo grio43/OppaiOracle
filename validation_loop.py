@@ -61,6 +61,7 @@ from training_utils import DistributedTrainingHelper
 from model_architecture import create_model, VisionTransformerConfig
 from model_metadata import ModelMetadata
 from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
+from safe_checkpoint import safe_load_checkpoint, InvalidCheckpointError
 
 
 logger = logging.getLogger(__name__)
@@ -321,7 +322,8 @@ class ValidationRunner:
         checkpoint = None
         if self.config.checkpoint_path:
             logger.info(f"Loading model from checkpoint: {self.config.checkpoint_path}")
-            checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu')
+            state_dict, meta = safe_load_checkpoint(self.config.checkpoint_path)
+            checkpoint = {"state_dict": state_dict, **meta}
             
             # Extract model config
             if 'config' in checkpoint:
@@ -379,8 +381,9 @@ class ValidationRunner:
                 logger.info(f"Found normalization params in checkpoint (legacy): {norm}")
 
         elif self.config.model_path:
-            logger.info(f"Loading model from path: {self.config.model_path}")
-            model = torch.load(self.config.model_path, map_location='cpu')
+            raise InvalidCheckpointError(
+                "Loading pickled model objects is disabled. Save state_dict checkpoints instead."
+            )
         else:
             raise ValueError("Either checkpoint_path or model_path must be provided")
         
