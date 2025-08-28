@@ -1,18 +1,12 @@
 from __future__ import annotations
-import os, io, time, atexit, pickle, signal, queue
+import os, time, atexit, signal, queue
 import multiprocessing as mp
 from typing import Optional, Tuple
 import lmdb
 import torch
+from cache_codec import encode_tensor as _tensor_to_bytes, decode_tensor as _tensor_from_bytes
 
-# --- Serialization helpers (fast, torch-native) ---
-def _tensor_to_bytes(t: torch.Tensor) -> bytes:
-    buf = io.BytesIO()
-    torch.save(t.contiguous(), buf)
-    return buf.getvalue()
-
-def _tensor_from_bytes(b: bytes) -> torch.Tensor:
-    return torch.load(io.BytesIO(b), map_location="cpu")
+# Serialization now lives in cache_codec.py (safetensors + optional HMAC)
 
 # --- Read-only per-process cache handle ---
 class LMDBReader:
