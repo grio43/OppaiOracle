@@ -416,9 +416,36 @@ def train_with_orientation_tracking(config: FullConfig):
     amp_enabled = config.training.use_amp and device_type == 'cuda'
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
+    # Provide an autocast wrapper compatible with both torch.amp and torch.cuda.amp
+    # Older PyTorch versions do not accept the 'device_type' argument.
+    from contextlib import contextmanager
+    try:
+        # Probe signature (do not enter context)
+        _probe_ctx = autocast(device_type=device_type, enabled=False, dtype=amp_dtype)
+        def amp_autocast():
+            return autocast(device_type=device_type, enabled=amp_enabled, dtype=amp_dtype)
+    except TypeError:  # Older API without device_type
+        try:
+            from torch.cuda.amp import autocast as cuda_autocast  # type: ignore
+            def amp_autocast():
+                return cuda_autocast(enabled=amp_enabled, dtype=amp_dtype)
+        except Exception:
+            @contextmanager
+            def amp_autocast():
+                yield
+
     # GradScaler is only needed for float16 AMP.
     use_scaler = amp_enabled and amp_dtype == torch.float16 and torch.cuda.get_device_capability()[0] >= 7
-    scaler = GradScaler(device_type=device_type, enabled=use_scaler)
+    # Support older GradScaler API that lacks 'device_type'
+    try:
+        scaler = GradScaler(device_type=device_type, enabled=use_scaler)
+    except TypeError:
+        try:
+            from torch.cuda.amp import GradScaler as CudaGradScaler  # type: ignore
+            scaler = CudaGradScaler(enabled=use_scaler)
+        except Exception:
+            # Fallback to torch.amp.GradScaler without device_type
+            scaler = GradScaler(enabled=use_scaler)
     if amp_enabled:
         logger.info(f"AMP enabled with dtype={amp_dtype} and GradScaler={'enabled' if use_scaler else 'disabled'}.")
     else:
@@ -481,7 +508,7 @@ def train_with_orientation_tracking(config: FullConfig):
                         f"mean: {images.mean().item():.6f}, max: {images.max().item():.6f}"
                     )
 
-                with autocast(device_type=device_type, enabled=amp_enabled, dtype=amp_dtype):
+                with amp_autocast():
                     pmask = batch.get('padding_mask', None)
                     if pmask is not None: pmask = pmask.to(device)
                     outputs = model(images, padding_mask=pmask)
@@ -602,7 +629,7 @@ def train_with_orientation_tracking(config: FullConfig):
                 tag_labels = batch['tag_labels'].to(device)
                 rating_labels = batch['rating_labels'].to(device)
 
-                with autocast(device_type=device_type, enabled=amp_enabled, dtype=amp_dtype):
+                with amp_autocast():
                     pmask = batch.get('padding_mask', None)
                     if pmask is not None:
                         pmask = pmask.to(device)
