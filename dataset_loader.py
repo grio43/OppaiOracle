@@ -14,6 +14,13 @@ import torch
 from torch.utils.data import Dataset, get_worker_info, DataLoader
 from PIL import Image
 from torchvision import transforms
+# Torchvision v2 joint transforms (optional)
+try:
+    from torchvision.transforms import v2 as T
+    from torchvision import tv_tensors
+except Exception:  # keep backward compatible
+    T = None
+    tv_tensors = None
 from utils.path_utils import sanitize_identifier, validate_image_path, resolve_and_confine
 from utils.metadata_ingestion import parse_tags_field
 
@@ -27,6 +34,7 @@ class DatasetLoader(Dataset):
         annotations_path,
         image_dir,
         transform=None,
+        joint_transforms=None,  # NEW: torchvision v2 transforms applied to (image, mask) together
         max_retries=3,
         num_classes=None,
         # Image pipeline params
@@ -48,6 +56,7 @@ class DatasetLoader(Dataset):
         self.annotations = self._load_annotations(annotations_path)
         self.image_dir = image_dir
         self.transform = transform
+        self.joint_transforms = joint_transforms
         self.max_retries = max_retries
         self.num_classes = num_classes
         self.retry_counts = {}
@@ -193,22 +202,33 @@ class DatasetLoader(Dataset):
             pmask = torch.ones(target, target, dtype=torch.bool)
             pmask[top:top + resized.size[1], left:left + resized.size[0]] = False
 
-            # 3) To tensor + normalize (optionally allow external augmentations if provided)
-            if self.transform:
-                try:
-                    tmp = self.transform(canvas)
-                    if isinstance(tmp, torch.Tensor):
-                        t = tmp
-                    else:
-                        canvas = tmp
+            # If provided, run joint v2 transforms to keep image & mask aligned
+            if self.joint_transforms is not None and T is not None and tv_tensors is not None:
+                img_tv = tv_tensors.Image(canvas)
+                mask_tv = tv_tensors.Mask(pmask.to(torch.uint8))  # 1=PAD, 0=valid
+                # v2 ops automatically use NEAREST for Mask; geometry stays in sync
+                img_tv, mask_tv = self.joint_transforms(img_tv, mask_tv)
+                # To tensor + normalize (use v2 ToTensor for tv_tensors input)
+                t = T.ToTensor()(img_tv)
+                t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
+                pmask = mask_tv.to(torch.bool)
+            else:
+                # Fallback: color-only transforms ok; any geometry here would desync pmask
+                if self.transform:
+                    try:
+                        tmp = self.transform(canvas)
+                        if isinstance(tmp, torch.Tensor):
+                            t = tmp
+                        else:
+                            canvas = tmp
+                            t = transforms.ToTensor()(canvas)
+                            t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
+                    except Exception:
                         t = transforms.ToTensor()(canvas)
                         t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
-                except Exception:
+                else:
                     t = transforms.ToTensor()(canvas)
                     t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
-            else:
-                t = transforms.ToTensor()(canvas)
-                t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
 
             # Reset retry count on success
             self.retry_counts[idx] = 0
@@ -379,6 +399,7 @@ class SidecarJsonDataset(Dataset):
         json_files: List[Path],
         vocab: TagVocabulary,
         transform=None,
+        joint_transforms=None,  # NEW
         max_retries: int = 3,
         # Image pipeline params
         image_size: int = 640,
@@ -396,6 +417,7 @@ class SidecarJsonDataset(Dataset):
         self.json_files = list(json_files)
         self.vocab = vocab
         self.transform = transform
+        self.joint_transforms = joint_transforms
         self.max_retries = max_retries
         self.retry_counts: Dict[int, int] = {}
         self.failed_samples = set()
@@ -508,22 +530,31 @@ class SidecarJsonDataset(Dataset):
             canvas.paste(resized, (left, top))
             pmask = torch.ones(target, target, dtype=torch.bool)
             pmask[top:top + resized.size[1], left:left + resized.size[0]] = False
-            # 3) To tensor + normalize with optional augmentations support
-            if self.transform:
-                try:
-                    tmp = self.transform(canvas)
-                    if isinstance(tmp, torch.Tensor):
-                        img = tmp
-                    else:
-                        canvas = tmp
+            # Joint v2 transforms keep geometry aligned with mask when used
+            if self.joint_transforms is not None and T is not None and tv_tensors is not None:
+                img_tv = tv_tensors.Image(canvas)
+                mask_tv = tv_tensors.Mask(pmask.to(torch.uint8))
+                img_tv, mask_tv = self.joint_transforms(img_tv, mask_tv)
+                img = T.ToTensor()(img_tv)
+                img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
+                pmask = mask_tv.to(torch.bool)
+            else:
+                # Fallback: color-only transforms permitted
+                if self.transform:
+                    try:
+                        tmp = self.transform(canvas)
+                        if isinstance(tmp, torch.Tensor):
+                            img = tmp
+                        else:
+                            canvas = tmp
+                            img = transforms.ToTensor()(canvas)
+                            img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
+                    except Exception:
                         img = transforms.ToTensor()(canvas)
                         img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
-                except Exception:
+                else:
                     img = transforms.ToTensor()(canvas)
                     img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
-            else:
-                img = transforms.ToTensor()(canvas)
-                img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
 
             # Encode labels
             tag_vec = self.vocab.encode_tags(ann["tags"])  # (V,)
