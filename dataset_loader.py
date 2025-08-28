@@ -482,10 +482,12 @@ class SidecarJsonDataset(Dataset):
                 tags_raw = data.get("tags")
                 tags_list = parse_tags_field(tags_raw)
                 rating = data.get("rating", "unknown")
+                # Remember the shard folder this pair lives in for image resolution
                 self.items.append({
                     "image_id": image_id,
                     "tags": tags_list,
                     "rating": rating,
+                    "dir": Path(jp).parent,
                 })
             except Exception as e:
                 self.logger.warning(f"Failed to parse {jp}: {e}")
@@ -582,8 +584,9 @@ class SidecarJsonDataset(Dataset):
                             "image_id": image_id,
                         }
 
-            # Cache miss: load from disk
-            img_path = validate_image_path(self.root, image_id)
+            # Cache miss: load from disk (resolve under the JSON's shard folder)
+            img_root = ann.get("dir", self.root)
+            img_path = validate_image_path(Path(img_root), image_id)
             with Image.open(img_path) as pil_img:
                 pil = pil_img
             # 1) Alpha composite onto gray
@@ -804,10 +807,10 @@ def create_dataloaders(
             l2_writer_queue=q,
         )
     else:
-        # Sidecar JSON mode: scan *.json in the same folder as images
+        # Sidecar JSON mode: scan per-image *.json recursively (shard-aware)
         logger.info("Manifest not found; entering sidecar JSON mode (scanning .json next to images)")
 
-        all_jsons = sorted([p for p in root.iterdir() if p.suffix.lower() == ".json"]) if root.exists() else []
+        all_jsons = sorted(root.rglob("*.json")) if root.exists() else []
         if not all_jsons:
             raise FileNotFoundError(
                 f"No annotation JSON files found under {root}. Expected per-image JSON sidecars."
