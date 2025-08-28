@@ -133,7 +133,11 @@ class DatasetLoader(Dataset):
                         std = torch.tensor(self.normalize_std, dtype=t.dtype, device=t.device)
                         pad_norm = ((pad_vec - mean) / std).view(3, 1, 1)
                         with torch.no_grad():
-                            pmask = torch.isclose(t, pad_norm, atol=1e-6).all(dim=0)
+                            # Increase tolerance for float comparisons when reconstructing
+                            # the padding mask. A strict tolerance (1e-6) can lead to false
+                            # negatives under mixed-precision (e.g. bfloat16) or when
+                            # normalization introduces minor rounding differences.
+                            pmask = torch.isclose(t, pad_norm, atol=1e-3).all(dim=0)
 
                         # Prepare labels for training loop compatibility
                         tag_indices = annotation.get("labels") or []
