@@ -68,6 +68,8 @@ from training_utils import (
     log_sample_order_hash,
     CosineAnnealingWarmupRestarts,
 )
+from training_utils import VOCAB_PATH as DEFAULT_VOCAB_PATH
+from vocabulary import create_vocabulary_from_datasets  # NEW: rebuild vocab each run
 from dataset_loader import AugmentationStats, validate_dataset
 from utils.logging_sanitize import ensure_finite_tensor
 
@@ -264,6 +266,24 @@ def train_with_orientation_tracking(config: FullConfig):
 
     active_data_path = Path(active_location['path'])
     logger.info(f"Using active data path: {active_data_path}")
+
+    # --- NEW: Always rebuild vocabulary before creating dataloaders ---
+    try:
+        logger.info("Rebuilding tag vocabulary from dataset at %s", active_data_path)
+        # Build from the active dataset root; function scans recursively for JSON sidecars
+        rebuilt_vocab = create_vocabulary_from_datasets([active_data_path])
+
+        # Save to the configured vocab path so downstream loading stays consistent
+        vocab_dest = Path(getattr(config, "vocab_path", str(DEFAULT_VOCAB_PATH)))
+        if vocab_dest.is_dir():
+            vocab_dest = vocab_dest / "vocabulary.json"
+        rebuilt_vocab.save_vocabulary(vocab_dest)
+        logger.info("Vocabulary rebuilt with %d tags -> %s",
+                    len(rebuilt_vocab.tag_to_index), vocab_dest)
+    except Exception as e:
+        logger.error("Failed to rebuild vocabulary: %s", e)
+        raise
+    # -----------------------------------------------------------------
 
     # Setup orientation handling
     orientation_config = setup_orientation_aware_training(
