@@ -91,13 +91,19 @@ class DatasetLoader(Dataset):
                 self._ensure_l2_reader()
                 payload = self._l2_reader.get(image_key) if self._l2_reader else None
                 if payload is not None:
-                    t = _tensor_from_bytes(payload)
-                    return {
-                        "image": t,
-                        "labels": torch.tensor(annotation["labels"]),
-                        "image_id": image_id,
-                        "cached": True,
-                    }
+                    try:
+                        t = _tensor_from_bytes(payload)
+                        return {
+                            "image": t,
+                            "labels": torch.tensor(annotation["labels"]),
+                            "image_id": image_id,
+                            "cached": True,
+                        }
+                    except Exception as e:
+                        # Treat as cache miss; skip bad/tampered records safely
+                        self.logger.warning(
+                            f"L2 cache decode failed for {image_id}: {e} (treating as miss)"
+                        )
 
             # --- Cache miss: load + transform ---
             image = Image.open(f"{self.image_dir}/{image_id}.jpg")
