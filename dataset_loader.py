@@ -29,6 +29,11 @@ class DatasetLoader(Dataset):
         transform=None,
         max_retries=3,
         num_classes=None,
+        # Image pipeline params
+        image_size: int = 640,
+        pad_color: Tuple[int, int, int] = (114, 114, 114),
+        normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+        normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         # L2 cache plumbing
         l2_enabled: bool = False,
         l2_cache_path: Optional[str] = None,
@@ -48,6 +53,14 @@ class DatasetLoader(Dataset):
         self.retry_counts = {}
         self.failed_samples = set()
         self.logger = logging.getLogger(__name__)
+
+        # Image pipeline settings
+        self.image_size = int(image_size)
+        self.pad_color: Tuple[int, int, int] = (
+            int(pad_color[0]), int(pad_color[1]), int(pad_color[2])
+        ) if isinstance(pad_color, (list, tuple)) else (114, 114, 114)
+        self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
+        self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
 
         # Properly initialise background validator
         self.validator = BackgroundValidator(self)
@@ -97,9 +110,52 @@ class DatasetLoader(Dataset):
                 if payload is not None:
                     try:
                         t = _tensor_from_bytes(payload)
+
+                        # Attempt to reconstruct padding mask by detecting normalized pad color
+                        pad_vec = torch.tensor([c / 255.0 for c in self.pad_color], dtype=t.dtype, device=t.device)
+                        mean = torch.tensor(self.normalize_mean, dtype=t.dtype, device=t.device)
+                        std = torch.tensor(self.normalize_std, dtype=t.dtype, device=t.device)
+                        pad_norm = ((pad_vec - mean) / std).view(3, 1, 1)
+                        with torch.no_grad():
+                            pmask = torch.isclose(t, pad_norm, atol=1e-6).all(dim=0)
+
+                        # Prepare labels for training loop compatibility
+                        tag_indices = annotation.get("labels") or []
+                        if (
+                            isinstance(tag_indices, list) and len(tag_indices) > 0 and isinstance(tag_indices[0], (int, float))
+                            and self.num_classes
+                        ):
+                            tag_vec = torch.zeros(self.num_classes, dtype=torch.float32)
+                            tag_vec.scatter_(
+                                0,
+                                torch.tensor(
+                                    [int(i) for i in tag_indices if 0 <= int(i) < self.num_classes], dtype=torch.long
+                                ),
+                                1.0,
+                            )
+                        else:
+                            tag_vec = torch.zeros(self.num_classes or 1, dtype=torch.float32)
+
+                        rating = annotation.get("rating", "unknown")
+                        rating_idx = 4  # default 'unknown'
+                        if isinstance(rating, int):
+                            rating_idx = int(rating)
+                        elif isinstance(rating, str):
+                            r = rating.strip().lower()
+                            mapping = {
+                                "g": 0, "general": 0, "safe": 0,
+                                "sensitive": 1,
+                                "q": 2, "questionable": 2,
+                                "e": 3, "explicit": 3,
+                                "u": 4, "unknown": 4,
+                            }
+                            rating_idx = mapping.get(r, 4)
+
                         return {
-                            "image": t,
-                            "labels": torch.tensor(annotation["labels"]),
+                            "images": t,
+                            "padding_mask": pmask.to(torch.bool),
+                            "tag_labels": tag_vec,
+                            "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
                             "image_id": image_id,
                             "cached": True,
                         }
@@ -112,10 +168,47 @@ class DatasetLoader(Dataset):
             # --- Cache miss: load + transform (confined path) ---
             img_path = validate_image_path(Path(self.image_dir), image_id)
             with Image.open(img_path) as pil_img:
-                image = pil_img.convert("RGB")
+                img = pil_img
 
+            # 1) Load & composite transparency onto gray
+            if img.mode in ("RGBA", "LA") or ("transparency" in img.info):
+                bg = Image.new("RGBA", img.size, (*self.pad_color, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg.convert("RGB")
+            else:
+                img = img.convert("RGB")
+
+            # 2) Keep aspect ratio via letterbox to square + build padding mask (True = PAD)
+            target = int(self.image_size)
+            w, h = img.size
+            scale = min(target / float(w), target / float(h)) if (w > 0 and h > 0) else 1.0
+            nw, nh = int(round(w * scale)), int(round(h * scale))
+            resized = img.resize((max(1, nw), max(1, nh)), Image.BILINEAR)
+
+            canvas = Image.new("RGB", (target, target), tuple(self.pad_color))
+            left = (target - resized.size[0]) // 2
+            top = (target - resized.size[1]) // 2
+            canvas.paste(resized, (left, top))
+
+            pmask = torch.ones(target, target, dtype=torch.bool)
+            pmask[top:top + resized.size[1], left:left + resized.size[0]] = False
+
+            # 3) To tensor + normalize (optionally allow external augmentations if provided)
             if self.transform:
-                image = self.transform(image)
+                try:
+                    tmp = self.transform(canvas)
+                    if isinstance(tmp, torch.Tensor):
+                        t = tmp
+                    else:
+                        canvas = tmp
+                        t = transforms.ToTensor()(canvas)
+                        t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
+                except Exception:
+                    t = transforms.ToTensor()(canvas)
+                    t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
+            else:
+                t = transforms.ToTensor()(canvas)
+                t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
 
             # Reset retry count on success
             self.retry_counts[idx] = 0
@@ -145,7 +238,8 @@ class DatasetLoader(Dataset):
                 rating_idx = mapping.get(r, 4)
 
             sample = {
-                "images": image,
+                "images": t,
+                "padding_mask": pmask,
                 "tag_labels": tag_vec,
                 "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
                 "image_id": image_id,
@@ -154,7 +248,7 @@ class DatasetLoader(Dataset):
             # Enqueue write but never block __getitem__
             if self._l2_enabled and self._l2_writer_q is not None:
                 try:
-                    self._l2_writer_q.put_nowait((image_key, _tensor_to_bytes(image)))
+                    self._l2_writer_q.put_nowait((image_key, _tensor_to_bytes(sample["images"])))
                 except queue.Full:
                     # Drop silently; training must not stall on cache IO
                     pass
@@ -175,9 +269,10 @@ class DatasetLoader(Dataset):
     def _create_error_sample(self, idx, reason):
         """Create a clearly marked error sample"""
         # Default to a common square size when transform is unknown
-        sz = 224
+        sz = int(getattr(self, "image_size", 224) or 224)
         return {
             "images": torch.zeros((3, sz, sz)),  # Placeholder tensor
+            "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
             "tag_labels": torch.zeros(self.num_classes or 1, dtype=torch.float32),
             "rating_labels": torch.tensor(4, dtype=torch.long),  # unknown
             "image_id": f"error_{idx}",
@@ -285,6 +380,11 @@ class SidecarJsonDataset(Dataset):
         vocab: TagVocabulary,
         transform=None,
         max_retries: int = 3,
+        # Image pipeline params
+        image_size: int = 640,
+        pad_color: Tuple[int, int, int] = (114, 114, 114),
+        normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+        normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         # L2 cache plumbing
         l2_enabled: bool = False,
         l2_cache_path: Optional[str] = None,
@@ -300,6 +400,14 @@ class SidecarJsonDataset(Dataset):
         self.retry_counts: Dict[int, int] = {}
         self.failed_samples = set()
         self.logger = logging.getLogger(__name__)
+
+        # Image pipeline settings
+        self.image_size = int(image_size)
+        self.pad_color: Tuple[int, int, int] = (
+            int(pad_color[0]), int(pad_color[1]), int(pad_color[2])
+        ) if isinstance(pad_color, (list, tuple)) else (114, 114, 114)
+        self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
+        self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
 
         # L2 cache
         self._l2_enabled = bool(l2_enabled and l2_cache_path)
@@ -362,8 +470,16 @@ class SidecarJsonDataset(Dataset):
                     if img_t is not None:
                         tag_vec = self.vocab.encode_tags(ann["tags"])  # (V,)
                         rating_idx = _map_rating(ann.get("rating", "unknown"))
+                        # Reconstruct padding mask by detecting normalized pad color
+                        pad_vec = torch.tensor([c / 255.0 for c in self.pad_color], dtype=img_t.dtype, device=img_t.device)
+                        mean = torch.tensor(self.normalize_mean, dtype=img_t.dtype, device=img_t.device)
+                        std = torch.tensor(self.normalize_std, dtype=img_t.dtype, device=img_t.device)
+                        pad_norm = ((pad_vec - mean) / std).view(3, 1, 1)
+                        with torch.no_grad():
+                            pmask = torch.isclose(img_t, pad_norm, atol=1e-6).all(dim=0)
                         return {
                             "images": img_t,
+                            "padding_mask": pmask.to(torch.bool),
                             "tag_labels": tag_vec,
                             "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
                             "image_id": image_id,
@@ -372,9 +488,42 @@ class SidecarJsonDataset(Dataset):
             # Cache miss: load from disk
             img_path = validate_image_path(self.root, image_id)
             with Image.open(img_path) as pil_img:
-                img = pil_img.convert("RGB")
+                pil = pil_img
+            # 1) Alpha composite onto gray
+            if pil.mode in ("RGBA", "LA") or ("transparency" in pil.info):
+                bg = Image.new("RGBA", pil.size, (*self.pad_color, 255))
+                bg.paste(pil, mask=pil.split()[-1])
+                pil = bg.convert("RGB")
+            else:
+                pil = pil.convert("RGB")
+            # 2) Letterbox to square and padding mask
+            target = int(self.image_size)
+            w, h = pil.size
+            scale = min(target / float(w), target / float(h)) if (w > 0 and h > 0) else 1.0
+            nw, nh = int(round(w * scale)), int(round(h * scale))
+            resized = pil.resize((max(1, nw), max(1, nh)), Image.BILINEAR)
+            canvas = Image.new("RGB", (target, target), tuple(self.pad_color))
+            left = (target - resized.size[0]) // 2
+            top = (target - resized.size[1]) // 2
+            canvas.paste(resized, (left, top))
+            pmask = torch.ones(target, target, dtype=torch.bool)
+            pmask[top:top + resized.size[1], left:left + resized.size[0]] = False
+            # 3) To tensor + normalize with optional augmentations support
             if self.transform:
-                img = self.transform(img)
+                try:
+                    tmp = self.transform(canvas)
+                    if isinstance(tmp, torch.Tensor):
+                        img = tmp
+                    else:
+                        canvas = tmp
+                        img = transforms.ToTensor()(canvas)
+                        img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
+                except Exception:
+                    img = transforms.ToTensor()(canvas)
+                    img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
+            else:
+                img = transforms.ToTensor()(canvas)
+                img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
 
             # Encode labels
             tag_vec = self.vocab.encode_tags(ann["tags"])  # (V,)
@@ -390,6 +539,7 @@ class SidecarJsonDataset(Dataset):
             self.retry_counts[idx] = 0
             return {
                 "images": img,
+                "padding_mask": pmask,
                 "tag_labels": tag_vec,
                 "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
                 "image_id": image_id,
@@ -405,11 +555,12 @@ class SidecarJsonDataset(Dataset):
             return self._error_sample(idx, f"Temporary failure: {e}")
 
     def _error_sample(self, idx: int, reason: str) -> Dict[str, Any]:
-        sz = getattr(self.transform.transforms[0], "size", 224) if hasattr(self, "transform") and self.transform else 224
+        sz = getattr(self.transform.transforms[0], "size", 224) if hasattr(self, "transform") and self.transform else getattr(self, "image_size", 224)
         if isinstance(sz, (tuple, list)):
             sz = sz[0]
         return {
             "images": torch.zeros((3, int(sz), int(sz))),
+            "padding_mask": torch.ones((int(sz), int(sz)), dtype=torch.bool),
             "tag_labels": torch.zeros(len(self.vocab.tag_to_index), dtype=torch.float32),
             "rating_labels": torch.tensor(4, dtype=torch.long),
             "image_id": f"error_{idx}",
@@ -469,15 +620,12 @@ def create_dataloaders(
     vocab = load_vocabulary_for_training(Path(vocab_path))
     num_tags = len(vocab.tag_to_index)
 
-    # Build basic transform (match inference defaults)
+    # Dataset performs letterbox + tensor + normalize; use None unless you add PIL-only augmentations
     image_size = int(getattr(data_config, "image_size", 640))
-    mean = list(getattr(data_config, "normalize_mean", [0.5, 0.5, 0.5]))
-    std = list(getattr(data_config, "normalize_std", [0.5, 0.5, 0.5]))
-    transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-    ])
+    mean = tuple(getattr(data_config, "normalize_mean", [0.5, 0.5, 0.5]))
+    std = tuple(getattr(data_config, "normalize_std", [0.5, 0.5, 0.5]))
+    pad_color = tuple(getattr(data_config, "pad_color", [114, 114, 114]))
+    transform = None
 
     # Determine dataset mode
     root = Path(active_data_path)
@@ -492,6 +640,10 @@ def create_dataloaders(
             image_dir=str(images_dir),
             transform=transform,
             num_classes=num_tags,
+            image_size=image_size,
+            pad_color=pad_color,
+            normalize_mean=mean,
+            normalize_std=std,
             l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
             l2_cache_path=getattr(data_config, "l2_cache_path", None),
             l2_map_size_bytes=map_size_bytes,
@@ -504,6 +656,10 @@ def create_dataloaders(
             image_dir=str(images_dir),
             transform=transform,
             num_classes=num_tags,
+            image_size=image_size,
+            pad_color=pad_color,
+            normalize_mean=mean,
+            normalize_std=std,
             l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
             l2_cache_path=getattr(data_config, "l2_cache_path", None),
             l2_map_size_bytes=map_size_bytes,
@@ -534,6 +690,10 @@ def create_dataloaders(
             json_files=train_list,
             vocab=vocab,
             transform=transform,
+            image_size=image_size,
+            pad_color=pad_color,
+            normalize_mean=mean,
+            normalize_std=std,
             l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
             l2_cache_path=getattr(data_config, "l2_cache_path", None),
             l2_map_size_bytes=map_size_bytes,
@@ -546,6 +706,10 @@ def create_dataloaders(
             json_files=val_list,
             vocab=vocab,
             transform=transform,
+            image_size=image_size,
+            pad_color=pad_color,
+            normalize_mean=mean,
+            normalize_std=std,
             l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
             l2_cache_path=getattr(data_config, "l2_cache_path", None),
             l2_map_size_bytes=map_size_bytes,
