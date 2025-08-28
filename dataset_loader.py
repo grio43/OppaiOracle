@@ -6,13 +6,32 @@ import queue
 import time
 from threading import Thread
 
+from pathlib import Path
+import multiprocessing as mp
+from typing import Optional
+
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 from PIL import Image
+
+from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
 
 
 class DatasetLoader(Dataset):
-    def __init__(self, annotations_path, image_dir, transform=None, max_retries=3, num_classes=None):
+    def __init__(
+        self,
+        annotations_path,
+        image_dir,
+        transform=None,
+        max_retries=3,
+        num_classes=None,
+        # L2 cache plumbing
+        l2_enabled: bool = False,
+        l2_cache_path: Optional[str] = None,
+        l2_map_size_bytes: int = 0,
+        l2_max_readers: int = 4096,
+        l2_writer_queue: Optional[mp.Queue] = None,
+    ):
         """
         Dataset loader for images and JSON metadata.
         Note: Despite legacy naming, this does NOT handle HDF5 files.
@@ -29,6 +48,22 @@ class DatasetLoader(Dataset):
         # Properly initialise background validator
         self.validator = BackgroundValidator(self)
         self.validator.start()
+
+        # --- L2 cache (read-only in workers) ---
+        self._l2_enabled = bool(l2_enabled and l2_cache_path)
+        self._l2_path = l2_cache_path
+        self._l2_map_size = int(l2_map_size_bytes or 0)
+        self._l2_max_readers = int(l2_max_readers or 4096)
+        self._l2_reader: Optional[LMDBReader] = None
+        self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
+
+    def _ensure_l2_reader(self):
+        if not self._l2_enabled:
+            return
+        # Open env lazily **inside** the worker process to avoid fork-related handle reuse
+        if self._l2_reader is None:
+            assert self._l2_path and self._l2_map_size > 0
+            self._l2_reader = LMDBReader(self._l2_path, self._l2_map_size, max_readers=self._l2_max_readers)
 
     def _load_annotations(self, path):
         with open(path, "r") as f:
@@ -47,7 +82,24 @@ class DatasetLoader(Dataset):
 
         try:
             annotation = self.annotations[idx]
-            image = Image.open(f"{self.image_dir}/{annotation['image_id']}.jpg")
+            image_id = str(annotation['image_id'])
+            image_key = image_id.encode('utf-8')
+
+            # --- L2 READ PATH ---
+            if self._l2_enabled:
+                self._ensure_l2_reader()
+                payload = self._l2_reader.get(image_key) if self._l2_reader else None
+                if payload is not None:
+                    t = _tensor_from_bytes(payload)
+                    return {
+                        "image": t,
+                        "labels": torch.tensor(annotation["labels"]),
+                        "image_id": image_id,
+                        "cached": True,
+                    }
+
+            # --- Cache miss: load + transform ---
+            image = Image.open(f"{self.image_dir}/{image_id}.jpg")
 
             if self.transform:
                 image = self.transform(image)
@@ -55,11 +107,20 @@ class DatasetLoader(Dataset):
             # Reset retry count on success
             self.retry_counts[idx] = 0
 
-            return {
+            sample = {
                 "image": image,
                 "labels": torch.tensor(annotation["labels"]),
-                "image_id": annotation["image_id"],
+                "image_id": image_id,
             }
+
+            # Enqueue write but never block __getitem__
+            if self._l2_enabled and self._l2_writer_q is not None:
+                try:
+                    self._l2_writer_q.put_nowait((image_key, _tensor_to_bytes(image)))
+                except queue.Full:
+                    # Drop silently; training must not stall on cache IO
+                    pass
+            return sample
 
         except Exception as e:
             self.retry_counts[idx] += 1
