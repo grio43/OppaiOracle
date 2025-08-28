@@ -33,9 +33,11 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import _LRScheduler
-from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
-# Alternative if not using Lightning Bolts:
-# from torch.optim.lr_scheduler import CosineAnnealingLR  # Use standard PyTorch scheduler
+#
+# NOTE:
+# We dropped `pl_bolts` because it is incompatible with PyTorch Lightning >= 2.0.
+# Use our vendored scheduler instead (behavior matches the one from pl_bolts).
+from schedulers import LinearWarmupCosineLR as LinearWarmupCosineAnnealingLR
 from torch.amp import GradScaler, autocast
 from safe_checkpoint import safe_load_checkpoint
 import torch.backends.cudnn as cudnn
