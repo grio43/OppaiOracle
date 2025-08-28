@@ -8,7 +8,8 @@ from threading import Thread
 
 from pathlib import Path
 import multiprocessing as mp
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
+import hashlib
 
 import torch
 from torch.utils.data import Dataset, get_worker_info, DataLoader
@@ -21,11 +22,17 @@ try:
 except Exception:  # keep backward compatible
     T = None
     tv_tensors = None
+from vocabulary import load_vocabulary_for_training, TagVocabulary
+
+# Orientation-aware flipping (optional; keeps file usable in legacy setups)
+try:
+    from orientation_handler import OrientationHandler  # noqa: F401
+except Exception:  # pragma: no cover
+    OrientationHandler = None  # type: ignore
 from utils.path_utils import sanitize_identifier, validate_image_path, resolve_and_confine
 from utils.metadata_ingestion import parse_tags_field
 
 from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
-from vocabulary import load_vocabulary_for_training, TagVocabulary
 
 
 class DatasetLoader(Dataset):
@@ -412,6 +419,11 @@ class SidecarJsonDataset(Dataset):
         l2_map_size_bytes: int = 0,
         l2_max_readers: int = 4096,
         l2_writer_queue: Optional[mp.Queue] = None,
+        # --- Orientation / flipping ---
+        random_flip_prob: float = 0.0,
+        orientation_handler: Optional["OrientationHandler"] = None,
+        flip_overrides_path: Optional[str] = None,   # JSON with {"force_flip":[ids], "never_flip":[ids]} (also accepts {"flip":[...]} or a bare list)
+        respect_flip_list: bool = True,
     ):
         self.root = Path(root_dir)
         self.json_files = list(json_files)
@@ -438,6 +450,27 @@ class SidecarJsonDataset(Dataset):
         self._l2_max_readers = int(l2_max_readers or 4096)
         self._l2_reader: Optional[LMDBReader] = None
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
+
+        # --- Orientation / flipping state ---
+        self.random_flip_prob = float(random_flip_prob or 0.0)
+        self.orientation_handler = orientation_handler
+        self.respect_flip_list = bool(respect_flip_list)
+        self._force_flip_ids: Set[str] = set()
+        self._never_flip_ids: Set[str] = set()
+        if flip_overrides_path:
+            try:
+                path = Path(flip_overrides_path)
+                if path.exists():
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        force = data.get("force_flip") or data.get("flip") or []
+                        never = data.get("never_flip") or data.get("no_flip") or []
+                        self._force_flip_ids = {sanitize_identifier(str(x)) for x in force}
+                        self._never_flip_ids = {sanitize_identifier(str(x)) for x in never}
+                    elif isinstance(data, list):
+                        self._force_flip_ids = {sanitize_identifier(str(x)) for x in data}
+            except Exception as e:
+                self.logger.warning(f"Failed to load flip_overrides from {flip_overrides_path}: {e}")
 
         # Pre-parse minimal fields for speed
         self.items: List[Dict[str, Any]] = []
@@ -467,6 +500,34 @@ class SidecarJsonDataset(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
+    def _deterministic_coin(self, image_id: str) -> bool:
+        """Stable per-image coin flip based on SHA256(image_id)."""
+        if self.random_flip_prob <= 0:
+            return False
+        h = hashlib.sha256(image_id.encode("utf-8")).digest()
+        v = int.from_bytes(h[:4], byteorder="big") / 2**32  # [0,1)
+        return v < float(self.random_flip_prob)
+
+    def _decide_flip_mode(self, image_id: str, tags: List[str]) -> str:
+        """
+        Decide flipping policy: 'none' | 'random' | 'force'
+        Respects flip list first; then applies safety veto; then p-coin.
+        """
+        if self.respect_flip_list:
+            if image_id in self._never_flip_ids:
+                return "none"
+            if image_id in self._force_flip_ids:
+                return "force"
+        if self.random_flip_prob <= 0:
+            return "none"
+        if self.orientation_handler is not None:
+            try:
+                if self.orientation_handler.should_skip_flip(tags):
+                    return "none"
+            except Exception:
+                pass
+        return "random" if self._deterministic_coin(image_id) else "none"
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if idx in self.failed_samples:
             return self._error_sample(idx, "Previously failed sample")
@@ -478,6 +539,8 @@ class SidecarJsonDataset(Dataset):
             ann = self.items[idx]
             image_id = ann["image_id"]
             image_key = image_id.encode("utf-8")
+            tags_now: List[str] = list(ann["tags"])
+            mode = self._decide_flip_mode(image_id, tags_now)
 
             # Try L2 cache
             if self._l2_enabled:
@@ -490,7 +553,16 @@ class SidecarJsonDataset(Dataset):
                         self.logger.warning(f"L2 cache decode failed for {image_id}: {e}")
                         img_t = None
                     if img_t is not None:
-                        tag_vec = self.vocab.encode_tags(ann["tags"])  # (V,)
+                        flipped = False
+                        if mode != "none":
+                            if self.orientation_handler is not None:
+                                if mode == "force":
+                                    tags_now = [self.orientation_handler.swap_tag(t) for t in tags_now]
+                                    flipped = True
+                                else:
+                                    tags_now, flipped = self.orientation_handler.swap_tags(tags_now)
+                            if flipped:
+                                img_t = torch.flip(img_t, dims=[2])  # CHW, flip width
                         rating_idx = _map_rating(ann.get("rating", "unknown"))
                         # Reconstruct padding mask by detecting normalized pad color
                         pad_vec = torch.tensor([c / 255.0 for c in self.pad_color], dtype=img_t.dtype, device=img_t.device)
@@ -499,6 +571,9 @@ class SidecarJsonDataset(Dataset):
                         pad_norm = ((pad_vec - mean) / std).view(3, 1, 1)
                         with torch.no_grad():
                             pmask = torch.isclose(img_t, pad_norm, atol=1e-6).all(dim=0)
+                        if flipped:
+                            pmask = torch.flip(pmask, dims=[1])
+                        tag_vec = self.vocab.encode_tags(tags_now)
                         return {
                             "images": img_t,
                             "padding_mask": pmask.to(torch.bool),
@@ -530,6 +605,18 @@ class SidecarJsonDataset(Dataset):
             canvas.paste(resized, (left, top))
             pmask = torch.ones(target, target, dtype=torch.bool)
             pmask[top:top + resized.size[1], left:left + resized.size[0]] = False
+            # Apply horizontal flip (and swap tags) before tensor/normalize
+            flipped = False
+            if mode != "none" and self.orientation_handler is not None:
+                if mode == "force":
+                    tags_now = [self.orientation_handler.swap_tag(t) for t in tags_now]
+                    flipped = True
+                else:
+                    tags_now, flipped = self.orientation_handler.swap_tags(tags_now)
+                if flipped:
+                    from PIL import ImageOps
+                    canvas = ImageOps.mirror(canvas)
+                    pmask = torch.flip(pmask, dims=[1])
             # Joint v2 transforms keep geometry aligned with mask when used
             if self.joint_transforms is not None and T is not None and tv_tensors is not None:
                 img_tv = tv_tensors.Image(canvas)
@@ -556,8 +643,8 @@ class SidecarJsonDataset(Dataset):
                     img = transforms.ToTensor()(canvas)
                     img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
 
-            # Encode labels
-            tag_vec = self.vocab.encode_tags(ann["tags"])  # (V,)
+            # Encode labels (post-flip)
+            tag_vec = self.vocab.encode_tags(tags_now)  # (V,)
             rating_idx = _map_rating(ann.get("rating", "unknown"))
 
             # Enqueue write (non-blocking)
@@ -664,6 +751,25 @@ def create_dataloaders(
     manifest_val = root / "val.json"
     images_dir = root / "images"
 
+    # --- Orientation handler / flip list wiring ---
+    random_flip_prob = float(getattr(data_config, "random_flip_prob", 0.0))
+    orientation_map_path = getattr(data_config, "orientation_map_path", None)
+    if isinstance(orientation_map_path, str) and orientation_map_path:
+        orientation_map_path = Path(orientation_map_path)
+    flip_overrides_path = getattr(data_config, "flip_overrides_path", None)
+    _handler = None
+    try:
+        if random_flip_prob > 0 and OrientationHandler is not None:
+            _handler = OrientationHandler(
+                mapping_file=orientation_map_path if orientation_map_path else None,
+                random_flip_prob=random_flip_prob,
+                strict_mode=bool(getattr(data_config, "strict_orientation_validation", False)),
+                safety_mode=str(getattr(data_config, "orientation_safety_mode", "conservative")),
+                skip_unmapped=bool(getattr(data_config, "skip_unmapped", False)),
+            )
+    except Exception as e:
+        logger.warning(f"OrientationHandler init failed; flips disabled: {e}")
+
     if manifest_train.exists() and manifest_val.exists() and images_dir.exists():
         # Manifest mode (back-compat)
         train_ds = DatasetLoader(
@@ -730,6 +836,9 @@ def create_dataloaders(
             l2_map_size_bytes=map_size_bytes,
             l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
             l2_writer_queue=q,
+            random_flip_prob=random_flip_prob,
+            orientation_handler=_handler,
+            flip_overrides_path=flip_overrides_path,
         )
 
         val_ds = SidecarJsonDataset(
@@ -746,6 +855,9 @@ def create_dataloaders(
             l2_map_size_bytes=map_size_bytes,
             l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
             l2_writer_queue=q,
+            random_flip_prob=0.0,          # keep val deterministic
+            orientation_handler=_handler,  # still needed to encode swapped tags if you ever TTA
+            flip_overrides_path=None,
         )
 
     # DataLoaders
