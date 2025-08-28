@@ -7,6 +7,33 @@ Centralized configuration management with validation and persistence
 import os
 import json
 import yaml
+import typing as _typing
+from dataclasses import replace  # import for with_updates
+try:
+    import types as _types
+    # Python 3.10 introduced types.UnionType to represent ``X | Y`` unions.
+    # It aliases to typing.Union in Python 3.14+, but older versions return
+    # a distinct class. Capture it if available to allow cross-version checks.
+    _UnionType = getattr(_types, "UnionType", None)
+except Exception:
+    _UnionType = None
+
+def _is_union_origin(origin: _typing.Any) -> bool:
+    """Return True if the given origin comes from a typing.Union or PEP 604 UnionType.
+
+    Python 3.10 introduced the ``|`` operator to build union types. Prior to
+    Python 3.14, ``get_origin(int | str)`` returns ``types.UnionType`` instead
+    of ``typing.Union``【719174400860031†L79-L90】【165362151616795†L1114-L1147】.  On Python 3.14+
+    both syntaxes produce a plain ``typing.Union``.  Checking both allows
+    code to detect unions across Python versions.
+
+    Args:
+        origin: the result of ``typing.get_origin(some_type)``.
+
+    Returns:
+        True if the origin represents a union type, False otherwise.
+    """
+    return (origin is _typing.Union) or (_UnionType is not None and origin is _UnionType)
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Type, TypeVar, get_type_hints, get_origin, get_args
@@ -54,7 +81,7 @@ class ConfigType(Enum):
     FULL = "full"
 
 
-def _object_to_dict(obj: Any, exclude_private: bool = True) -> Any:
+def _object_to_dict(obj: Any, exclude_private: bool = True, preserve_tuples: bool = True) -> Any:
     """Recursively convert an object to a serializable structure.
 
     Unlike ``dataclasses.asdict`` this helper preserves tuple types by
@@ -71,13 +98,17 @@ def _object_to_dict(obj: Any, exclude_private: bool = True) -> Any:
         types suitable for serialization.
     """
     if is_dataclass(obj):
+        # Use obj.to_dict for nested dataclasses; do not pass preserve_tuples because the dataclass
+        # methods are responsible for handling their own private fields.
         return obj.to_dict(exclude_private)  # type: ignore[attr-defined]
     if isinstance(obj, dict):
-        return {k: _object_to_dict(v, exclude_private) for k, v in obj.items()}
+        return {k: _object_to_dict(v, exclude_private, preserve_tuples) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_object_to_dict(v, exclude_private) for v in obj]
+        return [_object_to_dict(v, exclude_private, preserve_tuples) for v in obj]
     if isinstance(obj, tuple):
-        return tuple(_object_to_dict(v, exclude_private) for v in obj)
+        # When preserve_tuples=False, emit lists to avoid !!python/tuple tags【752494560202949†L1177-L1181】.
+        mapped = [_object_to_dict(v, exclude_private, preserve_tuples) for v in obj]
+        return tuple(mapped) if preserve_tuples else mapped
     return obj
 
 
@@ -88,7 +119,7 @@ class BaseConfig:
     # Config versioning
     _config_version: str = field(default=CONFIG_VERSION, init=False, repr=False)
     
-    def to_dict(self, exclude_private: bool = True) -> Dict[str, Any]:
+    def to_dict(self, exclude_private: bool = True, *, preserve_tuples: bool = True) -> Dict[str, Any]:
         """
         Convert config to dictionary
         
@@ -101,24 +132,36 @@ class BaseConfig:
                 continue
 
             value = getattr(self, field_obj.name)
-            result[field_obj.name] = _object_to_dict(value, exclude_private)
+            result[field_obj.name] = _object_to_dict(value, exclude_private, preserve_tuples)
 
         return result
-    
-    def to_yaml(self, path: Union[str, Path], **kwargs):
-        """Save config to YAML file"""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(path, 'w') as f:
-            yaml.dump(
-                self.to_dict(), 
-                f, 
-                default_flow_style=False, 
-                sort_keys=False,
+
+    def to_yaml(self, path: Union[str, Path], *, sort_keys: bool = False, preserve_tuples: bool = False, **kwargs) -> None:
+        """Save config to a YAML file.
+
+        By default this method emits standard YAML by using ``yaml.safe_dump`` and
+        converting tuples to lists when ``preserve_tuples`` is ``False``. Using
+        ``safe_dump`` avoids emitting Python-specific tags like ``!!python/tuple``
+        which can cause compatibility issues with other tools【246116543212867†L1701-L1712】【752494560202949†L1177-L1181】.
+
+        Args:
+            path: destination path where YAML will be written.
+            sort_keys: whether to sort dictionary keys in the output.
+            preserve_tuples: if True, tuple values are preserved in the emitted YAML;
+                if False, tuples are converted to lists for portability.
+            **kwargs: additional arguments passed through to ``yaml.safe_dump``.
+        """
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(
+                self.to_dict(exclude_private=True, preserve_tuples=preserve_tuples),
+                f,
+                sort_keys=sort_keys,
+                default_flow_style=False,
                 **kwargs
             )
-        logger.info(f"Saved config to {path}")
+        logger.info(f"Saved config to {p}")
     
     def to_json(self, path: Union[str, Path], **kwargs):
         """Save config to JSON file"""
@@ -150,26 +193,37 @@ class BaseConfig:
             # Handle nested dataclasses
             if is_dataclass(field_type) and isinstance(value, dict):
                 kwargs[key] = field_type.from_dict(value)
-            # Handle Optional types
-            elif get_origin(field_type) is Union:
+            # Handle Optional and Union types including PEP 604 ``X | Y`` unions
+            elif _is_union_origin(get_origin(field_type)):
                 args = get_args(field_type)
-                if len(args) >= 2 and type(None) in args:
-                    # This is Optional[T]
-                    actual_type = args[0] if args[1] is type(None) else args[1]
-                    if value is not None and is_dataclass(actual_type) and isinstance(value, dict):
-                        kwargs[key] = actual_type.from_dict(value)
-                    else:
-                        kwargs[key] = value
+                non_none = [t for t in args if t is not type(None)]
+                # If the incoming value is None, treat it as the Optional case and set None
+                if value is None:
+                    kwargs[key] = None
                 else:
-                    # Handle complex Union types - try each type in order
-                    converted = False
-                    for arg_type in args:
-                        if is_dataclass(arg_type) and isinstance(value, dict):
-                            kwargs[key] = arg_type.from_dict(value)
-                            converted = True
+                    last_err = None
+                    assigned = False
+                    # Try each type variant until one succeeds. For dataclasses,
+                    # recursively call from_dict; for primitives, cast directly.
+                    for t in non_none:
+                        try:
+                            if is_dataclass(t) and isinstance(value, dict):
+                                kwargs[key] = t.from_dict(value)  # type: ignore[attr-defined]
+                            else:
+                                # If this variant itself is another typing construct (e.g. list[int]),
+                                # fall back to assigning the raw value and let later validation handle it.
+                                origin_t = get_origin(t)
+                                if origin_t is not None:
+                                    kwargs[key] = value
+                                else:
+                                    kwargs[key] = t(value)
+                            assigned = True
                             break
-                    if not converted:
-                        kwargs[key] = value
+                        except Exception as e:
+                            last_err = e
+                    if not assigned:
+                        # None of the variants matched; raise a useful error
+                        raise TypeError(f"Cannot coerce {key}={value!r} to {field_type}") from last_err
             # Handle Lists with dataclass elements
             elif get_origin(field_type) is list:
                 args = get_args(field_type)
@@ -186,23 +240,109 @@ class BaseConfig:
         
         return cls(**kwargs)
     
-    def update(self, updates: Dict[str, Any], validate: bool = True):
+    def update(self, updates: Dict[str, Any], validate: bool = True) -> None:
         """
-        Update config values
-        
-        Args:
-            updates: Dictionary of updates
-            validate: Whether to validate after updating
+        Update configuration values in-place with validation and type coercion.
+
+        Unknown keys are rejected to avoid silently corrupting the configuration. Values
+        for nested dataclasses and Union/Optional types are coerced using the same
+        rules as ``from_dict``. When ``validate`` is True the updated instance is
+        validated via ``self.validate()``.
         """
-        for key, value in updates.items():
-            if hasattr(self, key):
-                if not key.startswith('_'):  # Don't update private fields
-                    setattr(self, key, value)
+        allowed = {f.name: f.type for f in fields(self)}
+        # Identify unknown keys to prevent silently adding invalid attributes
+        unknown = set(updates) - set(allowed)
+        if unknown:
+            raise AttributeError(f"Unknown config field(s): {sorted(unknown)}")
+        for name, raw in updates.items():
+            ftype = allowed[name]
+            # Coerce nested dataclasses
+            if is_dataclass(ftype) and isinstance(raw, dict):
+                coerced = ftype.from_dict(raw)  # type: ignore[attr-defined]
             else:
-                logger.warning(f"Unknown config field: {key}")
-        
+                origin = get_origin(ftype)
+                # Handle Union/Optional types using the helper
+                if _is_union_origin(origin):
+                    args = get_args(ftype)
+                    if raw is None:
+                        coerced = None
+                    else:
+                        last_err = None
+                        assigned = False
+                        for t in args:
+                            if t is type(None):
+                                continue
+                            try:
+                                if is_dataclass(t) and isinstance(raw, dict):
+                                    coerced = t.from_dict(raw)  # type: ignore[attr-defined]
+                                else:
+                                    # If nested typing constructs, leave raw value
+                                    if get_origin(t) is not None:
+                                        coerced = raw
+                                    else:
+                                        coerced = t(raw)
+                                assigned = True
+                                break
+                            except Exception as e:
+                                last_err = e
+                        if not assigned:
+                            raise TypeError(f"Cannot coerce {name}={raw!r} to {ftype}") from last_err
+                else:
+                    coerced = raw
+            setattr(self, name, coerced)
         if validate:
             self.validate()
+
+    def with_updates(self, **kwargs):
+        """Return a new instance with validated updates applied.
+
+        This method constructs a new dataclass instance by validating and coercing
+        the provided keyword arguments against the field types. Unknown keys
+        are rejected. Under the hood it uses ``dataclasses.replace`` which
+        raises ``TypeError`` if a field name does not exist【752035413495800†L502-L506】.
+
+        Returns:
+            A new instance of the same type with updated fields.
+        """
+        allowed = {f.name: f.type for f in fields(self)}
+        unknown = set(kwargs) - set(allowed)
+        if unknown:
+            raise AttributeError(f"Unknown config field(s): {sorted(unknown)}")
+        validated: Dict[str, Any] = {}
+        for name, ftype in allowed.items():
+            if name in kwargs:
+                raw = kwargs[name]
+                if is_dataclass(ftype) and isinstance(raw, dict):
+                    validated[name] = ftype.from_dict(raw)  # type: ignore[attr-defined]
+                else:
+                    origin = get_origin(ftype)
+                    if _is_union_origin(origin):
+                        args = get_args(ftype)
+                        if raw is None:
+                            validated[name] = None
+                        else:
+                            last_err = None
+                            assigned = False
+                            for t in args:
+                                if t is type(None):
+                                    continue
+                                try:
+                                    if is_dataclass(t) and isinstance(raw, dict):
+                                        validated[name] = t.from_dict(raw)  # type: ignore[attr-defined]
+                                    else:
+                                        if get_origin(t) is not None:
+                                            validated[name] = raw
+                                        else:
+                                            validated[name] = t(raw)
+                                    assigned = True
+                                    break
+                                except Exception as e:
+                                    last_err = e
+                            if not assigned:
+                                raise TypeError(f"Cannot coerce {name}={raw!r} to {ftype}") from last_err
+                    else:
+                        validated[name] = raw
+        return replace(self, **validated)
     
     def validate(self):
         """Validate configuration values - override in subclasses"""
@@ -859,7 +999,7 @@ class ExportConfig(BaseConfig):
     
     # Use the latest available opset for transformer models with LayerNormalization
     # Opset 19 aligns with ONNX Runtime 1.22 and CUDA 12.8
-    opset_version: int = 19
+    opset_version: int = 19  # default, will be clamped at export time
     export_params: bool = True
     do_constant_folding: bool = True
     
@@ -917,6 +1057,45 @@ class ExportConfig(BaseConfig):
         
         if errors:
             raise ConfigValidationError("Export config validation failed:\n" + "\n".join(errors))
+
+
+# --- ONNX opset resolution helpers ---
+def resolve_opset(requested: int | None = None) -> int:
+    """Resolve the ONNX opset version based on installed PyTorch/ONNX support.
+
+    PyTorch’s ONNX exporter supports a limited range of opset versions.  As of
+    recent releases, ``torch.onnx._constants.ONNX_MIN_OPSET`` and
+    ``torch.onnx._constants.ONNX_MAX_OPSET`` describe the supported interval.
+    ``ONNX_TORCHSCRIPT_EXPORTER_MAX_OPSET`` may cap the TorchScript exporter at
+    a lower version (e.g., 20) than the global maximum【464953657985222†L4-L9】.  ONNX
+    Runtime, on the other hand, can run models up to opset 21 with version
+    1.20【598437280542461†L224-L248】.  To choose a safe default, clamp the requested
+    version into the supported range.  When the requested value is ``None``,
+    ``ExportConfig.opset_version`` is used as the target.
+
+    Args:
+        requested: desired opset version, or ``None`` to use the default on
+            ``ExportConfig``.
+
+    Returns:
+        A version within the exporter’s supported range.
+    """
+    try:
+        import torch.onnx._constants as _c  # type: ignore
+        min_o = getattr(_c, "ONNX_MIN_OPSET", 7)
+        # Prefer the TorchScript exporter max if available; fall back to ONNX_MAX_OPSET
+        max_o = getattr(_c, "ONNX_TORCHSCRIPT_EXPORTER_MAX_OPSET", None)
+        if max_o is None:
+            max_o = getattr(_c, "ONNX_MAX_OPSET", 17)
+    except Exception:
+        # Conservative defaults when constants are unavailable
+        min_o, max_o = 7, 21
+    target = requested if requested is not None else ExportConfig.opset_version
+    if target < min_o:
+        return min_o
+    if target > max_o:
+        return max_o
+    return target
 
 
 @dataclass
