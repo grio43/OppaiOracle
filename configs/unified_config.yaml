@@ -285,7 +285,7 @@ inference:
 # Export Configuration (from export_config.yaml)
 export:
   export_format: "onnx"
-  opset_version: 18
+  opset_version: 19
   export_params: true
   do_constant_folding: true
   dynamic_batch_size: true
