@@ -11,6 +11,8 @@ exactly.
 """
 
 from pathlib import Path
+# Reuse canonicalized helpers
+from .path_utils import safe_join as _safe_join, validate_image_path as _validate_image_path
 from typing import Iterable, List
 
 def parse_tags_field(tags_field) -> List[str]:
@@ -38,30 +40,8 @@ def dedupe_preserve_order(items: Iterable[str]) -> List[str]:
     return out
 
 def safe_join(root: Path, rel: str) -> Path:
-    """Join root and rel, raising if the result escapes the dataset root."""
-    p = (root / rel).resolve()
-    if not str(p).startswith(str(root.resolve())):
-        raise ValueError(f"Path escapes dataset root: {rel}")
-    return p
+    return _safe_join(root, rel)
 
 def validate_image_path(root: Path, name: str,
                         allowed_exts=(".jpg", ".jpeg", ".png", ".webp")) -> Path:
-    """Resolve and validate an image path.
-
-    Ensures the extension is allowed and the file exists.  Performs a
-    case‑insensitive lookup if the exact file is missing.
-    """
-    p = safe_join(root, name)
-    if p.suffix.lower() not in [ext.lower() for ext in allowed_exts]:
-        raise ValueError(f"Unsupported image extension: {p.suffix}")
-    if p.exists():
-        return p
-    # case‑insensitive search
-    try:
-        candidates = {f.name.lower(): f for f in p.parent.iterdir() if f.is_file()}
-    except FileNotFoundError:
-        candidates = {}
-    alt = candidates.get(p.name.lower())
-    if alt and alt.exists():
-        return alt
-    raise FileNotFoundError(f"Image not found: {p}")
+    return _validate_image_path(root, str(name), allowed_exts)
