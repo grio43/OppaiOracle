@@ -1,0 +1,12 @@
+## Build system configuration for the project
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+## Basic project metadata. Adjust as needed.
+[project]
+name = "OppaiOracle"
+description = "PyTorch‑based image‑tagging system"
+# Require Python 3.12 or later for running the project
+requires-python = ">=3.12"
+
