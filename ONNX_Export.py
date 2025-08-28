@@ -40,7 +40,7 @@ try:
     from Configuration_System import ConfigManager, ConfigType, FullConfig
 except ImportError as e:
     print(f"Error importing ONNX libraries: {e}")
-    print("Please install: pip install onnx onnxruntime")
+    print("Please install: pip install onnx onnxruntime-gpu")
     sys.exit(1)
 
 try:
