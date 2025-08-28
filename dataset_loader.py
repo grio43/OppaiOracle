@@ -11,10 +11,11 @@ import multiprocessing as mp
 from typing import Optional
 
 import torch
-from torch.utils.data import Dataset, get_worker_info
+from torch.utils.data import Dataset, get_worker_info, DataLoader
 from PIL import Image
 
 from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
+from vocabulary import load_vocabulary_for_training
 
 
 class DatasetLoader(Dataset):
@@ -223,9 +224,91 @@ def validate_dataset(*args, **kwargs):
     return {}
 
 
-def create_dataloaders(*args, **kwargs):
-    """Placeholder dataloader creation function."""
-    raise NotImplementedError("create_dataloaders is not implemented")
+def create_dataloaders(
+    data_config,
+    validation_config,
+    vocab_path,
+    active_data_path,
+    distributed=False,
+    rank=-1,
+    world_size=1,
+    seed=42,
+    debug_config=None,
+    **kwargs,
+):
+    logger = logging.getLogger(__name__)
+
+    # Map size for LMDB (bytes)
+    map_size_bytes = int(getattr(data_config, "l2_max_size_gb", 0) * (1024 ** 3))
+
+    # Optional writer process
+    if getattr(data_config, "l2_cache_enabled", False):
+        q, _proc = start_l2_writer(data_config.l2_cache_path, map_size_bytes)
+        logger.info(
+            "L2 cache enabled at %s (map_size_bytes=%d)",
+            data_config.l2_cache_path,
+            map_size_bytes,
+        )
+    else:
+        q, _proc = None, None
+        logger.info("L2 cache disabled; proceeding without LMDB writer")
+
+    # Build datasets
+    train_ds = DatasetLoader(
+        annotations_path=str(Path(active_data_path) / "train.json"),
+        image_dir=str(Path(active_data_path) / "images"),
+        transform=None,
+        num_classes=None,
+        l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
+        l2_cache_path=getattr(data_config, "l2_cache_path", None),
+        l2_map_size_bytes=map_size_bytes,
+        l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
+        l2_writer_queue=q,
+    )
+
+    val_ds = DatasetLoader(
+        annotations_path=str(Path(active_data_path) / "val.json"),
+        image_dir=str(Path(active_data_path) / "images"),
+        transform=None,
+        num_classes=None,
+        l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
+        l2_cache_path=getattr(data_config, "l2_cache_path", None),
+        l2_map_size_bytes=map_size_bytes,
+        l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
+        l2_writer_queue=q,
+    )
+
+    # DataLoaders
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=data_config.batch_size,
+        num_workers=data_config.num_workers,
+        pin_memory=data_config.pin_memory,
+        prefetch_factor=data_config.prefetch_factor,
+        persistent_workers=data_config.persistent_workers,
+        drop_last=data_config.drop_last,
+        shuffle=True,
+    )
+
+    val_batch = (
+        validation_config.dataloader.batch_size
+        if hasattr(validation_config, "dataloader")
+        else data_config.batch_size
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=val_batch,
+        num_workers=data_config.num_workers,
+        pin_memory=data_config.pin_memory,
+        prefetch_factor=data_config.prefetch_factor,
+        persistent_workers=data_config.persistent_workers,
+        drop_last=False,
+        shuffle=False,
+    )
+
+    vocab = load_vocabulary_for_training(Path(vocab_path))
+
+    return train_loader, val_loader, vocab
 
 
 class CompressingRotatingFileHandler(logging.handlers.RotatingFileHandler):
