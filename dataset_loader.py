@@ -13,6 +13,7 @@ from typing import Optional
 import torch
 from torch.utils.data import Dataset, get_worker_info, DataLoader
 from PIL import Image
+from utils.path_utils import sanitize_identifier, validate_image_path, resolve_and_confine
 
 from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
 from vocabulary import load_vocabulary_for_training
@@ -83,7 +84,8 @@ class DatasetLoader(Dataset):
 
         try:
             annotation = self.annotations[idx]
-            image_id = str(annotation['image_id'])
+            # Enforce allowlist and strip any sneaky path components
+            image_id = sanitize_identifier(str(annotation['image_id']))
             image_key = image_id.encode('utf-8')
 
             # --- L2 READ PATH ---
@@ -105,8 +107,10 @@ class DatasetLoader(Dataset):
                             f"L2 cache decode failed for {image_id}: {e} (treating as miss)"
                         )
 
-            # --- Cache miss: load + transform ---
-            image = Image.open(f"{self.image_dir}/{image_id}.jpg")
+            # --- Cache miss: load + transform (confined path) ---
+            img_path = validate_image_path(Path(self.image_dir), image_id)
+            with Image.open(img_path) as pil_img:
+                image = pil_img.convert("RGB")
 
             if self.transform:
                 image = self.transform(image)
@@ -187,10 +191,12 @@ class BackgroundValidator(Thread):
         try:
             annotation = self.dataset_loader.annotations[idx]
 
-            # Check if image file exists
-            image_path = f"{self.dataset_loader.image_dir}/{annotation['image_id']}.jpg"
-            if not os.path.exists(image_path):
-                logging.warning(f"Missing image file: {image_path}")
+            # Confine and locate image file safely
+            try:
+                image_id = sanitize_identifier(str(annotation["image_id"]))
+                image_path = validate_image_path(Path(self.dataset_loader.image_dir), image_id)
+            except Exception as e:
+                logging.warning(f"Invalid image_id for item {idx}: {e}")
                 return False
 
             # Validate image can be opened

@@ -4,6 +4,9 @@ import re
 
 DEFAULT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
+class PathTraversalError(ValueError):
+    """Raised when a candidate path escapes the allowed root."""
+
 def sanitize_identifier(s: str, pattern: re.Pattern[str] = DEFAULT_ID_RE) -> str:
     if not pattern.fullmatch(s):
         raise ValueError(f"Invalid identifier: {s!r}. Use only A–Z, a–z, 0–9, _ . -")
@@ -16,7 +19,7 @@ def safe_join(root: Path, *parts: str) -> Path:
     try:
         candidate.relative_to(root)   # Py 3.9+
     except ValueError:
-        raise ValueError(f"Path escapes dataset root: {candidate}")
+        raise PathTraversalError(f"Path escapes dataset root: {candidate}")
     return candidate
 
 
@@ -41,3 +44,11 @@ def validate_image_path(
     except FileNotFoundError:
         pass
     raise FileNotFoundError(f"Image not found under {root}: {stem}")
+
+
+def resolve_and_confine(root: Path, candidate: str | Path) -> Path:
+    """
+    Spec-named helper: resolve candidate under root and ensure it does not escape.
+    Mirrors safe_join semantics to satisfy 'resolve_and_confine(root, candidate)' deliverable.
+    """
+    return safe_join(Path(root), str(candidate))
