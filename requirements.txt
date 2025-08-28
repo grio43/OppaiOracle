@@ -23,11 +23,11 @@ scikit-learn==1.0.0
 scipy>=1.9
 seaborn==0.11.0
 tensorboard>=2.14,<2.17
-# Upgrade PyTorch stack for modern APIs and CUDA 12 support
-torch>=2.3
-torchvision>=0.18
+# Upgrade PyTorch stack for modern APIs and CUDA 12.8+ / SM_120 support
+torch>=2.7
+torchvision>=0.22
 # Ensure matching CUDA runtime when installing via pip
-pytorch-cuda>=12.1; platform_system=='Linux' and platform_machine=='x86_64'
+pytorch-cuda>=12.8; platform_system=='Linux' and platform_machine=='x86_64'
 tqdm==4.62.0
 uvicorn==0.15.0  # for API
 wandb==0.12.0  # optional
