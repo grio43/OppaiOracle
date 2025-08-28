@@ -641,7 +641,8 @@ def train_with_orientation_tracking(config: FullConfig):
 
                 tag_probs = torch.sigmoid(outputs['tag_logits']).detach().cpu()
                 all_val_preds.append(tag_probs)
-                all_val_targets.append(tag_labels.detach().cpu())
+                # Keep float labels for loss; metrics need {0,1} ints.
+                all_val_targets.append((tag_labels > 0.5).to(torch.long).cpu())
 
                 if val_step == 0 and config.training.use_tensorboard:
                     tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
