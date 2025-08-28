@@ -267,23 +267,57 @@ def train_with_orientation_tracking(config: FullConfig):
     active_data_path = Path(active_location['path'])
     logger.info(f"Using active data path: {active_data_path}")
 
-    # --- NEW: Always rebuild vocabulary before creating dataloaders ---
-    try:
-        logger.info("Rebuilding tag vocabulary from dataset at %s", active_data_path)
-        # Build from the active dataset root; function scans recursively for JSON sidecars
-        rebuilt_vocab = create_vocabulary_from_datasets([active_data_path])
+    # --- Prompt to (re)build vocabulary at startup ---------------------------------
+    # Decide where the vocabulary should live and whether we already have one
+    vocab_dest = Path(getattr(config, "vocab_path", str(DEFAULT_VOCAB_PATH)))
+    check_path = vocab_dest / "vocabulary.json" if vocab_dest.is_dir() else vocab_dest
+    has_vocab = check_path.exists()
 
-        # Save to the configured vocab path so downstream loading stays consistent
-        vocab_dest = Path(getattr(config, "vocab_path", str(DEFAULT_VOCAB_PATH)))
-        if vocab_dest.is_dir():
-            vocab_dest = vocab_dest / "vocabulary.json"
-        rebuilt_vocab.save_vocabulary(vocab_dest)
-        logger.info("Vocabulary rebuilt with %d tags -> %s",
-                    len(rebuilt_vocab.tag_to_index), vocab_dest)
-    except Exception as e:
-        logger.error("Failed to rebuild vocabulary: %s", e)
-        raise
-    # -----------------------------------------------------------------
+    def _ask_yes_no(prompt: str, default: Optional[bool]) -> bool:
+        """
+        Simple Y/N prompt. If not attached to a TTY, fall back to the default.
+        default=True  -> [Y/n]
+        default=False -> [y/N]
+        default=None  -> [y/n]
+        """
+        # Non-interactive (e.g., piped/cron) -> use default
+        if not sys.stdin or not sys.stdin.isatty():
+            return bool(default) if default is not None else False
+        choices = " [Y/n] " if default is True else (" [y/N] " if default is False else " [y/n] ")
+        ans = input(prompt + choices).strip().lower()
+        if ans in ("y", "yes"): return True
+        if ans in ("n", "no"):  return False
+        return bool(default) if default is not None else False
+
+    # Default choice: build if missing, otherwise skip
+    rebuild = _ask_yes_no(
+        "Build a new tag vocabulary from dataset JSONs?",
+        default=(not has_vocab)
+    )
+
+    # If the user declines but there is no vocabulary, build anyway to avoid crash
+    if not has_vocab and not rebuild:
+        logger.warning(
+            "No vocabulary found at %s but rebuild was declined; "
+            "building now to avoid a startup failure.", check_path
+        )
+        rebuild = True
+
+    if rebuild:
+        try:
+            logger.info("Rebuilding tag vocabulary from dataset at %s", active_data_path)
+            # Scans recursively for *.json sidecars
+            rebuilt_vocab = create_vocabulary_from_datasets([active_data_path])
+            vocab_file = (vocab_dest / "vocabulary.json") if vocab_dest.is_dir() else vocab_dest
+            rebuilt_vocab.save_vocabulary(vocab_file)
+            logger.info("Vocabulary rebuilt with %d tags -> %s",
+                        len(rebuilt_vocab.tag_to_index), vocab_file)
+        except Exception as e:
+            logger.error("Failed to (re)build vocabulary: %s", e)
+            raise
+    else:
+        logger.info("Using existing vocabulary at %s", check_path)
+    # -------------------------------------------------------------------------------
 
     # Setup orientation handling
     orientation_config = setup_orientation_aware_training(
