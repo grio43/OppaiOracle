@@ -487,20 +487,48 @@ def train_with_orientation_tracking(config: FullConfig):
     global_step = 0
     start_epoch = 0
 
-    latest_ckpt = checkpoint_manager.get_latest_checkpoint()
-    if latest_ckpt:
-        ckpt = checkpoint_manager.load_checkpoint(
-            checkpoint_path=latest_ckpt,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device=device,
-        )
-        training_state = TrainingState.from_dict(ckpt.get('training_state', {}))
-        start_epoch = ckpt.get('epoch', 0)
-        global_step = ckpt.get('step', 0)
-        training_state.best_metric = ckpt.get('metrics', {}).get('val_f1_macro', training_state.best_metric)
-        logger.info(f"Resumed from checkpoint: epoch={start_epoch}, step={global_step}")
+    # --- Resume logic controlled by config.training.resume_from ---
+    resume_opt = str(getattr(config.training, "resume_from", "latest")).strip().lower()
+    ckpt_path = None
+
+    if resume_opt in ("", "none", "false", "off"):
+        logger.info("Resume disabled by config (training.resume_from=%r). Starting fresh.", resume_opt)
+    elif resume_opt == "latest":
+        ckpt_path = checkpoint_manager.get_latest_checkpoint()
+        if ckpt_path is None:
+            logger.info("No latest checkpoint found. Starting fresh.")
+    elif resume_opt == "best":
+        ckpt_path = checkpoint_manager.get_best_checkpoint()
+        if ckpt_path is None:
+            # Fallback to latest if user asked for best but it's missing
+            logger.warning("Requested resume_from='best' but best_model.pt not found; trying latest instead.")
+            ckpt_path = checkpoint_manager.get_latest_checkpoint()
+            if ckpt_path is None:
+                logger.info("No checkpoint available. Starting fresh.")
+    else:
+        # Treat as explicit path
+        try_path = Path(getattr(config.training, "resume_from"))
+        if try_path.exists():
+            ckpt_path = try_path
+        else:
+            logger.warning("Requested resume_from path does not exist: %s; starting fresh.", try_path)
+
+    if ckpt_path:
+        try:
+            ckpt = checkpoint_manager.load_checkpoint(
+                checkpoint_path=ckpt_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device=device,
+            )
+            training_state = TrainingState.from_dict(ckpt.get('training_state', {}))
+            start_epoch = ckpt.get('epoch', 0)
+            global_step = ckpt.get('step', 0)
+            training_state.best_metric = ckpt.get('metrics', {}).get('val_f1_macro', training_state.best_metric)
+            logger.info("Resumed from %s (epoch=%s, step=%s)", ckpt_path, start_epoch, global_step)
+        except Exception as e:
+            logger.exception("Failed to load checkpoint from %s; starting fresh. Error: %s", ckpt_path, e)
 
     for epoch in range(start_epoch, config.training.num_epochs):
         model.train()
