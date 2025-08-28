@@ -590,6 +590,8 @@ class LossConfig(BaseConfig):
 @dataclass
 class TrainingConfig(BaseConfig):
     """Training configuration"""
+    # Memory layout to unlock Tensor Core perf on Ampere+ (and Blackwell)
+    memory_format: str = "contiguous"  # or "channels_last"
     # Basic settings
     num_epochs: int = 100
     learning_rate: float = 1e-4
@@ -613,7 +615,7 @@ class TrainingConfig(BaseConfig):
     # Mixed precision
     use_amp: bool = True
     amp_opt_level: str = "O1"
-    amp_dtype: str = "float16"  # float16 or bfloat16
+    amp_dtype: str = "bfloat16"  # float16 or bfloat16
     enable_anomaly_detection: bool = False
 
     # Gradient clipping
@@ -730,7 +732,7 @@ class InferenceConfig(BaseConfig):
     """Inference configuration"""
     # Model
     model_path: Optional[str] = None
-    precision: str = "fp16"  # Options: "fp32", "fp16", "bf16"
+    precision: str = "bf16"  # Options: "fp32", "fp16", "bf16"
     compile_model: bool = False
     
     # Prediction
