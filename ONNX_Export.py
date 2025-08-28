@@ -67,13 +67,13 @@ class ONNXExportConfig:
     output_path: str = "model.onnx"
     
     # Export settings
-    # Use opset 18 or higher for transformer models with LayerNormalization support
+    # Use the latest stable opset for transformer models with LayerNormalization support
     # Opset timeline:
     # - 16 (2021): Basic support, no LayerNormalization
     # - 17 (2022): Added LayerNormalization, GroupNormalization improvements
     # - 18 (2023): Additional optimizations for transformers
-    # - 19 (2024): Latest improvements
-    opset_version: int = 17  # Use 17 for better LayerNorm compatibility, avoid opset 18 ReduceMean issues
+    # - 19 (2024): Latest improvements and better CUDA kernels
+    opset_version: int = 19
     input_names: List[str] = field(default_factory=lambda: ["input_image"])
     # Only export scores, not binary predictions (to avoid threshold-related validation issues)
     output_names: List[str] = field(default_factory=lambda: ["scores"])
