@@ -8,15 +8,17 @@ from threading import Thread
 
 from pathlib import Path
 import multiprocessing as mp
-from typing import Optional
+from typing import Optional, List, Dict, Any, Tuple
 
 import torch
 from torch.utils.data import Dataset, get_worker_info, DataLoader
 from PIL import Image
+from torchvision import transforms
 from utils.path_utils import sanitize_identifier, validate_image_path, resolve_and_confine
+from utils.metadata_ingestion import parse_tags_field
 
 from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
-from vocabulary import load_vocabulary_for_training
+from vocabulary import load_vocabulary_for_training, TagVocabulary
 
 
 class DatasetLoader(Dataset):
@@ -118,9 +120,34 @@ class DatasetLoader(Dataset):
             # Reset retry count on success
             self.retry_counts[idx] = 0
 
+            # Prepare labels for training loop compatibility
+            tag_indices = annotation.get("labels") or []
+            if isinstance(tag_indices, list) and len(tag_indices) > 0 and isinstance(tag_indices[0], (int, float)) and self.num_classes:
+                tag_vec = torch.zeros(self.num_classes, dtype=torch.float32)
+                tag_vec.scatter_(0, torch.tensor([int(i) for i in tag_indices if 0 <= int(i) < self.num_classes], dtype=torch.long), 1.0)
+            else:
+                # Fallback if no labels provided
+                tag_vec = torch.zeros(self.num_classes or 1, dtype=torch.float32)
+
+            rating = annotation.get("rating", "unknown")
+            rating_idx = 4  # default 'unknown'
+            if isinstance(rating, int):
+                rating_idx = int(rating)
+            elif isinstance(rating, str):
+                r = rating.strip().lower()
+                mapping = {
+                    "g": 0, "general": 0, "safe": 0,
+                    "sensitive": 1,
+                    "q": 2, "questionable": 2,
+                    "e": 3, "explicit": 3,
+                    "u": 4, "unknown": 4,
+                }
+                rating_idx = mapping.get(r, 4)
+
             sample = {
-                "image": image,
-                "labels": torch.tensor(annotation["labels"]),
+                "images": image,
+                "tag_labels": tag_vec,
+                "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
                 "image_id": image_id,
             }
 
@@ -147,9 +174,12 @@ class DatasetLoader(Dataset):
 
     def _create_error_sample(self, idx, reason):
         """Create a clearly marked error sample"""
+        # Default to a common square size when transform is unknown
+        sz = 224
         return {
-            "image": torch.zeros((3, 224, 224)),  # Placeholder tensor
-            "labels": torch.tensor([-1]),  # Error label
+            "images": torch.zeros((3, sz, sz)),  # Placeholder tensor
+            "tag_labels": torch.zeros(self.num_classes or 1, dtype=torch.float32),
+            "rating_labels": torch.tensor(4, dtype=torch.long),  # unknown
             "image_id": f"error_{idx}",
             "error": True,
             "error_reason": reason,
@@ -211,8 +241,11 @@ class BackgroundValidator(Thread):
             # Validate labels are within expected range
             if "labels" in annotation and self.dataset_loader.num_classes is not None:
                 labels = annotation["labels"]
-                if not all(0 <= label < self.dataset_loader.num_classes for label in labels):
-                    logging.warning(f"Invalid labels for item {idx}: {labels}")
+                try:
+                    if not all(0 <= int(label) < int(self.dataset_loader.num_classes) for label in labels):
+                        logging.warning(f"Invalid labels for item {idx}: {labels}")
+                        return False
+                except Exception:
                     return False
 
             return True
@@ -234,6 +267,173 @@ class AugmentationStats:
 def validate_dataset(*args, **kwargs):
     """Placeholder dataset validation function."""
     return {}
+
+
+class SidecarJsonDataset(Dataset):
+    """Dataset that reads per-image JSON sidecars in the same folder as images.
+
+    Each JSON is expected to contain at least:
+      - filename: image file name (e.g., "12345.jpg")
+      - tags: space-delimited string or list of tags
+      - rating: optional rating string or int (safe/general/questionable/explicit/unknown)
+    """
+
+    def __init__(
+        self,
+        root_dir: Path,
+        json_files: List[Path],
+        vocab: TagVocabulary,
+        transform=None,
+        max_retries: int = 3,
+        # L2 cache plumbing
+        l2_enabled: bool = False,
+        l2_cache_path: Optional[str] = None,
+        l2_map_size_bytes: int = 0,
+        l2_max_readers: int = 4096,
+        l2_writer_queue: Optional[mp.Queue] = None,
+    ):
+        self.root = Path(root_dir)
+        self.json_files = list(json_files)
+        self.vocab = vocab
+        self.transform = transform
+        self.max_retries = max_retries
+        self.retry_counts: Dict[int, int] = {}
+        self.failed_samples = set()
+        self.logger = logging.getLogger(__name__)
+
+        # L2 cache
+        self._l2_enabled = bool(l2_enabled and l2_cache_path)
+        self._l2_path = l2_cache_path
+        self._l2_map_size = int(l2_map_size_bytes or 0)
+        self._l2_max_readers = int(l2_max_readers or 4096)
+        self._l2_reader: Optional[LMDBReader] = None
+        self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
+
+        # Pre-parse minimal fields for speed
+        self.items: List[Dict[str, Any]] = []
+        for jp in self.json_files:
+            try:
+                data = json.loads(Path(jp).read_text(encoding="utf-8"))
+                fname = str(data.get("filename") or jp.with_suffix(".png").name)
+                image_id = sanitize_identifier(Path(fname).stem)
+                tags_raw = data.get("tags")
+                tags_list = parse_tags_field(tags_raw)
+                rating = data.get("rating", "unknown")
+                self.items.append({
+                    "image_id": image_id,
+                    "tags": tags_list,
+                    "rating": rating,
+                })
+            except Exception as e:
+                self.logger.warning(f"Failed to parse {jp}: {e}")
+
+    def _ensure_l2_reader(self):
+        if not self._l2_enabled:
+            return
+        if self._l2_reader is None:
+            assert self._l2_path and self._l2_map_size > 0
+            self._l2_reader = LMDBReader(self._l2_path, self._l2_map_size, max_readers=self._l2_max_readers)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if idx in self.failed_samples:
+            return self._error_sample(idx, "Previously failed sample")
+
+        if idx not in self.retry_counts:
+            self.retry_counts[idx] = 0
+
+        try:
+            ann = self.items[idx]
+            image_id = ann["image_id"]
+            image_key = image_id.encode("utf-8")
+
+            # Try L2 cache
+            if self._l2_enabled:
+                self._ensure_l2_reader()
+                payload = self._l2_reader.get(image_key) if self._l2_reader else None
+                if payload is not None:
+                    try:
+                        img_t = _tensor_from_bytes(payload)
+                    except Exception as e:
+                        self.logger.warning(f"L2 cache decode failed for {image_id}: {e}")
+                        img_t = None
+                    if img_t is not None:
+                        tag_vec = self.vocab.encode_tags(ann["tags"])  # (V,)
+                        rating_idx = _map_rating(ann.get("rating", "unknown"))
+                        return {
+                            "images": img_t,
+                            "tag_labels": tag_vec,
+                            "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
+                            "image_id": image_id,
+                        }
+
+            # Cache miss: load from disk
+            img_path = validate_image_path(self.root, image_id)
+            with Image.open(img_path) as pil_img:
+                img = pil_img.convert("RGB")
+            if self.transform:
+                img = self.transform(img)
+
+            # Encode labels
+            tag_vec = self.vocab.encode_tags(ann["tags"])  # (V,)
+            rating_idx = _map_rating(ann.get("rating", "unknown"))
+
+            # Enqueue write (non-blocking)
+            if self._l2_enabled and self._l2_writer_q is not None:
+                try:
+                    self._l2_writer_q.put_nowait((image_key, _tensor_to_bytes(img)))
+                except queue.Full:
+                    pass
+
+            self.retry_counts[idx] = 0
+            return {
+                "images": img,
+                "tag_labels": tag_vec,
+                "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
+                "image_id": image_id,
+            }
+
+        except Exception as e:
+            self.retry_counts[idx] += 1
+            self.logger.warning(f"Failed to load sample {idx}: {e}")
+            if self.retry_counts[idx] >= self.max_retries:
+                self.failed_samples.add(idx)
+                self.logger.error(f"Sample {idx} exceeded max retries, marking as failed")
+                return self._error_sample(idx, str(e))
+            return self._error_sample(idx, f"Temporary failure: {e}")
+
+    def _error_sample(self, idx: int, reason: str) -> Dict[str, Any]:
+        sz = getattr(self.transform.transforms[0], "size", 224) if hasattr(self, "transform") and self.transform else 224
+        if isinstance(sz, (tuple, list)):
+            sz = sz[0]
+        return {
+            "images": torch.zeros((3, int(sz), int(sz))),
+            "tag_labels": torch.zeros(len(self.vocab.tag_to_index), dtype=torch.float32),
+            "rating_labels": torch.tensor(4, dtype=torch.long),
+            "image_id": f"error_{idx}",
+            "error": True,
+            "error_reason": reason,
+        }
+
+
+def _map_rating(rating: Any) -> int:
+    """Map dataset rating field to fixed indices used by the model.
+
+    Mapping: general/safe->0, sensitive->1, questionable->2, explicit->3, unknown->4
+    """
+    if isinstance(rating, int):
+        return int(rating)
+    r = str(rating).strip().lower()
+    mapping = {
+        "g": 0, "general": 0, "safe": 0,
+        "sensitive": 1,
+        "q": 2, "questionable": 2,
+        "e": 3, "explicit": 3,
+        "u": 4, "unknown": 4,
+    }
+    return mapping.get(r, 4)
 
 
 def create_dataloaders(
@@ -265,30 +465,93 @@ def create_dataloaders(
         q, _proc = None, None
         logger.info("L2 cache disabled; proceeding without LMDB writer")
 
-    # Build datasets
-    train_ds = DatasetLoader(
-        annotations_path=str(Path(active_data_path) / "train.json"),
-        image_dir=str(Path(active_data_path) / "images"),
-        transform=None,
-        num_classes=None,
-        l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
-        l2_cache_path=getattr(data_config, "l2_cache_path", None),
-        l2_map_size_bytes=map_size_bytes,
-        l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
-        l2_writer_queue=q,
-    )
+    # Load vocabulary once (needed for sidecar mode and to determine num classes)
+    vocab = load_vocabulary_for_training(Path(vocab_path))
+    num_tags = len(vocab.tag_to_index)
 
-    val_ds = DatasetLoader(
-        annotations_path=str(Path(active_data_path) / "val.json"),
-        image_dir=str(Path(active_data_path) / "images"),
-        transform=None,
-        num_classes=None,
-        l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
-        l2_cache_path=getattr(data_config, "l2_cache_path", None),
-        l2_map_size_bytes=map_size_bytes,
-        l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
-        l2_writer_queue=q,
-    )
+    # Build basic transform (match inference defaults)
+    image_size = int(getattr(data_config, "image_size", 640))
+    mean = list(getattr(data_config, "normalize_mean", [0.5, 0.5, 0.5]))
+    std = list(getattr(data_config, "normalize_std", [0.5, 0.5, 0.5]))
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+
+    # Determine dataset mode
+    root = Path(active_data_path)
+    manifest_train = root / "train.json"
+    manifest_val = root / "val.json"
+    images_dir = root / "images"
+
+    if manifest_train.exists() and manifest_val.exists() and images_dir.exists():
+        # Manifest mode (back-compat)
+        train_ds = DatasetLoader(
+            annotations_path=str(manifest_train),
+            image_dir=str(images_dir),
+            transform=transform,
+            num_classes=num_tags,
+            l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
+            l2_cache_path=getattr(data_config, "l2_cache_path", None),
+            l2_map_size_bytes=map_size_bytes,
+            l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
+            l2_writer_queue=q,
+        )
+
+        val_ds = DatasetLoader(
+            annotations_path=str(manifest_val),
+            image_dir=str(images_dir),
+            transform=transform,
+            num_classes=num_tags,
+            l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
+            l2_cache_path=getattr(data_config, "l2_cache_path", None),
+            l2_map_size_bytes=map_size_bytes,
+            l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
+            l2_writer_queue=q,
+        )
+    else:
+        # Sidecar JSON mode: scan *.json in the same folder as images
+        logger.info("Manifest not found; entering sidecar JSON mode (scanning .json next to images)")
+
+        all_jsons = sorted([p for p in root.iterdir() if p.suffix.lower() == ".json"]) if root.exists() else []
+        if not all_jsons:
+            raise FileNotFoundError(
+                f"No annotation JSON files found under {root}. Expected per-image JSON sidecars."
+            )
+
+        # Deterministic split
+        import random as _random
+        rng = _random.Random(int(seed))
+        rng.shuffle(all_jsons)
+        split_ratio = 0.95
+        n_train = max(1, int(len(all_jsons) * split_ratio))
+        train_list = all_jsons[:n_train]
+        val_list = all_jsons[n_train:] if n_train < len(all_jsons) else all_jsons[-max(1, len(all_jsons)//20):]
+
+        train_ds = SidecarJsonDataset(
+            root_dir=root,
+            json_files=train_list,
+            vocab=vocab,
+            transform=transform,
+            l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
+            l2_cache_path=getattr(data_config, "l2_cache_path", None),
+            l2_map_size_bytes=map_size_bytes,
+            l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
+            l2_writer_queue=q,
+        )
+
+        val_ds = SidecarJsonDataset(
+            root_dir=root,
+            json_files=val_list,
+            vocab=vocab,
+            transform=transform,
+            l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
+            l2_cache_path=getattr(data_config, "l2_cache_path", None),
+            l2_map_size_bytes=map_size_bytes,
+            l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
+            l2_writer_queue=q,
+        )
 
     # DataLoaders
     train_loader = DataLoader(
@@ -317,8 +580,6 @@ def create_dataloaders(
         drop_last=False,
         shuffle=False,
     )
-
-    vocab = load_vocabulary_for_training(Path(vocab_path))
 
     return train_loader, val_loader, vocab
 

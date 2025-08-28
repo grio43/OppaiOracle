@@ -54,7 +54,7 @@ data:
   # The script will look for .json files in this directory and then find the
   # corresponding images based on the "filename" field in each JSON.
   storage_locations:
-    - path: "/mnt/raid0/Danbroo/shard_00022/"  # <-- IMPORTANT: Change this to your actual data path
+    - path: "/media/andrewk/qnap-public/workspace/shard_00022/"  # <-- IMPORTANT: Change this to your actual data path
       priority: 0
       type: "local"
       enabled: true
