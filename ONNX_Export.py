@@ -26,6 +26,7 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
+from safe_checkpoint import safe_load_checkpoint
 
 try:
     from model_metadata import ModelMetadata
@@ -242,12 +243,10 @@ class ONNXExporter:
             # Check for embedded vocabulary in checkpoint first
             checkpoint_path = Path(self.config.checkpoint_path)
             if checkpoint_path.exists():
-                from safe_checkpoint import safe_load_checkpoint
                 _, meta = safe_load_checkpoint(checkpoint_path)
-                checkpoint = {"state_dict": {}, **meta}
-                if 'vocab_b64_gzip' in checkpoint:
+                if 'vocab_b64_gzip' in meta:
                     logger.info("Found embedded vocabulary in checkpoint, extracting...")
-                    vocab_data = ModelMetadata.extract_vocabulary(checkpoint)
+                    vocab_data = ModelMetadata.extract_vocabulary(meta)
                     if vocab_data:
                         self.vocab = TagVocabulary()
                         self.vocab.tag_to_index = vocab_data['tag_to_index']
@@ -336,21 +335,20 @@ class ONNXExporter:
     def _update_preprocessing_params(self):
         """Update preprocessing parameters from checkpoint if available"""
         try:
-            from safe_checkpoint import safe_load_checkpoint
-            _, checkpoint = safe_load_checkpoint(self.config.checkpoint_path)
+            _, meta = safe_load_checkpoint(self.config.checkpoint_path)
 
             # Check for preprocessing params in checkpoint
-            if 'preprocessing_params' in checkpoint:
-                params = checkpoint['preprocessing_params']
+            if 'preprocessing_params' in meta:
+                params = meta['preprocessing_params']
                 self.config.normalize_mean = params.get('normalize_mean', self.config.normalize_mean)
                 self.config.normalize_std = params.get('normalize_std', self.config.normalize_std)
                 self.config.image_size = params.get('image_size', self.config.image_size)
                 self.config.patch_size = params.get('patch_size', self.config.patch_size)
                 logger.info(f"Loaded preprocessing params from checkpoint: mean={self.config.normalize_mean}, std={self.config.normalize_std}")
-            elif 'config' in checkpoint and isinstance(checkpoint['config'], dict):
+            elif 'config' in meta and isinstance(meta['config'], dict):
                 # Try to extract from training config
-                if 'data' in checkpoint['config']:
-                    data_config = checkpoint['config']['data']
+                if 'data' in meta['config']:
+                    data_config = meta['config']['data']
                     self.config.normalize_mean = list(data_config.get('normalize_mean', self.config.normalize_mean))
                     self.config.normalize_std = list(data_config.get('normalize_std', self.config.normalize_std))
                     self.config.image_size = data_config.get('image_size', self.config.image_size)
@@ -415,20 +413,10 @@ class ONNXExporter:
         if not Path(self.config.checkpoint_path).exists():
             raise FileNotFoundError(f"Checkpoint not found: {self.config.checkpoint_path}")
 
-        from safe_checkpoint import safe_load_checkpoint
         state_dict, meta = safe_load_checkpoint(self.config.checkpoint_path)
-        checkpoint = {"state_dict": state_dict, **meta}
         # Detect number of tags from checkpoint
         num_tags = None
-        
-        # First check state dict for tag_head dimensions
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        elif 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        else:
-            state_dict = checkpoint
-        
+
         # Look for tag_head.weight or tag_head.bias to determine num_tags
         for key in state_dict.keys():
             if 'tag_head.weight' in key:
@@ -447,8 +435,8 @@ class ONNXExporter:
         
         # Extract model config
         model_config = None
-        if 'config' in checkpoint:
-            model_config = checkpoint['config']
+        if 'config' in meta:
+            model_config = meta['config']
             if isinstance(model_config, dict) and 'model_config' in model_config:
                 model_config = model_config['model_config']
         

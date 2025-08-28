@@ -37,6 +37,7 @@ from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 # Alternative if not using Lightning Bolts:
 # from torch.optim.lr_scheduler import CosineAnnealingLR  # Use standard PyTorch scheduler
 from torch.amp import GradScaler, autocast
+from safe_checkpoint import safe_load_checkpoint
 import torch.backends.cudnn as cudnn
 
 # Import ModelMetadata at module level for fail-fast behavior
@@ -697,21 +698,18 @@ class CheckpointManager:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         
         logger.info(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        
+        state_dict, meta = safe_load_checkpoint(checkpoint_path)
+
         # Load model state
         if model is not None:
-            if hasattr(model, 'module'):
-                model.module.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                model.load_state_dict(checkpoint['model_state_dict'])
-        
+            model.load_state_dict(state_dict)
+
         # Load optimizer state
-        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        if optimizer is not None and 'optimizer_state_dict' in meta:
             # Check if optimizer has state before trying to move it
             if hasattr(optimizer, 'state') and optimizer.state:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                
+                optimizer.load_state_dict(meta['optimizer_state_dict'])
+
                 # Move optimizer state to device
                 for state in optimizer.state.values():
                     for k, v in state.items():
@@ -720,15 +718,15 @@ class CheckpointManager:
             else:
                 # Some optimizers might not have state yet
                 try:
-                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    optimizer.load_state_dict(meta['optimizer_state_dict'])
                 except Exception as e:
                     logger.warning(f"Could not load optimizer state: {e}")
-        
+
         # Load scheduler state
-        if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        return checkpoint
+        if scheduler is not None and 'scheduler_state_dict' in meta:
+            scheduler.load_state_dict(meta['scheduler_state_dict'])
+
+        return {"state_dict": state_dict, **meta}
     
     def get_best_checkpoint(self) -> Optional[Path]:
         """Get path to best checkpoint"""
@@ -752,7 +750,8 @@ class CheckpointManager:
 
         try:
             latest = max(existing, key=lambda x: x.stat().st_mtime)
-            return torch.load(latest, map_location='cpu')
+            state_dict, meta = safe_load_checkpoint(latest)
+            return {"state_dict": state_dict, **meta}
         except (FileNotFoundError, ValueError):
             return None
 
@@ -761,7 +760,8 @@ class CheckpointManager:
         best_path = self.checkpoint_dir / "best_model.pt"
         if best_path.exists():
             try:
-                return torch.load(best_path, map_location='cpu')
+                state_dict, meta = safe_load_checkpoint(best_path)
+                return {"state_dict": state_dict, **meta}
             except Exception as e:
                 print(f"Warning: Could not load best checkpoint: {e}")
         return None
