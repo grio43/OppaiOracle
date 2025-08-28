@@ -178,6 +178,12 @@ training:
     save_steps: 10000
     save_total_limit: 3
     save_best_only: false
+    # Resume behavior (choose per run/goal):
+    #   "none" | "latest" | "best" | "/path/to/checkpoint.pt"
+    # Tip: use "latest" while iterating, "best" for polishing/finetune,
+    # or point to an exact checkpoint to branch experiments safely.
+    resume_from: "latest"
+
     eval_steps: 1000
     logging_steps: 100
 
