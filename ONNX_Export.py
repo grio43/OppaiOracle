@@ -7,7 +7,7 @@ Export trained model to ONNX format for deployment
 import os
 import json
 import pathlib
-import pickle
+from packaging.version import Version
 import logging
 import shutil
 from pathlib import Path
@@ -57,6 +57,25 @@ from vocabulary import load_vocabulary_for_training, TagVocabulary
 # Configure logging
 logger = logging.getLogger(__name__)
 
+
+MIN_ONNX = Version("1.16.0")
+MIN_ORT  = Version("1.20.0")
+
+
+def _fail(msg: str):
+    logger.error(msg)
+    raise RuntimeError(msg)
+
+
+def _check_versions_and_env(opset: int) -> None:
+    onnx_v = Version(onnx.__version__)
+    ort_v = Version(ort.__version__)
+    if onnx_v < MIN_ONNX:
+        _fail(f"ONNX >= {MIN_ONNX} required (found {onnx_v}). Try: pip install -U 'onnx>={MIN_ONNX},<2'")
+    if ort_v < MIN_ORT:
+        _fail(f"onnxruntime >= {MIN_ORT} required (found {ort_v}). For GPU: pip install -U 'onnxruntime-gpu>={MIN_ORT}'")
+    if opset < 18:
+        _fail(f"opset >= 18 required (requested {opset}). Set export.opset_version to 18 or 19.")
 
 @dataclass
 class ONNXExportConfig:
@@ -207,6 +226,10 @@ class ONNXExporter:
 
     def __init__(self, config: ONNXExportConfig):
         self.config = config
+        if self.config.opset_version < 18:
+            logger.warning(f"Raising opset_version from {self.config.opset_version} to 18 (minimum).")
+            self.config.opset_version = 18
+        _check_versions_and_env(self.config.opset_version)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Using device: {self.device}")
         
@@ -219,7 +242,9 @@ class ONNXExporter:
             # Check for embedded vocabulary in checkpoint first
             checkpoint_path = Path(self.config.checkpoint_path)
             if checkpoint_path.exists():
-                checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                from safe_checkpoint import safe_load_checkpoint
+                _, meta = safe_load_checkpoint(checkpoint_path)
+                checkpoint = {"state_dict": {}, **meta}
                 if 'vocab_b64_gzip' in checkpoint:
                     logger.info("Found embedded vocabulary in checkpoint, extracting...")
                     vocab_data = ModelMetadata.extract_vocabulary(checkpoint)
@@ -311,7 +336,8 @@ class ONNXExporter:
     def _update_preprocessing_params(self):
         """Update preprocessing parameters from checkpoint if available"""
         try:
-            checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu', weights_only=False)
+            from safe_checkpoint import safe_load_checkpoint
+            _, checkpoint = safe_load_checkpoint(self.config.checkpoint_path)
 
             # Check for preprocessing params in checkpoint
             if 'preprocessing_params' in checkpoint:
@@ -388,25 +414,10 @@ class ONNXExporter:
         
         if not Path(self.config.checkpoint_path).exists():
             raise FileNotFoundError(f"Checkpoint not found: {self.config.checkpoint_path}")
-        
-        try:
-            # Try loading with weights_only=True first (safer)
-            try:
-                # Add pathlib.PosixPath to safe globals for newer PyTorch versions
-                import torch.serialization
-                with torch.serialization.safe_globals([pathlib.PosixPath, pathlib.Path, pathlib.WindowsPath]):
-                    checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu', weights_only=True)
-            except (pickle.UnpicklingError, TypeError) as e:
-                # Fallback to weights_only=False for compatibility
-                # This is safe since we're loading our own trained checkpoint
-                logger.warning(f"Loading with weights_only=True failed: {e}")
-                logger.info("Attempting to load with weights_only=False (trusted checkpoint)")
-                checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu', weights_only=False)
-        except RuntimeError as e:
-            # Handle old PyTorch versions that don't have weights_only parameter
-            checkpoint = torch.load(self.config.checkpoint_path, map_location='cpu')
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint: {e}")
+
+        from safe_checkpoint import safe_load_checkpoint
+        state_dict, meta = safe_load_checkpoint(self.config.checkpoint_path)
+        checkpoint = {"state_dict": state_dict, **meta}
         # Detect number of tags from checkpoint
         num_tags = None
         
