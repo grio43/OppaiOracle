@@ -247,6 +247,9 @@ def train_with_orientation_tracking(config: FullConfig):
     except Exception:
         pass
 
+    # Allow cuDNN to pick the fastest kernels when not in strict-deterministic mode
+    torch.backends.cudnn.benchmark = bool(getattr(config.training, "benchmark", True))
+
     # Find the active data path from storage_locations
     active_location = next((loc for loc in config.data.storage_locations if loc.get('enabled')), None)
 
@@ -313,6 +316,9 @@ def train_with_orientation_tracking(config: FullConfig):
     # If it is, this line would be redundant.
     model_config["num_ratings"] = num_ratings
     model = create_model(**model_config)
+    # Use channels_last if requested (benefits conv/projection kernels)
+    if getattr(config.training, "memory_format", "contiguous") == "channels_last":
+        model = model.to(memory_format=torch.channels_last)
     model.to(device)
 
     # Update monitor config with values from other parts of the config for backward compatibility
@@ -454,7 +460,9 @@ def train_with_orientation_tracking(config: FullConfig):
 
         with anomaly_ctx:
             for step, batch in enumerate(train_loader):
-                images = batch['images'].to(device)
+                images = batch['images'].to(device, non_blocking=True)
+                if getattr(config.training, "memory_format", "contiguous") == "channels_last":
+                    images = images.contiguous(memory_format=torch.channels_last)
                 tag_labels = batch['tag_labels'].to(device)
                 rating_labels = batch['rating_labels'].to(device)
 
@@ -588,7 +596,9 @@ def train_with_orientation_tracking(config: FullConfig):
         all_val_targets: list[torch.Tensor] = []
         with torch.no_grad():
             for val_step, batch in enumerate(val_loader):
-                images = batch['images'].to(device)
+                images = batch['images'].to(device, non_blocking=True)
+                if getattr(config.training, "memory_format", "contiguous") == "channels_last":
+                    images = images.contiguous(memory_format=torch.channels_last)
                 tag_labels = batch['tag_labels'].to(device)
                 rating_labels = batch['rating_labels'].to(device)
 
