@@ -616,8 +616,9 @@ class SidecarJsonDataset(Dataset):
             # Cache miss: load from disk (resolve under the JSON's shard folder)
             img_root = ann.get("dir", self.root)
             img_path = validate_image_path(Path(img_root), image_id)
+            # Detach from the file before leaving the context
             with Image.open(img_path) as pil_img:
-                pil = pil_img
+                pil = pil_img.copy()
             # 1) Alpha composite onto gray
             if pil.mode in ("RGBA", "LA") or ("transparency" in pil.info):
                 bg = Image.new("RGBA", pil.size, (*self.pad_color, 255))
