@@ -185,7 +185,7 @@ training:
     resume_from: "latest"
 
     eval_steps: 1000
-    logging_steps: 100
+    logging_steps: 3000
 
     # Loss configuration
     tag_loss:

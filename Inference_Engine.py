@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from safe_checkpoint import safe_load_checkpoint
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from PIL import Image
+from PIL import Image, ImageOps, ImageFile
 
 # Vocabulary utilities
 from model_metadata import ModelMetadata
@@ -69,6 +69,10 @@ except ImportError:
     raise ImportError("model_architecture.py not found. Cannot load SimplifiedTagger model.")   
 
 logger = logging.getLogger(__name__)
+
+# Allow truncated images if requested via env (opt-in)
+if bool(int(os.environ.get("OO_ALLOW_TRUNCATED", "0"))):
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -189,6 +193,8 @@ class ImagePreprocessor:
         # Load image if path
         if isinstance(image, str):
             with Image.open(image) as img:
+                img.load()
+                img = ImageOps.exif_transpose(img)
                 image = img.convert('RGB')
         elif isinstance(image, np.ndarray):
             image = Image.fromarray(image)
