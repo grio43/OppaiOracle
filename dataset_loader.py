@@ -202,8 +202,9 @@ class DatasetLoader(Dataset):
 
             # --- Cache miss: load + transform (confined path) ---
             img_path = validate_image_path(Path(self.image_dir), image_id)
+            # Copy inside the context so fp isn't needed after the 'with' exits.
             with Image.open(img_path) as pil_img:
-                img = pil_img
+                img = pil_img.copy()
 
             # 1) Load & composite transparency onto gray
             if img.mode in ("RGBA", "LA") or ("transparency" in img.info):
@@ -218,6 +219,8 @@ class DatasetLoader(Dataset):
             w, h = img.size
             scale = min(target / float(w), target / float(h)) if (w > 0 and h > 0) else 1.0
             nw, nh = int(round(w * scale)), int(round(h * scale))
+            # (Optional) modern Pillow name to avoid deprecation noise:
+            # from PIL import Image; resample = Image.Resampling.BILINEAR
             resized = img.resize((max(1, nw), max(1, nh)), Image.BILINEAR)
 
             canvas = Image.new("RGB", (target, target), tuple(self.pad_color))
