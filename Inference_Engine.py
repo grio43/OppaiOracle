@@ -4,6 +4,7 @@ Inference Engine for Anime Image Tagger
 Handles model inference, batch processing, and real-time predictions
 Uses Monitor_log.py for monitoring and logging functionality
 """
+from __future__ import annotations
 
 import os
 import json
@@ -11,7 +12,7 @@ import time
 import logging
 from pathlib import Path
 import yaml
-from typing import Dict, List, Optional, Tuple, Union, Any, Callable
+from typing import Dict, List, Optional, Tuple, Union, Any, Callable, TYPE_CHECKING
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 import warnings
@@ -37,7 +38,7 @@ from PIL import Image
 from model_metadata import ModelMetadata
 from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
 from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
-from Configuration_System import load_config, InferenceConfig as BaseInferenceConfig
+from Configuration_System import load_config, InferenceConfig as BaseInferenceConfig, MonitorConfig
 
 # Make cv2 optional - not needed for basic inference
 try:
@@ -47,13 +48,19 @@ except ImportError:  # pragma: no cover - optional dependency
     CV2_AVAILABLE = False
     warnings.warn("OpenCV (cv2) not available. Some image loading features may be limited.")
 
-# Import monitoring system from Monitor_log
+# Import monitoring system from Monitor_log (optional)
 try:
-    from Monitor_log import MonitorConfig, TrainingMonitor
+    from Monitor_log import TrainingMonitor  # MonitorConfig is provided by Configuration_System
     MONITORING_AVAILABLE = True
 except ImportError:
     warnings.warn("Monitor_log not available. Monitoring will be disabled.")
     MONITORING_AVAILABLE = False
+    TrainingMonitor = None  # type: ignore[assignment]
+
+# Hint to static type checkers without importing at runtime
+if TYPE_CHECKING:
+    from Configuration_System import MonitorConfig as _MC  # re-export for checkers
+    MonitorConfig = _MC
 
 # Import the actual model architecture
 try:
@@ -104,7 +111,7 @@ class InferenceConfig(BaseInferenceConfig):
     max_queue_size: int = 100
     timeout: float = 30.0
     enable_monitoring: bool = True
-    monitor_config: Optional[MonitorConfig] = None
+    monitor_config: Optional["MonitorConfig"] = None
     enable_cache: bool = True
     cache_size: int = 1000
     cache_ttl_seconds: int = 3600
