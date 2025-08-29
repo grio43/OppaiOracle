@@ -658,7 +658,7 @@ class SidecarJsonDataset(Dataset):
                 else:
                     tags_now, flipped = self.orientation_handler.swap_tags(tags_now)
                 if flipped:
-                    from PIL import ImageOps
+                    # Use the module-level ImageOps imported at the top of the file
                     canvas = ImageOps.mirror(canvas)
                     pmask = torch.flip(pmask, dims=[1])
             # Joint v2 transforms keep geometry aligned with mask when used
