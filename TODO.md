@@ -2,108 +2,220 @@ TODO — Orphans, Critical and Major Fixes
 
 Scope: Only orphan code, critical errors, and major errors that block or meaningfully degrade training, validation, export, or inference.
 
-Critical Errors
-- ONNX export missing import: `torch.nn.functional as F`
-  - File: `ONNX_Export.py:1`
-  - Symptom: `NameError: F` in `InferenceWrapper.forward()` when calling `F.pad`/`F.interpolate`.
-  - Fix: `import torch.nn.functional as F` near other imports.
-  - 2025 context: Newer PyTorch ONNX export paths still rely on torchvision-free pre/post transforms; keeping preprocessing in-graph (pad/resize/normalize) is supported with opset 18/19. Ensure `F.interpolate` uses `align_corners=False` (already set) to avoid export warnings.
-  - References: ONNX opset 18–19 support; PyTorch ONNX exporter notes for SDPA and image ops.
+## Critical Errors
 
-- ONNX inference alpha compositing uses incorrect mask
-  - File: `onnx_infer.py:102`
-  - Symptom: `PIL.Image.paste` called with `mask=img` (RGBA image) instead of alpha channel, causing bad transparency handling or runtime errors.
-  - Fix: `background.paste(img, mask=img.split()[-1])`.
-  - 2025 context: Pillow 10/11 keep the same API; mask must be a single-channel image (usually alpha). Using the full RGBA as mask is incorrect and may error on strict builds.
-  - References: Pillow Image.paste docs (mask argument requires single-band image).
+### ONNX export missing import: `torch.nn.functional as F`
 
-- Fragile type annotation when monitoring is unavailable
-  - File: `Inference_Engine.py:107`
-  - Symptom: `InferenceConfig` annotates `monitor_config: Optional[MonitorConfig]` but `Monitor_log` import is optional. On Python 3.12, this can raise `NameError` at class creation if the import fails.
-  - Fix: use string annotations: `monitor_config: Optional['MonitorConfig'] = None` and/or guard with `if TYPE_CHECKING:` for the import.
-  - 2025 context: Postponed evaluation of annotations is still opt‑in; forward references should be strings for optional/conditional imports. Alternative: add `from __future__ import annotations` at file top.
-  - References: Python typing `TYPE_CHECKING`; dataclasses + forward refs best practices.
+- **File**: `ONNX_Export.py:1`
+- **Symptom**: `NameError: F` in `InferenceWrapper.forward()` when calling `F.pad`/`F.interpolate`.
+- **Fix**: Add `import torch.nn.functional as F` near the other imports so the functional API is available. Without this import, calls to `F.pad`/`F.interpolate` will fail during export.
+- **2025 context**: The PyTorch 2.8 ONNX exporter still relies on the functional API for in‑graph pre‑/post‑processing. Exporting ops like pad, resize and normalise is supported from opset 18 onward, but they still require the `F` alias. When resizing, ensure `align_corners=False` to silence deprecation warnings and produce deterministic results:contentReference[oaicite:0]{index=0}.
+- **Code example**:
 
-- Hard-coded absolute path fallback for vocabulary
-  - File: `ONNX_Export.py:155`
-  - Symptom: Tries `/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json` if normal paths fail; breaks portability.
-  - Fix: remove hard-coded path; surface a clear error instructing to use embedded vocab or provide `export.vocab_dir`.
-  - 2025 context: Best practice is embedding vocab in checkpoints/ONNX metadata (already supported) or taking it from unified config. Hard-coded absolute fallbacks cause CI/container failures.
-  - References: ONNX custom metadata map usage; ModelMetadata helpers in this repo.
+  ```python
+  # In ONNX_Export.py
+  import torch.nn.functional as F  # required for pad/interpolate functions
 
-- Packaging constraints need platform‑specific install guidance
-  - File: `requirements.txt:29–30`
-  - Symptom: `torch>=2.8.0` and `torchvision>=0.23.0` are current as of 2025 but wheel availability depends on OS/Python/CUDA. Blind `pip install -r` may fail without the correct extra index (or CPU fallback) and matching CUDA.
-  - Fix: document installation via the PyTorch selector (pip command with proper `--index-url` for CUDA version) and pin a tested pair (e.g., Py3.12 + CUDA 12.x: torch==2.8.0, torchvision==0.23.0). Offer CPU-only fallback (`pip install torch==…+cpu` route) for machines without NVIDIA drivers.
-  - References: PyTorch “Get Started” installer matrix (2.8), torchvision compat matrix.
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+      # pad to a square and resize for ONNX export
+      x = F.pad(x, (0, 0, pad_h, pad_w))
+      x = F.interpolate(x, size=(self.cfg.img_size, self.cfg.img_size), mode="bilinear", align_corners=False)
+      return x
+  ```
+- **References**: ONNX opset 18–19 support for image operations and PyTorch ONNX exporter notes.
 
-- Unused helper with incorrect signature (would error if called)
-  - File: `onnx_infer.py:115`
-  - Symptom: `_preprocess_simple(image_path, image_size, mean, std)` calls `_preprocess(...)` with extra args that don’t exist.
-  - Fix: remove dead function or implement correct signature.
-  - 2025 context: Keep a single preprocessing path; the ONNX graph includes preprocessing. A second codepath invites divergence and export/infer mismatches.
+### ONNX inference alpha compositing uses incorrect mask
 
-Major Issues
-- Lightning training path is incomplete/broken (treat as orphan unless finished)
-  - Files: `train_lightning.py`, `lightning_module.py:28,43,62`
-  - Problems:
-    - DataModule returns empty loaders (non-functional placeholder).
-    - `LightningModule` expects outputs `outputs['tag']`/`['rating']` but the model returns `{'tag_logits','rating_logits'}` causing KeyError.
-  - Options: mark Lightning path experimental and exclude from docs; or fix to use `tag_logits`/`rating_logits` and implement a real DataModule wired to `dataset_loader`.
-  - 2025 fix guidance:
-    - Dataloaders: wrap `dataset_loader.create_dataloaders()` and feed `LitOppai` batches as `(images, targets_dict)`.
-    - Outputs: rename to `outputs['tag_logits']` / `outputs['rating_logits']` when computing loss/metrics; pass `targets['tag_labels']` and `targets['rating_labels']`.
-    - TorchMetrics: in PL 2.5, prefer `task="multilabel"` metrics or `Multilabel*` with `num_labels=vocab_size` and thresholding on probabilities.
-  - References: Lightning 2.4–2.5 data flow; torchmetrics multilabel APIs.
+- **File**: `onnx_infer.py:102`
+- **Symptom**: `PIL.Image.paste` is called with `mask=img` (an RGBA image) instead of using its alpha channel, causing incorrect transparency handling and errors on strict builds.
+- **Fix**: Use the alpha channel of the RGBA image when pasting: `background.paste(img, mask=img.split()[-1])`. The mask must be a single‑channel (L/1) image:contentReference[oaicite:1]{index=1}.
+- **2025 context**: Pillow 10/11 retain the same API; the `mask` argument to `Image.paste` must be a single‑band image. Passing the full RGBA image is invalid and may raise a `ValueError`:contentReference[oaicite:2]{index=2}.
+- **References**: Pillow `Image.paste` documentation:contentReference[oaicite:3]{index=3}.
 
-- Epoch-based warmup misconfigured to 10000
-  - File: `configs/unified_config.yaml: training.warmup_steps`
-  - Context: `CosineAnnealingWarmupRestarts` is stepped once per epoch (see `train_direct.py:754`), so `warmup_steps` is in epochs. Current value `10000` will hold LR near minimum for the entire run.
-  - Fix: set to a small integer (e.g., `3–10`).
-  - 2025 context: PL 2.x and our scheduler both advance once/epoch unless explicitly hooked per‑step; validate `interval="epoch"`. Keep warmup short to avoid freezing learning rate.
-  - References: Cosine warmup restarts papers and PL scheduler interval docs.
+### Fragile type annotation when monitoring is unavailable
 
-- Non-portable default data path enabled
-  - File: `configs/unified_config.yaml: data.storage_locations[0].path`
-  - Symptom: Points to a machine-specific path and `enabled: true` by default; new users will hit “No data” errors.
-  - Fix: disable by default or switch to an obvious placeholder; document how to set one `enabled: true` path.
-  - 2025 context: Many users run in containers; prefer environment variables or relative workspace paths. Keep exactly one `enabled: true` entry.
+- **File**: `Inference_Engine.py:107`
+- **Symptom**: `InferenceConfig` annotates `monitor_config: Optional[MonitorConfig]`, but the `MonitorConfig` import is optional. On Python 3.12, evaluating the annotation when the import fails raises a `NameError` at class definition time.
+- **Fix**: Use string forward references and conditional imports:
 
-- Duplicated path utilities increase confusion
-  - Files: `utils/metadata_ingestion.py:47` and `utils/path_utils.py:26`
-  - Symptom: Two different `validate_image_path`/`safe_join` implementations; only `utils/path_utils.py` is used in the loaders.
-  - Fix: remove duplicates from `metadata_ingestion.py` and import from `utils/path_utils` where needed.
-  - 2025 context: Centralize path traversal protections in one module; DataLoader already relies on `utils/path_utils`.
+  ```python
+  from typing import Optional, TYPE_CHECKING
+  if TYPE_CHECKING:
+      from .monitoring import MonitorConfig
 
-- Logging couples to dataset module
-  - File: `utils/logging_setup.py:15`
-  - Symptom: Imports `dataset_loader.CompressingRotatingFileHandler` just to get a rotating file handler; this pulls in heavy dataset imports for generic logging.
-  - Fix: move `CompressingRotatingFileHandler` into `utils/` (e.g., `utils/logging_handlers.py`) and import it there to avoid side effects.
-  - 2025 context: Avoid heavy/side‑effect imports in logging (import‑sanity). Use stdlib handlers or a tiny, isolated helper module.
+  class InferenceConfig(BaseModel):
+      monitor_config: Optional["MonitorConfig"] = None
+  ```
 
-Orphan/Dead Code
-- `_preprocess_simple` in `onnx_infer.py` (unused and wrong signature). Remove or fix.
-- `vocab_utils.py` is only used by `train_lightning.py`. If Lightning is deferred, remove or migrate needed helpers.
-- `dataset_loader.py:408, 415` placeholders (`AugmentationStats`, `validate_dataset`) are unused; either implement or remove from public surface.
- - 2025 context: Keep public surface minimal; remove placeholders or hide behind private helpers to avoid import‑sanity failures and user confusion.
+  Alternatively, add `from __future__ import annotations` at the top of the file to postpone evaluation of annotations.
+- **2025 context**: Postponed evaluation of annotations is still opt‑in in Python 3.12; using strings or enabling the future import prevents runtime name errors. Forward references are required whenever the target may not be imported:contentReference[oaicite:4]{index=4}.
+- **References**: Python typing module documentation on `TYPE_CHECKING` and postponed annotation evaluation:contentReference[oaicite:5]{index=5}.
 
-Preflight/Config Gating (non-code but critical to avoid runtime failures)
-- Provide a real `vocabulary.json` (no `tag_###` placeholders) for training/export
-  - Files: `vocabulary.py`, `ONNX_Export.py`
-  - Action: Generate via `vocabulary.create_vocabulary_from_datasets(...)` or embed vocabulary in checkpoints; code fails fast by design.
-  - 2025 context: Prefer embedding vocab in checkpoints/ONNX (ModelMetadata) for reproducibility; external files can drift across runs.
+### Hard‑coded absolute path fallback for vocabulary
 
-- Orientation flips require map when enabled
-  - Files: `configs/unified_config.yaml: data.random_flip_prob`, `configs/orientation_map.json`
-  - Action: Ensure `orientation_map.json` exists when `random_flip_prob>0`, or set `data.strict_orientation_validation=false`.
-  - 2025 context: Safety modes (“conservative/balanced/permissive”) should be explicit; default to conservative to avoid mislabeled flips.
+- **File**: `ONNX_Export.py:155`
+- **Symptom**: The code attempts to load `/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json` when normal paths fail, making the export non‑portable.
+- **Fix**: Remove the hard‑coded path and surface a clear error instructing the user to provide a `vocabulary.json` via `export.vocab_dir` or embed it in the checkpoint/ONNX metadata. When exporting, load the vocabulary from configuration or embed it directly into the ONNX model’s metadata using `model.metadata_props.add()`.
+- **2025 context**: The ONNX format supports arbitrary key‑value metadata. Best practice is to embed class names or vocabulary in the model so that it travels with the checkpoint. For example, you can attach a dictionary of class names using the Python API:
 
-Notes
-- Validation header glitch mentioned in the runbook is not present; `validation_loop.py` starts with a proper shebang/docstring.
+  ```python
+  import json
+  import onnx
 
-Quick References (2025)
-- Pillow paste mask: https://pillow.readthedocs.io/en/stable/reference/Image.html#PIL.Image.Image.paste
-- Python typing forward refs/TYPE_CHECKING: https://docs.python.org/3/library/typing.html#typing.TYPE_CHECKING
-- PyTorch get-started installer (2.8): https://pytorch.org/get-started/locally
-- ONNX Runtime GPU providers and versions: https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html
-- TorchMetrics multilabel: https://torchmetrics.readthedocs.io/en/stable/classification/multilabel_f1_score.html
+  model = onnx.load("model.onnx")
+  class_names = {0: "tag0", 1: "tag1", 2: "tag2"}
+  meta = model.metadata_props.add()
+  meta.key = "class_names"
+  meta.value = json.dumps(class_names)
+  onnx.save(model, "model.onnx")
+  ```
+
+  This avoids searching for external JSON files and makes the export self‑contained:contentReference[oaicite:6]{index=6}.
+- **References**: ONNX custom metadata examples:contentReference[oaicite:7]{index=7}.
+
+### Packaging constraints need platform‑specific install guidance
+
+- **File**: `requirements.txt:29–30`
+- **Symptom**: The project pins `torch>=2.8.0` and `torchvision>=0.23.0`. Installing these packages blindly can fail because wheels differ by Python version, OS and CUDA. Users might hit installation errors or get CPU‑only builds unintentionally.
+- **Fix**: Document explicit installation commands for common environments and pin a tested pair. For example:
+
+  * **CUDA 12.x on Linux (PyTorch 2.8.0 + torchvision 0.23.0)**
+
+    ```bash
+    pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu121
+    ```
+
+  * **CUDA 11.x** — use the cu118 or cu121 index corresponding to your driver; see the PyTorch selector for the full matrix:contentReference[oaicite:8]{index:8}.
+
+  * **CPU‑only** (no NVIDIA GPU):
+
+    ```bash
+    pip install torch==2.8.0 torchvision==0.23.0
+    ```
+
+  Always ensure your Python version (≥3.9) matches the supported wheels, and install `torchmetrics` separately when using Lightning metrics.
+- **2025 context**: PyTorch 2.8 requires Python 3.9+ and provides wheels for CPU and CUDA 12.x/11.x. Use the official installer matrix to select the correct index URL:contentReference[oaicite:9]{index=9}:contentReference[oaicite:10]{index=10}. For GPU inference with ONNX Runtime, match your CUDA major version (11.x or 12.x) to avoid mismatched cuDNN versions:contentReference[oaicite:11]{index=11}.
+- **References**: PyTorch “Get Started” installer matrix:contentReference[oaicite:12]{index=12}:contentReference[oaicite:13]{index=13} and ONNX Runtime CUDA compatibility table:contentReference[oaicite:14]{index=14}.
+
+### Unused helper with incorrect signature
+
+- **File**: `onnx_infer.py:115`
+- **Symptom**: `_preprocess_simple(image_path, image_size, mean, std)` calls an undefined `_preprocess(...)` and is never invoked.
+- **Fix**: Delete `_preprocess_simple` or implement it properly. Since the ONNX graph already performs preprocessing, maintaining a second code path invites divergence; prefer a single preprocessing implementation.
+- **2025 context**: Consolidating preprocessing reduces maintenance and ensures parity between training, export and inference.
+
+## Major Issues
+
+### Lightning training path is incomplete/broken (treat as orphan unless finished)
+
+- **Files**: `train_lightning.py`, `lightning_module.py:28,43,62`
+- **Problems**:
+  - The `LightningDataModule` returns empty dataloaders, so no training data is ever consumed.
+  - The `LightningModule` expects outputs `outputs['tag']` and `outputs['rating']`, but the model returns `{'tag_logits', 'rating_logits'}`, causing `KeyError`.
+- **Options**:
+  - Mark the Lightning training path as experimental and exclude it from documentation until it is complete.
+  - Or, fix the implementation: create a real `LightningDataModule` that wraps the existing `dataset_loader.create_dataloaders()` and yield batches as `(images, targets_dict)`, and modify the `LightningModule` to use the correct keys.
+- **2025 fix guidance**:
+  - **Implement a proper DataModule** – A `LightningDataModule` should implement `setup()`, `train_dataloader()`, `val_dataloader()` and optionally `test_dataloader()`. Use the existing dataset loader to populate training and validation datasets and wrap them in `DataLoader` instances:contentReference[oaicite:15]{index=15}. For example:
+
+    ```python
+    class OppaiDataModule(L.LightningDataModule):
+        def __init__(self, cfg):
+            super().__init__()
+            self.cfg = cfg
+
+        def setup(self, stage: str = None):
+            loaders = dataset_loader.create_dataloaders(self.cfg)
+            self.train_loader = loaders['train']
+            self.val_loader = loaders['val']
+
+        def train_dataloader(self):
+            return self.train_loader
+
+        def val_dataloader(self):
+            return self.val_loader
+    ```
+
+  - **Align outputs** – In the `training_step`, rename the keys returned by the model to match those expected by the loss functions and metrics:
+
+    ```python
+    def training_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self.model(images)
+        tag_logits = outputs['tag_logits']
+        rating_logits = outputs['rating_logits']
+        # compute losses using targets['tag_labels'], targets['rating_labels']
+        ...
+    ```
+
+  - **Use TorchMetrics for multi‑label classification** – TorchMetrics provides `MultilabelF1Score` and other metrics. Instantiate them with `num_labels` equal to your vocabulary size and set a probability threshold:
+
+    ```python
+    from torchmetrics.classification import MultilabelF1Score
+    self.train_f1 = MultilabelF1Score(num_labels=len(self.vocab), average='macro', threshold=0.5)
+    self.valid_f1 = MultilabelF1Score(num_labels=len(self.vocab), average='macro', threshold=0.5)
+    ```
+
+    During each step, update the metric with `(logits, targets)` and log it at the end of the epoch.
+- **References**: Lightning DataModule documentation:contentReference[oaicite:17]{index=17} and a multi‑label classification example demonstrating `MultilabelF1Score`.
+
+### Epoch‑based warmup misconfigured
+
+- **File**: `configs/unified_config.yaml: training.warmup_steps`
+- **Context**: The scheduler used (`CosineAnnealingWarmupRestarts`) advances once per **epoch** (not per batch). Setting `warmup_steps` to `10000` therefore applies a 10 k‑epoch warmup, keeping the learning rate near zero for the entire run.
+- **Fix**: Set `training.warmup_steps` to a small integer (3–10) so the learning rate ramps up over a few epochs. For example:
+
+  ```yaml
+  training:
+    warmup_steps: 5  # number of epochs to warm up
+  ```
+
+- **2025 context**: Warm‑restart schedulers like cosine annealing with warm restarts use parameters `T_0` (number of epochs until first restart) and `T_mult` to determine cycle lengths. Shorter cycles are suitable for small datasets, while very large values can stall training:contentReference[oaicite:19]{index=19}. Always configure the scheduler to step per epoch or per batch consistently:contentReference[oaicite:20]{index=20}.
+- **References**: Milvus article on implementing cosine annealing with warm restarts:contentReference[oaicite:21]{index=21} and PyTorch scheduler documentation:contentReference[oaicite:22]{index=22}.
+
+### Non‑portable default data path enabled
+
+- **File**: `configs/unified_config.yaml: data.storage_locations[0].path`
+- **Symptom**: The first storage location points to a machine‑specific absolute path and is marked `enabled: true`, causing “No data” errors on other systems.
+- **Fix**: Disable this entry by default or replace it with a placeholder path (e.g., `path: /path/to/your/dataset` and `enabled: false`). Document how to set exactly one `enabled: true` path via environment variables or CLI arguments.
+- **2025 context**: Users often run training in Docker containers or cloud environments. Using relative paths or environment variables improves portability and prevents accidental leaks of local directory names.
+
+### Duplicated path utilities increase confusion
+
+- **Files**: `utils/metadata_ingestion.py:47` and `utils/path_utils.py:26`
+- **Symptom**: Two implementations of `validate_image_path`/`safe_join` exist. Only the one in `utils/path_utils` is used by the data loaders.
+- **Fix**: Remove the duplicate implementations from `metadata_ingestion.py` and import the functions from `utils/path_utils` wherever they are needed. Keep path sanitisation logic in one place to avoid inconsistencies.
+- **2025 context**: Centralised path utilities reduce bugs and make it easier to audit path traversal protections.
+
+### Logging couples to dataset module
+
+- **File**: `utils/logging_setup.py:15`
+- **Symptom**: Imports `dataset_loader.CompressingRotatingFileHandler` solely to get a log handler, thereby pulling in heavy dataset dependencies during logger initialisation.
+- **Fix**: Move `CompressingRotatingFileHandler` into a lightweight module under `utils/` (e.g., `utils/logging_handlers.py`). In `logging_setup.py`, import it from this new module. This decouples logging from the dataset module and prevents side effects when configuring logging.
+- **2025 context**: Avoid side‑effect imports in generic code paths. Keeping logging independent makes it easier to use the utilities in non‑training scripts.
+
+## Orphan/Dead Code
+
+- `_preprocess_simple` in `onnx_infer.py` is unused and has the wrong signature. Delete it or make it call the correct `_preprocess` function with matching arguments.
+- `vocab_utils.py` is only referenced by `train_lightning.py`. If the Lightning path is deferred, remove this file or migrate its functions into the main training utilities.
+- Placeholder classes/functions in `dataset_loader.py` (`AugmentationStats`, `validate_dataset`) are unused. Implement them or remove them from the public API. Keeping unused placeholders confuses new contributors and can trigger import‑sanity failures.
+
+## Preflight/Config Gating (non‑code but critical to avoid runtime failures)
+
+- **Vocabulary**: Provide a real `vocabulary.json` (no `tag_###` placeholders) before starting training or export. You can generate this file with `vocabulary.create_vocabulary_from_datasets(...)` or embed the vocabulary directly in the checkpoint/ONNX metadata using the method shown above. Failing to provide a proper vocabulary will cause immediate errors when loading the model.
+- **Orientation flips**: When `data.random_flip_prob > 0`, ensure that `configs/orientation_map.json` exists and maps each tag to its flipped equivalent. If no map is provided, set `data.strict_orientation_validation=false` to disable orientation checks. Default to conservative safety settings to avoid training on incorrectly flipped labels.
+
+## Notes
+
+- The “validation header glitch” mentioned in the runbook is not present; `validation_loop.py` begins with a proper shebang and docstring.
+
+## Quick References (2025)
+
+- **Pillow paste mask** – `Image.paste` requires a single‑band mask (alpha channel):contentReference[oaicite:23]{index=23}.
+- **Python typing forward refs/`TYPE_CHECKING`** – Use string annotations or `from __future__ import annotations` to avoid evaluation errors:contentReference[oaicite:24]{index=24}.
+- **PyTorch install matrix (2.8)** – Use the official selector to choose the correct wheel and index URL:contentReference[oaicite:25]{index=25}:contentReference[oaicite:26]{index=26}.
+- **ONNX Runtime GPU providers** – Match ONNX Runtime CUDA version (11.x/12.x) with your PyTorch CUDA version to avoid cuDNN mismatches:contentReference[oaicite:27]{index=27}.
+- **Lightning DataModule** – A `LightningDataModule` encapsulates data preparation and dataloaders:contentReference[oaicite:28]{index=28}.
+- **TorchMetrics multi‑label F1** – Use `MultilabelF1Score(num_labels, average="macro", threshold=…)` to compute F1 for multi‑label tasks.
+- **Cosine annealing warm restarts** – Tune `T_0` and `T_mult` values and keep warmup epochs small to prevent a long warm‑up phase:contentReference[oaicite:30]{index=30}:contentReference[oaicite:31]{index=31}.
+
