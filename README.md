@@ -1,126 +1,137 @@
-# OppaiOracle
+# OppaiOracle (MAID)
 
-OppaiOracle, also known as **MAID (Model for AI-based Detection)**, is a PyTorch-based system for training, evaluating, and deploying image-tagging models. It supports configuration-driven experimentation, ONNX export, and a suite of utilities for data handling and evaluation.
+OppaiOracle, also known as MAID, is a PyTorch system to train, evaluate, and deploy image‑tagging models. It supports configuration‑driven experiments, ONNX export, robust vocabulary handling, and orientation‑aware augmentation.
 
 ## Features
 
--   **Training:** Train custom image tagging models using your own datasets.
--   **Inference:** Run inference with trained models on new images.
--   **ONNX Export:** Export trained models to ONNX format for optimized inference.
--   **Configuration System:** A unified configuration system to manage all aspects of the project.
--   **HDF5 Data Loading:** Efficient data loading using HDF5 files.
--   **Evaluation Tools:** Batch evaluation, live monitoring, and visualization scripts.
+- Training: AMP/bfloat16, channels_last, gradient checkpointing, safe checkpointing.
+- Dataset loading: Manifest or per‑image JSON sidecars; letterbox resize; optional LMDB L2 cache.
+- Orientation‑aware aug: Flip with tag swaps via `orientation_map.json` and safety modes.
+- Evaluation: Macro/micro F1 and mAP via TorchMetrics; standalone validation loop.
+- ONNX pipeline: Export with preprocessing wrapper, metadata embed/extract, and integrity checks.
+- Config system: Single unified YAML for training/validation/inference/export.
 
 ## Project Structure
 
-The repository is organized as follows:
-
 ```
 .
-├── configs/              # Configuration files for the model and training process
-├── logs/                 # Logs from training and other processes
-├── scripts/              # Various utility scripts
-├── tools/                # Tools for calibration and other tasks
-├── TEst and review/      # Scripts for testing and visualizing results
-├── utils/                # Utility functions used across the project
-├── Configuration_System.py   # Validates and manages configuration files
-├── model_architecture.py # Defines the neural network architecture
-├── train_direct.py       # Main training script
-├── Inference_Engine.py   # Handles model inference
-├── ONNX_Export.py        # Exports the trained model to ONNX format
-├── onnx_infer.py         # Runs inference with exported ONNX models
-├── dataset_loader.py     # Loads images and JSON annotations
-└── requirements.txt      # Project dependencies
+├── configs/                  # Unified config + orientation map docs
+├── logs/                     # Logs and checkpoints
+├── scripts/                  # Utilities (e.g., deterministic run)
+├── tools/                    # Linting, audits, helpers
+├── TEst and review/          # Evaluation & visualization helpers
+├── utils/                    # Logging, metrics, ingestion, path utils
+├── Configuration_System.py   # Load/validate unified config
+├── train_direct.py           # Training entrypoint (AMP, checkpoints, monitoring)
+├── validation_loop.py        # Standalone validation/eval pipeline
+├── model_architecture.py     # ViT‑based tagger and stability guards
+├── dataset_loader.py         # Sidecar/manifest loaders, LMDB L2 cache, orientation
+├── Inference_Engine.py       # PyTorch inference with embedded vocab support
+├── ONNX_Export.py            # Export with preprocessing + integrity checks
+├── onnx_infer.py             # ONNX inference
+└── requirements.txt          # Dependencies
 ```
 
 ## Installation
 
-1.  Clone the repository:
-    ```bash
-    git clone <repository-url>
-    cd <repository-directory>
-    ```
-
-2.  Install the required dependencies using pip:
-    ```bash
-    # Create a Python 3.12 virtual environment (recommended)
-    python3.12 -m venv .venv
-    source .venv/bin/activate
-
-    # Install required dependencies
-    pip install -r requirements.txt
-    ```
-
-## Configuration
-
-The project uses a unified configuration file, `configs/unified_config.yaml`, to manage all settings for the model, training, inference, and more. Before running any scripts, make sure to review and modify this file to suit your needs.
-
-You can validate your configuration using the `Configuration_System.py` script:
+1) Create a Python 3.12 env and install deps
 ```bash
-python3.12 Configuration_System.py validate configs/unified_config.yaml
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
 ```
 
-## Usage
+Notes:
+- The requirements pin PyTorch (>=2.8) and torchvision. If you need a specific CUDA build, install the matching torch/torchvision first, then `pip install -r requirements.txt`.
+- ONNX GPU runtime is expected (`onnxruntime-gpu`).
 
-### Training
-
-To train the model, run the `train_direct.py` script with the path to your configuration file:
+## Quick Commands
 
 ```bash
-python3.12 train_direct.py --config configs/unified_config.yaml
+# Compile all (sanity)
+git ls-files '*.py' | xargs -I {} python -m py_compile "{}"
+
+# Validate config (after installing deps)
+python Configuration_System.py validate configs/unified_config.yaml
+
+# Import sanity (catches top-level runtime errors)
+python - << 'PY'
+import importlib
+for m in ['train_direct','validation_loop','Inference_Engine','ONNX_Export','dataset_loader']:
+  print('import', m); importlib.import_module(m)
+print('OK')
+PY
+
+# Dataset preflight (optional)
+python Dataset_Analysis.py --help
 ```
 
-### Inference
+## Configuration Basics
 
-You can run inference using either the PyTorch model or the ONNX model.
+- Storage path: Under `data.storage_locations`, set exactly one `enabled: true` pointing to real data (root containing images + per‑image JSONs, or `train.json`/`val.json` manifests and `images/`).
+- Normalization: Set `data.normalize_mean/std`. Validation inherits from the unified config.
+- Vocabulary: Use a real `vocabulary.json` (no `tag_###` placeholders). Export fails fast if placeholders are detected.
+- Orientation flips: If `data.random_flip_prob > 0`, provide `configs/orientation_map.json` or set `data.strict_orientation_validation: false`. Safety modes: conservative | balanced | permissive.
+- LR warmup semantics: `CosineAnnealingWarmupRestarts` is stepped once per EPOCH. Therefore `training.warmup_steps` is in EPOCHS. Recommended: 3–10. The default `10000` keeps LR near min for the whole run — lower it before training.
 
--   **PyTorch Inference:**
-    ```bash
-    python3.12 Inference_Engine.py --config configs/unified_config.yaml --vocab vocabulary.json --image /path/to/your/image.jpg
-    ```
-    The `--vocab` argument defaults to `vocabulary.json` in the project root if not specified.
+Edit config at `configs/unified_config.yaml`.
 
--   **ONNX Inference:**
-    ```bash
-    python3.12 onnx_infer.py --config configs/unified_config.yaml --image /path/to/your/image.jpg
-    ```
+## Training
+
+```bash
+python train_direct.py --config configs/unified_config.yaml
+```
+
+Tips:
+- AMP chooses bfloat16 when supported; model and DataLoader respect `channels_last` when configured.
+- The training script prompts to build a vocabulary if missing. Keep it consistent across train/eval/export.
+- Determinism: Use `scripts/run_train_deterministic.sh` or set `training.deterministic: true` and a seed; expect some perf trade‑offs.
 
 ## Evaluation
 
-The `TEst and review` directory contains scripts for assessing model performance.
-
-1.  **Run batch evaluation** to generate a JSONL file with results:
-    ```bash
-    python3.12 TEst\ and\ review/batch_evaluate.py \
-        --model-path /path/to/your/model.pt \
-        --image-dir /path/to/images \
-        --json-dir /path/to/json_tags \
-        --output /path/to/results.jsonl
-    ```
-
-2.  **Monitor progress** while evaluation runs (optional):
-    ```bash
-    python3.12 TEst\ and\ review/live_viewer.py /path/to/results.jsonl
-    ```
-
-3.  **Visualize final results** to analyze model performance:
-    ```bash
-    python3.12 TEst\ and\ review/visualize_results.py \
-        --results /path/to/results.jsonl \
-        --outdir /path/to/visualization_output
-    ```
-
-## Workflow
-
-The following diagram illustrates the general workflow of the project:
-
-```mermaid
-graph TD
-    A[Data Preparation] --> B(HDF5 Data Loading);
-    B --> C{Training};
-    C -- PyTorch Model --> D[Inference Engine];
-    C -- ONNX Export --> E[ONNX Model];
-    E --> F[ONNX Inference];
-    D --> G((Predictions));
-    F --> G;
+- Standalone validation: `validation_loop.py` reads settings from the unified config.
+- Batch evaluation and visualization:
+```bash
+python "TEst and review/batch_evaluate.py" --help
+python "TEst and review/live_viewer.py" /path/to/results.jsonl
+python "TEst and review/visualize_results.py" --help
 ```
+
+## ONNX Export & Inference
+
+- Export
+```bash
+python ONNX_Export.py --config configs/unified_config.yaml
+```
+- ONNX inference
+```bash
+python onnx_infer.py --config configs/unified_config.yaml --image /path/to/image.jpg
+```
+- PyTorch inference
+```bash
+python Inference_Engine.py --config configs/unified_config.yaml --image /path/to/image.jpg
+```
+
+Notes:
+- Export embeds preprocessing and validates the vocabulary; it also tries to extract training normalization and tag metadata from the checkpoint.
+- For GPU, ensure `onnxruntime-gpu` is installed and matches your CUDA.
+
+## Known Issues & Fixes
+
+- Validation header glitch: If you encounter a stray literal prefix before the shebang in `validation_loop.py`, remove it so the first line is a shebang or docstring. Import‑sanity catches this.
+- LR warmup units: Warmup is epoch‑based. Set `training.warmup_steps` to a small integer (e.g., 3–10).
+- Background validator lifecycle: `dataset_loader.BackgroundValidator` is daemonized. Training does not explicitly stop it; this is benign for normal runs. If embedding the loader elsewhere, call `validator.stop()` during teardown.
+- Validation memory: `validation_loop.py` aggregates predictions/targets to compute metrics. For very large sets, consider chunked/streaming metrics if you extend it.
+
+## Troubleshooting
+
+- No data found: Ensure one `data.storage_locations[*].enabled` is true and the path exists. Sidecar mode scans `*.json` recursively.
+- Orientation warnings: Provide `configs/orientation_map.json` or disable flips. Conservative mode blocks flips on unmapped tags.
+- Vocabulary errors: Placeholder `tag_###` indicates a corrupted/placeholder vocab; regenerate via `vocabulary.py` helpers or allow the training prompt to build it.
+- Import/validation fails due to missing `torch`: Install requirements first (`pip install -r requirements.txt`), or install the appropriate PyTorch wheel for your CUDA.
+
+## Security & Safety
+
+- Checkpoint safety: Code uses `safe_checkpoint.safe_load_checkpoint`. Avoid introducing raw `torch.load` of pickled objects.
+- Logging hygiene: Training/inference use a listener queue and stop listeners on exit.

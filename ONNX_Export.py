@@ -26,6 +26,7 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from safe_checkpoint import safe_load_checkpoint
 
 try:
