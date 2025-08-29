@@ -503,11 +503,21 @@ def create_dataset_config(vocab: TagVocabulary) -> Dict:
         # Add other dataset configuration parameters as needed
     }
 
-def create_vocabulary_from_datasets(dataset_path: Optional[List[Path]] = None):
+def create_vocabulary_from_datasets(
+    dataset_path: Optional[List[Path]] = None,
+    *,
+    min_frequency: int = 4,
+    top_k: int = 100_000,
+):
     """Create vocabulary from datasets (for training).
 
-    This function scans the dataset directories for JSON annotation files,
-    builds a vocabulary, and saves it to the project root ``vocabulary.json``.
+    Scans the dataset directories for JSON annotation files, builds a
+    frequency‑sorted vocabulary, and saves it to ``vocabulary.json``.
+
+    Args:
+        dataset_path: List with a single root directory to scan recursively for ``*.json``
+        min_frequency: Minimum tag frequency to include in the vocabulary
+        top_k: Maximum number of tags to keep (most frequent first)
     """
     from pathlib import Path
 
@@ -516,8 +526,8 @@ def create_vocabulary_from_datasets(dataset_path: Optional[List[Path]] = None):
     for file in data_dir.rglob('*.json'):
         json_files.append(str(file))
 
-    vocab = TagVocabulary(min_frequency=5)
-    vocab.build_from_annotations([Path(f) for f in json_files], top_k=5000)
+    vocab = TagVocabulary(min_frequency=min_frequency)
+    vocab.build_from_annotations([Path(f) for f in json_files], top_k=top_k)
 
     vocab.save_vocabulary(VOCAB_PATH)
 
