@@ -191,6 +191,8 @@ class DatasetLoader(Dataset):
                             "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
                             "image_id": image_id,
                             "cached": True,
+                            "error": False,
+                            "error_reason": "",
                         }
                     except Exception as e:
                         # Treat as cache miss; skip bad/tampered records safely
@@ -287,6 +289,9 @@ class DatasetLoader(Dataset):
                 "tag_labels": tag_vec,
                 "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
                 "image_id": image_id,
+                "cached": False,
+                "error": False,
+                "error_reason": "",
             }
 
             # Enqueue write but never block __getitem__
@@ -599,6 +604,9 @@ class SidecarJsonDataset(Dataset):
                             "tag_labels": tag_vec,
                             "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
                             "image_id": image_id,
+                            "cached": True,
+                            "error": False,
+                            "error_reason": "",
                         }
 
             # Cache miss: load from disk (resolve under the JSON's shard folder)
@@ -681,6 +689,9 @@ class SidecarJsonDataset(Dataset):
                 "tag_labels": tag_vec,
                 "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
                 "image_id": image_id,
+                "cached": False,
+                "error": False,
+                "error_reason": "",
             }
 
         except Exception as e:
