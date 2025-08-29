@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps, ImageFile
 import onnxruntime as ort
 import yaml
 from Configuration_System import ConfigManager, ConfigType
@@ -93,6 +93,8 @@ def _preprocess(image_path: str) -> tuple[np.ndarray, bool]:
     """
     was_composited = False
     with Image.open(image_path) as img:
+        img.load()
+        img = ImageOps.exif_transpose(img)
         # Check for transparency and composite if necessary
         if img.mode in ('RGBA', 'LA') or 'transparency' in img.info:
             was_composited = True
@@ -245,5 +247,9 @@ def main():
             listener.stop()
 
 
+# Optionally allow truncated images to load (opt-in)
+import os as _os
+if bool(int(_os.environ.get("OO_ALLOW_TRUNCATED", "0"))):
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
 if __name__ == '__main__':
     main()

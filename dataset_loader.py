@@ -13,7 +13,7 @@ import hashlib
 
 import torch
 from torch.utils.data import Dataset, get_worker_info, DataLoader as _TorchDataLoader
-from PIL import Image
+from PIL import Image, ImageOps, ImageFile
 from torchvision import transforms
 # Torchvision v2 joint transforms (optional)
 try:
@@ -33,6 +33,17 @@ from utils.path_utils import sanitize_identifier, validate_image_path, resolve_a
 from utils.metadata_ingestion import parse_tags_field
 
 from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
+
+# Pillow resampling compatibility and truncated image handling
+try:  # Pillow ≥10
+    RESAMPLE_BILINEAR = Image.Resampling.BILINEAR  # type: ignore[attr-defined]
+except AttributeError:  # Pillow <10
+    RESAMPLE_BILINEAR = Image.BILINEAR
+
+# Optionally allow loading truncated/corrupt files (opt-in via env)
+ALLOW_TRUNCATED = bool(int(os.environ.get("OO_ALLOW_TRUNCATED", "0")))
+if ALLOW_TRUNCATED:
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 # Guarded DataLoader wrapper:
@@ -202,17 +213,19 @@ class DatasetLoader(Dataset):
 
             # --- Cache miss: load + transform (confined path) ---
             img_path = validate_image_path(Path(self.image_dir), image_id)
-            # Copy inside the context so fp isn't needed after the 'with' exits.
+            # Fully decode while file is open; fix EXIF rotations.
             with Image.open(img_path) as pil_img:
-                img = pil_img.copy()
+                pil_img.load()
+                pil_img = ImageOps.exif_transpose(pil_img)
 
-            # 1) Load & composite transparency onto gray
-            if img.mode in ("RGBA", "LA") or ("transparency" in img.info):
-                bg = Image.new("RGBA", img.size, (*self.pad_color, 255))
-                bg.paste(img, mask=img.split()[-1])
-                img = bg.convert("RGB")
-            else:
-                img = img.convert("RGB")
+                if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
+                    rgba = pil_img.convert("RGBA")
+                    bg = Image.new("RGB", rgba.size, tuple(self.pad_color))
+                    alpha = rgba.getchannel("A")
+                    bg.paste(rgba, mask=alpha)
+                    img = bg
+                else:
+                    img = pil_img.convert("RGB")
 
             # 2) Keep aspect ratio via letterbox to square + build padding mask (True = PAD)
             target = int(self.image_size)
@@ -221,7 +234,7 @@ class DatasetLoader(Dataset):
             nw, nh = int(round(w * scale)), int(round(h * scale))
             # (Optional) modern Pillow name to avoid deprecation noise:
             # from PIL import Image; resample = Image.Resampling.BILINEAR
-            resized = img.resize((max(1, nw), max(1, nh)), Image.BILINEAR)
+            resized = img.resize((max(1, nw), max(1, nh)), RESAMPLE_BILINEAR)
 
             canvas = Image.new("RGB", (target, target), tuple(self.pad_color))
             left = (target - resized.size[0]) // 2
@@ -245,13 +258,9 @@ class DatasetLoader(Dataset):
                 # Fallback: color-only transforms ok; any geometry here would desync pmask
                 if self.transform:
                     try:
-                        tmp = self.transform(canvas)
-                        if isinstance(tmp, torch.Tensor):
-                            t = tmp
-                        else:
-                            canvas = tmp
-                            t = transforms.ToTensor()(canvas)
-                            t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
+                        transformed = self.transform(canvas)
+                        t = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
+                        t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
                     except Exception:
                         t = transforms.ToTensor()(canvas)
                         t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
@@ -616,22 +625,24 @@ class SidecarJsonDataset(Dataset):
             # Cache miss: load from disk (resolve under the JSON's shard folder)
             img_root = ann.get("dir", self.root)
             img_path = validate_image_path(Path(img_root), image_id)
-            # Detach from the file before leaving the context
+            # Fully decode and correct EXIF while file is open
             with Image.open(img_path) as pil_img:
-                pil = pil_img.copy()
-            # 1) Alpha composite onto gray
-            if pil.mode in ("RGBA", "LA") or ("transparency" in pil.info):
-                bg = Image.new("RGBA", pil.size, (*self.pad_color, 255))
-                bg.paste(pil, mask=pil.split()[-1])
-                pil = bg.convert("RGB")
-            else:
-                pil = pil.convert("RGB")
+                pil_img.load()
+                pil_img = ImageOps.exif_transpose(pil_img)
+                if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
+                    rgba = pil_img.convert("RGBA")
+                    bg = Image.new("RGB", rgba.size, tuple(self.pad_color))
+                    alpha = rgba.getchannel("A")
+                    bg.paste(rgba, mask=alpha)
+                    pil = bg
+                else:
+                    pil = pil_img.convert("RGB")
             # 2) Letterbox to square and padding mask
             target = int(self.image_size)
             w, h = pil.size
             scale = min(target / float(w), target / float(h)) if (w > 0 and h > 0) else 1.0
             nw, nh = int(round(w * scale)), int(round(h * scale))
-            resized = pil.resize((max(1, nw), max(1, nh)), Image.BILINEAR)
+            resized = pil.resize((max(1, nw), max(1, nh)), RESAMPLE_BILINEAR)
             canvas = Image.new("RGB", (target, target), tuple(self.pad_color))
             left = (target - resized.size[0]) // 2
             top = (target - resized.size[1]) // 2
@@ -662,13 +673,9 @@ class SidecarJsonDataset(Dataset):
                 # Fallback: color-only transforms permitted
                 if self.transform:
                     try:
-                        tmp = self.transform(canvas)
-                        if isinstance(tmp, torch.Tensor):
-                            img = tmp
-                        else:
-                            canvas = tmp
-                            img = transforms.ToTensor()(canvas)
-                            img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
+                        transformed = self.transform(canvas)
+                        img = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
+                        img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
                     except Exception:
                         img = transforms.ToTensor()(canvas)
                         img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)

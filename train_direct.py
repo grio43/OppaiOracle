@@ -684,6 +684,16 @@ def train_with_orientation_tracking(config: FullConfig):
                 running_loss += loss.item()
                 global_step += 1
 
+                # Log every N steps (throttled) and ensure first-step write
+                if global_step == 1 or (global_step % config.training.logging_steps == 0):
+                    monitor.log_step(
+                        global_step,
+                        loss.item(),
+                        losses,
+                        optimizer.param_groups[0]['lr'],
+                        images.size(0),
+                    )
+
             if stats_queue:
                 while not stats_queue.empty():
                     try:
@@ -695,8 +705,7 @@ def train_with_orientation_tracking(config: FullConfig):
                     except Exception as e:
                         logger.warning(f"Error processing stats queue: {e}")
 
-            if global_step % config.training.logging_steps == 0:
-                monitor.log_step(global_step, loss.item(), losses, optimizer.param_groups[0]['lr'], images.size(0))
+            # Logging moved into inner loop (above) to avoid missing epoch-boundary steps.
 
         avg_train_loss = running_loss / len(train_loader)
         
