@@ -325,6 +325,7 @@ class DatasetLoader(Dataset):
             "tag_labels": torch.zeros(self.num_classes or 1, dtype=torch.float32),
             "rating_labels": torch.tensor(4, dtype=torch.long),  # unknown
             "image_id": f"error_{idx}",
+            "cached": False,
             "error": True,
             "error_reason": reason,
         }
@@ -713,6 +714,7 @@ class SidecarJsonDataset(Dataset):
             "tag_labels": torch.zeros(len(self.vocab.tag_to_index), dtype=torch.float32),
             "rating_labels": torch.tensor(4, dtype=torch.long),
             "image_id": f"error_{idx}",
+            "cached": False,
             "error": True,
             "error_reason": reason,
         }
