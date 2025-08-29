@@ -98,8 +98,12 @@ def _preprocess(image_path: str) -> tuple[np.ndarray, bool]:
             was_composited = True
             # Create a grey background to match training
             background = Image.new('RGB', img.size, (114, 114, 114))
-            # Paste the image using its alpha channel as a mask
-            background.paste(img, mask=img)
+            # Ensure we have explicit alpha and RGB color data, even for 'LA' or 'P' images
+            img_rgba = img.convert('RGBA')           # normalizes 'LA'/'P' w/ transparency to RGBA
+            alpha = img_rgba.getchannel('A')         # single-band (L) mask
+            rgb   = img_rgba.convert('RGB')
+            # Paste with a single-channel mask for correct transparency handling
+            background.paste(rgb, mask=alpha)
             img = background
         else:
             img = img.convert('RGB')
