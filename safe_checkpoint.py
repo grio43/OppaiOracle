@@ -40,7 +40,12 @@ def safe_load_checkpoint(path: Union[str, Path]) -> Tuple[Dict[str, torch.Tensor
     if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
         state_dict = checkpoint["state_dict"]
         meta = {k: v for k, v in checkpoint.items() if k != "state_dict"}
+    elif "model_state_dict" in checkpoint and isinstance(checkpoint["model_state_dict"], dict):
+        # Backward-compat: accept older key
+        state_dict = checkpoint["model_state_dict"]
+        meta = {k: v for k, v in checkpoint.items() if k != "model_state_dict"}
     else:
+        # Fallback: assume entire mapping is a state_dict
         state_dict = checkpoint
         meta = {}
 
