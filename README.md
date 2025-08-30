@@ -124,6 +124,18 @@ Notes:
 - Background validator lifecycle: `dataset_loader.BackgroundValidator` is daemonized. The trainer now attempts to stop any loader `validator` on exit. If embedding the loader elsewhere, call `validator.stop()` during teardown.
 - Validation memory: `validation_loop.py` aggregates predictions/targets to compute metrics. For very large sets, consider chunked/streaming metrics if you extend it.
 
+  - L2 cache invalidation and padding masks: The optional LMDB L2 cache now stores both
+    the normalized image tensor and a compact explicit padding mask (`uint8 H×W`).
+    Previous versions reconstructed the mask by comparing pixel values against the
+    normalized pad colour, which could be brittle when the pad colour, image-size or
+    normalization statistics change. Storing the mask avoids these heuristics. However,
+    the cache remains coupled to the preprocessing configuration (image size, `pad_color`,
+    normalization mean/std and flip policy) because these parameters are encoded into
+    the L2 cache key. If you change any of these settings, you must clear or change
+    the L2 cache path to avoid stale data. See [Caching Strategies] for more on cache
+    invalidation and [MONAI CacheDataset] for why deterministic
+    preprocessing results should be cached.
+
 ## Troubleshooting
 
 - No data found: Ensure one `data.storage_locations[*].enabled` is true and the path exists. Sidecar mode scans `*.json` recursively.
