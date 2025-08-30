@@ -38,6 +38,7 @@ from utils.path_utils import sanitize_identifier, validate_image_path, resolve_a
 from utils.metadata_ingestion import parse_tags_field
 
 from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
+from l1_cache import build_l1_cache, encode_l1_image_01, decode_l1_image_01
 
 # Pillow resampling compatibility and truncated image handling
 try:  # Pillow ≥10
@@ -87,6 +88,11 @@ class DatasetLoader(Dataset):
         l2_map_size_bytes: int = 0,
         l2_max_readers: int = 4096,
         l2_writer_queue: Optional[mp.Queue] = None,
+        # --- L1 (in-memory) cache ---
+        use_memory_cache: bool = True,
+        l1_per_worker_mb: int = 256,
+        canonical_cache_dtype: str = "uint8",
+        preload_files: int = 0,
         # Background validator control
         enable_background_validator: Optional[bool] = None,
     ):
@@ -128,6 +134,13 @@ class DatasetLoader(Dataset):
         self._l2_reader: Optional[LMDBReader] = None
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
 
+        # --- L1 cache (per-worker; created lazily in worker) ---
+        self._use_l1 = bool(use_memory_cache)
+        self._l1_mb = int(l1_per_worker_mb or 0)
+        self._l1_dtype_str = str(canonical_cache_dtype or "uint8").lower()
+        self._l1 = None  # created lazily per worker
+        self._preload_n = int(preload_files or 0)
+
     def _ensure_l2_reader(self):
         """Create the L2 LMDB reader if (and only if) the path is set and size is positive."""
         if not getattr(self, "_l2_enabled", False):
@@ -142,6 +155,25 @@ class DatasetLoader(Dataset):
         # Open env lazily **inside** the worker process to avoid fork-related handle reuse
         if self._l2_reader is None:
             self._l2_reader = LMDBReader(self._l2_path, self._l2_map_size, max_readers=self._l2_max_readers)
+
+    # ---------- L1 ----------
+    def _ensure_l1(self):
+        if not self._use_l1 or self._l1 is not None or self._l1_mb <= 0:
+            return
+        self._l1 = build_l1_cache(self._l1_mb, self._l1_dtype_str)
+
+    def _l1_keys(self, image_key: bytes, *, flipped: bool) -> tuple[bytes, bytes]:
+        sz = str(int(self.image_size)).encode("utf-8")
+        flip = b"1" if flipped else b"0"
+        base = image_key + b"|sz" + sz + b"|flip" + flip
+        return base + b"|raw", base + b"|m"
+
+    def preload_first_n(self, n: int):
+        n = int(max(0, n))
+        if n == 0 or len(self) == 0:
+            return
+        for i in range(min(n, len(self))):
+            _ = self[i]
 
     def _load_annotations(self, path):
         with open(path, "r") as f:
@@ -163,6 +195,58 @@ class DatasetLoader(Dataset):
             # Enforce allowlist and strip any sneaky path components
             image_id = sanitize_identifier(str(annotation['image_id']))
             image_key = image_id.encode('utf-8')
+
+            flipped = False  # this Dataset has no flip logic
+
+            # --- L1 READ PATH (precedes L2) ---
+            if self._use_l1 and self._l1_mb > 0:
+                self._ensure_l1()
+                if self._l1 is not None:
+                    raw_key, mask_key = self._l1_keys(image_key, flipped=flipped)
+                    raw_stored = self._l1.get(raw_key)
+                    if raw_stored is not None:
+                        if transforms is None:
+                            raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
+                        img_01 = decode_l1_image_01(raw_stored)
+                        t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
+                        m = self._l1.get(mask_key)
+                        pmask = m.to(torch.bool) if (m is not None) else (img_01[0] != img_01[0])
+
+                        # labels (same as L2 path)
+                        tag_indices = annotation.get("labels") or []
+                        if (
+                            isinstance(tag_indices, list) and len(tag_indices) > 0 and isinstance(tag_indices[0], (int, float))
+                            and self.num_classes
+                        ):
+                            tag_vec = torch.zeros(self.num_classes, dtype=torch.float32)
+                            tag_vec.scatter_(
+                                0,
+                                torch.tensor(
+                                    [int(i) for i in tag_indices if 0 <= int(i) < self.num_classes], dtype=torch.long
+                                ),
+                                1.0,
+                            )
+                        else:
+                            tag_vec = torch.zeros(self.num_classes or 1, dtype=torch.float32)
+
+                        rating = annotation.get("rating", "unknown")
+                        rating_idx = 4
+                        if isinstance(rating, int):
+                            rating_idx = int(rating)
+                        elif isinstance(rating, str):
+                            r = rating.strip().lower()
+                            rating_idx = {"g":0,"general":0,"safe":0,"sensitive":1,"q":2,"questionable":2,"e":3,"explicit":3,"u":4,"unknown":4}.get(r, 4)
+
+                        return {
+                            "images": t,
+                            "padding_mask": pmask.to(torch.bool),
+                            "tag_labels": tag_vec,
+                            "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
+                            "image_id": image_id,
+                            "cached": True,
+                            "error": False,
+                            "error_reason": "",
+                        }
 
             # --- L2 READ PATH ---
             if self._l2_enabled:
@@ -273,9 +357,11 @@ class DatasetLoader(Dataset):
                 mask_tv = tv_tensors.Mask(pmask.to(torch.uint8))  # 1=PAD, 0=valid
                 # v2 ops automatically use NEAREST for Mask; geometry stays in sync
                 img_tv, mask_tv = self.joint_transforms(img_tv, mask_tv)
-                # To tensor + normalize (use v2 ToTensor for tv_tensors input)
-                t = T.ToTensor()(img_tv)
-                t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
+                # Pre-norm 0..1 tensor for L1; then normalize for model
+                img_01 = T.ToTensor()(img_tv)  # 0..1 float
+                if transforms is None:
+                    raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
+                t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
                 pmask = mask_tv.to(torch.bool)
             else:
                 # Fallback: color-only transforms ok; any geometry here would desync pmask
@@ -284,18 +370,21 @@ class DatasetLoader(Dataset):
                         transformed = self.transform(canvas)
                         if transforms is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                        t = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
-                        t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
+                        # Ensure we can derive 0..1 image for L1 regardless of transform type
+                        img_01 = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
+                        if isinstance(img_01, torch.Tensor) and img_01.dtype != torch.float32:
+                            img_01 = img_01.to(torch.float32)
+                        t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
                     except Exception:
                         if transforms is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                        t = transforms.ToTensor()(canvas)
-                        t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
+                        img_01 = transforms.ToTensor()(canvas)
+                        t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
                 else:
                     if transforms is None:
                         raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                    t = transforms.ToTensor()(canvas)
-                    t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
+                    img_01 = transforms.ToTensor()(canvas)
+                    t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
 
             # Reset retry count on success
             self.retry_counts[idx] = 0
@@ -342,6 +431,16 @@ class DatasetLoader(Dataset):
                 except queue.Full:
                     # Drop silently; training must not stall on cache IO
                     pass
+            # L1: write pre-norm image (and mask) in canonical dtype; never block
+            if self._use_l1 and self._l1_mb > 0:
+                self._ensure_l1()
+                if self._l1 is not None:
+                    try:
+                        raw_key, mask_key = self._l1_keys(image_key, flipped=False)
+                        self._l1.put(raw_key, encode_l1_image_01(img_01, dtype_str=self._l1_dtype_str))
+                        self._l1.put(mask_key, pmask.to(torch.uint8))
+                    except Exception:
+                        pass
             return sample
 
         except Exception as e:
