@@ -118,6 +118,25 @@ class DatasetLoader(Dataset):
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
 
+        # --- Compute a short hash of preprocessing parameters for L2 cache versioning ---
+        # Include image size, pad colour and normalization statistics so changes
+        # to these values invalidate the L2 cache via different keys.
+        try:
+            cfg_str = f"{self.image_size}|{self.pad_color}|{self.normalize_mean}|{self.normalize_std}"
+            self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
+        except Exception:
+            self._l2_cfg_hash = "00000000"
+
+        # --- Compute a short hash of preprocessing parameters for L2 cache versioning ---
+        # Include image size, pad colour and normalization statistics so changes
+        # to these values invalidate the L2 cache via different keys.
+        try:
+            cfg_str = f"{self.image_size}|{self.pad_color}|{self.normalize_mean}|{self.normalize_std}"
+            self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
+        except Exception:
+            # Fall back to a constant to avoid crashing during initialization
+            self._l2_cfg_hash = "00000000"
+
         # Properly initialise background validator (opt-out via env or param)
         if enable_background_validator is None:
             enable_background_validator = os.getenv("DATASET_BACKGROUND_VALIDATOR", "1") != "0"
@@ -162,6 +181,16 @@ class DatasetLoader(Dataset):
             return
         self._l1 = build_l1_cache(self._l1_mb, self._l1_dtype_str)
 
+    # Helpers for L2 keys: incorporate preprocessing config and flip status
+    def _l2_key(self, image_id: str, *, flipped: bool) -> bytes:
+        """
+        Build a unique key for the L2 cache that includes the image_id, a hash of
+        the preprocessing configuration, and a flip bit.  The flip bit is always
+        false for DatasetLoader since this dataset does not support flipping.
+        """
+        flip = "1" if flipped else "0"
+        return f"{image_id}|cfg{self._l2_cfg_hash}|flip{flip}".encode("utf-8")
+
     def _l1_keys(self, image_key: bytes, *, flipped: bool) -> tuple[bytes, bytes]:
         sz = str(int(self.image_size)).encode("utf-8")
         flip = b"1" if flipped else b"0"
@@ -193,16 +222,18 @@ class DatasetLoader(Dataset):
         try:
             annotation = self.annotations[idx]
             # Enforce allowlist and strip any sneaky path components
-            image_id = sanitize_identifier(str(annotation['image_id']))
-            image_key = image_id.encode('utf-8')
+            raw_image_id = sanitize_identifier(str(annotation['image_id']))
+            # L1 keys are based on the raw image id; L2 keys include config + flip bit
+            image_key_base = raw_image_id.encode("utf-8")
 
             flipped = False  # this Dataset has no flip logic
+            l2_key = self._l2_key(raw_image_id, flipped=flipped)
 
             # --- L1 READ PATH (precedes L2) ---
             if self._use_l1 and self._l1_mb > 0:
                 self._ensure_l1()
                 if self._l1 is not None:
-                    raw_key, mask_key = self._l1_keys(image_key, flipped=flipped)
+                    raw_key, mask_key = self._l1_keys(image_key_base, flipped=flipped)
                     raw_stored = self._l1.get(raw_key)
                     if raw_stored is not None:
                         if transforms is None:
@@ -210,7 +241,24 @@ class DatasetLoader(Dataset):
                         img_01 = decode_l1_image_01(raw_stored)
                         t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
                         m = self._l1.get(mask_key)
-                        pmask = m.to(torch.bool) if (m is not None) else (img_01[0] != img_01[0])
+                        if m is not None:
+                            pmask = m.to(torch.bool)
+                        else:
+                            # Legacy entries may lack a stored mask. Reconstruct by comparing
+                            # the pre-normalised 0–1 image to the pad colour. Without this
+                            # fallback the model would incorrectly treat all tokens as valid.
+                            pad_vec = torch.tensor(
+                                [c / 255.0 for c in self.pad_color],
+                                dtype=img_01.dtype,
+                                device=img_01.device,
+                            ).view(3, 1, 1)
+                            with torch.no_grad():
+                                pmask = torch.isclose(
+                                    img_01,
+                                    pad_vec,
+                                    atol=PAD_MASK_ATOL,
+                                    rtol=0.0,
+                                ).all(dim=0)
 
                         # labels (same as L2 path)
                         tag_indices = annotation.get("labels") or []
@@ -242,7 +290,7 @@ class DatasetLoader(Dataset):
                             "padding_mask": pmask.to(torch.bool),
                             "tag_labels": tag_vec,
                             "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
-                            "image_id": image_id,
+                            "image_id": raw_image_id,
                             "cached": True,
                             "error": False,
                             "error_reason": "",
@@ -251,22 +299,31 @@ class DatasetLoader(Dataset):
             # --- L2 READ PATH ---
             if self._l2_enabled:
                 self._ensure_l2_reader()
-                payload = self._l2_reader.get(image_key) if self._l2_reader else None
+                payload = self._l2_reader.get(l2_key) if self._l2_reader else None
                 if payload is not None:
                     try:
                         t = _tensor_from_bytes(payload)
-
-                        # Attempt to reconstruct padding mask by detecting normalized pad color
-                        pad_vec = torch.tensor([c / 255.0 for c in self.pad_color], dtype=t.dtype, device=t.device)
+                        # Fail fast if cached tensor shape does not match current configuration
+                        if t.dim() != 3 or t.shape[-2] != int(self.image_size) or t.shape[-1] != int(self.image_size):
+                            raise ValueError(
+                                f"L2 cached tensor shape {t.shape} does not match expected {(3, self.image_size, self.image_size)}"
+                            )
+                        # Attempt to reconstruct padding mask by detecting normalized pad colour
+                        pad_vec = torch.tensor(
+                            [c / 255.0 for c in self.pad_color],
+                            dtype=t.dtype,
+                            device=t.device,
+                        )
                         mean = torch.tensor(self.normalize_mean, dtype=t.dtype, device=t.device)
                         std = torch.tensor(self.normalize_std, dtype=t.dtype, device=t.device)
                         pad_norm = ((pad_vec - mean) / std).view(3, 1, 1)
                         with torch.no_grad():
-                            # Increase tolerance for float comparisons when reconstructing
-                            # the padding mask. A strict tolerance (1e-6) can lead to false
-                            # negatives under mixed-precision (e.g. bfloat16) or when
-                            # normalization introduces minor rounding differences.
-                            pmask = torch.isclose(t, pad_norm, atol=PAD_MASK_ATOL, rtol=0.0).all(dim=0)
+                            pmask = torch.isclose(
+                                t,
+                                pad_norm,
+                                atol=PAD_MASK_ATOL,
+                                rtol=0.0,
+                            ).all(dim=0)
 
                         # Prepare labels for training loop compatibility
                         tag_indices = annotation.get("labels") or []
@@ -305,7 +362,7 @@ class DatasetLoader(Dataset):
                             "padding_mask": pmask.to(torch.bool),
                             "tag_labels": tag_vec,
                             "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
-                            "image_id": image_id,
+                            "image_id": raw_image_id,
                             "cached": True,
                             "error": False,
                             "error_reason": "",
@@ -418,7 +475,7 @@ class DatasetLoader(Dataset):
                 "padding_mask": pmask,
                 "tag_labels": tag_vec,
                 "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
-                "image_id": image_id,
+                "image_id": raw_image_id,
                 "cached": False,
                 "error": False,
                 "error_reason": "",
@@ -427,7 +484,8 @@ class DatasetLoader(Dataset):
             # Enqueue write but never block __getitem__
             if self._l2_enabled and self._l2_writer_q is not None:
                 try:
-                    self._l2_writer_q.put_nowait((image_key, _tensor_to_bytes(sample["images"])))
+                    # Write using the L2 key that includes config version and flip bit
+                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(sample["images"])))
                 except queue.Full:
                     # Drop silently; training must not stall on cache IO
                     pass
@@ -710,42 +768,57 @@ class SidecarJsonDataset(Dataset):
         try:
             ann = self.items[idx]
             image_id = ann["image_id"]
-            image_key = image_id.encode("utf-8")
-            tags_now: List[str] = list(ann["tags"])
-            mode = self._decide_flip_mode(image_id, tags_now)
+            # Work on a copy of the tag list so we can safely modify it
+            original_tags: List[str] = list(ann["tags"])
+            tags_now: List[str] = original_tags
+            # Decide whether to flip and adjust tags accordingly
+            mode = self._decide_flip_mode(image_id, original_tags)
+            flip_bit = False
+            if mode != "none" and self.orientation_handler is not None:
+                if mode == "force":
+                    tags_now = [self.orientation_handler.swap_tag(t) for t in original_tags]
+                    flip_bit = True
+                else:
+                    tags_now, flipped = self.orientation_handler.swap_tags(original_tags)
+                    flip_bit = bool(flipped)
+            # Build the L2 key using the config hash and flip bit
+            l2_key = self._l2_key(image_id, flipped=flip_bit)
 
-            # Try L2 cache
+            # Try L2 cache first
             if self._l2_enabled:
                 self._ensure_l2_reader()
-                payload = self._l2_reader.get(image_key) if self._l2_reader else None
+                payload = self._l2_reader.get(l2_key) if self._l2_reader else None
                 if payload is not None:
                     try:
                         img_t = _tensor_from_bytes(payload)
+                        # Verify cached shape matches expected resolution
+                        if img_t.dim() != 3 or img_t.shape[-2] != int(self.image_size) or img_t.shape[-1] != int(self.image_size):
+                            raise ValueError(
+                                f"L2 cached tensor shape {img_t.shape} does not match expected {(3, self.image_size, self.image_size)}"
+                            )
                     except Exception as e:
                         self.logger.warning(f"L2 cache decode failed for {image_id}: {e}")
                         img_t = None
                     if img_t is not None:
-                        flipped = False
-                        if mode != "none":
-                            if self.orientation_handler is not None:
-                                if mode == "force":
-                                    tags_now = [self.orientation_handler.swap_tag(t) for t in tags_now]
-                                    flipped = True
-                                else:
-                                    tags_now, flipped = self.orientation_handler.swap_tags(tags_now)
-                            if flipped:
-                                img_t = torch.flip(img_t, dims=[2])  # CHW, flip width
-                        rating_idx = _map_rating(ann.get("rating", "unknown"))
-                        # Reconstruct padding mask by detecting normalized pad color
-                        pad_vec = torch.tensor([c / 255.0 for c in self.pad_color], dtype=img_t.dtype, device=img_t.device)
+                        # Reconstruct padding mask by detecting normalized pad colour
+                        pad_vec = torch.tensor(
+                            [c / 255.0 for c in self.pad_color],
+                            dtype=img_t.dtype,
+                            device=img_t.device,
+                        )
                         mean = torch.tensor(self.normalize_mean, dtype=img_t.dtype, device=img_t.device)
                         std = torch.tensor(self.normalize_std, dtype=img_t.dtype, device=img_t.device)
                         pad_norm = ((pad_vec - mean) / std).view(3, 1, 1)
                         with torch.no_grad():
-                            pmask = torch.isclose(img_t, pad_norm, atol=PAD_MASK_ATOL, rtol=0.0).all(dim=0)
-                        if flipped:
-                            pmask = torch.flip(pmask, dims=[1])
+                            pmask = torch.isclose(
+                                img_t,
+                                pad_norm,
+                                atol=PAD_MASK_ATOL,
+                                rtol=0.0,
+                            ).all(dim=0)
+                        # Use tags that already reflect the flip decision
                         tag_vec = self.vocab.encode_tags(tags_now)
+                        rating_idx = _map_rating(ann.get("rating", "unknown"))
                         return {
                             "images": img_t,
                             "padding_mask": pmask.to(torch.bool),
@@ -786,18 +859,10 @@ class SidecarJsonDataset(Dataset):
             canvas.paste(resized, (left, top))
             pmask = torch.ones(target, target, dtype=torch.bool)
             pmask[top:top + resized.size[1], left:left + resized.size[0]] = False
-            # Apply horizontal flip (and swap tags) before tensor/normalize
-            flipped = False
-            if mode != "none" and self.orientation_handler is not None:
-                if mode == "force":
-                    tags_now = [self.orientation_handler.swap_tag(t) for t in tags_now]
-                    flipped = True
-                else:
-                    tags_now, flipped = self.orientation_handler.swap_tags(tags_now)
-                if flipped:
-                    # Use the module-level ImageOps imported at the top of the file
-                    canvas = ImageOps.mirror(canvas)
-                    pmask = torch.flip(pmask, dims=[1])
+            # Apply horizontal flip based on the pre-decided flip_bit
+            if flip_bit:
+                canvas = ImageOps.mirror(canvas)
+                pmask = torch.flip(pmask, dims=[1])
             # Joint v2 transforms keep geometry aligned with mask when used
             if self.joint_transforms is not None and T is not None and tv_tensors is not None:
                 img_tv = tv_tensors.Image(canvas)
@@ -828,14 +893,14 @@ class SidecarJsonDataset(Dataset):
                     img = transforms.ToTensor()(canvas)
                     img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
 
-            # Encode labels (post-flip)
+            # Encode labels (tags already account for flipping)
             tag_vec = self.vocab.encode_tags(tags_now)  # (V,)
             rating_idx = _map_rating(ann.get("rating", "unknown"))
 
             # Enqueue write (non-blocking)
             if self._l2_enabled and self._l2_writer_q is not None:
                 try:
-                    self._l2_writer_q.put_nowait((image_key, _tensor_to_bytes(img)))
+                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(img)))
                 except queue.Full:
                     pass
 
