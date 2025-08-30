@@ -54,7 +54,7 @@ OppaiOracle (MAID) is a PyTorch system to train, evaluate, and deploy image‑ta
 ## Known Issues & Fixes
 
 - Validation header glitch: `validation_loop.py` begins with a stray literal prefix before the shebang when viewed in some repos. Import‑sanity catches this. If present, remove any leading non‑comment text so the first line is a shebang or a docstring.
-- LR warmup units: As noted, warmup is epoch‑based. Adjust `training.warmup_steps` to avoid stalled learning.
+- LR warmup units: Warmup is step‑based (optimizer updates). Set `training.warmup_steps` to match your desired warmup duration (e.g., ~3–10 epochs worth of updates).
 - Background validator lifecycle: `dataset_loader.BackgroundValidator` is daemonized but not explicitly stopped by training. This is benign for normal runs; if you embed loaders elsewhere, call `validator.stop()` during teardown.
   - The trainer now attempts to stop any loader `validator` on exit.
   - Memory in validation: `validation_loop.py` aggregates all predictions/targets to compute metrics. For very large sets consider chunking or streaming metrics if you extend it.

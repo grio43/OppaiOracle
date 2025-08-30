@@ -120,7 +120,7 @@ Notes:
 ## Known Issues & Fixes
 
 - Validation header glitch: If you encounter a stray literal prefix before the shebang in `validation_loop.py`, remove it so the first line is a shebang or docstring. Import‑sanity catches this.
-- LR warmup units: Warmup is epoch‑based. Set `training.warmup_steps` to a small integer (e.g., 3–10).
+- LR warmup units: Warmup is step‑based (optimizer updates). Choose `training.warmup_steps` accordingly (e.g., ~3–10 epochs worth of updates: `ceil(len(train_loader)/gradient_accumulation_steps) × desired_epochs`).
 - Background validator lifecycle: `dataset_loader.BackgroundValidator` is daemonized. The trainer now attempts to stop any loader `validator` on exit. If embedding the loader elsewhere, call `validator.stop()` during teardown.
 - Validation memory: `validation_loop.py` aggregates predictions/targets to compute metrics. For very large sets, consider chunked/streaming metrics if you extend it.
 
