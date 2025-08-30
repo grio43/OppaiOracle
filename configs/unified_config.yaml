@@ -151,7 +151,7 @@ training:
 
     # Scheduler
     scheduler: "cosine_restarts"
-    warmup_steps: 10000  # number of OPTIMIZER STEPS to warm up (step-based)
+    warmup_steps: 3000  # number of OPTIMIZER STEPS to warm up (step-based)
     warmup_ratio: 0.0
     num_cycles: 1.0
     lr_end: 1.0e-6
