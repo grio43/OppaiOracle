@@ -515,7 +515,19 @@ class ResultProcessor:
             if self._th_by_idx:
                 above = [i for i in range(pred.numel()) if pred[i].item() > self._th_by_idx.get(i, self.config.threshold)]
             else:
-                above = (pred > self.config.threshold).nonzero(as_tuple=False).squeeze(-1).tolist()
+                # Use torch.where for forward-compatibility and simpler 1-D indexing
+                above = torch.where(pred > self.config.threshold)[0].tolist()
+
+            # Drop special tokens (<PAD>=0, <UNK>=1) regardless of score
+            vocab = getattr(self.model_wrapper, "vocabulary", None)
+            if vocab is not None:
+                try:
+                    pad_idx = vocab.tag_to_index.get(getattr(vocab, "pad_token", "<PAD>"), 0)
+                except Exception:
+                    pad_idx = 0
+                unk_idx = getattr(vocab, "unk_index",
+                                  vocab.tag_to_index.get(getattr(vocab, "unk_token", "<UNK>"), 1))
+                above = [i for i in above if i not in (pad_idx, unk_idx)]
 
             items = [(self.tag_names[i], float(pred[i].item())) for i in above if i < len(self.tag_names)]
             if self.config.eye_color_exclusive and self._eye_idx:

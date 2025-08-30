@@ -200,12 +200,27 @@ def main():
                 scores = outputs[-1][0]
 
             idxs = np.argsort(scores)[::-1][:args.top_k]
+            # Resolve special-token indices once
+            try:
+                pad_idx = vocab.tag_to_index.get(getattr(vocab, "pad_token", "<PAD>"), 0)
+            except Exception:
+                pad_idx = 0
+            unk_idx = getattr(vocab, "unk_index",
+                              vocab.tag_to_index.get(getattr(vocab, "unk_token", "<UNK>"), 1))
+
             tags = []
             for idx in idxs:
                 score = float(scores[idx])
                 if score < args.threshold:
                     continue
-                tag_name = vocab.get_tag_from_index(int(idx))
+                # Skip special tokens (padding/unknown)
+                if int(idx) in (pad_idx, unk_idx):
+                    continue
+                try:
+                    tag_name = vocab.get_tag_from_index(int(idx))
+                except ValueError:
+                    # Defensive: ignore corrupted/placeholder tags
+                    continue
                 tags.append(TagPrediction(name=tag_name, score=score))
 
             # Conditionally filter the gray_background tag if we added it
