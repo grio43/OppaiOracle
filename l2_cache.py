@@ -27,9 +27,12 @@ class LMDBReader:
                 "LMDB is not installed but L2 cache was requested. "
                 "Install with `pip install lmdb` or disable L2 cache."
             )
+        # ensure the directory exists before opening the environment
         os.makedirs(path, exist_ok=True)
         # Avoid a race where a reader starts before the writer has created the env.
-        import os
+        # Remove the `import os` inside this method. Importing inside a function
+        # causes Python to treat the name `os` as local, so referencing it before
+        # the import (e.g., in os.makedirs above) raises UnboundLocalError:contentReference[oaicite:4]{index=4}.
         if not os.path.exists(os.path.join(path, "data.mdb")):
             try:
                 _wait_for_env_files(path, timeout_s=2.0)
