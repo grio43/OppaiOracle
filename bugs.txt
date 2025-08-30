@@ -1,0 +1,31 @@
+L1/L2 Cache Bug Review
+
+L1 Cache (in-memory)
+- Mutable return reference: `l1_cache.py:36-47,63-76` — `ByteLRU.get()` returns the stored tensor object directly. Callers modifying it in place will corrupt the cached value (aliasing risk).
+- Unused dtype field: `l1_cache.py:26,59` — `ByteLRU` stores `dtype_str` but never uses it internally, which can be misleading and lead to inconsistent assumptions about stored dtype.
+
+L2 Cache (LMDB)
+- Potential env creation race/read-only open: `l2_cache.py:15-31` — `LMDBReader` opens with `readonly=True` and does not explicitly set `create=True`. If the LMDB environment is not yet created, opening can fail when a reader initializes before the writer has created the environment.
+- Writer MapFull handling: `l2_cache.py:53-113` — Writer does not catch `lmdb.MapFullError`. If the DB grows beyond `map_size_bytes`, the writer process can crash silently; subsequent enqueue calls will eventually fill the queue and be dropped without visibility.
+- Excessive queue capacity and memory pressure: `l2_cache.py:121-135` — `start_l2_writer` uses `Queue(maxsize=16384)`. Entries are large (normalized image tensor bytes + mask). This can consume tens of GB of RAM under sustained cache misses and slow disk, leading to OOM or heavy swapping.
+- Missing mask shape/type validation: `l2_cache.py` (decode path used via callers) — Decoding mask payload trusts the stored tensor, converting to `bool` without verifying shape equals current `image_size`. Corrupted or stale entries may bypass shape checks.
+- Async/non-fsync writer settings: `l2_cache.py:68-86` — `writemap=True`, `map_async=True`, `sync=False` increase risk of data loss on abrupt termination or power loss (performance trade-off). Not necessarily a bug, but safety implications.
+- Reader `max_readers` default: `l2_cache.py:18-31` — Very high default (`4096`) may exceed OS fd limits on constrained systems, causing runtime failures.
+- Lack of explicit `env.close()` usage by readers: `l2_cache.py:33-41` — `LMDBReader.close()` exists but there’s no lifecycle hook to ensure it’s called when workers exit; resources rely on process teardown.
+
+Cache Codec (safetensors + HMAC)
+- HMAC key mismatch hazard: `cache_codec.py:7-36,38-61` — Encoding/decoding uses an optional env key `CACHE_CODEC_HMAC_KEY`. If the key differs between writer and readers (or is set for one and not the other), decoding fails, causing systematic L2 misses that look like transient decode errors.
+
+Integration in dataset_loader
+- Reader/writer start sequencing assumptions: `dataset_loader.py:1048-1110,1129-1201` — `create_dataloaders()` starts the writer before datasets, reducing races. However, other entry points using `DatasetLoader`/`SidecarJsonDataset` directly must pass a writer or pre-existing DB; otherwise `LMDBReader` may try to open a non-existent env (see L2 race above).
+- Inconsistent mask validation across paths: `dataset_loader.py:336-361,866-887` — When mask payload is missing/invalid, code reconstructs it via pad-color/normalization heuristic. No explicit verification that the reconstructed mask aligns with the stored image’s geometry beyond a tolerance check; subtle numerical drift in normalization could incorrectly classify padded pixels.
+- L1 aliasing risk on reuse: `dataset_loader.py:260-321` — Because L1 returns a mutable reference, downstream transforms or accidental in-place ops on the returned tensors can corrupt future reads from the L1 cache.
+- Silent L2 write drops: `dataset_loader.py:519-527,969-976` — On `queue.Full`, writes are dropped without logging; persistent saturation hides systemic writer failures (e.g., crashed writer or undersized mapsize).
+- No L2 mask shape check: `dataset_loader.py:340-347,866-872` — Decoded mask is converted to `bool` without enforcing `(H,W)==(image_size,image_size)`. A malformed cache entry could propagate shape mismatches downstream.
+
+Configuration-related risks
+- `data.l1_per_worker_mb` very large by default: `configs/unified_config.yaml:99-107` — 10240 MB per worker can exhaust RAM with multiple workers; not a logic bug but dangerous default.
+- `l2_max_size_gb` and `l2_map_size_bytes` consistency: `dataset_loader.py:1030-1046` — Misconfiguration (zero/negative) throws early, but there’s no runtime guard against DB growth exceeding the configured map size (ties back to MapFull handling bug).
+
+Notes
+- Some items are design trade-offs (performance vs. safety) but can manifest as bugs operationally under load or misconfiguration.

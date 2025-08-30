@@ -86,7 +86,7 @@ class DatasetLoader(Dataset):
         l2_enabled: bool = False,
         l2_cache_path: Optional[str] = None,
         l2_map_size_bytes: int = 0,
-        l2_max_readers: int = 4096,
+        l2_max_readers: int = 512,
         l2_writer_queue: Optional[mp.Queue] = None,
         # --- L1 (in-memory) cache ---
         use_memory_cache: bool = True,
@@ -159,6 +159,7 @@ class DatasetLoader(Dataset):
         self._l2_max_readers = int(l2_max_readers or 4096)
         self._l2_reader: Optional[LMDBReader] = None
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
+        self._last_qfull_warn: float = 0.0
 
         # Compute a short hash of preprocessing parameters for L2 cache versioning.
         try:
@@ -340,7 +341,11 @@ class DatasetLoader(Dataset):
                         if mask_payload is not None:
                             try:
                                 m = _tensor_from_bytes(mask_payload)
-                                pmask = m.to(torch.bool)
+                                # Validate mask geometry matches current config
+                                if m.dim() != 2 or m.shape[0] != int(self.image_size) or m.shape[1] != int(self.image_size):
+                                    mask_payload = None  # fall back to reconstruction
+                                else:
+                                    pmask = m.to(torch.bool)
                             except Exception:
                                 mask_payload = None
                         if mask_payload is None:
@@ -523,8 +528,13 @@ class DatasetLoader(Dataset):
                     self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(sample["images"])))
                     self._l2_writer_q.put_nowait((self._l2_mask_key(raw_image_id, flipped=False), _tensor_to_bytes(sample["padding_mask"].to(torch.uint8))))
                 except queue.Full:
-                    # Drop silently; training must not stall on cache IO
-                    pass
+                    # Drop, but surface a rate-limited warning for visibility.
+                    now = time.time()
+                    if (now - self._last_qfull_warn) > 5.0:
+                        self._last_qfull_warn = now
+                        self.logger.warning(
+                            "L2 writer queue full; dropping cache write (rate-limited)"
+                        )
             # L1: write pre-norm image (and mask) in canonical dtype; never block
             if self._use_l1 and self._l1_mb > 0:
                 self._ensure_l1()
@@ -674,7 +684,7 @@ class SidecarJsonDataset(Dataset):
         l2_enabled: bool = False,
         l2_cache_path: Optional[str] = None,
         l2_map_size_bytes: int = 0,
-        l2_max_readers: int = 4096,
+        l2_max_readers: int = 512,
         l2_writer_queue: Optional[mp.Queue] = None,
         # --- Orientation / flipping ---
         random_flip_prob: float = 0.0,
@@ -707,6 +717,7 @@ class SidecarJsonDataset(Dataset):
         self._l2_max_readers = int(l2_max_readers or 4096)
         self._l2_reader: Optional[LMDBReader] = None
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
+        self._last_qfull_warn: float = 0.0
 
         # Compute a short hash of preprocessing parameters for L2 cache versioning.
         try:
@@ -866,7 +877,10 @@ class SidecarJsonDataset(Dataset):
                         if mask_payload is not None:
                             try:
                                 m = _tensor_from_bytes(mask_payload)
-                                pmask = m.to(torch.bool)
+                                if m.dim() != 2 or m.shape[0] != int(self.image_size) or m.shape[1] != int(self.image_size):
+                                    mask_payload = None
+                                else:
+                                    pmask = m.to(torch.bool)
                             except Exception:
                                 mask_payload = None
                         if mask_payload is None:
@@ -973,7 +987,12 @@ class SidecarJsonDataset(Dataset):
                     self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(img)))
                     self._l2_writer_q.put_nowait((mask_key, _tensor_to_bytes(pmask.to(torch.uint8))))
                 except queue.Full:
-                    pass
+                    now = time.time()
+                    if (now - self._last_qfull_warn) > 5.0:
+                        self._last_qfull_warn = now
+                        self.logger.warning(
+                            "L2 writer queue full; dropping cache write (rate-limited)"
+                        )
 
             self.retry_counts[idx] = 0
             return {

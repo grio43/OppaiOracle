@@ -9,6 +9,14 @@ except ModuleNotFoundError:
 import torch
 from cache_codec import encode_tensor as _tensor_to_bytes, decode_tensor as _tensor_from_bytes
 
+# Small helper to reduce readonly-open races before the writer has created files.
+def _wait_for_env_files(path: str, *, timeout_s: float = 2.0, poll_ms: int = 50) -> None:
+    import os, time
+    end = time.time() + float(timeout_s)
+    data = os.path.join(path, "data.mdb")
+    while not os.path.exists(data) and time.time() < end:
+        time.sleep(poll_ms / 1000.0)
+
 # Serialization now lives in cache_codec.py (safetensors + optional HMAC)
 
 # --- Read-only per-process cache handle ---
@@ -20,6 +28,21 @@ class LMDBReader:
                 "Install with `pip install lmdb` or disable L2 cache."
             )
         os.makedirs(path, exist_ok=True)
+        # Avoid a race where a reader starts before the writer has created the env.
+        import os
+        if not os.path.exists(os.path.join(path, "data.mdb")):
+            try:
+                _wait_for_env_files(path, timeout_s=2.0)
+                if not os.path.exists(os.path.join(path, "data.mdb")):
+                    # Best-effort: create the env if still missing, then reopen readonly.
+                    tmp_env = lmdb.open(
+                        path, map_size=map_size_bytes, subdir=True,
+                        readonly=False, lock=True, max_dbs=1
+                    )
+                    tmp_env.close()
+            except Exception:
+                # Proceed to readonly open; if it still fails the caller will see the error.
+                pass
         # readonly=True avoids taking the write lock in workers
         self.env = lmdb.open(
             path,
@@ -38,6 +61,12 @@ class LMDBReader:
             return txn.get(key)
 
     def close(self):
+        try:
+            self.env.close()
+        except Exception:
+            pass
+
+    def __del__(self):
         try:
             self.env.close()
         except Exception:
@@ -108,18 +137,35 @@ class _WriterProc(mp.Process):
                      or (time.time() - last_flush) >= self.flush_s)
             ):
                 # Single short write txn → minimal time holding the writer lock
-                with env.begin(write=True) as txn:
-                    for k, v in pending:
-                        txn.put(k, v, overwrite=True)
+                try:
+                    with env.begin(write=True) as txn:
+                        for k, v in pending:
+                            txn.put(k, v, overwrite=True)
+                except lmdb.MapFullError:
+                    # Grow the map and retry once.
+                    info = env.info()
+                    new_size = int(max(self.map_size_bytes, info.get("map_size", self.map_size_bytes)) * 2)
+                    env.set_mapsize(new_size)
+                    with env.begin(write=True) as txn:
+                        for k, v in pending:
+                            txn.put(k, v, overwrite=True)
                 pending.clear()
                 pending_bytes = 0
                 last_flush = time.time()
 
         # Final flush
         if pending:
-            with env.begin(write=True) as txn:
-                for k, v in pending:
-                    txn.put(k, v, overwrite=True)
+            try:
+                with env.begin(write=True) as txn:
+                    for k, v in pending:
+                        txn.put(k, v, overwrite=True)
+            except lmdb.MapFullError:
+                info = env.info()
+                new_size = int(max(self.map_size_bytes, info.get("map_size", self.map_size_bytes)) * 2)
+                env.set_mapsize(new_size)
+                with env.begin(write=True) as txn:
+                    for k, v in pending:
+                        txn.put(k, v, overwrite=True)
         try:
             env.sync(False)
             env.close()
@@ -130,7 +176,10 @@ def start_l2_writer(path: str, map_size_bytes: int) -> Tuple[mp.Queue, mp.Proces
     if lmdb is None:
         raise RuntimeError("LMDB is required to start L2 writer. Install `lmdb`.")
     ctx = mp.get_context("spawn")
-    q: mp.Queue = ctx.Queue(maxsize=16384)
+    import os as _os
+    q_max = int(_os.environ.get("L2_WRITER_QUEUE_MAX", "1024"))
+    # Keep a floor to avoid pathological tiny queues.
+    q: mp.Queue = ctx.Queue(maxsize=max(64, q_max))
     proc = _WriterProc(path=path, map_size_bytes=map_size_bytes, q=q)
     proc.start()
 
