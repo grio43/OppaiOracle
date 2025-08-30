@@ -96,7 +96,7 @@ data:
   
   # Caching
   cache_size_gb: 120.0
-  l1_per_worker_mb: 10240
+  l1_per_worker_mb: 1024   # safer default; increase if you have plenty of RAM
   preload_files: 2
   use_memory_cache: true
   cache_precision: "bfloat16"

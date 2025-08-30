@@ -42,8 +42,19 @@ def decode_tensor(b: bytes, key: Optional[bytes | str] = None) -> torch.Tensor:
         if not hmac.compare_digest(digest, expected):
             raise ValueError("HMAC verification failed")
         data = payload
-    tensors = load(data)
-    return tensors["t"]
+        tensors = load(data)
+        return tensors["t"]
+    # No key provided: try plain payload first; if that fails, also try skipping a possible HMAC prefix
+    try:
+        tensors = load(data)
+        return tensors["t"]
+    except Exception:
+        try:
+            tensors = load(data[_DIGEST_SIZE:])
+            return tensors["t"]
+        except Exception:
+            # propagate original error for clarity
+            raise
 
 
 __all__ = ["encode_tensor", "decode_tensor"]

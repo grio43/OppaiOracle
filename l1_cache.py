@@ -57,6 +57,7 @@ class ByteLRU:
         return int(t.numel() * t.element_size())
 
     def get(self, key: bytes) -> Optional[torch.Tensor]:
+        """Return a copy of the stored tensor to avoid aliasing corruption by callers."""
         if self.capacity <= 0:
             return None
         with self._lock:
@@ -64,7 +65,9 @@ class ByteLRU:
             if e is None:
                 return None
             self._m.move_to_end(key)  # MRU
-            return e.value
+            # Return a fresh tensor so in-place ops downstream can't corrupt the cache
+            # (clone keeps it on CPU and contiguous, matching how values are stored).
+            return e.value.detach().clone()
 
     def put(self, key: bytes, value: torch.Tensor) -> None:
         if self.capacity <= 0:
@@ -93,4 +96,3 @@ def encode_l1_image_01(x_01: torch.Tensor, *, dtype_str: str) -> torch.Tensor:
 
 def decode_l1_image_01(x_stored: torch.Tensor) -> torch.Tensor:
     return _from_canonical_01(x_stored)
-
