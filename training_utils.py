@@ -510,7 +510,7 @@ class CheckpointManager:
         checkpoint = {
             'epoch': epoch,
             'step': step,
-            'model_state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
+            'state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
             'metrics': metrics,
             'training_state': training_state.to_dict(),
             'timestamp': datetime.now().isoformat()
