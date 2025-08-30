@@ -9,7 +9,7 @@ import socket
 import multiprocessing
 from pathlib import Path
 from typing import Optional, Dict, Any
-from dataset_loader import CompressingRotatingFileHandler
+from utils.file_handlers import CompressingRotatingFileHandler
 
 # --- Globals for context ---
 _GLOBAL_CONTEXT = {

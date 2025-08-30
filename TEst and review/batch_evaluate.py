@@ -344,20 +344,31 @@ def create_pytorch_session(model_path, device='cuda', compile_model=False):
         print("Note: For best PyTorch performance, use a native .pt checkpoint")
         return None
 
-    # Assume it's a PyTorch checkpoint
-    checkpoint = torch.load(model_path, map_location=device)
+    # Assume it's a PyTorch checkpoint; load safely
+    from safe_checkpoint import safe_load_checkpoint
+    from model_architecture import create_model
+    state_dict, meta = safe_load_checkpoint(model_path)
 
-    # Extract model from checkpoint
-    if 'model_state_dict' in checkpoint:
-        # Need to reconstruct model architecture
-        from model_architecture import create_model
-        model = create_model(
-            num_tags=checkpoint.get('num_tags', 10000),
-            num_ratings=checkpoint.get('num_ratings', 5)
-        )
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model = checkpoint
+    # Infer model dimensions
+    num_tags = None
+    for k, v in state_dict.items():
+        if k.endswith('tag_head.weight') or k.endswith('tag_head.bias'):
+            try:
+                num_tags = int(v.shape[0])
+                break
+            except Exception:
+                pass
+    if num_tags is None:
+        num_tags = int(meta.get('num_tags', 10000))
+    num_ratings = int(meta.get('num_ratings', 5))
+
+    # Reconstruct model and load weights
+    model = create_model(num_tags=num_tags, num_ratings=num_ratings)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"Warning: missing keys in checkpoint: {missing[:5]}...")
+    if unexpected:
+        print(f"Warning: unexpected keys in checkpoint: {unexpected[:5]}...")
 
     model.to(device)
     model.eval()
