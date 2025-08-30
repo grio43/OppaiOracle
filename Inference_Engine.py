@@ -178,15 +178,35 @@ class ImagePreprocessor:
         self.transform = self._build_transform()
         
     def _build_transform(self):
-        """Build image transformation pipeline"""
+        """Build tensor + normalize transform (geometry handled manually to avoid stretching/upscale)."""
         return transforms.Compose([
-            transforms.Resize((self.config.image_size, self.config.image_size)),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=self.config.normalize_mean,
                 std=self.config.normalize_std
             )
         ])
+
+    @staticmethod
+    def _letterbox_downscale_only(img: Image.Image, target: int, pad_color=(114, 114, 114)) -> Image.Image:
+        """Letterbox to square target without upscaling.
+
+        - Preserves aspect ratio
+        - Downscales if larger than target
+        - Never upscales; pads to target with pad_color
+        """
+        w, h = img.size
+        if w <= 0 or h <= 0:
+            return Image.new("RGB", (target, target), tuple(pad_color))
+        ratio = min(target / float(w), target / float(h))
+        scale = min(1.0, ratio)
+        nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+        resized = img.resize((nw, nh), Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR)
+        canvas = Image.new("RGB", (target, target), tuple(pad_color))
+        left = (target - nw) // 2
+        top = (target - nh) // 2
+        canvas.paste(resized, (left, top))
+        return canvas
     
     def preprocess_image(self, image: Union[str, np.ndarray, Image.Image]) -> torch.Tensor:
         """Preprocess a single image"""
@@ -195,12 +215,22 @@ class ImagePreprocessor:
             with Image.open(image) as img:
                 img.load()
                 img = ImageOps.exif_transpose(img)
-                image = img.convert('RGB')
+                # Handle transparency by compositing onto neutral gray
+                if img.mode in ("RGBA", "LA") or ("transparency" in img.info):
+                    rgba = img.convert("RGBA")
+                    bg = Image.new("RGB", rgba.size, (114, 114, 114))
+                    alpha = rgba.getchannel("A")
+                    bg.paste(rgba, mask=alpha)
+                    image = bg
+                else:
+                    image = img.convert('RGB')
         elif isinstance(image, np.ndarray):
             image = Image.fromarray(image)
-        
-        # Apply transforms
-        return self.transform(image)
+
+        # Geometry: letterbox to target without upscaling, no stretching
+        lb = self._letterbox_downscale_only(image, int(self.config.image_size))
+        # Apply tensor + normalize
+        return self.transform(lb)
     
     def preprocess_batch(self, images: List[Union[str, np.ndarray, Image.Image]]) -> torch.Tensor:
         """Preprocess a batch of images"""

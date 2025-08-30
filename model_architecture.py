@@ -108,14 +108,15 @@ class TransformerBlock(nn.Module):
             v = v.transpose(1, 2)
             
             # Build attention mask with SDPA semantics:
-            # Bool attn_mask uses True = KEEP/ALLOW, False = MASK.
-            # Our key_padding_mask uses True = IGNORE, so invert it.
+            # For torch.nn.functional.scaled_dot_product_attention, a boolean
+            # attn_mask uses True = MASK (i.e., disallow attention), False = keep.
+            # Our key_padding_mask already uses True = IGNORE, so we can pass it through.
             attn_mask = None
             if key_padding_mask is not None:
                 # If any sample masks all positions, fail fast
                 if torch.all(key_padding_mask, dim=1).any():
                     raise RuntimeError("key_padding_mask masks all keys for at least one sample.")
-                attn_mask = (~key_padding_mask).unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
+                attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B,1,1,L) True = MASK
 
             # Use scaled_dot_product_attention with flash backend when available
             attn_out = F.scaled_dot_product_attention(
