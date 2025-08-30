@@ -73,7 +73,7 @@ python Dataset_Analysis.py --help
 - Normalization: Set `data.normalize_mean/std`. Validation inherits from the unified config.
 - Vocabulary: Use a real `vocabulary.json` (no `tag_###` placeholders). Export fails fast if placeholders are detected.
 - Orientation flips: If `data.random_flip_prob > 0`, provide `configs/orientation_map.json` or set `data.strict_orientation_validation: false`. Safety modes: conservative | balanced | permissive.
-- LR warmup semantics: `CosineAnnealingWarmupRestarts` is stepped once per EPOCH. Therefore `training.warmup_steps` is in EPOCHS. Recommended: 3–10. The default `10000` keeps LR near min for the whole run — lower it before training.
+- LR warmup semantics: Step-based scheduling. `training.warmup_steps` is in optimizer steps (default `10000`). The trainer advances the LR scheduler once per optimizer update (after grad accumulation).
 
 Edit config at `configs/unified_config.yaml`.
 
@@ -121,7 +121,7 @@ Notes:
 
 - Validation header glitch: If you encounter a stray literal prefix before the shebang in `validation_loop.py`, remove it so the first line is a shebang or docstring. Import‑sanity catches this.
 - LR warmup units: Warmup is epoch‑based. Set `training.warmup_steps` to a small integer (e.g., 3–10).
-- Background validator lifecycle: `dataset_loader.BackgroundValidator` is daemonized. Training does not explicitly stop it; this is benign for normal runs. If embedding the loader elsewhere, call `validator.stop()` during teardown.
+- Background validator lifecycle: `dataset_loader.BackgroundValidator` is daemonized. The trainer now attempts to stop any loader `validator` on exit. If embedding the loader elsewhere, call `validator.stop()` during teardown.
 - Validation memory: `validation_loop.py` aggregates predictions/targets to compute metrics. For very large sets, consider chunked/streaming metrics if you extend it.
 
 ## Troubleshooting

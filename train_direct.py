@@ -465,13 +465,21 @@ def train_with_orientation_tracking(config: FullConfig):
         eps=config.training.adam_epsilon
     )
 
+    # ---- LR scheduler: STEP-BASED semantics ----
+    # Interpret warmup / cycle lengths in optimizer updates (not epochs).
+    accum = max(1, int(getattr(config.training, "gradient_accumulation_steps", 1)))
+    steps_per_epoch = max(1, len(train_loader))
+    updates_per_epoch = (steps_per_epoch + accum - 1) // accum  # ceil division
+    total_updates = max(1, int(getattr(config.training, "num_epochs", 1)) * updates_per_epoch)
+    warmup_steps = int(getattr(config.training, "warmup_steps", 10_000))
+
     scheduler = CosineAnnealingWarmupRestarts(
         optimizer,
-        first_cycle_steps=config.training.num_epochs,
+        first_cycle_steps=total_updates,
         cycle_mult=1.0,
         max_lr=config.training.learning_rate,
         min_lr=getattr(config.training, "lr_end", 1e-6),
-        warmup_steps=config.training.warmup_steps,
+        warmup_steps=warmup_steps,
     )
 
     amp_enabled = config.training.use_amp and device_type == 'cuda'
@@ -583,6 +591,7 @@ def train_with_orientation_tracking(config: FullConfig):
         with anomaly_ctx:
             for step, batch in enumerate(train_loader):
                 images = batch['images'].to(device, non_blocking=True)
+                # accum defined above; used for correct grad-accum scaling
                 if getattr(config.training, "memory_format", "contiguous") == "channels_last":
                     images = images.contiguous(memory_format=torch.channels_last)
                 tag_labels = batch['tag_labels'].to(device)
@@ -650,9 +659,11 @@ def train_with_orientation_tracking(config: FullConfig):
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
-                scaler.scale(loss).backward()
+                # ---- Correct gradient-accumulation scaling ----
+                # Average the loss over accumulation micro-steps before backward.
+                scaler.scale(loss / accum).backward()
 
-                if (step + 1) % config.training.gradient_accumulation_steps == 0:
+                if (step + 1) % accum == 0:
                     # --- TensorBoard: param/grad histograms (throttled) ---
                     try:
                         interval = getattr(config, "param_hist_interval_steps", None)
@@ -691,6 +702,12 @@ def train_with_orientation_tracking(config: FullConfig):
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
+                    # ---- Step-based scheduler: advance once per optimizer update ----
+                    try:
+                        scheduler.step()
+                    except Exception:
+                        # keep training even if a rare scheduler state issue occurs
+                        pass
 
                 running_loss += loss.item()
                 global_step += 1
@@ -775,8 +792,11 @@ def train_with_orientation_tracking(config: FullConfig):
         )
         monitor.log_validation(global_step, {'loss': avg_val_loss, 'f1_macro': val_f1_macro, 'f1_micro': val_f1_micro, 'mAP': val_mAP})
 
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
+        # Scheduler already stepped per optimizer update; just read the last LR here.
+        try:
+            current_lr = scheduler.get_last_lr()[0]
+        except Exception:
+            current_lr = optimizer.param_groups[0]['lr']
         monitor.log_scalar('lr', current_lr, global_step)
 
         training_state.epoch = epoch + 1
@@ -835,6 +855,16 @@ def train_with_orientation_tracking(config: FullConfig):
         pass
 
     monitor.close()
+
+    # ---- Teardown: stop any background validators if present ----
+    try:
+        for _loader in (train_loader, val_loader):
+            ds = getattr(_loader, "dataset", None)
+            validator = getattr(ds, "validator", None) if ds is not None else None
+            if validator is not None and hasattr(validator, "stop"):
+                validator.stop()
+    except Exception:
+        pass
 
 
 def validate_orientation_mappings():
