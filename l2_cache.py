@@ -2,7 +2,10 @@ from __future__ import annotations
 import os, time, atexit, signal, queue
 import multiprocessing as mp
 from typing import Optional, Tuple
-import lmdb
+try:
+    import lmdb  # type: ignore
+except ModuleNotFoundError:
+    lmdb = None  # optional dependency
 import torch
 from cache_codec import encode_tensor as _tensor_to_bytes, decode_tensor as _tensor_from_bytes
 
@@ -11,6 +14,11 @@ from cache_codec import encode_tensor as _tensor_to_bytes, decode_tensor as _ten
 # --- Read-only per-process cache handle ---
 class LMDBReader:
     def __init__(self, path: str, map_size_bytes: int, max_readers: int = 4096):
+        if lmdb is None:
+            raise RuntimeError(
+                "LMDB is not installed but L2 cache was requested. "
+                "Install with `pip install lmdb` or disable L2 cache."
+            )
         os.makedirs(path, exist_ok=True)
         # readonly=True avoids taking the write lock in workers
         self.env = lmdb.open(
@@ -119,6 +127,8 @@ class _WriterProc(mp.Process):
             pass
 
 def start_l2_writer(path: str, map_size_bytes: int) -> Tuple[mp.Queue, mp.Process]:
+    if lmdb is None:
+        raise RuntimeError("LMDB is required to start L2 writer. Install `lmdb`.")
     ctx = mp.get_context("spawn")
     q: mp.Queue = ctx.Queue(maxsize=16384)
     proc = _WriterProc(path=path, map_size_bytes=map_size_bytes, q=q)

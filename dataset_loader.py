@@ -15,7 +15,11 @@ import hashlib
 import torch
 from torch.utils.data import Dataset, get_worker_info, DataLoader as _TorchDataLoader
 from PIL import Image, ImageOps, ImageFile
-from torchvision import transforms
+# Make torchvision optional at import time; raise only when actually used.
+try:
+    from torchvision import transforms  # type: ignore
+except Exception:
+    transforms = None  # resolved lazily
 # Torchvision v2 joint transforms (optional)
 try:
     from torchvision.transforms import v2 as T
@@ -83,6 +87,8 @@ class DatasetLoader(Dataset):
         l2_map_size_bytes: int = 0,
         l2_max_readers: int = 4096,
         l2_writer_queue: Optional[mp.Queue] = None,
+        # Background validator control
+        enable_background_validator: Optional[bool] = None,
     ):
         """
         Dataset loader for images and JSON metadata.
@@ -106,9 +112,13 @@ class DatasetLoader(Dataset):
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
 
-        # Properly initialise background validator
-        self.validator = BackgroundValidator(self)
-        self.validator.start()
+        # Properly initialise background validator (opt-out via env or param)
+        if enable_background_validator is None:
+            enable_background_validator = os.getenv("DATASET_BACKGROUND_VALIDATOR", "1") != "0"
+        self.validator = None
+        if enable_background_validator:
+            self.validator = BackgroundValidator(self)
+            self.validator.start()
 
         # --- L2 cache (read-only in workers) ---
         self._l2_enabled = bool(l2_enabled and l2_cache_path)
@@ -272,12 +282,18 @@ class DatasetLoader(Dataset):
                 if self.transform:
                     try:
                         transformed = self.transform(canvas)
+                        if transforms is None:
+                            raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         t = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
                         t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
                     except Exception:
+                        if transforms is None:
+                            raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         t = transforms.ToTensor()(canvas)
                         t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
                 else:
+                    if transforms is None:
+                        raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                     t = transforms.ToTensor()(canvas)
                     t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(t)
 
@@ -689,6 +705,8 @@ class SidecarJsonDataset(Dataset):
                 mask_tv = tv_tensors.Mask(pmask.to(torch.uint8))
                 img_tv, mask_tv = self.joint_transforms(img_tv, mask_tv)
                 img = T.ToTensor()(img_tv)
+                if transforms is None:
+                    raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                 img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
                 pmask = mask_tv.to(torch.bool)
             else:
@@ -696,12 +714,18 @@ class SidecarJsonDataset(Dataset):
                 if self.transform:
                     try:
                         transformed = self.transform(canvas)
+                        if transforms is None:
+                            raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
                         img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
                     except Exception:
+                        if transforms is None:
+                            raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img = transforms.ToTensor()(canvas)
                         img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
                 else:
+                    if transforms is None:
+                        raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                     img = transforms.ToTensor()(canvas)
                     img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
 

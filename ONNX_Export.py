@@ -41,7 +41,7 @@ try:
     from Configuration_System import ConfigManager, ConfigType, FullConfig
 except ImportError as e:
     print(f"Error importing ONNX libraries: {e}")
-    print("Please install: pip install onnx onnxruntime-gpu")
+    print("Please install: pip install onnx  (CPU: pip install onnxruntime  |  GPU: pip install onnxruntime-gpu)")
     sys.exit(1)
 
 try:
@@ -84,7 +84,10 @@ class ONNXExportConfig:
     """Configuration for ONNX export"""
     # Model paths
     checkpoint_path: str
-    vocab_dir: str = "./vocabulary.json"  # Use relative path by default
+    # Accept a file or directory. Kept backward-compatible: 'vocab_dir' still works via __post_init__.
+    vocab_path: str = "./vocabulary.json"
+    # deprecated alias (kept for YAMLs/CLIs that still use it)
+    vocab_dir: str = "./vocabulary.json"
     output_path: str = "model.onnx"
     
     # Export settings
@@ -133,8 +136,14 @@ class ONNXExportConfig:
     model_description: str = "Anime Image Tagger Model"
     model_author: str = "AnimeTaggers"
     model_version: str = "1.0"
+    # Require explicit opt-in to rebuild head on mismatch
+    force_rebuild_head: bool = False
     
     def __post_init__(self):
+        # Back-compat: if old configs specify vocab_dir, honor it.
+        if self.vocab_path and self.vocab_dir and self.vocab_dir != "./vocabulary.json":
+            if self.vocab_path == "./vocabulary.json":
+                self.vocab_path = self.vocab_dir
         if self.use_dynamic_axes:
             if self.dynamic_axes is None:
                 # The new wrapper takes a raw image with dynamic H and W
@@ -284,8 +293,8 @@ class ONNXExporter:
 
             # If vocabulary not loaded from checkpoint, load from file
             if not hasattr(self, 'vocab'):
-                vocab_path = Path(config.vocab_dir)
-
+                vocab_path = Path(config.vocab_path)
+                
                 if vocab_path.is_dir():
                     vocab_path = vocab_path / "vocabulary.json"
                 
@@ -487,15 +496,17 @@ class ONNXExporter:
         if hasattr(model, 'tag_head'):
             tag_head_out_features = model.tag_head.out_features
             if tag_head_out_features != num_tags:
-                logger.warning(
+                msg = (
                     f"Model tag_head output size ({tag_head_out_features}) doesn't match "
-                    f"vocabulary size ({num_tags}). This may cause issues."
+                    f"vocabulary size ({num_tags})."
                 )
-                # Try to fix by recreating the tag_head
+                if not self.config.force_rebuild_head:
+                    raise RuntimeError(msg + " Pass --force-rebuild-head to proceed.")
+                logger.warning(msg + " Recreating tag_head due to --force-rebuild-head.")
                 if hasattr(model, 'config'):
                     model.config.num_tags = num_tags
-                    model.tag_head = nn.Linear(model.tag_head.in_features, num_tags)
-                    logger.info(f"Recreated tag_head with {num_tags} outputs")
+                model.tag_head = nn.Linear(model.tag_head.in_features, num_tags)
+                logger.info(f"Recreated tag_head with {num_tags} outputs")
 
         
         # Handle DDP weights
@@ -861,7 +872,8 @@ class ONNXExporter:
 
             # Fallback: try to load from file if not already embedded
             if not vocab_embedded_successfully:
-                vocab_path = Path(self.config.vocab_dir) / "vocabulary.json" if Path(self.config.vocab_dir).is_dir() else Path(self.config.vocab_dir)
+                vp = Path(self.config.vocab_path)
+                vocab_path = vp / "vocabulary.json" if vp.is_dir() else vp
                 if vocab_path.exists():
                     temp_checkpoint: Dict[str, Any] = {}
                     temp_checkpoint = ModelMetadata.embed_vocabulary(temp_checkpoint, vocab_path)
@@ -1187,7 +1199,10 @@ def main():
 
         parser = argparse.ArgumentParser(description='Export Anime Tagger model to ONNX')
         parser.add_argument('checkpoint', type=str, help='Path to model checkpoint')
-        parser.add_argument('vocab_dir', type=str, nargs='?', default=None, help='Path to vocabulary directory or file')
+        # New preferred flag; can point to file or directory
+        parser.add_argument('--vocab_path', type=str, default=None, help='Path to vocabulary file or directory')
+        # Backward-compat positional (optional). If provided, used when --vocab_path is not.
+        parser.add_argument('vocab_dir', type=str, nargs='?', default=None, help='[deprecated] Path to vocabulary directory or file')
         parser.add_argument('-o', '--output', type=str, default=None, help=f'Output ONNX model path (default: {export_cfg.output_path})')
         parser.add_argument('-b', '--batch-size', type=int, default=1, help='Batch size for export (for dummy input)')
         parser.add_argument('-s', '--image-size', type=int, default=None, help=f'Input image size (default: {data_cfg.image_size})')
@@ -1199,6 +1214,7 @@ def main():
         parser.add_argument('--quantization-type', type=str, default=None, choices=['dynamic', 'static'], help=f'Quantization type (default: {export_cfg.quantization_type})')
         parser.add_argument('--no-validate', action='store_true', default=None, help='Skip validation')
         parser.add_argument('--benchmark', action='store_true', help='Run benchmark after export')
+        parser.add_argument('--force-rebuild-head', action='store_true', help='Recreate tag head if its out_features does not match the vocabulary size')
         parser.add_argument('--benchmark-runs', type=int, default=100, help='Number of benchmark iterations')
 
         args = parser.parse_args()
@@ -1225,7 +1241,7 @@ def main():
         # Create config
         config = ONNXExportConfig(
             checkpoint_path=args.checkpoint,
-            vocab_dir=args.vocab_dir or unified_config.vocab_path or data_cfg.vocab_dir,
+            vocab_path=(args.vocab_path if args.vocab_path is not None else (args.vocab_dir or getattr(unified_config, 'vocab_path', None) or getattr(data_cfg, 'vocab_dir', None) or "./vocabulary.json")),
             output_path=args.output or export_cfg.output_path,
             batch_size=args.batch_size,
             image_size=args.image_size or data_cfg.image_size,
@@ -1247,10 +1263,11 @@ def main():
             normalize_std=list(data_cfg.normalize_std),
             tolerance_atol=export_cfg.tolerance_atol,
             tolerance_rtol=export_cfg.tolerance_rtol,
+            force_rebuild_head=args.force_rebuild_head,
         )
 
         # Log vocabulary path being used
-        logger.info(f"Using vocabulary: {config.vocab_dir}")
+        logger.info(f"Using vocabulary: {config.vocab_path}")
         logger.info(f"Checkpoint: {config.checkpoint_path}")
 
         # Create exporter

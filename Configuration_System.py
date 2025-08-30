@@ -40,6 +40,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any, Type, TypeVar, get_t
 from dataclasses import dataclass, field, asdict, fields, is_dataclass
 from enum import Enum
 import argparse
+import sys
 from datetime import datetime
 import copy
 import time
@@ -1824,110 +1825,126 @@ def generate_example_configs(output_dir: Path = Path("./config_examples")):
 
 
 if __name__ == "__main__":
-    import sys
-    from utils.logging_setup import setup_logging
-    
-    # Set up logging
-    listener = setup_logging()
-    
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "generate":
-            # Generate example configs
-            output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("./config_examples")
-            generate_example_configs(output_dir)
-        elif sys.argv[1] == "validate":
-            # Validate a config file
-            if len(sys.argv) < 3:
-                print("Usage: python Configuration_System.py validate <config_file>")
-                sys.exit(1)
-            
-            try:
-                manager = ConfigManager(ConfigType.FULL)
-                config = manager.load_from_file(sys.argv[2])
-                print(f"✓ Config file '{sys.argv[2]}' is valid")
-            except Exception as e:
-                print(f"✗ Config validation failed: {e}")
-                sys.exit(1)
-        else:
-            print("Unknown command. Use 'generate' or 'validate'")
+    # Defer heavy logging for 'validate' to avoid importing any training deps.
+    is_validate = any(arg == "validate" for arg in sys.argv[1:])
+
+    if len(sys.argv) > 1 and is_validate:
+        # Lightweight console logging only; avoid importing logging_setup (which may import heavy deps)
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+        # Validate a config file
+        if len(sys.argv) < 3:
+            print("Usage: python Configuration_System.py validate <config_file>")
+            sys.exit(1)
+
+        try:
+            manager = ConfigManager(ConfigType.FULL)
+            _ = manager.load_from_file(sys.argv[2])
+            print(f"✓ Config file '{sys.argv[2]}' is valid")
+        except Exception as e:
+            print(f"✗ Config validation failed: {e}")
             sys.exit(1)
     else:
-        # Run tests
-        print("Testing Enhanced Configuration System...")
-        print("=" * 60)
-        
-        # Test 1: Create and validate default config
-        print("\n1. Testing default configuration creation...")
-        config = FullConfig()
+        # Full logging for other commands and interactive tests
+        from utils.logging_setup import setup_logging
+        listener = setup_logging()
         try:
-            config.validate()
-            print("   ✓ Default config is valid")
-        except Exception as e:
-            print(f"   ✗ Validation failed: {e}")
-        
-        # Test 2: Save and load config
-        print("\n2. Testing save/load functionality...")
-        test_file = Path("test_config.yaml")
-        config.to_yaml(test_file)
-        
-        manager = ConfigManager(ConfigType.FULL)
-        loaded = manager.load_from_file(test_file)
-        
-        if config == loaded:
-            print("   ✓ Config saved and loaded correctly")
-        else:
-            print("   ✗ Loaded config doesn't match original")
-        
-        # Test 3: Environment variable override
-        print("\n3. Testing environment variable override...")
-        os.environ["ANIME_TAGGER_TRAINING__LEARNING_RATE"] = "0.0005"
-        os.environ["ANIME_TAGGER_MODEL__NUM_GROUPS"] = "20"  # Keep consistent with default tags_per_group
-        os.environ["ANIME_TAGGER_DATA__BATCH_SIZE"] = "64"
-        # num_labels will be calculated correctly: 20 * 10000 = 200000 (default)
-        
-        manager.update_from_env()
-        
-        assert manager.config.training.learning_rate == 0.0005
-        assert manager.config.model.num_groups == 20
-        assert manager.config.data.batch_size == 64
-        print("   ✓ Environment overrides work correctly")
-        
-        # Test 4: Config diff
-        print("\n4. Testing config diff functionality...")
-        config2 = FullConfig()
-        # Create a fresh manager to avoid contamination from previous test
-        manager2 = ConfigManager(ConfigType.FULL)
-        manager2.config = config2
-        config2.training.num_epochs = 200
-        config2.model.hidden_size = 2048
-        
-        # Compare with original unmodified config
-        original_manager = ConfigManager(ConfigType.FULL)
-        
-        diff = original_manager.get_diff(manager2)
-        print(f"   Found {len(diff)} differences")
-        for key, (val1, val2) in list(diff.items())[:3]:
-            print(f"   - {key}: {val1} → {val2}")
-        
-        # Test 5: Checkpointing
-        print("\n5. Testing checkpoint functionality...")
-        manager.checkpoint("before_changes", "Testing checkpoint")
-        manager.config.training.num_epochs = 500
-        
-        success = manager.restore_checkpoint("before_changes")
-        if success and manager.config.training.num_epochs != 500:
-            print("   ✓ Checkpoint restore successful")
-        else:
-            print("   ✗ Checkpoint restore failed")
-        
-        # Clean up
-        test_file.unlink()
-        for key in list(os.environ.keys()):
-            if key.startswith("ANIME_TAGGER_"):
-                del os.environ[key]
-        
-        print("\n" + "=" * 60)
-        print("All tests completed successfully!")
+            if len(sys.argv) > 1:
+                if sys.argv[1] == "generate":
+                    # Generate example configs
+                    output_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("./config_examples")
+                    generate_example_configs(output_dir)
+                elif sys.argv[1] == "validate":
+                    # Should have been handled above; keep here for safety
+                    if len(sys.argv) < 3:
+                        print("Usage: python Configuration_System.py validate <config_file>")
+                        sys.exit(1)
+                    try:
+                        manager = ConfigManager(ConfigType.FULL)
+                        _ = manager.load_from_file(sys.argv[2])
+                        print(f"✓ Config file '{sys.argv[2]}' is valid")
+                    except Exception as e:
+                        print(f"✗ Config validation failed: {e}")
+                        sys.exit(1)
+                else:
+                    print("Unknown command. Use 'generate' or 'validate'")
+                    sys.exit(1)
+            else:
+                # Run tests
+                print("Testing Enhanced Configuration System...")
+                print("=" * 60)
 
-    if listener:
-        listener.stop()
+                # Test 1: Create and validate default config
+                print("\n1. Testing default configuration creation...")
+                config = FullConfig()
+                try:
+                    config.validate()
+                    print("   ✓ Default config is valid")
+                except Exception as e:
+                    print(f"   ✗ Validation failed: {e}")
+
+                # Test 2: Save and load config
+                print("\n2. Testing save/load functionality...")
+                test_file = Path("test_config.yaml")
+                config.to_yaml(test_file)
+
+                manager = ConfigManager(ConfigType.FULL)
+                loaded = manager.load_from_file(test_file)
+
+                if config == loaded:
+                    print("   ✓ Config saved and loaded correctly")
+                else:
+                    print("   ✗ Loaded config doesn't match original")
+
+                # Test 3: Environment variable override
+                print("\n3. Testing environment variable override...")
+                os.environ["ANIME_TAGGER_TRAINING__LEARNING_RATE"] = "0.0005"
+                os.environ["ANIME_TAGGER_MODEL__NUM_GROUPS"] = "20"  # Keep consistent with default tags_per_group
+                os.environ["ANIME_TAGGER_DATA__BATCH_SIZE"] = "64"
+
+                manager.update_from_env()
+
+                assert manager.config.training.learning_rate == 0.0005
+                assert manager.config.model.num_groups == 20
+                assert manager.config.data.batch_size == 64
+                print("   ✓ Environment overrides work correctly")
+
+                # Test 4: Config diff
+                print("\n4. Testing config diff functionality...")
+                config2 = FullConfig()
+                # Create a fresh manager to avoid contamination from previous test
+                manager2 = ConfigManager(ConfigType.FULL)
+                manager2.config = config2
+                config2.training.num_epochs = 200
+                config2.model.hidden_size = 2048
+
+                # Compare with original unmodified config
+                original_manager = ConfigManager(ConfigType.FULL)
+
+                diff = original_manager.get_diff(manager2)
+                print(f"   Found {len(diff)} differences")
+                for key, (val1, val2) in list(diff.items())[:3]:
+                    print(f"   - {key}: {val1} → {val2}")
+
+                # Test 5: Checkpointing
+                print("\n5. Testing checkpoint functionality...")
+                manager.checkpoint("before_changes", "Testing checkpoint")
+                manager.config.training.num_epochs = 500
+
+                success = manager.restore_checkpoint("before_changes")
+                if success and manager.config.training.num_epochs != 500:
+                    print("   ✓ Checkpoint restore successful")
+                else:
+                    print("   ✗ Checkpoint restore failed")
+
+                # Clean up
+                test_file.unlink()
+                for key in list(os.environ.keys()):
+                    if key.startswith("ANIME_TAGGER_"):
+                        del os.environ[key]
+
+                print("\n" + "=" * 60)
+                print("All tests completed successfully!")
+        finally:
+            if listener:
+                listener.stop()
