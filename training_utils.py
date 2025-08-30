@@ -872,9 +872,19 @@ class MixedPrecisionTrainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
 
-        # Create gradient scaler for FP16 with new API
+        # Create gradient scaler for FP16 with new API; prefer CUDA device when available
         if self.use_amp and self.amp_dtype == torch.float16:
-            self.scaler = GradScaler()
+            try:
+                # torch.amp.GradScaler (PyTorch >= 2.0) supports 'device'
+                self.scaler = GradScaler(device='cuda')
+            except TypeError:
+                # Fallback to legacy CUDA GradScaler
+                try:
+                    from torch.cuda.amp import GradScaler as CudaGradScaler  # type: ignore
+                    self.scaler = CudaGradScaler()
+                except Exception:
+                    # Final fallback without device specification
+                    self.scaler = GradScaler()
         else:
             self.scaler = None
     

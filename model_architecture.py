@@ -108,15 +108,17 @@ class TransformerBlock(nn.Module):
             v = v.transpose(1, 2)
             
             # Build attention mask with SDPA semantics:
-            # For torch.nn.functional.scaled_dot_product_attention, a boolean
-            # attn_mask uses True = MASK (i.e., disallow attention), False = keep.
-            # Our key_padding_mask already uses True = IGNORE, so we can pass it through.
+            # PyTorch SDPA expects boolean attn_mask where True = KEEP (participate),
+            # False = MASK (disallow attention). Our key_padding_mask uses True = IGNORE.
+            # Invert it for SDPA.
             attn_mask = None
             if key_padding_mask is not None:
-                # If any sample masks all positions, fail fast
-                if torch.all(key_padding_mask, dim=1).any():
-                    raise RuntimeError("key_padding_mask masks all keys for at least one sample.")
-                attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B,1,1,L) True = MASK
+                # If any sample masks all positions, fail fast (skip inside tracing)
+                if not torch.jit.is_tracing():
+                    if key_padding_mask.all(dim=1).any().item():
+                        raise RuntimeError("key_padding_mask masks all keys for at least one sample.")
+                # Invert for SDPA: True=keep, False=mask
+                attn_mask = (~key_padding_mask).unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
 
             # Use scaled_dot_product_attention with flash backend when available
             attn_out = F.scaled_dot_product_attention(
@@ -226,9 +228,10 @@ class SimplifiedTagger(nn.Module):
             attn_kpm = torch.cat([cls_keep, token_ignore], dim=1) # (B, 1+Lp) True=IGNORE
 
         if attn_kpm is not None:
-            # If any sample masks all positions, fail fast
-            if torch.all(attn_kpm, dim=1).any():
-                raise RuntimeError("attn_kpm masks all keys for at least one sample.")
+            # If any sample masks all positions, fail fast (skip inside tracing)
+            if not torch.jit.is_tracing():
+                if attn_kpm.all(dim=1).any().item():
+                    raise RuntimeError("attn_kpm masks all keys for at least one sample.")
 
         # Transformer blocks with optional gradient checkpointing
         for block in self.blocks:
