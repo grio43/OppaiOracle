@@ -103,9 +103,9 @@ data:
   canonical_cache_dtype: "bfloat16"
   
   # L2 Caching
-  l2_cache_enabled: false
+  l2_cache_enabled: true
   l2_cache_path: "./l2_cache"
-  l2_max_size_gb: 60.0
+  l2_max_size_gb: 2048.0
 
   # Augmentation (from augmentation.yaml)
   augmentation_enabled: true
