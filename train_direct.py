@@ -23,6 +23,8 @@ from contextlib import nullcontext
 import shutil
 import torch
 from torch.amp import GradScaler, autocast
+from torch.utils.data.distributed import DistributedSampler
+from torchmetrics.classification import MultilabelF1Score, MultilabelAveragePrecision
 import numpy as np
 from Monitor_log import MonitorConfig, TrainingMonitor
 from evaluation_metrics import MetricComputer
@@ -74,6 +76,9 @@ from dataset_loader import AugmentationStats, validate_dataset
 from utils.logging_sanitize import ensure_finite_tensor
 
 # Add after other imports
+
+# Alias to match usage below; avoids NameError and keeps intent clear.
+amp_autocast = autocast
 
 try:
     from loss_functions import MultiTaskLoss, AsymmetricFocalLoss
@@ -565,6 +570,12 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.exception("Failed to load checkpoint from %s; starting fresh. Error: %s", ckpt_path, e)
 
     for epoch in range(start_epoch, config.training.num_epochs):
+        # Ensure distinct shuffles across epochs in distributed mode
+        try:
+            if isinstance(getattr(train_loader, "sampler", None), DistributedSampler):
+                train_loader.sampler.set_epoch(epoch)
+        except Exception as e:
+            logger.debug(f"set_epoch skipped: {e}")
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
@@ -712,8 +723,12 @@ def train_with_orientation_tracking(config: FullConfig):
         # Validation loop
         model.eval()
         val_loss = 0.0
-        all_val_preds: list[torch.Tensor] = []
-        all_val_targets: list[torch.Tensor] = []
+        # Streaming metrics to avoid holding the entire validation set in memory
+        num_tags = len(vocab.index_to_tag)
+        threshold = getattr(getattr(config, "threshold_calibration", {}), "default_threshold", 0.5)
+        f1_macro = MultilabelF1Score(num_labels=num_tags, average="macro", threshold=threshold).to(device)
+        f1_micro = MultilabelF1Score(num_labels=num_tags, average="micro", threshold=threshold).to(device)
+        map_macro = MultilabelAveragePrecision(num_labels=num_tags, average="macro").to(device)
         with torch.no_grad():
             for val_step, batch in enumerate(val_loader):
                 images = batch['images'].to(device, non_blocking=True)
@@ -730,17 +745,19 @@ def train_with_orientation_tracking(config: FullConfig):
                     loss, _ = criterion(outputs['tag_logits'], outputs['rating_logits'], tag_labels, rating_labels)
                 val_loss += loss.item()
 
-                tag_probs = torch.sigmoid(outputs['tag_logits']).detach().cpu()
-                all_val_preds.append(tag_probs)
-                # Keep float labels for loss; metrics need {0,1} ints.
-                all_val_targets.append((tag_labels > 0.5).to(torch.long).cpu())
+                # Update streaming metrics
+                probs = torch.sigmoid(outputs['tag_logits'])
+                targs = (tag_labels > 0.5).to(torch.long)
+                f1_macro.update(probs, targs)
+                f1_micro.update(probs, targs)
+                map_macro.update(probs, targs)
 
                 if val_step == 0 and config.training.use_tensorboard:
                     tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
                     monitor.log_predictions(
                         step=global_step,
                         images=images,
-                        predictions=tag_probs.to(device),
+                        predictions=probs,
                         targets=tag_labels,
                         tag_names=tag_names,
                         prefix="val",
@@ -749,16 +766,14 @@ def train_with_orientation_tracking(config: FullConfig):
                     )
 
         avg_val_loss = val_loss / len(val_loader)
-        all_val_preds = torch.cat(all_val_preds, dim=0)
-        all_val_targets = torch.cat(all_val_targets, dim=0)
-        val_metrics = metric_computer.compute_all_metrics(all_val_preds, all_val_targets)
-        val_f1_macro = val_metrics.get('f1_macro', 0.0)
-        val_mAP = val_metrics.get('mAP', 0.0)
+        val_f1_macro = f1_macro.compute().item()
+        val_f1_micro = f1_micro.compute().item()
+        val_mAP = map_macro.compute().item()
         logger.info(
             f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, "
-            f"Val F1(macro): {val_f1_macro:.4f}, Val mAP: {val_mAP:.4f}"
+            f"Val F1(macro): {val_f1_macro:.4f}, Val F1(micro): {val_f1_micro:.4f}, Val mAP: {val_mAP:.4f}"
         )
-        monitor.log_validation(global_step, {'loss': avg_val_loss, 'f1_macro': val_f1_macro, 'mAP': val_mAP})
+        monitor.log_validation(global_step, {'loss': avg_val_loss, 'f1_macro': val_f1_macro, 'f1_micro': val_f1_micro, 'mAP': val_mAP})
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
