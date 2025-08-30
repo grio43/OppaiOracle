@@ -1,103 +1,13 @@
-OppaiOracle L1/L2 Cache Review — Resizing, Aspect Ratio, Masking, Processing (Updated 2025‑08‑30)
+OppaiOracle L1/L2 Cache — Open Issues Only (Updated 2025‑08‑30)
 
-Executive Summary
-- Verified: Aspect ratio preserved via downscale‑only letterbox across train/val/infer/export. No stretching or upscaling.
-- L1 cache: Stores pre‑normalized 0–1 letterboxed images plus an explicit pixel padding mask; robust to normalization changes.
-- L2 cache: Stores normalized, letterboxed images without an explicit mask and reconstructs masks by color matching. Coupling to preprocessing is now mitigated by config‑scoped keys.
-- Fixed: Prior Sidecar L2 double‑flip bug. L2 keys include a flip bit and reads no longer re‑apply flips; image/tag orientation stays consistent.
+Open Issues
+- L2 explicit mask: L2 still reconstructs padding masks via normalized pad‑color matching. This can be brittle across preprocessing changes or precision drift. Store a compact explicit mask (uint8 H,W) alongside image bytes to avoid heuristics.
+  - Evidence: mask reconstruction on read
+    - dataset_loader.py:311–326 (DatasetLoader)
+    - dataset_loader.py:803–811 (SidecarJsonDataset)
 
-Verified Pipeline Behavior
-- Train/Val loaders letterbox with preserved aspect and no upscale:
-  - dataset_loader.py:392–416 (DatasetLoader letterbox)
-  - dataset_loader.py:848–867 (SidecarJsonDataset letterbox)
-  - Inference_Engine.py:191–209 (downscale‑only letterbox)
-  - ONNX_Export.py:193–233 (interpolate + pad)
-- Padding mask semantics: pixel‑level True=PAD; pooled to token‑level ignore and passed to attention:
-  - model_architecture.py:219–235 (build key‑padding mask from pixel mask)
-  - mask_utils.py:11–37, 39–61 (standardize + pool to token ignore)
+- Documentation on L2 coupling: Even with config‑scoped keys, documentation should clearly state that L2 is tied to preprocessing (image_size, pad_color, normalization, flip policy) and may require invalidation when these change.
+  - Action: Update README/operator docs to mention cache invalidation guidance.
 
-L1 Cache (in‑memory per‑worker)
-- Where: dataset_loader.py (manifest mode only)
-  - Build/open: dataset_loader.py:156–183 (ensure), 91–121 (config params)
-  - Read path: dataset_loader.py:232–297
-  - Write path: dataset_loader.py:492–501
-  - Encoding helpers: l1_cache.py:1–120 (encode_l1_image_01/decode_l1_image_01)
-- What is cached:
-  - Image: pre‑normalized 0–1 CHW tensor after letterbox, stored in canonical dtype (`canonical_cache_dtype`: uint8/float16/bfloat16/float32).
-  - Mask: explicit pixel padding mask (H,W) saved alongside the image.
-- How it’s used:
-  - On hit, decode to 0–1 and apply current Normalize(mean,std) at read time.
-  - Mask is loaded directly; attention receives correct token ignore via mask_utils.
-- Strengths:
-  - Robust to Normalize(mean,std) changes across runs (normalization applied at read, not baked in cache).
-  - Explicit mask avoids heuristic reconstruction.
-  - Keys incorporate `image_size` and `flip` flag; resistant to size changes.
-- Findings/Issues:
-  1) Fallback mask when missing — RESOLVED:
-     - Missing L1 masks are now reconstructed via pad‑color match on the 0–1 image. See dataset_loader.py:246–261.
-  2) Keys omit pad_color — OK:
-     - Benign because L1 stores explicit masks; normalization is applied at read time.
-
-L2 Cache (LMDB, disk‑backed)
-- Where: l2_cache.py + dataset_loader.py (DatasetLoader and SidecarJsonDataset)
-  - Reader: l2_cache.py (LMDBReader)
-  - Writer: l2_cache.py (_WriterProc) with safetensors (cache_codec.py)
-  - SidecarJsonDataset L2 read/write: dataset_loader.py:787–806 (read), 900–905 (write)
-  - DatasetLoader L2 read/write: dataset_loader.py:299–326 (read), 484–491 (write)
-- What is cached:
-  - Normalized letterboxed image tensor (CHW) only. No mask, no extra metadata.
-- How masking is recovered:
-  - Reconstruct pixel padding mask via color matching to normalized pad_color with tolerance `PAD_MASK_ATOL=1e‑3`:
-    - DatasetLoader: dataset_loader.py:311–326
-    - SidecarJsonDataset: dataset_loader.py:803–811
-- Strengths:
-  - Reduces decode/resize/normalize cost on cache hit.
-  - safetensors + optional HMAC in cache_codec.py improves integrity.
-- Findings/Issues:
-  1) Sidecar L2 double‑flip — FIXED:
-     - L2 keys now include a flip bit; cache stores post‑flip tensors keyed by flip. Reads select the correct key and do not re‑flip. See dataset_loader.py:784–786 (key) and 787–806 (read).
-  2) Config coupling (no versioning) — FIXED/MITIGATED:
-     - Keys include a short hash of (`image_size`, `pad_color`, `normalize_mean`, `normalize_std`). See dataset_loader.py:121–138, 185–192.
-     - Readers validate cached tensor shape equals current target. See dataset_loader.py:305–310 and 795–798.
-  3) No explicit cached mask — OPEN:
-     - Still reconstructs via color match; consider caching a compact (H,W) uint8 mask alongside image bytes to avoid heuristics.
-  4) Normalization baked into cache — ACCEPTED:
-     - Coupling is mitigated by config‑scoped keys (mean/std in hash). Keep in mind for cache reuse across configs.
-  5) Orientation (flip) metadata — FIXED:
-     - Flip bit included in keys. See dataset_loader.py:185–192 and 784–786.
-  6) Potential dtype/precision drift — LOW RISK:
-     - Current pipeline writes float32 tensors; reconstruction tolerance is adequate. Explicit casting policy on read is optional hardening.
-
-Attention Masking and Model Usage
-- Pixel mask to token ignore:
-  - mask_utils pools (B,1,H,W) via avg_pool2d with kernel=stride=patch; marks tokens ignore when pad_fraction ≥ threshold (default 0.9). mask_utils.py:39–61.
-  - Model builds key‑padding mask and uses SDPA semantics (True=keep). See model_architecture.py:219–235 and TransformerBlock SDPA path.
-  - Guardrails: asserts H/W divisible by patch; early‑fail if all tokens masked.
-- Dataset adherence:
-  - L1 path provides explicit mask. L2 path reconstructs via normalized pad color; Sidecar flips mask in sync with images. See dataset_loader.py:862–865.
-  - Joint v2 transforms (if used) keep geometry aligned: dataset_loader.py:409–420 (DatasetLoader) and 867–875 (Sidecar).
-
-Other Processing Notes (relevant to caches)
-- EXIF transpose and alpha compositing to neutral gray occur pre‑letterbox to maintain consistent geometry: dataset_loader.py:382–392 and 835–846; Inference_Engine.py:215–226.
-- No upscaling: `scale = min(1.0, min(target/w, target/h))` across loaders/inference/export.
-- Resample mode: BILINEAR across PIL; bilinear interpolate in ONNX Export; consistent.
-
-Recommendations — Status
-1) Fix Sidecar L2 double‑flip — DONE (flip‑aware keys; no re‑flip on read).
-2) Add config versioning to L2 keys — DONE (hash of size/pad/mean/std in key).
-3) Cache explicit mask in L2 — OPEN (store compact (H,W) mask alongside image bytes).
-4) Validate L2 shapes on read — DONE (shape checks in both loaders).
-5) Improve L1 fallback mask — DONE (pad‑color reconstruction on L1 hit without mask).
-6) Document L2 coupling — OPEN (docs should note cache invalidation on preprocessing changes).
-
-File References
-- dataset_loader.py:121–138, 156–183, 185–192, 232–297, 299–326, 382–420, 392–416, 484–501, 784–806, 848–867, 862–865, 867–875, 900–905
-- l1_cache.py:1–120
-- l2_cache.py:1–200
-- cache_codec.py:1–200
-- mask_utils.py:11–37, 39–61
-- model_architecture.py:219–268
-- Inference_Engine.py:191–209, 215–230
-- ONNX_Export.py:193–239
-
-End of report.
+Notes
+- All other previously reported items were verified or fixed (flip‑aware keys, config‑versioned keys, shape checks on read, L1 fallback mask reconstruction). These are intentionally omitted here.
