@@ -8,7 +8,7 @@ import re
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Counter
+from typing import Dict, List, Optional, Set, Tuple, Counter, Any
 import warnings
 import threading
 
@@ -544,7 +544,7 @@ class OrientationHandler:
         
         return {k: v for k, v in issues.items() if v}
     
-    def get_usage_statistics(self) -> Dict[str, any]:
+    def get_usage_statistics(self) -> Dict[str, Any]:
         """Get usage statistics."""
         with self._stats_lock:
             total_flips = self.stats['total_flips']
@@ -575,7 +575,7 @@ class OrientationHandler:
             }
         }
 
-    def get_statistics(self) -> Dict[str, any]:
+    def get_statistics(self) -> Dict[str, Any]:
         """Alias for get_usage_statistics for backwards compatibility."""
         return self.get_usage_statistics()
     
@@ -624,7 +624,7 @@ class OrientationHandler:
         stats = self.get_usage_statistics()
         return stats['num_unmapped_tags'] <= max_unmapped_threshold
 
-    def generate_safety_report(self, output_path: Optional[Path] = None) -> Dict[str, any]:
+    def generate_safety_report(self, output_path: Optional[Path] = None) -> Dict[str, Any]:
         """
         Generate a comprehensive safety report for flip decisions.
         
@@ -658,7 +658,7 @@ class OrientationHandler:
         }
         
         if output_path:
-            with open(output_path, 'w') as f:
+            with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
                 json.dump(report, f, indent=2)
             logger.info(f"Safety report saved to {output_path}")
         
@@ -688,19 +688,30 @@ class OrientationHandler:
 class OrientationMonitor:
     """Monitor for tracking orientation handling health during training."""
     
-    def __init__(self, threshold_unmapped: int = 10, check_interval: int = 100):
+    def __init__(self, threshold_unmapped: int = 10, check_interval: int = 100, out_dir: Optional[Path] = None):
         """
         Initialize the monitor.
         
         Args:
             threshold_unmapped: Number of unmapped tags before warning
             check_interval: How often to check (every N batches)
+            out_dir: Optional directory to write diagnostics into (defaults to CWD)
         """
         self.threshold_unmapped = threshold_unmapped
         self.check_interval = check_interval
         self.warning_issued = False
         self.batch_count = 0
         self.last_unmapped_count = 0
+        self.last_written_count = -1
+        # Destination for diagnostics (default: CWD). Create it if missing.
+        self.out_dir = Path(out_dir) if out_dir else Path.cwd()
+        try:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # Fallback so we never crash if an invalid path is provided.
+            self.out_dir = Path.cwd()
+        # Ensure the file exists from the start so it's produced by default.
+        self._write_unmapped_file({'unmapped_tags_by_frequency': []}, handler=None)
     
     def check_health(self, handler: OrientationHandler, force: bool = False) -> None:
         """Check if too many unmapped tags are accumulating.
@@ -718,6 +729,11 @@ class OrientationMonitor:
         stats = handler.get_statistics()
         unmapped_count = stats['num_unmapped_tags']
         
+        # Always (re)write the diagnostics file at each check when count changed; warning is separate.
+        if unmapped_count != self.last_written_count:
+            self._write_unmapped_file(stats, handler)
+            self.last_written_count = unmapped_count
+
         # Check if unmapped tags are growing
         if unmapped_count > self.last_unmapped_count:
             new_unmapped = unmapped_count - self.last_unmapped_count
@@ -732,24 +748,29 @@ class OrientationMonitor:
                 "Consider updating orientation_map.json"
             )
             self.warning_issued = True
-            
-            # Save unmapped tags with frequency and suggestions to file for review
-            unmapped_file = Path("unmapped_orientation_tags.txt")
-            with open(unmapped_file, 'w') as f:
-                f.write("# Unmapped orientation tags found during training\n")
-                f.write("# Add these to orientation_map.json if needed\n\n")
-                f.write("# Format: tag (frequency) -> suggested_mapping\n\n")
-                
-                # Get suggestions
-                suggestions = handler.suggest_mappings()
-                
-                # Write tags sorted by frequency
-                for tag, freq in stats['unmapped_tags_by_frequency']:
-                    suggested = suggestions.get(tag, "# No suggestion")
-                    f.write(f"{tag} ({freq}x) -> {suggested}\n")
-            logger.info(f"Saved unmapped tags to {unmapped_file}")
+            # File was already refreshed above; nothing else to do here.
         
         self.last_unmapped_count = unmapped_count
+
+    def _write_unmapped_file(self, stats: Dict[str, Any], handler: Optional['OrientationHandler'] = None) -> None:
+        """Write (or overwrite) unmapped_orientation_tags.txt atomically."""
+        unmapped_file = self.out_dir / "unmapped_orientation_tags.txt"
+        tmp = unmapped_file.with_suffix('.tmp')
+        try:
+            suggestions = handler.suggest_mappings() if handler else {}
+            with tmp.open('w', encoding='utf-8', newline='\n') as f:
+                f.write("# Unmapped orientation tags found during training\n")
+                f.write("# Format: tag (frequency) -> suggested_mapping\n\n")
+                entries = stats.get('unmapped_tags_by_frequency') or []
+                if not entries:
+                    f.write("# No unmapped orientation tags encountered yet.\n")
+                else:
+                    for tag, freq in entries:
+                        suggested = suggestions.get(tag, "# No suggestion")
+                        f.write(f"{tag} ({freq}x) -> {suggested}\n")
+            tmp.replace(unmapped_file)  # atomic on POSIX/NT
+        except Exception as e:
+            logger.error(f"Failed to write {unmapped_file}: {e}")
 
 
 def test_orientation_handler():
