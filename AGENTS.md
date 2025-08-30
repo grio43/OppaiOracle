@@ -42,8 +42,8 @@ OppaiOracle (MAID) is a PyTorch system to train, evaluate, and deploy image‑ta
   - **AMP precision**: Training uses `bfloat16` when supported; inference adopts checkpoint precision.
 
 - LR scheduler semantics:
-  - `training_utils.CosineAnnealingWarmupRestarts` is stepped once per EPOCH. Therefore `training.warmup_steps` is in EPOCHS, not optimization steps.
-  - Recommendation: set `warmup_steps` to a small integer (e.g., 3–10). The current default `10000` in `configs/unified_config.yaml` will keep LR near min for the whole run.
+  - Step-based: the trainer now calls `scheduler.step()` after each optimizer update (respects gradient accumulation). `training.warmup_steps` is in optimizer steps.
+  - Default: `warmup_steps: 10000`. Tune per dataset if convergence is slow to start.
 
 - Checkpoint safety:
   - Always use `safe_checkpoint.safe_load_checkpoint` (already wired). Do not introduce raw `torch.load` with pickled objects.
@@ -56,7 +56,8 @@ OppaiOracle (MAID) is a PyTorch system to train, evaluate, and deploy image‑ta
 - Validation header glitch: `validation_loop.py` begins with a stray literal prefix before the shebang when viewed in some repos. Import‑sanity catches this. If present, remove any leading non‑comment text so the first line is a shebang or a docstring.
 - LR warmup units: As noted, warmup is epoch‑based. Adjust `training.warmup_steps` to avoid stalled learning.
 - Background validator lifecycle: `dataset_loader.BackgroundValidator` is daemonized but not explicitly stopped by training. This is benign for normal runs; if you embed loaders elsewhere, call `validator.stop()` during teardown.
-- Memory in validation: `validation_loop.py` aggregates all predictions/targets to compute metrics. For very large sets consider chunking or streaming metrics if you extend it.
+  - The trainer now attempts to stop any loader `validator` on exit.
+  - Memory in validation: `validation_loop.py` aggregates all predictions/targets to compute metrics. For very large sets consider chunking or streaming metrics if you extend it.
 
 ## Coding Standards (for agents)
 
