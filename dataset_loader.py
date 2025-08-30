@@ -241,7 +241,9 @@ class DatasetLoader(Dataset):
             # 2) Keep aspect ratio via letterbox to square + build padding mask (True = PAD)
             target = int(self.image_size)
             w, h = img.size
-            scale = min(target / float(w), target / float(h)) if (w > 0 and h > 0) else 1.0
+            # Downscale-only letterbox: preserve aspect, never upscale
+            ratio = min(target / float(w), target / float(h)) if (w > 0 and h > 0) else 1.0
+            scale = min(1.0, ratio)
             nw, nh = int(round(w * scale)), int(round(h * scale))
             # (Optional) modern Pillow name to avoid deprecation noise:
             # from PIL import Image; resample = Image.Resampling.BILINEAR
@@ -658,7 +660,9 @@ class SidecarJsonDataset(Dataset):
             # 2) Letterbox to square and padding mask
             target = int(self.image_size)
             w, h = pil.size
-            scale = min(target / float(w), target / float(h)) if (w > 0 and h > 0) else 1.0
+            # Downscale-only letterbox: preserve aspect, never upscale
+            ratio = min(target / float(w), target / float(h)) if (w > 0 and h > 0) else 1.0
+            scale = min(1.0, ratio)
             nw, nh = int(round(w * scale)), int(round(h * scale))
             resized = pil.resize((max(1, nw), max(1, nh)), RESAMPLE_BILINEAR)
             canvas = Image.new("RGB", (target, target), tuple(self.pad_color))

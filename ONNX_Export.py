@@ -181,31 +181,53 @@ class InferenceWrapper(nn.Module):
         shape = torch.ops.aten.shape_as_tensor(image_f32)
         b, c, h, w = shape[0], shape[1], shape[2], shape[3]
 
-        # 3. Pad to square
-        max_dim = torch.max(h, w)
-        pad_h = max_dim - h
-        pad_w = max_dim - w
+        # 3. Downscale-only letterbox to target size without stretching
+        # Compute uniform scale factor: min(target/h, target/w), clamped to <= 1.0
+        h_f = h.to(torch.float32)
+        w_f = w.to(torch.float32)
+        tgt = torch.tensor(float(self.target_size), dtype=torch.float32, device=image_f32.device)
+        eps = torch.tensor(1.0, dtype=torch.float32, device=image_f32.device)  # for clamp denominator
+        ratio_h = tgt / torch.maximum(h_f, eps)
+        ratio_w = tgt / torch.maximum(w_f, eps)
+        scale = torch.minimum(ratio_h, ratio_w)
+        scale = torch.minimum(scale, torch.tensor(1.0, dtype=torch.float32, device=image_f32.device))
 
+        # Resize with dynamic scale factor (uniform for H and W)
+        resized = F.interpolate(
+            image_f32,
+            scale_factor=scale,
+            mode='bilinear',
+            align_corners=False,
+            recompute_scale_factor=True,
+        )
+
+        # 4. Pad to fixed target canvas with pad_color
+        rshape = torch.ops.aten.shape_as_tensor(resized)  # (B,C,H',W')
+        rh, rw = rshape[2], rshape[3]
+        target_i64 = torch.tensor(self.target_size, dtype=torch.int64, device=image_f32.device)
+        pad_h = target_i64 - rh
+        pad_w = target_i64 - rw
         pad_top = pad_h // 2
         pad_bottom = pad_h - pad_top
         pad_left = pad_w // 2
         pad_right = pad_w - pad_left
 
-        padded_f32 = F.pad(image_f32, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+        padded = F.pad(resized, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
 
-        # Fill padding with the correct color
-        pad_mask = F.pad(torch.ones_like(image_f32), (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0) == 0
-        padded_f32 = padded_f32.masked_scatter(pad_mask, self.pad_color.expand_as(padded_f32)[pad_mask])
-
-        # 4. Resize to target size
-        # The input is now a square, so we can resize to a fixed size.
-        resized = F.interpolate(padded_f32, size=(self.target_size, self.target_size), mode='bilinear', align_corners=False)
+        # Build a single-channel padding mask (B,1,H,W) with True=PAD
+        pad_mask = F.pad(
+            torch.ones_like(resized[:, :1]),
+            (pad_left, pad_right, pad_top, pad_bottom),
+            mode='constant', value=0
+        ) == 0
+        pad_mask3 = pad_mask.expand_as(padded)
+        padded = padded.masked_scatter(pad_mask3, self.pad_color.expand_as(padded)[pad_mask3])
 
         # 5. Normalization
-        normalized = (resized - self.mean) / self.std
+        normalized = (padded - self.mean) / self.std
 
-        # 6. Inference
-        outputs = self.model(normalized)
+        # 6. Inference (propagate padding mask)
+        outputs = self.model(normalized, padding_mask=pad_mask)
 
         if isinstance(outputs, dict):
             logits = outputs.get('logits', outputs.get('output', outputs))
