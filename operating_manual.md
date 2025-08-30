@@ -18,7 +18,7 @@ Key Abbreviations
   - Provide `configs/orientation_map.json`; or
   - Set `data.strict_orientation_validation: false` to allow flips without a map (not recommended beyond experiments).
   - Safety modes: `conservative | balanced | permissive`. Conservative is safest in production.
-- LR Warmup Units: The scheduler steps once per EPOCH, so `training.warmup_steps` is in epochs. Set `3–10` for typical runs. The UC default `10000` is intentionally conservative but will pin LR near minimum for the whole run—lower it before training.
+- LR Warmup Units: The scheduler steps once per optimizer update (after gradient accumulation), so `training.warmup_steps` is in optimizer steps. Typical guidance: use ~3–10 epochs worth of updates (compute as `ceil(len(train_loader)/gradient_accumulation_steps) × desired_epochs`). The UC default `10000` is intentionally conservative and may keep LR near minimum too long—tune per dataset.
 - Vocabulary: Always use a real `vocabulary.json` (no `tag_###` placeholders). The system fails fast when placeholders are detected.
 - Logging: Set `log_dir` and ensure disk space; TB dir defaults to `<output_root>/<experiment_name>`.
 
@@ -145,7 +145,7 @@ Key Abbreviations
   - Increase `data.num_workers`, `prefetch_factor`; keep `pin_memory: true` on CUDA.
   - Use gradient checkpointing to trade compute for memory.
 - Optimization Schedule
-  - Warmup in epochs (3–10 typical). Adjust `num_epochs`, `lr_end`, and `num_cycles` thoughtfully.
+  - Warmup in optimizer steps. Aim for ~3–10 epochs worth of updates (compute `ceil(len(train_loader)/gradient_accumulation_steps) × desired_epochs`). Adjust `lr_end` and `num_cycles` thoughtfully.
 - Stability
   - Non‑finite guardrails exist in the model; if tripped, enable `training.enable_anomaly_detection: true` and set `debug.*` toggles to dump failing tensors.
 
@@ -181,4 +181,3 @@ File Pointers (for Operators)
 - ONNX export: `ONNX_Export.py:ONNXExporter`
 - ONNX inference: `onnx_infer.py:main`
 - Vocabulary tools: `vocabulary.py` and `tools/`
-
