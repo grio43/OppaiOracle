@@ -762,9 +762,16 @@ class TrainingMonitor:
         self.best_val_metric = float('inf')
         self._graph_logged = False
 
+        # Determine primary once; don't rely on an unset attribute
+        try:
+            self.is_primary = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+        except Exception:
+            self.is_primary = True
+
         # Optional components
         self.alerts = AlertSystem(config) if config.enable_alerts else None
-        self.system_monitor = SystemMonitor(config) if config.track_system_metrics else None
+        # Run system metrics on primary rank only
+        self.system_monitor = SystemMonitor(config) if (config.track_system_metrics and self.is_primary) else None
         if self.system_monitor:
             try:
                 self.system_monitor.start()
@@ -783,8 +790,7 @@ class TrainingMonitor:
         self.wandb_run = None
 
         use_tb = bool(getattr(self.config, "use_tensorboard", False))
-        is_primary = bool(getattr(self, "is_primary", True))  # falls back to True if not set
-        if use_tb and is_primary:
+        if use_tb and self.is_primary:
             from datetime import datetime
             import socket
             from pathlib import Path
@@ -833,12 +839,7 @@ class TrainingMonitor:
         ch.setFormatter(logging.Formatter(self.config.log_format))
         module_logger.addHandler(ch)
         # Only rank 0 writes files
-        is_primary = True
-        try:
-            is_primary = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
-        except Exception:
-            is_primary = True
-        if is_primary and self.config.log_to_file:
+        if getattr(self, "is_primary", True) and self.config.log_to_file:
             log_dir = Path(self.config.log_dir)
             log_dir.mkdir(parents=True, exist_ok=True)
             fh = logging.FileHandler(log_dir / "training_{:%Y%m%d_%H%M%S}.log".format(datetime.now()))

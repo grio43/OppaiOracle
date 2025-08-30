@@ -721,6 +721,12 @@ def train_with_orientation_tracking(config: FullConfig):
                         optimizer.param_groups[0]['lr'],
                         images.size(0),
                     )
+                    # Histogram logging (gated by monitor config)
+                    if config.training.use_tensorboard:
+                        try:
+                            monitor.log_param_and_grad_histograms(model, global_step)
+                        except Exception:
+                            pass
 
             if stats_queue:
                 while not stats_queue.empty():

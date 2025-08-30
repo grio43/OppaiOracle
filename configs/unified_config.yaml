@@ -347,6 +347,13 @@ monitor:
   # Visualization
   # Note: These are often overridden by the training config for convenience
   use_tensorboard: true
+  # Histogram logging defaults (set conservative intervals; disable by default)
+  log_histograms: false
+  log_param_histograms: false
+  log_grad_histograms: false
+  histogram_log_interval: 4000
+  param_hist_interval_steps: 4000
+  grad_hist_interval_steps: 4000
   tensorboard_dir: "./tensorboard"
   use_wandb: false
   wandb_project: "anime-tagger"
