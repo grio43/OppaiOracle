@@ -405,7 +405,7 @@ class DatasetLoader(Dataset):
                     except Exception as e:
                         # Treat as cache miss; skip bad/tampered records safely
                         self.logger.warning(
-                            f"L2 cache decode failed for {image_id}: {e} (treating as miss)"
+                            f"L2 cache decode failed for {raw_image_id}: {e} (treating as miss)"
                         )
 
             # --- Cache miss: load + transform (confined path) ---
@@ -530,7 +530,7 @@ class DatasetLoader(Dataset):
                 self._ensure_l1()
                 if self._l1 is not None:
                     try:
-                        raw_key, mask_key = self._l1_keys(image_key, flipped=False)
+                        raw_key, mask_key = self._l1_keys(image_key_base, flipped=False)
                         self._l1.put(raw_key, encode_l1_image_01(img_01, dtype_str=self._l1_dtype_str))
                         self._l1.put(mask_key, pmask.to(torch.uint8))
                     except Exception:
