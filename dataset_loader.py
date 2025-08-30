@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from torch.utils.data.distributed import DistributedSampler
 import logging.handlers
 import queue
 import time
@@ -45,6 +46,9 @@ ALLOW_TRUNCATED = bool(int(os.environ.get("OO_ALLOW_TRUNCATED", "0")))
 if ALLOW_TRUNCATED:
     ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+
+# Single place to control floating tolerance when reconstructing padding masks
+PAD_MASK_ATOL = 1e-3
 
 # Guarded DataLoader wrapper:
 # - If num_workers == 0, drop prefetch_factor and force persistent_workers=False.
@@ -115,11 +119,18 @@ class DatasetLoader(Dataset):
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
 
     def _ensure_l2_reader(self):
-        if not self._l2_enabled:
+        """Create the L2 LMDB reader if (and only if) the path is set and size is positive."""
+        if not getattr(self, "_l2_enabled", False):
+            return
+        # If the path is unset OR empty, treat L2 as disabled.
+        if not getattr(self, "_l2_path", None) or not str(self._l2_path):
+            return
+        # If size missing or non-positive, warn once and treat as disabled.
+        if not getattr(self, "_l2_map_size", None) or int(self._l2_map_size) <= 0:
+            logging.warning("L2 cache enabled but l2_map_size_bytes<=0 or missing; disabling L2 reads.")
             return
         # Open env lazily **inside** the worker process to avoid fork-related handle reuse
         if self._l2_reader is None:
-            assert self._l2_path and self._l2_map_size > 0
             self._l2_reader = LMDBReader(self._l2_path, self._l2_map_size, max_readers=self._l2_max_readers)
 
     def _load_annotations(self, path):
@@ -161,7 +172,7 @@ class DatasetLoader(Dataset):
                             # the padding mask. A strict tolerance (1e-6) can lead to false
                             # negatives under mixed-precision (e.g. bfloat16) or when
                             # normalization introduces minor rounding differences.
-                            pmask = torch.isclose(t, pad_norm, atol=1e-3).all(dim=0)
+                            pmask = torch.isclose(t, pad_norm, atol=PAD_MASK_ATOL, rtol=0.0).all(dim=0)
 
                         # Prepare labels for training loop compatibility
                         tag_indices = annotation.get("labels") or []
@@ -528,10 +539,17 @@ class SidecarJsonDataset(Dataset):
                 self.logger.warning(f"Failed to parse {jp}: {e}")
 
     def _ensure_l2_reader(self):
-        if not self._l2_enabled:
+        """Create the L2 LMDB reader if (and only if) the path is set and size is positive."""
+        if not getattr(self, "_l2_enabled", False):
+            return
+        # If the path is unset OR empty, treat L2 as disabled.
+        if not getattr(self, "_l2_path", None) or not str(self._l2_path):
+            return
+        # If size missing or non-positive, warn once and treat as disabled.
+        if not getattr(self, "_l2_map_size", None) or int(self._l2_map_size) <= 0:
+            logging.warning("L2 cache enabled but l2_map_size_bytes<=0 or missing; disabling L2 reads.")
             return
         if self._l2_reader is None:
-            assert self._l2_path and self._l2_map_size > 0
             self._l2_reader = LMDBReader(self._l2_path, self._l2_map_size, max_readers=self._l2_max_readers)
 
     def __len__(self) -> int:
@@ -607,7 +625,7 @@ class SidecarJsonDataset(Dataset):
                         std = torch.tensor(self.normalize_std, dtype=img_t.dtype, device=img_t.device)
                         pad_norm = ((pad_vec - mean) / std).view(3, 1, 1)
                         with torch.no_grad():
-                            pmask = torch.isclose(img_t, pad_norm, atol=1e-6).all(dim=0)
+                            pmask = torch.isclose(img_t, pad_norm, atol=PAD_MASK_ATOL, rtol=0.0).all(dim=0)
                         if flipped:
                             pmask = torch.flip(pmask, dims=[1])
                         tag_vec = self.vocab.encode_tags(tags_now)
@@ -763,8 +781,24 @@ def create_dataloaders(
 ):
     logger = logging.getLogger(__name__)
 
-    # Map size for LMDB (bytes)
-    map_size_bytes = int(getattr(data_config, "l2_max_size_gb", 0) * (1024 ** 3))
+    # ---- L2 fail-fast guard --------------------------------------------
+    if bool(getattr(data_config, "l2_cache_enabled", False)):
+        max_gb = getattr(data_config, "l2_max_size_gb", None)
+        max_bytes = getattr(data_config, "l2_map_size_bytes", None)
+        ok = False
+        try:
+            ok = (max_gb is not None and float(max_gb) > 0.0) or (max_bytes is not None and int(max_bytes) > 0)
+        except Exception:
+            ok = False
+        if not ok:
+            raise ValueError("data.l2_cache_enabled=true requires a positive l2_max_size_gb or l2_map_size_bytes.")
+
+    # Map size for LMDB (bytes) — accept either GB or direct bytes
+    _size_bytes_cfg = getattr(data_config, "l2_map_size_bytes", None)
+    if _size_bytes_cfg is not None and int(_size_bytes_cfg) > 0:
+        map_size_bytes = int(_size_bytes_cfg)
+    else:
+        map_size_bytes = int(getattr(data_config, "l2_max_size_gb", 0) * (1024 ** 3))
 
     # Optional writer process
     if getattr(data_config, "l2_cache_enabled", False):
@@ -904,6 +938,28 @@ def create_dataloaders(
             flip_overrides_path=None,
         )
 
+    # ---- Samplers for distributed --------------------------------------
+    train_sampler = None
+    val_sampler = None
+    if distributed:
+        # NOTE: when sampler is set, DataLoader.shuffle must be False.
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=int(world_size),
+            rank=int(rank),
+            shuffle=True,
+            drop_last=bool(getattr(data_config, "drop_last", False)),
+            seed=int(seed) if seed is not None else 0,
+        )
+        val_sampler = DistributedSampler(
+            val_ds,
+            num_replicas=int(world_size),
+            rank=int(rank),
+            shuffle=False,
+            drop_last=False,
+        )
+    # --------------------------------------------------------------------
+
     # DataLoaders
     def _dl_kwargs(cfg, *, shuffle: bool, drop_last: bool):
         kw = dict(
@@ -920,10 +976,14 @@ def create_dataloaders(
             kw["persistent_workers"] = bool(getattr(cfg, "persistent_workers", False))
         return kw
 
-    train_loader = DataLoader(
-        train_ds,
-        **_dl_kwargs(data_config, shuffle=True, drop_last=bool(getattr(data_config, "drop_last", False))),
+    _train_kw = _dl_kwargs(
+        data_config,
+        shuffle=(train_sampler is None),
+        drop_last=bool(getattr(data_config, "drop_last", False)),
     )
+    if train_sampler is not None:
+        _train_kw["sampler"] = train_sampler
+    train_loader = DataLoader(train_ds, **_train_kw)
 
     val_batch = (
         validation_config.dataloader.batch_size
@@ -933,10 +993,9 @@ def create_dataloaders(
     # Build kwargs for val loader separately to honor val batch size
     _val_kw = _dl_kwargs(data_config, shuffle=False, drop_last=False)
     _val_kw["batch_size"] = val_batch
-    val_loader = DataLoader(
-        val_ds,
-        **_val_kw,
-    )
+    if val_sampler is not None:
+        _val_kw["sampler"] = val_sampler
+    val_loader = DataLoader(val_ds, **_val_kw)
 
     return train_loader, val_loader, vocab
 
