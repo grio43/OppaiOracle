@@ -167,7 +167,11 @@ class _WriterProc(mp.Process):
                     for k, v in pending:
                         txn.put(k, v, overwrite=True)
         try:
-            env.sync(False)
+            # Force a synchronous flush to ensure durability when sync=False. Without
+            # calling sync(), writemap=True combined with sync=False leaves the OS
+            # with no hint for when to flush dirty pages to disk. A call to
+            # env.sync(force=True) forces a flush regardless of MDB_NOSYNC flags.
+            env.sync(force=True)
             env.close()
         except Exception:
             pass
