@@ -343,8 +343,11 @@ class OrientationHandler:
         # No mapping found - check if it's an orientation tag we should track
         # Note: 'asymmetric'/'asymmetrical' tags are NOT tracked as unmapped since they don't need swapping
         if any(keyword in tag for keyword in ['left', 'right']) and not any(skip in tag for skip in ['asymmetric', 'asymmetrical']):
-            # Mirror skip-logic from can_safely_flip(): don't track benign substrings
-            if not any(sub in tag for sub in ['bright', 'upright', 'straight', 'light', 'fight']):
+            # Mirror can_safely_flip() filters fully:
+            #  • ignore benign substrings (incl. 'copyright')
+            #  • ignore single_* descriptors
+            if not (any(sub in tag for sub in ['bright', 'upright', 'straight', 'light', 'fight', 'copyright'])
+                    or ('single_' in tag)):
                 with self._stats_lock:
                     self.stats['unmapped_tags'].add(tag)
                     self.stats['unmapped_tag_frequency'][tag] = self.stats['unmapped_tag_frequency'].get(tag, 0) + 1
