@@ -265,6 +265,29 @@ class ValidationRunner:
         if config.frequency_bins is None:
             self.config.frequency_bins = [0, 10, 100, 1000, 10000, float('inf')]
     
+    def _infer_num_tags(self, checkpoint: Optional[Dict]) -> int:
+        """
+        Decide the correct number of tags before model creation.
+        Priority:
+          1) embedded vocab in checkpoint
+          2) external vocab file (config.vocab_path, then defaults)
+        """
+        try:
+            vocab_data = ModelMetadata.extract_vocabulary(checkpoint) if checkpoint else None
+            if vocab_data and 'tag_to_index' in vocab_data:
+                return len(vocab_data['tag_to_index'])
+        except Exception:
+            pass
+        # External fallback(s)
+        vocab_path = Path(self.config.vocab_path)
+        if not vocab_path.exists():
+            for p in (DEFAULT_VOCAB_PATH, PROJECT_ROOT / "vocabulary" / "vocabulary.json"):
+                if p.exists():
+                    vocab_path = p
+                    break
+        vocab = TagVocabulary(vocab_path)
+        return len(vocab.tag_to_index)
+    
     def _metadata_dict_to_list(self, meta: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Convert a batch-level metadata dict-of-lists (as produced by the
@@ -339,9 +362,12 @@ class ValidationRunner:
             if not isinstance(model_config, dict):
                 model_config = asdict(model_config)
 
-            # Override num_tags with actual vocabulary size
-            model_config['num_tags'] = self.num_tags
-            logger.info(f"Creating model with {self.num_tags} tags (from vocabulary)")
+            # Ensure num_tags is defined before creating the model
+            # (self.num_tags may not be set yet the first time we get here)
+            if not hasattr(self, "num_tags") or not isinstance(getattr(self, "num_tags", None), int):
+                self.num_tags = self._infer_num_tags(checkpoint)
+            model_config['num_tags'] = int(self.num_tags)
+            logger.info(f"Creating model with {self.num_tags} tags (derived from vocab)")
 
             # Create model
             model = create_model(**model_config)
@@ -360,25 +386,19 @@ class ValidationRunner:
             
             model.load_state_dict(state_dict)
 
-            # Extract preprocessing parameters if available
-            if 'preprocessing_params' in checkpoint:
-                preprocessing = ModelMetadata.extract_preprocessing_params(checkpoint)
-                if preprocessing:
-                    logger.info(f"Found preprocessing params in checkpoint: {preprocessing}")
-                    # Store for later use
-                    self.preprocessing_params = preprocessing
-                    self.patch_size = preprocessing.get('patch_size', 16)
-                else:
-                    self.preprocessing_params = {
-                        'normalize_mean': [0.5, 0.5, 0.5],
-                        'normalize_std': [0.5, 0.5, 0.5],
-                        'image_size': 640,
-                        'patch_size': 16
-                    }
-            elif 'normalization_params' in checkpoint:
-                # Legacy format
-                norm = checkpoint['normalization_params']
-                logger.info(f"Found normalization params in checkpoint (legacy): {norm}")
+            # Always try to extract preprocessing; handle legacy inside the extractor.
+            preprocessing = ModelMetadata.extract_preprocessing_params(checkpoint) if checkpoint else None
+            if not preprocessing:
+                # Fall back to unified_config.yaml values (already loaded), or sensible defaults.
+                preprocessing = {
+                    "normalize_mean": list(self._val_mean) if self._val_mean else [0.5, 0.5, 0.5],
+                    "normalize_std": list(self._val_std) if self._val_std else [0.5, 0.5, 0.5],
+                    "image_size": int(self._val_image_size),
+                    "patch_size": int(self._val_patch_size),
+                }
+                logger.info("No preprocessing in checkpoint; using unified_config.yaml / defaults.")
+            self.preprocessing_params = preprocessing
+            self.patch_size = int(self.preprocessing_params.get("patch_size", self._val_patch_size))
 
         elif self.config.model_path:
             raise InvalidCheckpointError(
@@ -543,8 +563,15 @@ class ValidationRunner:
                 
                 # Handle hierarchical output
                 if logits.dim() == 3:
-                    batch_size = logits.shape[0]
-                    logits = logits.view(batch_size, -1)
+                    B, G, T = logits.shape
+                    logits = logits.reshape(B, -1)
+                # Make sure labels width matches model head (helpful when vocab/head disagree)
+                if tag_labels is not None and tag_labels.ndim == 2 and tag_labels.shape[1] != logits.shape[1]:
+                    raise RuntimeError(
+                        f"Prediction dim {logits.shape[1]} != target dim {tag_labels.shape[1]}. "
+                        "The checkpoint head and vocabulary/targets disagree. "
+                        "Rebuild the head or align the vocabulary."
+                    )
                 
                 # Convert to probabilities
                 predictions = torch.sigmoid(logits)
@@ -637,11 +664,12 @@ class ValidationRunner:
                 return len(self.data)
             def __getitem__(self, idx):
                 return self.data[idx]
-        
+        # Forward batches AS-IS (avoid stacking an extra leading dimension)
         fast_loader = DataLoader(
             ListDataset(limited_data),
             batch_size=1,
-            shuffle=False
+            shuffle=False,
+            collate_fn=lambda x: x[0],
         )
         
         # Run validation
@@ -689,8 +717,14 @@ class ValidationRunner:
                 
                 # Handle hierarchical output
                 if logits.dim() == 3:
-                    batch_size = logits.shape[0]
-                    logits = logits.view(batch_size, -1)
+                    B, G, T = logits.shape
+                    logits = logits.reshape(B, -1)
+                if tag_labels is not None and tag_labels.ndim == 2 and logits.shape[1] != tag_labels.shape[1]:
+                    raise RuntimeError(
+                        f"Prediction dim {logits.shape[1]} != target dim {tag_labels.shape[1]}. "
+                        "The checkpoint head and vocabulary/targets disagree. "
+                        "Rebuild the head or align the vocabulary."
+                    )
                 
                 # Get predictions for specific tags only
                 predictions = torch.sigmoid(logits[:, tag_indices])
@@ -1005,15 +1039,15 @@ class ValidationRunner:
 
         # Create metadata
         run_metadata = RunMetadata(
-            top_k=self.config.prediction_threshold,  # Using threshold as proxy for top_k
-            threshold=self.config.prediction_threshold,
+            top_k=None,  # thresholded mode; not using fixed top_k
+            threshold=float(self.config.prediction_threshold),
             vocab_sha256=self.vocab_sha256,
             normalize_mean=list(self.preprocessing_params.get('normalize_mean', [0.5, 0.5, 0.5])),
             normalize_std=list(self.preprocessing_params.get('normalize_std', [0.5, 0.5, 0.5])),
-            image_size=self.preprocessing_params.get('image_size', 640),
-            patch_size=self.patch_size,
+            image_size=int(self.preprocessing_params.get('image_size', 640)),
+            patch_size=int(self.patch_size),
             model_path=str(self.config.checkpoint_path or self.config.model_path),
-            num_tags=self.num_tags
+            num_tags=int(self.num_tags)
         )
 
         # Create image predictions
@@ -1200,7 +1234,10 @@ def main():
     parser.add_argument('--output-dir', type=str, default='./validation_results')
     parser.add_argument('--save-predictions', action='store_true')
     parser.add_argument('--save-per-image', action='store_true')
-    parser.add_argument('--create-plots', action='store_true', default=True)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--create-plots', action='store_true', dest='create_plots', help='Create plots')
+    group.add_argument('--no-create-plots', action='store_false', dest='create_plots', help='Disable plots')
+    parser.set_defaults(create_plots=False)
     
     # Performance arguments
     parser.add_argument('--no-amp', action='store_true', help='Disable AMP')
