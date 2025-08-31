@@ -39,7 +39,7 @@ from utils.logging_setup import setup_logging
 logger = logging.getLogger(__name__)
 
 # Import the orientation handler
-from orientation_handler import OrientationHandler
+from orientation_handler import OrientationHandler, OrientationMonitor
 
 # Import base modules with error handling
 try:
@@ -363,6 +363,17 @@ def train_with_orientation_tracking(config: FullConfig):
         debug_config=config.debug,
     )
 
+    # --- Orientation diagnostics (enabled by default) -----------------------
+    # Create an OrientationMonitor to write/update unmapped_orientation_tags.txt
+    # in the configured log directory and to surface suggestions.
+    orientation_monitor = None
+    oh = None
+    try:
+        oh = getattr(getattr(train_loader, "dataset", None), "orientation_handler", None)
+        orientation_monitor = OrientationMonitor(out_dir=Path(config.log_dir))
+    except Exception as e:
+        logger.debug(f"OrientationMonitor init skipped: {e}")
+
     # Pre-training validation
     if getattr(config.debug, 'validate_input_data', False):
         logger.info("Starting pre-training input validation...")
@@ -541,6 +552,10 @@ def train_with_orientation_tracking(config: FullConfig):
     training_state = TrainingState()
     patience = getattr(config.training, "early_stopping_patience", None)
     es_threshold = getattr(config.training, "early_stopping_threshold", 0.0)
+    # Early-stopping burn-in to avoid first-epoch outlier triggering patience
+    burn_in_epochs = int(getattr(config.training, "early_stopping_burn_in_epochs", 0) or 0)
+    burn_in_strategy = str(getattr(config.training, "early_stopping_burn_in_strategy", "median")).lower()
+    _burn_in_vals = []  # collect val metric during burn-in window
     global_step = 0
     start_epoch = 0
 
@@ -744,6 +759,13 @@ def train_with_orientation_tracking(config: FullConfig):
                         except Exception:
                             pass
 
+                # Orientation health check (writes/refreshes unmapped_orientation_tags.txt)
+                try:
+                    if orientation_monitor is not None and oh is not None:
+                        orientation_monitor.check_health(oh)
+                except Exception:
+                    pass
+
             if stats_queue:
                 # Non-blocking drain of augmentation stats (accept both tuple and bare dict)
                 while True:
@@ -858,14 +880,40 @@ def train_with_orientation_tracking(config: FullConfig):
             pass
 
         # Checkpointing and early stopping based on macro F1
-        if val_f1_macro > training_state.best_metric + es_threshold:
-            training_state.best_metric = val_f1_macro
-            training_state.patience_counter = 0
-            training_state.best_epoch = epoch + 1
-            is_best = True
+        is_best = False
+        # Handle burn-in (ignore early-stopping decisions for first N epochs)
+        if burn_in_epochs > 0 and (epoch + 1) <= burn_in_epochs:
+            _burn_in_vals.append(val_f1_macro)
+            # On the last burn-in epoch, reset baseline to a robust summary
+            if (epoch + 1) == burn_in_epochs:
+                try:
+                    if burn_in_strategy == "last":
+                        baseline = float(_burn_in_vals[-1])
+                    elif burn_in_strategy == "mean":
+                        baseline = float(np.mean(_burn_in_vals))
+                    elif burn_in_strategy == "max":
+                        baseline = float(np.max(_burn_in_vals))
+                    else:  # default: median
+                        baseline = float(np.median(_burn_in_vals))
+                except Exception:
+                    baseline = float(np.median(_burn_in_vals))
+                prev_best = training_state.best_metric
+                training_state.best_metric = baseline
+                training_state.patience_counter = 0
+                logger.info(
+                    "Early-stopping burn-in complete (epochs=%d, strategy=%s). "
+                    "Baseline set to %.4f (prev best %.4f).",
+                    burn_in_epochs, burn_in_strategy, baseline, prev_best,
+                )
+            # During burn-in: do not update patience/best based on improvement
         else:
-            training_state.patience_counter += 1
-            is_best = False
+            if val_f1_macro > training_state.best_metric + es_threshold:
+                training_state.best_metric = val_f1_macro
+                training_state.patience_counter = 0
+                training_state.best_epoch = epoch + 1
+                is_best = True
+            else:
+                training_state.patience_counter += 1
 
         # Respect "save_best_only": skip cadence saves unless this is a new best.
         keep_best_only = bool(getattr(config.training, "save_best_only", False))
@@ -900,6 +948,14 @@ def train_with_orientation_tracking(config: FullConfig):
         monitor.log_hyperparameters(hparams, final_metrics if final_metrics else {"final/placeholder": 1})
     except Exception:
         pass
+
+    # Final orientation safety report with recommendations
+    try:
+        if oh is not None:
+            report_path = Path(config.log_dir) / "orientation_safety_report.json"
+            oh.generate_safety_report(report_path)
+    except Exception as e:
+        logger.debug(f"Failed to write orientation_safety_report.json: {e}")
 
     monitor.close()
 

@@ -230,6 +230,10 @@ training:
     # Early stopping
     early_stopping_patience: 10
     early_stopping_threshold: 0.0001
+    # Ignore first N epochs for early-stopping to avoid initial instability
+    early_stopping_burn_in_epochs: 3
+    # One of: median, mean, last, max
+    early_stopping_burn_in_strategy: median
 
 # Inference Configuration (from inference_config.yaml)
 inference:
