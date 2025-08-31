@@ -513,16 +513,18 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # GradScaler is only needed for float16 AMP.
     use_scaler = amp_enabled and amp_dtype == torch.float16 and torch.cuda.get_device_capability()[0] >= 7
-    # Support older GradScaler API that lacks 'device_type'
+    # Prefer device-agnostic torch.amp.GradScaler; fallback to legacy CUDA scaler if needed.
     try:
-        scaler = GradScaler(device_type=device_type, enabled=use_scaler)
+        # PyTorch >= 2.x: torch.amp.GradScaler accepts 'device' as a string ('cuda' or 'cpu').
+        scaler = GradScaler(device=('cuda' if amp_enabled else 'cpu'), enabled=use_scaler)
     except TypeError:
+        # Older torch.amp.GradScaler without 'device' kwarg
         try:
+            scaler = GradScaler(enabled=use_scaler)
+        except Exception:
+            # Very old versions: use legacy CUDA GradScaler (may emit deprecation on newer torch)
             from torch.cuda.amp import GradScaler as CudaGradScaler  # type: ignore
             scaler = CudaGradScaler(enabled=use_scaler)
-        except Exception:
-            # Fallback to torch.amp.GradScaler without device_type
-            scaler = GradScaler(enabled=use_scaler)
     if amp_enabled:
         logger.info(f"AMP enabled with dtype={amp_dtype} and GradScaler={'enabled' if use_scaler else 'disabled'}.")
     else:
