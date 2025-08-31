@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, time, atexit, signal, queue
+import os, time, atexit, signal, queue, logging
 import multiprocessing as mp
 from typing import Optional, Tuple
 try:
@@ -21,19 +21,24 @@ def _wait_for_env_files(path: str, *, timeout_s: float = 2.0, poll_ms: int = 50)
 
 # --- Read-only per-process cache handle ---
 class LMDBReader:
+    """
+    A read-only handle to an LMDB environment.
+
+    This class is a context manager, ensuring that the environment is
+    properly closed when the context is exited.
+    """
     def __init__(self, path: str, map_size_bytes: int, max_readers: int = 4096):
         if lmdb is None:
             raise RuntimeError(
                 "LMDB is not installed but L2 cache was requested. "
                 "Install with `pip install lmdb` or disable L2 cache."
             )
-        # ensure the directory exists before opening the environment
-        os.makedirs(path, exist_ok=True)
         # Retry readonly open with backoff to avoid races with writer bootstrapping
         attempts = 3
         env = None
         for i in range(attempts):
             try:
+                _wait_for_env_files(path)
                 env = lmdb.open(
                     path,
                     map_size=map_size_bytes,
@@ -57,20 +62,29 @@ class LMDBReader:
         with self.env.begin(write=False) as txn:
             return txn.get(key)
 
-    def close(self):
+    def close(self) -> None:
         try:
-            self.env.close()
+            if self.env:
+                self.env.close()
+                self.env = None
         except Exception:
             pass
 
-    def __del__(self):
-        try:
-            self.env.close()
-        except Exception:
-            pass
+    def __enter__(self) -> LMDBReader:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
 # --- Dedicated writer process (single writer, batched commits) ---
 class _WriterProc(mp.Process):
+    """
+    A dedicated writer process for LMDB.
+
+    This process listens on a queue for (key, value) pairs and writes
+    them to the database in batches to improve performance. It handles
+    database map resizing and graceful shutdown.
+    """
     def __init__(
         self,
         path: str,
@@ -90,7 +104,7 @@ class _WriterProc(mp.Process):
         self._running = mp.Event()
         self._running.set()
 
-    def run(self):
+    def run(self) -> None:
         env = lmdb.open(
             self.path,
             map_size=self.map_size_bytes,
@@ -132,8 +146,8 @@ class _WriterProc(mp.Process):
             self._running.clear()
             try:
                 flush_pending()
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning(f"L2 cache writer shutdown flush failed: {e}")
 
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
@@ -163,12 +177,27 @@ class _WriterProc(mp.Process):
         try:
             flush_pending()
             env.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"L2 cache writer final flush failed: {e}")
 
 def start_l2_writer(path: str, map_size_bytes: int) -> Tuple[mp.Queue, mp.Process]:
+    """
+    Starts and returns a dedicated L2 cache writer process and its command queue.
+
+    Args:
+        path: The directory path for the LMDB environment.
+        map_size_bytes: The initial size of the LMDB memory map.
+
+    Returns:
+        A tuple containing the multiprocessing queue for commands and the
+        handle to the running writer process.
+    """
     if lmdb is None:
         raise RuntimeError("LMDB is required to start L2 writer. Install `lmdb`.")
+
+    # The writer process is responsible for creating the cache directory.
+    os.makedirs(path, exist_ok=True)
+
     ctx = mp.get_context("spawn")
     import os as _os
     q_max = int(_os.environ.get("L2_WRITER_QUEUE_MAX", "1024"))
