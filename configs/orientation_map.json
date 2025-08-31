@@ -57,7 +57,6 @@
     "injury_to_the_right_eye": "injury_to_the_left_eye",
     "bandage_over_left_eye": "bandage_over_right_eye",
     "bandage_over_right_eye": "bandage_over_left_eye",
-    "bandage_over_right_eye": "bandage_over_left_eye",
     "left_fist": "right_fist",
     "right_fist": "left_fist",
     "left_foot": "right_foot",
