@@ -53,7 +53,9 @@ if ALLOW_TRUNCATED:
 
 
 # Single place to control floating tolerance when reconstructing padding masks
-PAD_MASK_ATOL = 1e-3
+# When L2 stores images as bfloat16, quantization near |x|≈1 is ~7.8e‑3.
+# Use a slightly larger atol to keep legacy heuristic reconstruction viable.
+PAD_MASK_ATOL = 1e-2
 
 # Guarded DataLoader wrapper:
 # - If num_workers == 0, drop prefetch_factor and force persistent_workers=False.
@@ -151,7 +153,9 @@ class DatasetLoader(Dataset):
                 "pad_color": self.pad_color,
                 "normalize_mean": self.normalize_mean,
                 "normalize_std": self.normalize_std,
+                # L1 canonical dtype (pre‑norm) remains configurable; L2 stores bf16 normalized tensors
                 "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
+                "l2_storage_dtype": "bfloat16",
                 "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
             }
             cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
@@ -167,6 +171,7 @@ class DatasetLoader(Dataset):
                 "normalize_mean": self.normalize_mean,
                 "normalize_std": self.normalize_std,
                 "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
+                "l2_storage_dtype": "bfloat16",
                 "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
             }
             cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
@@ -182,6 +187,7 @@ class DatasetLoader(Dataset):
                 "normalize_mean": self.normalize_mean,
                 "normalize_std": self.normalize_std,
                 "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
+                "l2_storage_dtype": "bfloat16",
                 "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
             }
             cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
@@ -214,6 +220,7 @@ class DatasetLoader(Dataset):
                 "normalize_mean": self.normalize_mean,
                 "normalize_std": self.normalize_std,
                 "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
+                "l2_storage_dtype": "bfloat16",
                 "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
             }
             cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
@@ -582,8 +589,8 @@ class DatasetLoader(Dataset):
             # Enqueue write but never block __getitem__
             if self._l2_enabled and self._l2_writer_q is not None:
                 try:
-                    # Write normalized image and explicit padding mask
-                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(sample["images"])))
+                    # Write normalized image (store as bfloat16) and explicit padding mask
+                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(sample["images"].to(torch.bfloat16))))
                     self._l2_writer_q.put_nowait((self._l2_mask_key(raw_image_id, flipped=False), _tensor_to_bytes(sample["padding_mask"].to(torch.uint8))))
                 except queue.Full:
                     # Drop, but surface a rate-limited warning for visibility.
@@ -787,6 +794,7 @@ class SidecarJsonDataset(Dataset):
                 "normalize_std": self.normalize_std,
                 # Sidecar dataset does not use L1 dtype, but keep field for parity
                 "cache_storage_dtype": getattr(self, "canonical_cache_dtype", "float32"),
+                "l2_storage_dtype": "bfloat16",
                 "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
             }
             cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
@@ -1056,8 +1064,8 @@ class SidecarJsonDataset(Dataset):
             # Enqueue write (non-blocking)
             if self._l2_enabled and self._l2_writer_q is not None:
                 try:
-                    # Store the normalized image and explicit padding mask
-                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(img)))
+                    # Store the normalized image as bfloat16 and explicit padding mask
+                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(img.to(torch.bfloat16))))
                     self._l2_writer_q.put_nowait((mask_key, _tensor_to_bytes(pmask.to(torch.uint8))))
                 except queue.Full:
                     now = time.time()
