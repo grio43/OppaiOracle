@@ -68,6 +68,30 @@ class DataLoader(_TorchDataLoader):  # keep public name the same
         super().__init__(*args, **kwargs)
 
 
+def _make_worker_init(log_queue):
+    """Create a worker_init_fn that attaches a QueueHandler for logging."""
+    if log_queue is None:
+        return None
+    def _init(_worker_id: int):
+        logger = logging.getLogger()
+        # Ensure a single QueueHandler per worker
+        for h in list(logger.handlers):
+            try:
+                from logging.handlers import QueueHandler  # local import to avoid import-time dependency
+                if isinstance(h, QueueHandler):
+                    logger.removeHandler(h)
+            except Exception:
+                # Fallback: check class name to avoid hard import
+                if getattr(h, "__class__", None) and h.__class__.__name__ == "QueueHandler":
+                    logger.removeHandler(h)
+        try:
+            from logging.handlers import QueueHandler
+            logger.addHandler(QueueHandler(log_queue))
+        except Exception:
+            pass
+    return _init
+
+
 class DatasetLoader(Dataset):
     def __init__(
         self,
@@ -1342,6 +1366,10 @@ def create_dataloaders(
     )
     if train_sampler is not None:
         _train_kw["sampler"] = train_sampler
+    # Attach logging QueueHandler in workers if a queue is provided
+    log_queue = kwargs.get("log_queue")
+    if log_queue is not None:
+        _train_kw["worker_init_fn"] = _make_worker_init(log_queue)
     train_loader = DataLoader(train_ds, **_train_kw)
 
     val_batch = (
@@ -1354,6 +1382,8 @@ def create_dataloaders(
     _val_kw["batch_size"] = val_batch
     if val_sampler is not None:
         _val_kw["sampler"] = val_sampler
+    if log_queue is not None:
+        _val_kw["worker_init_fn"] = _make_worker_init(log_queue)
     val_loader = DataLoader(val_ds, **_val_kw)
 
     return train_loader, val_loader, vocab
