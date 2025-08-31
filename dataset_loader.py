@@ -725,6 +725,7 @@ class SidecarJsonDataset(Dataset):
         orientation_handler: Optional["OrientationHandler"] = None,
         flip_overrides_path: Optional[str] = None,   # JSON with {"force_flip":[ids], "never_flip":[ids]} (also accepts {"flip":[...]} or a bare list)
         respect_flip_list: bool = True,
+        stats_queue: Optional[mp.Queue] = None,
     ):
         self.root = Path(root_dir)
         self.json_files = list(json_files)
@@ -789,6 +790,10 @@ class SidecarJsonDataset(Dataset):
                         self._force_flip_ids = {sanitize_identifier(str(x)) for x in data}
             except Exception as e:
                 self.logger.warning(f"Failed to load flip_overrides from {flip_overrides_path}: {e}")
+
+        # Telemetry (optional): push orientation stats periodically
+        self._stats_queue = stats_queue
+        self._samples_seen = 0
 
         # Pre-parse minimal fields for speed
         self.items: List[Dict[str, Any]] = []
@@ -893,7 +898,8 @@ class SidecarJsonDataset(Dataset):
                     tags_now = [self.orientation_handler.swap_tag(t) for t in original_tags]
                     flip_bit = True
                 else:
-                    tags_now, flipped = self.orientation_handler.swap_tags(original_tags)
+                    # Avoid double safety checks here; decision already made by _decide_flip_mode
+                    tags_now, flipped = self.orientation_handler.swap_tags(original_tags, skip_safety_check=True)
                     flip_bit = bool(flipped)
             # Build the L2 key and mask key using the config hash and flip bit
             l2_key = self._l2_key(image_id, flipped=flip_bit)
@@ -1057,6 +1063,23 @@ class SidecarJsonDataset(Dataset):
                 self.logger.error(f"Sample {idx} exceeded max retries, marking as failed")
                 return self._error_sample(idx, str(e))
             return self._error_sample(idx, f"Temporary failure: {e}")
+        finally:
+            # Opportunistic telemetry: push orientation stats every 128 samples
+            try:
+                if self._stats_queue is not None and self.orientation_handler is not None:
+                    self._samples_seen += 1
+                    if (self._samples_seen & 127) == 0:
+                        stats = self.orientation_handler.get_statistics()
+                        payload = {
+                            "flip_total": int(stats.get("total_flips", 0)),
+                            "flip_safe": int(stats.get("safe_flips", 0)),
+                            "flip_skipped_text": int(stats.get("blocked_by_text", 0)),
+                            "flip_skipped_unmapped": int(stats.get("skipped_flips", 0)),
+                            "flip_blocked_safety": int(stats.get("blocked_by_safety", 0)),
+                        }
+                        self._stats_queue.put_nowait(payload)
+            except Exception:
+                pass
 
     def _error_sample(self, idx: int, reason: str) -> Dict[str, Any]:
         sz = getattr(self.transform.transforms[0], "size", 224) if hasattr(self, "transform") and self.transform else getattr(self, "image_size", 224)
@@ -1175,6 +1198,15 @@ def create_dataloaders(
 
     if manifest_train.exists() and manifest_val.exists() and images_dir.exists():
         # Manifest mode (back-compat)
+        # Manifest datasets are not orientation-aware. If flips are enabled, warn and disable them.
+        if float(getattr(data_config, "random_flip_prob", 0.0) or 0.0) > 0.0:
+            logger.warning(
+                "random_flip_prob > 0 with manifest dataset; disabling orientation-aware flips (manifest is non-orientation-aware)."
+            )
+            try:
+                setattr(data_config, "random_flip_prob", 0.0)
+            except Exception:
+                pass
         train_ds = DatasetLoader(
             annotations_path=str(manifest_train),
             image_dir=str(images_dir),
@@ -1242,6 +1274,7 @@ def create_dataloaders(
             random_flip_prob=random_flip_prob,
             orientation_handler=_handler,
             flip_overrides_path=flip_overrides_path,
+            stats_queue=getattr(data_config, "stats_queue", None),
         )
 
         val_ds = SidecarJsonDataset(
@@ -1261,6 +1294,7 @@ def create_dataloaders(
             random_flip_prob=0.0,          # keep val deterministic
             orientation_handler=_handler,  # still needed to encode swapped tags if you ever TTA
             flip_overrides_path=None,
+            stats_queue=getattr(data_config, "stats_queue", None),
         )
 
     # ---- Samplers for distributed --------------------------------------

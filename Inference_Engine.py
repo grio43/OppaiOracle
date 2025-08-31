@@ -39,6 +39,7 @@ from model_metadata import ModelMetadata
 from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
 from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
 from Configuration_System import load_config, InferenceConfig as BaseInferenceConfig, MonitorConfig
+from orientation_handler import OrientationHandler  # orientation-aware TTA mapping
 
 # Make cv2 optional - not needed for basic inference
 try:
@@ -89,6 +90,18 @@ def _load_vocab_path() -> Path:
     vd = data.get("vocab_dir")
     return (PROJECT_ROOT / vd / "vocabulary.json") if vd else (PROJECT_ROOT / "vocabulary.json")
 DEFAULT_VOCAB_PATH = _load_vocab_path()
+
+# Load orientation map path from unified_config.yaml (best-effort)
+def _load_orientation_map_path() -> Optional[Path]:
+    try:
+        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        cfg = {}
+    data = (cfg.get("data") or {})
+    p = data.get("orientation_map_path")
+    if p:
+        return Path(p)
+    return None
 
 
 @dataclass
@@ -319,6 +332,24 @@ class ModelWrapper:
             # Validate vocabulary contains real tags, not placeholders
             self._verify_vocabulary()
 
+            # Precompute left↔right index map once for TTA if enabled
+            self._tta_index_map = None
+            if getattr(self.config, "tta_flip", False) and self.tag_names:
+                try:
+                    map_path = _load_orientation_map_path()
+                    if map_path and map_path.exists():
+                        oh = OrientationHandler(mapping_file=map_path)
+                        mapping = oh.precompute_all_mappings(set(self.tag_names))
+                        index_map: List[int] = []
+                        for tag in self.tag_names:
+                            swapped = mapping.get(tag, tag)
+                            index_map.append(self.vocabulary.tag_to_index.get(swapped, self.vocabulary.tag_to_index[tag]))
+                        self._tta_index_map = torch.as_tensor(index_map, dtype=torch.long, device=self.device)
+                    else:
+                        logger.warning("TTA flip enabled but orientation_map_path not configured; left/right remap disabled.")
+                except Exception as e:
+                    logger.warning(f"Failed to build TTA left↔right index map: {e}")
+
             # Load preprocessing parameters from checkpoint
             if 'preprocessing_params' in meta:
                 preprocessing = ModelMetadata.extract_preprocessing_params(meta)
@@ -492,7 +523,24 @@ class ModelWrapper:
         if self.config.tta_flip:
             images_flipped = torch.flip(images, dims=[-1])
             outputs_flipped = self.model(images_flipped)
-            outputs = 0.5 * (outputs + outputs_flipped)
+            # Orientation-aware averaging if we have a mapping
+            if isinstance(outputs, dict):
+                if 'tag_logits' in outputs and self._tta_index_map is not None:
+                    tags_f = outputs_flipped['tag_logits'].index_select(dim=1, index=self._tta_index_map)
+                    outputs['tag_logits'] = 0.5 * (outputs['tag_logits'] + tags_f)
+                    # Ratings are orientation-invariant; average directly if present
+                    if 'rating_logits' in outputs and 'rating_logits' in outputs_flipped:
+                        outputs['rating_logits'] = 0.5 * (outputs['rating_logits'] + outputs_flipped['rating_logits'])
+                else:
+                    # Fallback: elementwise average common keys
+                    try:
+                        for k in outputs:
+                            outputs[k] = 0.5 * (outputs[k] + outputs_flipped[k])
+                    except Exception:
+                        pass
+            else:
+                # outputs is a tensor – simple average
+                outputs = 0.5 * (outputs + outputs_flipped)
 
         # Handle dictionary output from SimplifiedTagger
         if isinstance(outputs, dict):
