@@ -572,7 +572,13 @@ def train_with_orientation_tracking(config: FullConfig):
             training_state = TrainingState.from_dict(ckpt.get('training_state', {}))
             start_epoch = ckpt.get('epoch', 0)
             global_step = ckpt.get('step', 0)
-            training_state.best_metric = ckpt.get('metrics', {}).get('val_f1_macro', training_state.best_metric)
+            # Preserve historical best; only reconcile when explicitly marked as best
+            if ckpt.get('is_best', False):
+                try:
+                    loaded_best = float(ckpt.get('metrics', {}).get('val_f1_macro', training_state.best_metric))
+                    training_state.best_metric = max(training_state.best_metric, loaded_best)
+                except Exception:
+                    pass
             logger.info("Resumed from %s (epoch=%s, step=%s)", ckpt_path, start_epoch, global_step)
         except Exception as e:
             logger.exception("Failed to load checkpoint from %s; starting fresh. Error: %s", ckpt_path, e)
