@@ -215,22 +215,13 @@ def setup_orientation_aware_training(
                 if strict_orientation and any(issues.values()):
                     raise ValueError(f"Critical orientation mapping issues found: {issues}")
     
-    # Create configuration
-    config = {
-        "data_dir": data_dir,
-        "json_dir": json_dir,
-        "vocab_path": vocab_path,
-        "random_flip_prob": random_flip_prob,
-        "orientation_map_path": orientation_map_path,  # Keep as Path object
-        "strict_orientation": strict_orientation,
-        "skip_unmapped": skip_unmapped,
-        "dataloader_overrides": {
-            "random_flip_prob": random_flip_prob,
-            "orientation_map_path": orientation_map_path
+    # Return only validated orientation settings; loader reads from config.data directly.
+    return {
+        "orientation": {
+            "safety_mode": safety_mode,
+            "skip_unmapped": skip_unmapped,
         }
     }
-    
-    return config
 
 
 def train_with_orientation_tracking(config: FullConfig):
@@ -340,8 +331,25 @@ def train_with_orientation_tracking(config: FullConfig):
     device = torch.device(config.training.device)
     device_type = device.type
 
-    if stats_queue:
-        config.data.stats_queue = stats_queue
+    # Expose stats queue to dataloaders for optional telemetry
+    config.data.stats_queue = stats_queue
+
+    # Enforce mapping validation at startup when strict flag is set
+    try:
+        if bool(getattr(config.data, "strict_orientation_validation", False)):
+            if getattr(config.data, "random_flip_prob", 0.0) > 0:
+                oh = OrientationHandler(
+                    mapping_file=Path(config.data.orientation_map_path) if getattr(config.data, "orientation_map_path", None) else None,
+                    random_flip_prob=float(getattr(config.data, "random_flip_prob", 0.0) or 0.0),
+                    strict_mode=True,
+                    safety_mode=str(getattr(config.data, "orientation_safety_mode", "conservative")),
+                    skip_unmapped=bool(getattr(config.data, "skip_unmapped", False)),
+                )
+                issues = oh.validate_mappings()
+                if issues:
+                    raise ValueError(f"Orientation mapping validation failed with issues: {issues}")
+    except Exception as e:
+        logger.warning(f"Orientation mapping validation failed: {e}")
 
     train_loader, val_loader, vocab = create_dataloaders(
         data_config=config.data,
@@ -835,7 +843,10 @@ def train_with_orientation_tracking(config: FullConfig):
             training_state.patience_counter += 1
             is_best = False
 
-        if global_step % config.training.save_steps == 0 or is_best:
+        # Respect "save_best_only": skip cadence saves unless this is a new best.
+        keep_best_only = bool(getattr(config.training, "save_best_only", False))
+        should_save = (not keep_best_only and (global_step % config.training.save_steps == 0)) or is_best
+        if should_save:
             checkpoint_manager.save_checkpoint(
                 model=model,
                 optimizer=optimizer,

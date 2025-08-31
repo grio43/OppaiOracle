@@ -1,38 +1,29 @@
 Orientation Mapping: Bugs, Gaps, and Worklist
 
 Summary
-- Orientation-aware flipping is implemented via `OrientationHandler` and wired into sidecar JSON dataloading. Several correctness bugs, unused knobs, and integration gaps exist. This document lists concrete issues and actionable tasks to address them.
+- Orientation-aware flipping is implemented via `OrientationHandler` and wired into sidecar JSON dataloading. Several items have been fixed; remaining issues and new findings are tracked here with actionable tasks.
 
 Critical Bugs
-- Double safety check inflates stats and adds overhead
-  - `dataset_loader.py:855` calls `orientation_handler.should_skip_flip(tags)` inside `_decide_flip_mode`, then `__getitem__` calls `orientation_handler.swap_tags(...)` which calls `should_skip_flip` again (`orientation_handler.py:349`). This double-counts `images_analyzed`/`safe_flips` and can skip flips twice.
-  - Action: Ensure flip-safety is checked once per sample. Options: pass a flag to `swap_tags` to skip internal check, or have `__getitem__` call `swap_tag` directly when a prior decision is made.
+- Telemetry payload shape mismatch
+  - `train_direct.py` expects `(stat_type, stats_dict)` from `stats_queue` and unpacks `(stat_type, stats_data)`, but `SidecarJsonDataset` enqueues a bare dict. This triggers queue processing warnings and drops augmentation stats.
+  - Action: Enqueue as `('aug_stats', payload)` instead of just `payload`.
 
-- Unmapped-tag false positives in `swap_tag`
-  - `orientation_handler.py:297`: Tracks `unmapped_tags` for any tag containing "left"/"right", but unlike `can_safely_flip` (`orientation_handler.py:175`) it does not filter substrings like "bright", "upright", "copyright", etc. This overstates unmapped tags and blocks flips unnecessarily under conservative modes.
-  - Action: Mirror `can_safely_flip` filters in `swap_tag` unmapped tracking.
+- Mislabelled `flip_skipped_unmapped`
+  - Dataloader maps `flip_skipped_unmapped` to `OrientationHandler.stats['skipped_flips']`, which includes both text- and safety-based skips. This double counts with `flip_skipped_text` and misrepresents unmapped-only skips.
+  - Action: Map `flip_skipped_unmapped` to `blocked_by_safety` and keep `flip_skipped_text` from `blocked_by_text`.
 
-- `skip_unmapped` config is ignored
-  - `orientation_handler.py:36`/`orientation_handler.py:51`: The constructor stores `skip_unmapped`, but flip decision paths use only `safety_mode` and mapping checks. Behavior does not change with `skip_unmapped=true`.
-  - Action: Define and implement semantics (e.g., in balanced mode, if `skip_unmapped` true, force skip when a swap would be no-op) or remove the knob to avoid confusion.
+- Forced flips not counted in `flip_total`
+  - In `__getitem__` force path, tags are swapped via per-tag `swap_tag(...)` and `flip_bit=True`, but handler `total_flips` is never incremented.
+  - Action: Either call `swap_tags(tags, skip_safety_check=True)` in force mode or explicitly increment `total_flips` in the force branch.
 
-- TTA horizontal flip does not swap logits
-  - `Inference_Engine.py:492`: With `tta_flip=true`, outputs are averaged between original and flipped inputs without swapping left/right indices for the flipped pass, corrupting directional tags.
-  - Action: Precompute index mapping from vocab using `OrientationHandler.precompute_all_mappings` (`orientation_handler.py:374`) and apply it to the flipped logits before averaging.
+- Unmapped-tag false positives incomplete filter
+  - `swap_tag` now filters `bright/upright/straight/light/fight`, but still flags `copyright`-containing tags (e.g., "copyright_notice") as unmapped and does not consider `single_`-style descriptors.
+  - Action: Mirror `can_safely_flip` filters fully in `swap_tag` unmapped tracking (add `copyright`, consider `single_`).
 
 Behavioral Gaps
-- Manifest mode silently disables orientation flipping
-  - `DatasetLoader` (manifest mode) explicitly sets flip bit false and has no orientation handler; only `SidecarJsonDataset` (sidecar mode) performs flips.
-  - References: `dataset_loader.py:232` (manifest dataset comment), `dataset_loader.py:988` (flip only in sidecar path).
-  - Action: Either (a) add flipping/mapping support to manifest mode, or (b) document clearly that manifest mode is non-orientation-aware and enforce with a warning when `random_flip_prob>0`.
-
-- No telemetry wiring from handler to monitor
-  - `Monitor_log.py:1276` expects keys like `flip_total`, `flip_safe`, `flip_skipped_text`, `flip_skipped_unmapped`, `flip_blocked_safety`. `OrientationHandler` tracks `total_flips`, `skipped_flips`, `blocked_by_text`, `blocked_by_safety`, etc., but nothing publishes these to the `stats_queue` (`train_direct.py:339`, `train_direct.py:731`).
-  - Action: Add an adapter in the dataloader loop (or a small sidecar callback) to publish flip stats at intervals to `stats_queue` with Monitor-compatible keys.
-
-- Redundant `setup_orientation_aware_training`
-  - `train_direct.py:146` returns `dataloader_overrides` that are unused by `create_dataloaders` (which reads from `config.data` directly). This can drift and confuse.
-  - Action: Remove or repurpose to perform early validation only; avoid returning unused overrides.
+- Mapping validation not integrated into config validation
+  - `train_direct.py` enforces `validate_mappings()` when `strict_orientation_validation=true`, but `Configuration_System.py validate` does not run mapping checks.
+  - Action: Hook `OrientationHandler.validate_mappings()` into `Configuration_System.py validate` when `data.strict_orientation_validation=true` and `random_flip_prob>0`.
 
 Orphan / Unused Code
 - `OrientationMonitor` unused
@@ -43,66 +34,52 @@ Orphan / Unused Code
   - `orientation_handler.py:408` handles heterochromia and other asymmetric cases but is never called; `SidecarJsonDataset` uses only `swap_tags`.
   - Action: Integrate into flip decision (call before `swap_tags`) or document as future work and remove from handler proper (move to a helpers module).
 
-- CI validator stubs
-  - `train_direct.py:876` `validate_orientation_mappings()` is a no-op; `orientation_handler.py:866` has a functional dataset-tags validator not wired in.
-  - Action: Hook validation into a preflight command or `Configuration_System.py validate` path.
+- CI validator wiring
+  - `orientation_handler.py` exposes `validate_dataset_tags` / `validate_dataset_orientation_tags`, but config validation and training do not use dataset-tag validation.
+  - Action: Provide an optional preflight that scans dataset tag vocab and runs `validate_dataset_tags` with a threshold before training.
 
 Data/Mapping Hygiene
 - Duplicate explicit mapping key
   - `configs/orientation_map.json:~60`: `bandage_over_right_eye` appears twice. JSON keeps the last occurrence, but duplicates hinder review.
   - Action: Deduplicate keys and add a lint step that flags duplicates before training.
 
-- Mapping validation not enforced
-  - `orientation_handler.validate_mappings()` can detect bidirectional/circular/regex conflicts but isn’t invoked during config validation.
-  - Action: Run `validate_mappings()` at startup when `strict_orientation_validation=true` and fail fast on critical issues.
+- Mapping validation coverage
+  - `validate_mappings()` is enforced at train startup when `strict_orientation_validation=true`, but duplicate‑key linting is not implemented and config validation doesn’t run mapping checks.
+  - Action: Add duplicate‑key detection and integrate mapping checks into `Configuration_System.py validate`.
 
 Performance / Quality
 - Regex cost per-tag per-sample
   - `swap_tag` applies regex patterns tag-by-tag per sample. For large vocabularies this adds overhead.
   - Action: Use `precompute_all_mappings(known_vocabulary)` (`orientation_handler.py:374`) once from the vocabulary to build an index map; rely on O(1) lookups during training.
 
-- Better skip reason logging
-  - `OrientationHandler.can_safely_flip` returns reasons; dataset discards them.
-  - References: `orientation_handler.py:175`, `dataset_loader.py:855` and `dataset_loader.py:889`.
-  - Action: Capture top reasons and include in monitor metrics (e.g., count of "text/watermark" vs "unmapped" blocks).
+- Flip-rate semantics
+  - `safe_flips` is incremented on safety decisions (even when a flip is not performed), while `total_flips` reflects performed flips. `flip_rate = flip_safe/flip_total` in `Monitor_log` can exceed 1.
+  - Action: Either report a decision rate separately or change `flip_safe` to count only performed safe flips.
 
 Concrete Work Items (prioritized)
-1) Single-check flip decision
-   - Update `SidecarJsonDataset.__getitem__` (`dataset_loader.py:875`) to avoid a second `should_skip_flip` call after `_decide_flip_mode`.
-   - Option: add `swap_tags(tags, already_decided=True)` or a `skip_safety_check` flag.
+1) Fix stats_queue payload and mappings
+   - Enqueue `('aug_stats', payload)` and map fields as: `flip_total=total_flips`, `flip_safe` (performed safe flips or rename), `flip_skipped_text=blocked_by_text`, `flip_skipped_unmapped=blocked_by_safety`, `flip_blocked_safety=blocked_by_safety` (or drop one to avoid duplication).
 
-2) Fix unmapped tracking false positives
-   - Apply the same filters from `can_safely_flip` to `swap_tag` before adding to `unmapped_tags` (`orientation_handler.py:297`).
+2) Count forced flips in stats
+   - In force path, call `swap_tags(..., skip_safety_check=True)` or increment `total_flips` to keep stats consistent.
 
-3) Implement `skip_unmapped` semantics or remove
-   - If kept: when `skip_unmapped=true` and `safety_mode` is `balanced`, skip flipping if any orientation tag maps to itself (no-op).
-   - Wire into `can_safely_flip` and/or `_decide_flip_mode`.
+3) Complete unmapped filter in `swap_tag`
+   - Add `copyright` and consider `single_` to parity with `can_safely_flip`.
 
-4) Correct TTA flip averaging
-   - Precompute index mapping from vocabulary using `OrientationHandler.precompute_all_mappings` (`orientation_handler.py:374`).
-   - In `Inference_Engine.ModelWrapper.predict` (`Inference_Engine.py:480`), when `tta_flip`, apply index remap to `outputs_flipped` before averaging.
+4) Deduplicate orientation map and add lint
+   - Remove duplicate keys in `configs/orientation_map.json` and add a preflight that flags duplicates before training.
 
-5) Publish flip stats to monitor
-   - Add a small publisher (e.g., in `SidecarJsonDataset` every N items) to emit a dict with keys expected by `Monitor_log` (`Monitor_log.py:1276`).
-   - Keys: `flip_total`, `flip_safe`, `flip_skipped_text`, `flip_skipped_unmapped`, `flip_blocked_safety`.
-   - Source them from `OrientationHandler.get_statistics()` (`orientation_handler.py:547`) with a mapping.
+5) Integrate mapping checks into config validation
+   - When `strict_orientation_validation=true` and flips are enabled, run `validate_mappings()` in `Configuration_System.py validate`.
 
-6) Enforce mapping validation on startup
-   - When `strict_orientation_validation=true`, run `validate_mappings()` after loading `orientation_map.json` and fail on critical issues (`train_direct.py:202`).
-   - Also add a config-time lint that flags duplicate keys in JSON.
+6) Optional: precompute mapping for training
+   - Build a tag→tag swap dict from the training vocabulary once and use O(1) lookups during tag encoding.
 
-7) Manifest mode decision
-   - Either implement orientation flipping for `DatasetLoader` (manifest mode) or issue a warning and force `random_flip_prob=0` in that mode.
+7) Decide fate of `OrientationMonitor` and `handle_complex_tags`
+   - Wire in or remove/move to docs to reduce dead code.
 
-8) Remove/repurpose `setup_orientation_aware_training`
-   - `train_direct.py:146` is currently redundant; keep only validation and logging, remove unused `dataloader_overrides`.
-
-9) Decide fate of `OrientationMonitor` and `handle_complex_tags`
-   - Wire them in or remove/move to docs/tests to reduce dead code.
-
-10) Tests and docs
-   - Add unit tests for: single-check flow, unmapped filter, TTA left/right remap, manifest-vs-sidecar behavior, and monitor stat publishing.
-   - Update README and `configs/orientation_map.README.md` to reflect final semantics.
+8) Tests and docs
+   - Add unit tests for telemetry shape/mapping, forced-flip counting, unmapped filter parity, and TTA remap. Update docs to reflect flip-rate semantics.
 
 Nice-to-Have
 - Add a CLI to generate a left/right index map from a given vocab and mapping, saved to disk for inference.
@@ -111,17 +88,14 @@ Nice-to-Have
 References (one-line anchors)
 - orientation_handler.py:175
 - orientation_handler.py:245
-- orientation_handler.py:297
-- orientation_handler.py:349
-- orientation_handler.py:374
+- orientation_handler.py:343
+- orientation_handler.py:358
+- orientation_handler.py:380
 - orientation_handler.py:688
-- dataset_loader.py:855
-- dataset_loader.py:875
-- dataset_loader.py:889
-- dataset_loader.py:988
-- Inference_Engine.py:480
-- Inference_Engine.py:492
+- dataset_loader.py:860
+- dataset_loader.py:896
+- dataset_loader.py:1069
+- Inference_Engine.py:336
+- Inference_Engine.py:523
 - Monitor_log.py:1276
-- configs/unified_config.yaml:112
-- configs/unified_config.yaml:130
-
+- configs/unified_config.yaml:~170 data.orientation_map_path

@@ -230,6 +230,13 @@ class OrientationHandler:
                         unmapped.append(tag)
 
             if unmapped:
+                # In balanced mode, allow flips to proceed even if some
+                # orientation-sensitive tags are unmapped – unless the user
+                # explicitly requested to skip when unmapped.
+                if self.safety_mode == "balanced" and not self.skip_unmapped:
+                    with self._stats_lock:
+                        self.stats['safe_flips'] += 1
+                    return True, ["Unmapped orientation tags present"]
                 with self._stats_lock:
                     self.stats['blocked_by_safety'] += 1
                     for tag in unmapped:
@@ -333,12 +340,14 @@ class OrientationHandler:
                 except Exception as e:
                     logger.error(f"Regex substitution failed for tag '{tag}': {e}")
 
-        # No mapping found - check if it's an orientation tag we should track  
+        # No mapping found - check if it's an orientation tag we should track
         # Note: 'asymmetric'/'asymmetrical' tags are NOT tracked as unmapped since they don't need swapping
         if any(keyword in tag for keyword in ['left', 'right']) and not any(skip in tag for skip in ['asymmetric', 'asymmetrical']):
-            with self._stats_lock:
-                self.stats['unmapped_tags'].add(tag)
-                self.stats['unmapped_tag_frequency'][tag] = self.stats['unmapped_tag_frequency'].get(tag, 0) + 1
+            # Mirror skip-logic from can_safely_flip(): don't track benign substrings
+            if not any(sub in tag for sub in ['bright', 'upright', 'straight', 'light', 'fight']):
+                with self._stats_lock:
+                    self.stats['unmapped_tags'].add(tag)
+                    self.stats['unmapped_tag_frequency'][tag] = self.stats['unmapped_tag_frequency'].get(tag, 0) + 1
 
         return tag
     
@@ -346,18 +355,15 @@ class OrientationHandler:
         """Internal version of swap_tag that doesn't acquire locks. For use when lock is already held."""
         return self.swap_tag(tag)   
     
-    def swap_tags(self, tags: List[str]) -> Tuple[List[str], bool]:
+    def swap_tags(self, tags: List[str], *, skip_safety_check: bool = False) -> Tuple[List[str], bool]:
         """
-        Swap all tags for horizontal flip.
+        Swap all orientation-sensitive tags in a list.
 
-        Args:
-            tags: List of original tags
-
-        Returns:
-            Tuple of (swapped tags, whether flip was applied)
+        Set skip_safety_check=True if a safety decision has already been made
+        upstream (e.g. by a dataset component) to avoid double-counting stats.
         """
-        # Check if we should skip this flip
-        if self.should_skip_flip(tags):
+        # Optionally respect the safety decision upstream to avoid double-veto and stat drift
+        if not skip_safety_check and self.should_skip_flip(tags):
             return tags, False
 
         # Swap all tags

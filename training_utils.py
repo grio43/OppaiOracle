@@ -539,8 +539,9 @@ class CheckpointManager:
         if vocab_path.exists():
             checkpoint = ModelMetadata.embed_vocabulary(checkpoint, vocab_path)
         else:
-            logger.error(
-                f"Vocabulary file not found at {vocab_path} - checkpoint will not be self-contained!"
+            raise RuntimeError(
+                f"Vocabulary file not found at {vocab_path}. "
+                "Refusing to save a non self-contained checkpoint (fail-fast)."
             )
 
         # Embed preprocessing parameters - require explicit config
