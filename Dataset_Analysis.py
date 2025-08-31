@@ -14,8 +14,9 @@ from dataclasses import dataclass, field, asdict
 from collections import defaultdict, Counter
 from datetime import datetime
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import warnings
+from itertools import islice
 import random
 
 import numpy as np
@@ -54,11 +55,7 @@ except ImportError:
         # Fallback: no-op progress wrapper
         return iterable
 
-try:
-    import networkx as nx
-    NETWORKX_AVAILABLE = True
-except ImportError:
-    NETWORKX_AVAILABLE = False
+# networkx not required; planned for future graph-based analyses
 
 # Note: pandas support planned for future version
 # Will be used for advanced statistical analysis and data export
@@ -68,7 +65,7 @@ try:
     IMAGEHASH_AVAILABLE = True
 except ImportError:
     IMAGEHASH_AVAILABLE = False
-    warnings.warn("imagehash not available. Install with: pip install imagehash")
+    # defer any user-facing notice until the feature is actually requested
 
 # Optional wordcloud
 try:
@@ -76,7 +73,7 @@ try:
     WORDCLOUD_AVAILABLE = True
 except ImportError:
     WORDCLOUD_AVAILABLE = False
-    warnings.warn("wordcloud not available. Install with: pip install wordcloud")
+    # defer any user-facing notice until the feature is actually requested
 
 
 # Configure logging
@@ -106,8 +103,11 @@ class AnalysisConfig:
     
     # Tag analysis
     min_tag_frequency: int = 10
-    max_tags_to_analyze: int = 10000
+    max_tags_to_analyze: int = 2000  # safer default for clustering
     analyze_tag_hierarchy: bool = True
+    
+    # Per-image worker behavior
+    per_image_timeout_seconds: Optional[float] = None  # None = no timeout
     
     # Duplicate detection
     use_perceptual_hash: bool = True
@@ -252,13 +252,15 @@ class ImageAnalyzer:
             
             # Re-open for actual processing (verify closes the file)
             with Image.open(image_path) as img:
+                # Force decode to catch lazy errors that verify() may miss
+                img.load()
                 stats.width = img.width
                 stats.height = img.height
                 stats.format = img.format or 'unknown'
                 stats.channels = len(img.getbands())
                 
                 # Convert to RGB for analysis
-                if self.config.extract_color_stats:
+                if self.config.compute_image_stats and self.config.extract_color_stats:
                     try:
                         img_rgb = img.convert('RGB')
                         img_array = np.array(img_rgb)
@@ -312,7 +314,8 @@ class ImageAnalyzer:
                 # Perceptual hash is optional, continue
         
         # Quality checks
-        self._check_quality(stats)
+        if self.config.analyze_quality:
+            self._check_quality(stats)
         
         return stats
     
@@ -350,6 +353,8 @@ class ImageAnalyzer:
                 stats.is_low_quality = True
             elif stats.width > self.config.max_resolution[0] or stats.height > self.config.max_resolution[1]:
                 stats.quality_issues.append("excessive_resolution")
+                # treat excessive resolution as a low-quality outlier for downstream counts
+                stats.is_low_quality = True
         
         # Aspect ratio checks
         if self.config.check_aspect_ratio:
@@ -557,32 +562,36 @@ class DuplicateDetector:
         
         try:
             import imagehash
-            
-            for i in range(len(hashes)):
-                for j in range(i + 1, len(hashes)):
-                    try:
-                        # Skip empty or invalid hashes
-                        if not hashes[i] or not hashes[j]:
+            # Simple bucketing by hex prefix to reduce O(n^2) comparisons
+            from collections import defaultdict
+            buckets = defaultdict(list)
+            for h in hashes:
+                if h:
+                    buckets[h[:6]].append(h)
+
+            for bucket in buckets.values():
+                if len(bucket) < 2:
+                    continue
+                for i in range(len(bucket)):
+                    for j in range(i + 1, len(bucket)):
+                        try:
+                            h1, h2 = bucket[i], bucket[j]
+                            if not h1 or not h2:
+                                continue
+                            hash1 = imagehash.hex_to_hash(h1)
+                            hash2 = imagehash.hex_to_hash(h2)
+                        except (ValueError, TypeError) as e:
+                            logger.debug("Invalid hash format: %s", e)
                             continue
-                        hash1 = imagehash.hex_to_hash(hashes[i])
-                        hash2 = imagehash.hex_to_hash(hashes[j])
-                    except (ValueError, TypeError) as e:
-                        logger.debug("Invalid hash format: %s", e)
-                        continue
-                    
-                    # Calculate hamming distance
-                    distance = hash1 - hash2
-                    max_distance = len(hash1.hash) ** 2
-                    similarity = 1 - (distance / max_distance) if max_distance > 0 else 1.0
-                    
-                    if similarity >= self.config.duplicate_threshold:
-                        paths1 = self.perceptual_hashes[hashes[i]]
-                        paths2 = self.perceptual_hashes[hashes[j]]
-                        
-                        for p1 in paths1:
-                            for p2 in paths2:
-                                if p1 != p2:  # Don't compare with itself
-                                    near_duplicates.append((p1, p2, similarity))
+                        # Calculate hamming distance
+                        distance = hash1 - hash2
+                        max_distance = len(hash1.hash) ** 2
+                        similarity = 1 - (distance / max_distance) if max_distance > 0 else 1.0
+                        if similarity >= self.config.duplicate_threshold:
+                            for p1 in self.perceptual_hashes[h1]:
+                                for p2 in self.perceptual_hashes[h2]:
+                                    if p1 != p2:
+                                        near_duplicates.append((p1, p2, similarity))
         except Exception as e:
             logger.warning(f"Error in near-duplicate detection: {e}")
         
@@ -654,12 +663,13 @@ class DatasetAnalyzer:
         # Generate visualizations
         if self.config.create_visualizations:
             self._create_visualizations()
-        
-        # Generate report
+
+        # Compute duration BEFORE any reporting so metadata is accurate
+        self.dataset_stats.analysis_duration_seconds = (datetime.now() - start_time).total_seconds()
+
+        # Generate report (now sees the correct duration)
         if self.config.generate_report:
             self._generate_report()
-        
-        self.dataset_stats.analysis_duration_seconds = (datetime.now() - start_time).total_seconds()
         
         logger.info(f"Analysis completed in {self.dataset_stats.analysis_duration_seconds:.2f} seconds")
         
@@ -721,22 +731,37 @@ class DatasetAnalyzer:
 
     def _analyze_images_parallel(self, image_paths: List[Path]):
         """Analyze images in parallel"""
+        from itertools import repeat
+        n = len(image_paths)
+        max_outstanding = max(self.config.num_workers * 4, self.config.num_workers)
         with ProcessPoolExecutor(max_workers=self.config.num_workers) as executor:
-            # Submit all tasks
-            future_to_path = {
-                executor.submit(self._analyze_single_image_safe, path): path
-                for path in image_paths
-            }
-            # Process results as they complete
-            for future in tqdm(future_to_path, desc="Analyzing images (parallel)"):
-                try:
-                    stats = future.result(timeout=30)
-                    if stats:
-                        self.image_stats_buffer.append(stats)
-                        self.duplicate_detector.add_image(stats)
-                except Exception as e:
-                    path = future_to_path[future]
-                    logger.error(f"Error analyzing {path}: {e}")
+            # Prime a bounded window of futures to avoid memory spikes
+            it = iter(path.as_posix() for path in image_paths)
+            futures = {executor.submit(_analyze_single_image_worker, p, self.config): p
+                       for p in islice(it, max_outstanding)}
+            with tqdm(total=n, desc="Analyzing images (parallel)") as pbar:
+                while futures:
+                    # Recreate as_completed each loop so newly-submitted tasks are tracked
+                    for fut in as_completed(list(futures.keys())):
+                        path_str = futures.pop(fut)
+                        try:
+                            if self.config.per_image_timeout_seconds:
+                                stats = fut.result(timeout=self.config.per_image_timeout_seconds)
+                            else:
+                                stats = fut.result()
+                            if stats:
+                                self.image_stats_buffer.append(stats)
+                                self.duplicate_detector.add_image(stats)
+                        except Exception as e:
+                            logger.error(f"Error analyzing {path_str}: {e}")
+                        finally:
+                            pbar.update(1)
+                            # Submit next task to keep the window full
+                            next_path = next(it, None)
+                            if next_path is not None:
+                                futures[executor.submit(_analyze_single_image_worker, next_path, self.config)] = next_path
+                            # break to refresh as_completed() with the updated set
+                            break
     
     def _analyze_single_image_safe(self, path: Path) -> Optional[ImageStats]:
         """Safely analyze a single image (for parallel processing)"""
@@ -745,6 +770,19 @@ class DatasetAnalyzer:
         except Exception as e:
             logger.error(f"Error analyzing {path}: {e}")
             return None
+
+# --- Module-level worker for ProcessPoolExecutor (picklable, avoids bound method) ---
+def _analyze_single_image_worker(path_str: str, config: AnalysisConfig) -> Optional['ImageStats']:
+    """
+    Top-level worker function so ProcessPoolExecutor doesn't need to pickle a bound method.
+    Returns an ImageStats dataclass or None.
+    """
+    try:
+        analyzer = ImageAnalyzer(config)
+        return analyzer.analyze_image(Path(path_str))
+    except Exception:
+        # Workers shouldn't be too chatty; the main process logs failures on result retrieval.
+        return None
     
     def _flush_stats_buffer(self):
         """Flush stats buffer to main list"""
@@ -767,10 +805,23 @@ class DatasetAnalyzer:
                 if tag_file.exists():
                     tags = []
                     try:
-                        # Use 'replace' to preserve character count and stream line-by-line
+                        # Read once; support JSON arrays, comma/semicolon/whitespace delimited
+                        import re
                         with open(tag_file, 'r', encoding='utf-8', errors='replace') as f:
-                            for line in f:
-                                tags.extend(tag.strip() for tag in line.split(',') if tag.strip())
+                            content = f.read()
+                        stripped = content.strip()
+                        parsed: List[str] = []
+                        if stripped.startswith('[') and stripped.endswith(']'):
+                            try:
+                                arr = json.loads(stripped)
+                                parsed = [t.strip() for t in arr if isinstance(t, str) and t.strip()]
+                            except json.JSONDecodeError:
+                                parsed = []
+                        if not parsed:
+                            for line in content.splitlines():
+                                parts = re.split(r'[\,\s;]+', line.strip())
+                                parsed.extend(t for t in parts if t)
+                        tags.extend(parsed)
                     except (IOError, OSError) as e:
                         logger.warning(f"Error reading tag file {tag_file}: {e}")
                         continue
