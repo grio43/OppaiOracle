@@ -1,0 +1,75 @@
+Orientation Handler Code Review (orientation_handler.py)
+
+Scope
+- Focus: orientation_handler.py
+- Goals: highlight design, identify bugs/correctness risks, call out orphan/unused code, and note integration touchpoints. Reflects current code after recent fixes.
+
+Summary
+- The OrientationHandler remains a well‑structured, thread‑safe component for left↔right tag swapping with three safety modes. It supports explicit mappings, regex patterns, symmetric and skip‑flip tags, and maintains telemetry.
+- Recent changes addressed several issues: safer reverse‑mapping with duplicate detection, more precise typing, stats accounting improvements, and decoupled validation telemetry.
+- Integration remains in training (train_direct.py), data loading (dataset_loader.py), and inference (Inference_Engine.py). Monitoring/reporting/CLI helpers exist but are mostly optional to the main pipeline.
+
+Integration Touchpoints
+- train_direct.py:42 and 203/341 instantiate/validate the handler before dataloaders.
+- dataset_loader.py:1212–1320 wires OrientationHandler into sidecar JSON dataset; uses should_skip_flip() and swap_tags().
+- Inference_Engine.py:341 precomputes a left↔right index map for TTA via precompute_all_mappings().
+
+API & Behavior Notes
+- Initialization chooses between provided JSON mapping, minimal defaults (with warnings), or disabled flips.
+- Safety policy:
+  - conservative: requires explicit mapping for all orientation‑sensitive tags to allow flipping.
+  - balanced: allows flips if unmapped tags exist unless skip_unmapped=True.
+  - permissive: always allows flips unless skip‑flip tags (text/signature/etc.) appear.
+- Tag swap precedence: explicit mappings → reverse mappings → regex patterns → identity, while tracking unmapped orientation tags (with filtering for benign substrings like upright/bright and asymmetric/single_ cases).
+- Thread‑safe telemetry: uses a lock to track images analyzed, safe/blocked decisions, flips performed, unmapped sets and frequencies.
+
+Orphan/Unused Code (not referenced elsewhere in repo)
+- orientation_handler.py:423 can_swap_eye_colors — only used by handle_complex_tags(), which itself is unused.
+- orientation_handler.py:432 handle_complex_tags — not referenced anywhere.
+- orientation_handler.py:283 _find_unmapped_orientation_tags — comment says “phased out”; not referenced.
+- orientation_handler.py:718 OrientationMonitor — no external usage detected; creates an unmapped report file as a side effect when constructed.
+- orientation_handler.py:657 generate_safety_report — not referenced elsewhere.
+- orientation_handler.py:806 test_orientation_handler — standalone test harness, only runs when file is executed as __main__.
+- orientation_handler.py:896 validate_dataset_orientation_tags — CLI‑style helper; not used by core pipeline.
+
+Bugs / Correctness Risks
+- Validation side‑effects: RESOLVED. Validation now supports record_stats=False; validate_dataset_tags uses it by default to avoid polluting runtime telemetry.
+- Reverse mapping assumptions: ADDRESSED. Reverse map only includes bijective pairs; duplicate targets are detected and reported via validate_mappings(). Non‑bijective reversals no longer silently collapse.
+- Metrics naming/semantics: PARTIALLY ADDRESSED. get_usage_statistics() now includes attempted_flips and computes skip_rate over attempted flips. generate_safety_report() still mixes counters with different semantics; consider documenting or harmonizing.
+- Regex breadth vs. false positives: unchanged. validate_mappings() still checks a limited synthetic set; real‑world conflicts among regexes may go unnoticed.
+- API change risk: validate_dataset_tags now reports ‘bidirectional_mismatch’ (renamed from ‘asymmetric_mappings’) and drops ‘conflicting_patterns’. Update any external consumers relying on old keys.
+
+Edge Cases Observed
+- Balanced mode with skip_unmapped=False: can_safely_flip() returns True with reason “Unmapped orientation tags present”. Downstream code treats this as permission to flip; this is by design, but the reason string may be misread as a warning. Not a bug, just wording.
+- skip_flip_tags logic requires exact tag matches. This is likely intentional; if users expect hierarchical or substring behavior (e.g., any *_text), they must encode that via mappings or regex.
+- Heterochromia handling is a gate: presence of detailed left/right eye colors with heterochromia can block flips unless both sides are detected, but there’s no active transformation of such color tags. Because handle_complex_tags() is unused, the gate never triggers in the current pipeline.
+
+Performance & Thread‑Safety
+- Stats access is guarded by a threading.Lock. Reads aggregate outside the lock after copying needed data, which is appropriate. Operations are O(#tags) per sample; regex evaluation is linear in number of configured patterns. No red flags.
+
+Config Compatibility
+- Matches unified config keys: data.orientation_map_path, data.random_flip_prob, data.strict_orientation_validation, data.orientation_safety_mode, data.skip_unmapped.
+- Behavior aligns with project Quality Gates: conservative default, validation hooks present, and the dataset loader uses deterministic flip decisions and tags encoding for cache keys.
+
+Suggested Follow‑ups (post‑changes)
+- Expand regex_conflicts checks to evaluate full vocab or a representative corpus.
+- Consider clarifying reason strings for positive decisions in can_safely_flip() (e.g., “Proceeding despite N unmapped tags (balanced mode)”).
+- If complex asymmetric handling is desired, either integrate handle_complex_tags() into the data path or remove it to reduce dead code.
+- Document metric semantics (safe_flips, total_flips, skipped_flips, images_analyzed) to avoid confusion when monitoring.
+- Audit external usages (if any) of validate_dataset_tags to account for the new issue keys.
+
+File References
+- orientation_handler.py:283 (_find_unmapped_orientation_tags)
+- orientation_handler.py:375 (swap_tags)
+- orientation_handler.py:423 (can_swap_eye_colors)
+- orientation_handler.py:432 (handle_complex_tags)
+- orientation_handler.py:515 (validate_mappings)
+- orientation_handler.py:657 (generate_safety_report)
+- orientation_handler.py:718 (OrientationMonitor)
+- orientation_handler.py:806 (test_orientation_handler)
+- orientation_handler.py:896 (validate_dataset_orientation_tags)
+- train_direct.py:42 (import)
+- train_direct.py:203 (handler init)
+- train_direct.py:341 (handler init for strict validation)
+- dataset_loader.py:1212 (handler wiring)
+- Inference_Engine.py:341 (precompute mapping for TTA)
