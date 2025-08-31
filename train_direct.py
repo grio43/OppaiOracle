@@ -743,15 +743,37 @@ def train_with_orientation_tracking(config: FullConfig):
                             pass
 
             if stats_queue:
-                while not stats_queue.empty():
+                # Non-blocking drain of augmentation stats (accept both tuple and bare dict)
+                while True:
                     try:
-                        stat_type, stats_data = stats_queue.get_nowait()
-                        if stat_type == 'aug_stats':
-                            monitor.log_augmentations(global_step, stats_data)
+                        item = stats_queue.get_nowait()
                     except queue.Empty:
                         break
                     except Exception as e:
-                        logger.warning(f"Error processing stats queue: {e}")
+                        logger.warning(f"Error reading stats queue: {e}")
+                        break
+
+                    if isinstance(item, tuple) and len(item) == 2:
+                        stat_type, stats_data = item
+                    elif isinstance(item, dict):
+                        # Back-compat: bare payload treated as aug_stats
+                        stat_type, stats_data = 'aug_stats', item
+                    else:
+                        continue
+
+                    if stat_type == 'aug_stats':
+                        # Normalize keys to monitor schema and de-dupe semantics
+                        sd = dict(stats_data)
+                        if 'flip_total' not in sd and 'total_flips' in sd:
+                            sd['flip_total'] = sd['total_flips']
+                        if 'flip_safe' not in sd and 'safe_flips' in sd:
+                            sd['flip_safe'] = sd['safe_flips']
+                        if 'flip_skipped_text' not in sd and 'blocked_by_text' in sd:
+                            sd['flip_skipped_text'] = sd['blocked_by_text']
+                        if 'blocked_by_safety' in sd:
+                            sd.setdefault('flip_skipped_unmapped', sd['blocked_by_safety'])
+                            sd.setdefault('flip_blocked_safety', sd['blocked_by_safety'])
+                        monitor.log_augmentations(global_step, sd)
 
             # Logging moved into inner loop (above) to avoid missing epoch-boundary steps.
 

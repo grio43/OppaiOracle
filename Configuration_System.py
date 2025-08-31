@@ -667,6 +667,29 @@ class DataConfig(BaseConfig):
                 f"orientation_safety_mode must be one of 'conservative', 'balanced', 'permissive', got {self.orientation_safety_mode}"
             )
 
+        # Orientation mapping checks (strict mode only, and only if flips enabled)
+        try:
+            rfp = float(getattr(self, "random_flip_prob", 0.0) or 0.0)
+        except Exception:
+            rfp = 0.0
+
+        try:
+            if bool(getattr(self, "strict_orientation_validation", False)) and rfp > 0:
+                from pathlib import Path
+                from orientation_handler import OrientationHandler
+                handler = OrientationHandler(
+                    mapping_file=Path(self.orientation_map_path) if self.orientation_map_path else None,
+                    random_flip_prob=rfp,
+                    strict_mode=True,
+                    safety_mode=self.orientation_safety_mode,
+                    skip_unmapped=bool(getattr(self, "skip_unmapped", False)),
+                )
+                mapping_issues = handler.validate_mappings()
+                if mapping_issues:
+                    errors.append(f"orientation_mapping issues: {mapping_issues}")
+        except Exception as e:
+            errors.append(f"orientation_mapping_error: {e}")
+
         scale_min, scale_max = self.random_crop_scale
         if not (0 < scale_min <= scale_max <= 1):
             errors.append(f"random_crop_scale must satisfy 0 < min <= max <= 1, got {self.random_crop_scale}")
