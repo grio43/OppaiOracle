@@ -39,7 +39,7 @@ from torch.optim.lr_scheduler import _LRScheduler
 # Use our vendored scheduler instead (behavior matches the one from pl_bolts).
 from schedulers import LinearWarmupCosineLR as LinearWarmupCosineAnnealingLR
 from torch.amp import GradScaler, autocast
-from safe_checkpoint import safe_load_checkpoint
+from safe_checkpoint import safe_load_checkpoint, InvalidCheckpointError
 import torch.backends.cudnn as cudnn
 
 # Import ModelMetadata at module level for fail-fast behavior
@@ -55,6 +55,7 @@ except ImportError as e:
         ) from e
 
 logger = logging.getLogger(__name__)
+LAST_CKPT_NAME = "last.pt"  # always maintained for crash-resume
 
 # -----------------------------------------------------------------------------
 def setup_seed(user_seed: Optional[int], deterministic: bool) -> tuple[int, bool]:
@@ -437,22 +438,23 @@ class CheckpointManager:
         checkpoint_dir: Union[str, Path],
         max_checkpoints: int = 5,
         keep_best: bool = True,
-        save_frequency: int = 1,
         save_optimizer: bool = True,
-        save_scheduler: bool = True
+        save_scheduler: bool = True,
+        save_last: bool = True,
+        **_unused,
     ):
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         self.max_checkpoints = max_checkpoints
+        # when True, only retain numbered checkpoints on best
         self.keep_best = keep_best
-        self.save_frequency = save_frequency
         self.save_optimizer = save_optimizer
         self.save_scheduler = save_scheduler
+        self.save_last = save_last
         
         self.checkpoints = []
         self.best_checkpoint = None
-        self.best_metric = float('inf')
         
         # Load existing checkpoints
         self._scan_existing_checkpoints()
@@ -513,7 +515,8 @@ class CheckpointManager:
             'state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
             'metrics': metrics,
             'training_state': training_state.to_dict(),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'is_best': bool(is_best),
         }
         
         if self.save_optimizer and optimizer is not None:
@@ -603,36 +606,58 @@ class CheckpointManager:
                     'embedded': 'vocab_b64_gzip' in checkpoint
                 }
 
-        # Save regular checkpoint atomically
-        checkpoint_path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{step}.pt"
+        # Ensure directory exists
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        fd, temp_path = tempfile.mkstemp(suffix='.tmp', prefix='checkpoint_', dir=self.checkpoint_dir)
-        try:
-            torch.save(checkpoint, temp_path)
-            os.replace(temp_path, checkpoint_path)
-        finally:
-            os.close(fd)
+        # Save numbered checkpoint atomically unless enforcing best-only retention
+        checkpoint_path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{step}.pt"
+        wrote_numbered = False
+        if not (self.keep_best and not is_best):
+            fd, temp_path = tempfile.mkstemp(suffix='.tmp', prefix='checkpoint_', dir=self.checkpoint_dir)
+            try:
+                torch.save(checkpoint, temp_path)
+                os.replace(temp_path, checkpoint_path)
+                wrote_numbered = True
+            finally:
+                os.close(fd)
 
-        self.checkpoints.append(checkpoint_path)
-        
-        logger.info(f"Saved checkpoint to {checkpoint_path}")
+            if wrote_numbered:
+                self.checkpoints.append(checkpoint_path)
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
+        else:
+            logger.debug("save_best_only=True: skipping numbered checkpoint at step %s", step)
+
+        # Always update last.pt atomically for crash-resume
+        if self.save_last:
+            last_path = self.checkpoint_dir / LAST_CKPT_NAME
+            fd_last, temp_last = tempfile.mkstemp(suffix='.tmp', prefix='last_', dir=self.checkpoint_dir)
+            try:
+                torch.save(checkpoint, temp_last)
+                os.replace(temp_last, last_path)
+            except Exception as e:
+                logger.warning("Failed to update %s: %s", last_path, e)
+            finally:
+                os.close(fd_last)
         
         # Save best model if applicable
-        if is_best and self.keep_best:
+        if is_best and self.keep_best and wrote_numbered:
             best_path = self.checkpoint_dir / "best_model.pt"
             shutil.copy(checkpoint_path, best_path)
             self.best_checkpoint = best_path
             logger.info(f"Saved best model to {best_path}")
         
         # Manage checkpoint limit
-        self._cleanup_old_checkpoints()
+        if wrote_numbered:
+            self._cleanup_old_checkpoints()
         
         # Update training state
-        training_state.checkpoints_saved.append(str(checkpoint_path))
+        if wrote_numbered:
+            training_state.checkpoints_saved.append(str(checkpoint_path))
+        else:
+            training_state.checkpoints_saved.append(str(self.checkpoint_dir / LAST_CKPT_NAME))
         training_state.last_checkpoint_step = step
         
-        return checkpoint_path
+        return checkpoint_path if wrote_numbered else None
     
     def _cleanup_old_checkpoints(self):
         """Remove old checkpoints if exceeding limit"""
@@ -735,10 +760,14 @@ class CheckpointManager:
         return self.best_checkpoint
     
     def get_latest_checkpoint(self) -> Optional[Path]:
-        """Get path to latest checkpoint"""
-        if self.checkpoints:
-            return self.checkpoints[-1]
-        return None
+        """Get path to latest checkpoint. Prefers crash-resume pointer."""
+        last_path = self.checkpoint_dir / LAST_CKPT_NAME
+        if last_path.exists():
+            return last_path
+        # Otherwise, refresh and choose newest by mtime
+        self._refresh_checkpoint_list()
+        existing = [p for p in self.checkpoints if p.exists()]
+        return max(existing, key=lambda p: p.stat().st_mtime) if existing else None
 
     def load_latest_checkpoint(self) -> Optional[Dict[str, Any]]:
         """Load the most recent checkpoint."""
@@ -750,12 +779,22 @@ class CheckpointManager:
         if not existing:
             return None
 
-        try:
-            latest = max(existing, key=lambda x: x.stat().st_mtime)
-            state_dict, meta = safe_load_checkpoint(latest)
-            return {"state_dict": state_dict, **meta}
-        except (FileNotFoundError, ValueError):
-            return None
+        # Prefer explicit crash-resume pointer first
+        last_path = self.checkpoint_dir / LAST_CKPT_NAME
+        candidates: List[Path] = []
+        if last_path.exists():
+            candidates.append(last_path)
+        if existing:
+            candidates.append(max(existing, key=lambda x: x.stat().st_mtime))
+
+        for path in candidates:
+            try:
+                state_dict, meta = safe_load_checkpoint(path)
+                return {"state_dict": state_dict, **meta}
+            except (FileNotFoundError, ValueError, InvalidCheckpointError) as e:
+                logger.warning("Failed to load latest checkpoint %s: %s", path, e)
+                continue
+        return None
 
     def load_best_checkpoint(self) -> Optional[Dict[str, Any]]:
         """Load the best checkpoint based on metric."""
@@ -764,8 +803,8 @@ class CheckpointManager:
             try:
                 state_dict, meta = safe_load_checkpoint(best_path)
                 return {"state_dict": state_dict, **meta}
-            except Exception as e:
-                print(f"Warning: Could not load best checkpoint: {e}")
+            except (FileNotFoundError, ValueError, InvalidCheckpointError) as e:
+                logger.warning("Failed to load best checkpoint %s: %s", best_path, e)
         return None
 
 

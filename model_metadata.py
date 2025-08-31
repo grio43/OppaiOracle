@@ -63,7 +63,6 @@ class ModelMetadata:
                 raise ValueError(
                     f"Vocabulary contains {placeholder_count} placeholder tags! Will not embed corrupted vocabulary."
                 )
-                return checkpoint
 
             # Compress vocabulary
             vocab_json = json.dumps(vocab_data, ensure_ascii=False)
@@ -81,8 +80,8 @@ class ModelMetadata:
             return checkpoint
 
         except Exception as e:
-            logger.error(f"Failed to embed vocabulary: {e}")
-            return checkpoint
+            logger.error("Failed to embed vocabulary: %s", e)
+            raise
 
     @staticmethod
     def extract_vocabulary(checkpoint: Dict) -> Optional[Dict]:
@@ -168,4 +167,3 @@ class ModelMetadata:
             }
 
         return None
-
