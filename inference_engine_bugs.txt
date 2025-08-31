@@ -1,0 +1,67 @@
+Inference_Engine.py code review – bugs and issues
+
+- Missing profiling flag attribute (will raise AttributeError):
+  - Inference_Engine.py:1035 and Inference_Engine.py:1037
+  - engine.profile() checks `self.config.enable_profiling`, but `InferenceConfig` (here) and `Configuration_System.InferenceConfig` do not define this field. The flag lives on `MonitorConfig`.
+  - Fix: either add `enable_profiling: bool = False` to this file’s `InferenceConfig`, or switch the check to the monitoring config (e.g., `getattr(self.config.monitor_config, "enable_profiling", False)`).
+
+- Relative path resolution for vocabulary and orientation map:
+  - Inference_Engine.py:90–101
+  - `_load_vocab_path()` and `_load_orientation_map_path()` return `Path(p)` directly. If `p` is relative, it resolves relative to the current working directory instead of the project root, causing path errors when called from other CWDs.
+  - Fix: resolve relative paths against `PROJECT_ROOT` (e.g., `return (PROJECT_ROOT / p) if not Path(p).is_absolute() else Path(p)`). Do the same for orientation map.
+
+- Import-time side effects (IO during import):
+  - Inference_Engine.py:80–101 (and `DEFAULT_VOCAB_PATH = _load_vocab_path()` at import time)
+  - The module loads YAML on import to compute defaults. The runbook recommends avoiding side effects at import time; this can slow imports and break import‑sanity in some environments.
+  - Fix: defer YAML reads into `load_inference_config()` or the engine setup so imports are cheap and side‑effect free.
+
+- Potential misuse of `memory_format` with `nn.Module.to(...)`:
+  - Inference_Engine.py:449–452
+  - `self.model = self.model.to(memory_format=torch.channels_last)` may raise `TypeError` on PyTorch versions where `nn.Module.to` does not accept `memory_format`. For ViT, channels‑last on model params typically brings no benefit anyway.
+  - Fix: remove the module‑level `memory_format` call. Keep channels‑last on input tensors only (`images = images.contiguous(memory_format=torch.channels_last)`).
+
+- Output format inconsistency with centralized config:
+  - Inference_Engine.py:636–663
+  - This engine supports `json`, `csv`, and `txt`, but `Configuration_System.InferenceConfig.output_format` allows `json`, `text`, `csv`, `xml`, `yaml`.
+  - Fix: accept `text` (alias to current `txt`) or update centralized config to declare `txt`. Otherwise callers may pass a validated `text` and get no output.
+
+- Directory processing ignores configured input extensions:
+  - Inference_Engine.py:904–920
+  - `process_directory(..., extensions=[...])` uses a hardcoded default, ignoring `config.input_image_extensions`.
+  - Fix: default `extensions` to `self.config.input_image_extensions` when not explicitly provided.
+
+- Vocabulary integrity check source path handling:
+  - Inference_Engine.py:505–509
+  - `_verify_vocabulary()` always passes `Path(self.config.vocab_path)` even when vocabulary was loaded from the checkpoint’s embedded metadata. If `vocab_path` is intentionally unset, `Path(None)` would crash; currently the default prevents that, but the source name in error messages can be misleading.
+  - Fix: pass `None` for `source_path` when using embedded vocabulary; only pass a real file `Path` when loading from disk. Also record a `vocab_embedded` flag and include it in `RunMetadata`.
+
+- Ad‑hoc default for image_size when missing in checkpoint config:
+  - Inference_Engine.py:425–444 (defaults dict around `image_size`)
+  - Uses `image_size: self.config.image_size if self.config.image_size != 448 else 640`. Special‑casing 448 is brittle and may mismatch learned positional embeddings.
+  - Fix: prefer the checkpoint/meta value; if absent, use `self.config.image_size` directly without special cases. Let `load_state_dict` fail fast on shape mismatch.
+
+- `load_inference_config()` bypasses config validation and type coercion:
+  - Inference_Engine.py:148–176
+  - The function writes fields via `setattr(config, key, value)` instead of leveraging `Configuration_System`’s `update()`/`from_dict()` which enforce types and validations.
+  - Fix: call `config.update(updates)` (after filtering out `None`), or build via `InferenceConfig.from_dict(...)` and then validate.
+
+- Batch timing attribution is misleading:
+  - Inference_Engine.py:866–874
+  - For batch inference, each result gets `((time.time() - start_time) / len(images)) * 1000`, which is an average per‑image time, not the actual per‑item latency. This is fine for coarse stats but may confuse consumers.
+  - Fix: report batch time once in metadata/monitoring; leave per‑image time unset or computed after the fact if needed.
+
+- InferenceCache lazy eviction leaves stale keys in deque:
+  - Inference_Engine.py:690–741
+  - On TTL expiry in `get()`, entries are deleted from `cache` but not from `access_order`; they are later removed only when evicted. This is functionally OK but can grow the deque temporarily.
+  - Fix: optionally attempt a safe `deque.remove(key)` on expiry inside a try/except to bound deque growth.
+
+- Minor: pad color not sourced from unified config:
+  - Inference_Engine.py:204–224
+  - Letterbox uses `(114,114,114)` literal; unified config has `data.pad_color`.
+  - Fix: accept pad color from config (and/or embed it in checkpoint preprocessing params).
+
+- Minor: metadata does not record whether vocabulary was embedded:
+  - Inference_Engine.py:988–1013
+  - `RunMetadata` has `vocab_embedded: bool = True`, but the engine never sets it; external vocab loads will still say True.
+  - Fix: track a boolean in `ModelWrapper` (e.g., `self.vocab_embedded`) and set it when building `RunMetadata`.
+
