@@ -29,34 +29,28 @@ class LMDBReader:
             )
         # ensure the directory exists before opening the environment
         os.makedirs(path, exist_ok=True)
-        # Avoid a race where a reader starts before the writer has created the env.
-        # Remove the `import os` inside this method. Importing inside a function
-        # causes Python to treat the name `os` as local, so referencing it before
-        # the import (e.g., in os.makedirs above) raises UnboundLocalError:contentReference[oaicite:4]{index=4}.
-        if not os.path.exists(os.path.join(path, "data.mdb")):
+        # Retry readonly open with backoff to avoid races with writer bootstrapping
+        attempts = 3
+        env = None
+        for i in range(attempts):
             try:
-                _wait_for_env_files(path, timeout_s=2.0)
-                if not os.path.exists(os.path.join(path, "data.mdb")):
-                    # Best-effort: create the env if still missing, then reopen readonly.
-                    tmp_env = lmdb.open(
-                        path, map_size=map_size_bytes, subdir=True,
-                        readonly=False, lock=True, max_dbs=1
-                    )
-                    tmp_env.close()
-            except Exception:
-                # Proceed to readonly open; if it still fails the caller will see the error.
-                pass
-        # readonly=True avoids taking the write lock in workers
-        self.env = lmdb.open(
-            path,
-            map_size=map_size_bytes,
-            subdir=True,
-            readonly=True,
-            lock=True,          # keep OS locks; safe on local fs
-            readahead=False,    # good for random access on SSD
-            max_readers=max_readers,
-            max_dbs=1
-        )
+                env = lmdb.open(
+                    path,
+                    map_size=map_size_bytes,
+                    subdir=True,
+                    readonly=True,
+                    lock=True,
+                    readahead=False,
+                    max_readers=max_readers,
+                    max_dbs=1,
+                )
+                break
+            except lmdb.Error:
+                if i < attempts - 1:
+                    time.sleep(0.05)
+                else:
+                    raise
+        self.env = env
 
     def get(self, key: bytes) -> Optional[bytes]:
         # short-lived read txns so the writer never waits on us
@@ -110,18 +104,42 @@ class _WriterProc(mp.Process):
             max_dbs=1
         )
 
+        pending = []
+        pending_bytes = 0
+        last_flush = time.monotonic()
+
+        def flush_pending():
+            nonlocal pending, pending_bytes, last_flush
+            if not pending:
+                return
+            try:
+                with env.begin(write=True) as txn:
+                    for k, v in pending:
+                        txn.put(k, v, overwrite=True)
+            except lmdb.MapFullError:
+                info = env.info()
+                new_size = int(max(self.map_size_bytes, info.get("map_size", self.map_size_bytes)) * 2)
+                env.set_mapsize(new_size)
+                with env.begin(write=True) as txn:
+                    for k, v in pending:
+                        txn.put(k, v, overwrite=True)
+            pending.clear()
+            pending_bytes = 0
+            last_flush = time.monotonic()
+
         def _shutdown(*_):
+            # flush pending writes and stop
             self._running.clear()
+            try:
+                flush_pending()
+            except Exception:
+                pass
 
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
-        pending = []
-        pending_bytes = 0
-        last_flush = time.time()
-
         while self._running.is_set():
-            timeout = max(0.0, self.flush_s - (time.time() - last_flush))
+            timeout = max(0.0, self.flush_s - (time.monotonic() - last_flush))
             try:
                 item = self.q.get(timeout=timeout)
                 if item is None:  # poison pill
@@ -137,44 +155,13 @@ class _WriterProc(mp.Process):
                 pending
                 and (len(pending) >= self.batch_items
                      or pending_bytes >= self.batch_bytes
-                     or (time.time() - last_flush) >= self.flush_s)
+                     or (time.monotonic() - last_flush) >= self.flush_s)
             ):
-                # Single short write txn → minimal time holding the writer lock
-                try:
-                    with env.begin(write=True) as txn:
-                        for k, v in pending:
-                            txn.put(k, v, overwrite=True)
-                except lmdb.MapFullError:
-                    # Grow the map and retry once.
-                    info = env.info()
-                    new_size = int(max(self.map_size_bytes, info.get("map_size", self.map_size_bytes)) * 2)
-                    env.set_mapsize(new_size)
-                    with env.begin(write=True) as txn:
-                        for k, v in pending:
-                            txn.put(k, v, overwrite=True)
-                pending.clear()
-                pending_bytes = 0
-                last_flush = time.time()
+                flush_pending()
 
         # Final flush
-        if pending:
-            try:
-                with env.begin(write=True) as txn:
-                    for k, v in pending:
-                        txn.put(k, v, overwrite=True)
-            except lmdb.MapFullError:
-                info = env.info()
-                new_size = int(max(self.map_size_bytes, info.get("map_size", self.map_size_bytes)) * 2)
-                env.set_mapsize(new_size)
-                with env.begin(write=True) as txn:
-                    for k, v in pending:
-                        txn.put(k, v, overwrite=True)
         try:
-            # Force a synchronous flush to ensure durability when sync=False. Without
-            # calling sync(), writemap=True combined with sync=False leaves the OS
-            # with no hint for when to flush dirty pages to disk. A call to
-            # env.sync(force=True) forces a flush regardless of MDB_NOSYNC flags.
-            env.sync(force=True)
+            flush_pending()
             env.close()
         except Exception:
             pass
