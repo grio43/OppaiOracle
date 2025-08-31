@@ -30,11 +30,13 @@ def _to_canonical_01(x: torch.Tensor, dtype_str: str) -> torch.Tensor:
 
 def _from_canonical_01(x: torch.Tensor) -> torch.Tensor:
     """
-    Decode canonical storage back to float32 in 0–1 range.
+    Decode canonical storage back to 0–1 range, preserving dtype for non-uint8.
+    - uint8 is dequantized to float32 in [0,1].
+    - float16/bfloat16/float32 are returned as-is to honor configured precision.
     """
     if x.dtype is torch.uint8:
         return x.to(torch.float32) / 255.0
-    return x.to(torch.float32)
+    return x
 
 @dataclass
 class _Entry:
