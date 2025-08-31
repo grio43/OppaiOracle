@@ -38,6 +38,7 @@ from utils.path_utils import sanitize_identifier, validate_image_path, resolve_a
 from utils.metadata_ingestion import parse_tags_field
 
 from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
+from utils.cache_keys import compute_l2_cfg_hash
 from l1_cache import build_l1_cache, encode_l1_image_01, decode_l1_image_01
 
 # Pillow resampling compatibility and truncated image handling
@@ -56,6 +57,19 @@ if ALLOW_TRUNCATED:
 # When L2 stores images as bfloat16, quantization near |x|≈1 is ~7.8e‑3.
 # Use a slightly larger atol to keep legacy heuristic reconstruction viable.
 PAD_MASK_ATOL = 1e-2
+
+# Minimal dtype mapping for cache plumbing
+_DTYPE_MAP = {
+    "uint8": torch.uint8,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
+
+def _canon_dtype(s: str) -> torch.dtype:
+    return _DTYPE_MAP.get(str(s).lower(), torch.bfloat16)
+
+## moved to utils/cache_keys.py: compute_l2_cfg_hash
 
 # Guarded DataLoader wrapper:
 # - If num_workers == 0, drop prefetch_factor and force persistent_workers=False.
@@ -114,6 +128,8 @@ class DatasetLoader(Dataset):
         l2_map_size_bytes: int = 0,
         l2_max_readers: int = 512,
         l2_writer_queue: Optional[mp.Queue] = None,
+        l2_storage_dtype: str = "bfloat16",
+        cpu_bf16_cache_pipeline: Optional[bool] = None,
         # --- L1 (in-memory) cache ---
         use_memory_cache: bool = True,
         l1_per_worker_mb: int = 256,
@@ -143,57 +159,12 @@ class DatasetLoader(Dataset):
         ) if isinstance(pad_color, (list, tuple)) else (114, 114, 114)
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
+        # L2 storage dtype + CPU bf16 preference
+        self._l2_dtype_str = str(l2_storage_dtype).lower()
+        self._l2_dtype = _canon_dtype(self._l2_dtype_str)
+        self._cpu_bf16_cache = bool(cpu_bf16_cache_pipeline) if cpu_bf16_cache_pipeline is not None else (self._l2_dtype is torch.bfloat16)
 
-        # Compute a hash of preprocessing parameters.  Include image size, pad
-        # colour, normalization, cache dtype and a schema version so that any
-        # change invalidates stale cache entries.
-        try:
-            cfg_fields = {
-                "image_size": self.image_size,
-                "pad_color": self.pad_color,
-                "normalize_mean": self.normalize_mean,
-                "normalize_std": self.normalize_std,
-                # L1 canonical dtype (pre‑norm) remains configurable; L2 stores bf16 normalized tensors
-                "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
-                "l2_storage_dtype": "bfloat16",
-                "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
-            }
-            cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
-            self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
-        except Exception:
-            self._l2_cfg_hash = "00000000"
-
-        # --- Compute a hash of preprocessing parameters for L2 cache versioning ---
-        try:
-            cfg_fields = {
-                "image_size": self.image_size,
-                "pad_color": self.pad_color,
-                "normalize_mean": self.normalize_mean,
-                "normalize_std": self.normalize_std,
-                "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
-                "l2_storage_dtype": "bfloat16",
-                "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
-            }
-            cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
-            self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
-        except Exception:
-            self._l2_cfg_hash = "00000000"
-
-        # --- Compute a hash of preprocessing parameters for L2 cache versioning ---
-        try:
-            cfg_fields = {
-                "image_size": self.image_size,
-                "pad_color": self.pad_color,
-                "normalize_mean": self.normalize_mean,
-                "normalize_std": self.normalize_std,
-                "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
-                "l2_storage_dtype": "bfloat16",
-                "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
-            }
-            cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
-            self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
-        except Exception:
-            self._l2_cfg_hash = "00000000"
+        # Hash computed after L1 dtype is known (see below)
 
         # Properly initialise background validator (opt-out via env or param)
         if enable_background_validator is None:
@@ -212,21 +183,15 @@ class DatasetLoader(Dataset):
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
         self._last_qfull_warn: float = 0.0
 
-        # Compute a hash of preprocessing parameters for L2 cache versioning.
-        try:
-            cfg_fields = {
-                "image_size": self.image_size,
-                "pad_color": self.pad_color,
-                "normalize_mean": self.normalize_mean,
-                "normalize_std": self.normalize_std,
-                "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
-                "l2_storage_dtype": "bfloat16",
-                "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
-            }
-            cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
-            self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
-        except Exception:
-            self._l2_cfg_hash = "00000000"
+        # Compute L2 cfg hash once (after L1 settings are known)
+        self._l2_cfg_hash = compute_l2_cfg_hash(
+            image_size=self.image_size,
+            pad_color=self.pad_color,
+            normalize_mean=self.normalize_mean,
+            normalize_std=self.normalize_std,
+            l1_dtype_str=self._l1_dtype_str,
+            l2_dtype_str=self._l2_dtype_str,
+        )
 
         # --- L1 cache (per-worker; created lazily in worker) ---
         self._use_l1 = bool(use_memory_cache)
@@ -325,6 +290,8 @@ class DatasetLoader(Dataset):
                         if transforms is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img_01 = decode_l1_image_01(raw_stored)
+                        if self._cpu_bf16_cache:
+                            img_01 = img_01.to(torch.bfloat16)
                         t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
                         m = self._l1.get(mask_key)
                         if m is not None:
@@ -521,6 +488,8 @@ class DatasetLoader(Dataset):
                 img_tv, mask_tv = self.joint_transforms(img_tv, mask_tv)
                 # Pre-norm 0..1 tensor for L1; then normalize for model
                 img_01 = T.ToTensor()(img_tv)  # 0..1 float
+                if self._cpu_bf16_cache:
+                    img_01 = img_01.to(torch.bfloat16)
                 if transforms is None:
                     raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                 t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
@@ -534,18 +503,23 @@ class DatasetLoader(Dataset):
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         # Ensure we can derive 0..1 image for L1 regardless of transform type
                         img_01 = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
-                        if isinstance(img_01, torch.Tensor) and img_01.dtype != torch.float32:
-                            img_01 = img_01.to(torch.float32)
+                        # Keep dtype as-is; bf16 preferred when configured
+                        if self._cpu_bf16_cache:
+                            img_01 = img_01.to(torch.bfloat16)
                         t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
                     except Exception:
                         if transforms is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img_01 = transforms.ToTensor()(canvas)
+                        if self._cpu_bf16_cache:
+                            img_01 = img_01.to(torch.bfloat16)
                         t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
                 else:
                     if transforms is None:
                         raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                     img_01 = transforms.ToTensor()(canvas)
+                    if self._cpu_bf16_cache:
+                        img_01 = img_01.to(torch.bfloat16)
                     t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
 
             # Reset retry count on success
@@ -589,8 +563,8 @@ class DatasetLoader(Dataset):
             # Enqueue write but never block __getitem__
             if self._l2_enabled and self._l2_writer_q is not None:
                 try:
-                    # Write normalized image (store as bfloat16) and explicit padding mask
-                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(sample["images"].to(torch.bfloat16))))
+                    # Write normalized image in configured L2 dtype and explicit padding mask
+                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(sample["images"].to(self._l2_dtype))))
                     self._l2_writer_q.put_nowait((self._l2_mask_key(raw_image_id, flipped=False), _tensor_to_bytes(sample["padding_mask"].to(torch.uint8))))
                 except queue.Full:
                     # Drop, but surface a rate-limited warning for visibility.
@@ -751,6 +725,8 @@ class SidecarJsonDataset(Dataset):
         l2_map_size_bytes: int = 0,
         l2_max_readers: int = 512,
         l2_writer_queue: Optional[mp.Queue] = None,
+        l2_storage_dtype: str = "bfloat16",
+        cpu_bf16_cache_pipeline: Optional[bool] = None,
         # --- Orientation / flipping ---
         random_flip_prob: float = 0.0,
         orientation_handler: Optional["OrientationHandler"] = None,
@@ -775,6 +751,10 @@ class SidecarJsonDataset(Dataset):
         ) if isinstance(pad_color, (list, tuple)) else (114, 114, 114)
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
+        # L2 dtype + CPU bf16 preference
+        self._l2_dtype_str = str(l2_storage_dtype).lower()
+        self._l2_dtype = _canon_dtype(self._l2_dtype_str)
+        self._cpu_bf16_cache = bool(cpu_bf16_cache_pipeline) if cpu_bf16_cache_pipeline is not None else (self._l2_dtype is torch.bfloat16)
 
         # L2 cache
         self._l2_enabled = bool(l2_enabled and l2_cache_path)
@@ -785,22 +765,15 @@ class SidecarJsonDataset(Dataset):
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
         self._last_qfull_warn: float = 0.0
 
-        # Compute a hash of preprocessing parameters for L2 cache versioning.
-        try:
-            cfg_fields = {
-                "image_size": self.image_size,
-                "pad_color": self.pad_color,
-                "normalize_mean": self.normalize_mean,
-                "normalize_std": self.normalize_std,
-                # Sidecar dataset does not use L1 dtype, but keep field for parity
-                "cache_storage_dtype": getattr(self, "canonical_cache_dtype", "float32"),
-                "l2_storage_dtype": "bfloat16",
-                "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
-            }
-            cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
-            self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
-        except Exception:
-            self._l2_cfg_hash = "00000000"
+        # Compute L2 cfg hash once for sidecar dataset (no L1 here, pass a placeholder)
+        self._l2_cfg_hash = compute_l2_cfg_hash(
+            image_size=self.image_size,
+            pad_color=self.pad_color,
+            normalize_mean=self.normalize_mean,
+            normalize_std=self.normalize_std,
+            l1_dtype_str="float32",
+            l2_dtype_str=self._l2_dtype_str,
+        )
 
         # --- Orientation / flipping state ---
         self.random_flip_prob = float(random_flip_prob or 0.0)
@@ -1033,6 +1006,8 @@ class SidecarJsonDataset(Dataset):
                 mask_tv = tv_tensors.Mask(pmask.to(torch.uint8))
                 img_tv, mask_tv = self.joint_transforms(img_tv, mask_tv)
                 img = T.ToTensor()(img_tv)
+                if self._cpu_bf16_cache:
+                    img = img.to(torch.bfloat16)
                 if transforms is None:
                     raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                 img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
@@ -1045,16 +1020,22 @@ class SidecarJsonDataset(Dataset):
                         if transforms is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
+                        if self._cpu_bf16_cache:
+                            img = img.to(torch.bfloat16)
                         img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
                     except Exception:
                         if transforms is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img = transforms.ToTensor()(canvas)
+                        if self._cpu_bf16_cache:
+                            img = img.to(torch.bfloat16)
                         img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
                 else:
                     if transforms is None:
                         raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                     img = transforms.ToTensor()(canvas)
+                    if self._cpu_bf16_cache:
+                        img = img.to(torch.bfloat16)
                     img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
 
             # Encode labels (tags already account for flipping)
@@ -1064,8 +1045,8 @@ class SidecarJsonDataset(Dataset):
             # Enqueue write (non-blocking)
             if self._l2_enabled and self._l2_writer_q is not None:
                 try:
-                    # Store the normalized image as bfloat16 and explicit padding mask
-                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(img.to(torch.bfloat16))))
+                    # Store the normalized image in L2 dtype and explicit padding mask
+                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(img.to(self._l2_dtype))))
                     self._l2_writer_q.put_nowait((mask_key, _tensor_to_bytes(pmask.to(torch.uint8))))
                 except queue.Full:
                     now = time.time()
@@ -1253,6 +1234,8 @@ def create_dataloaders(
             l2_map_size_bytes=map_size_bytes,
             l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
             l2_writer_queue=q,
+            l2_storage_dtype=getattr(data_config, "l2_storage_dtype", "bfloat16"),
+            cpu_bf16_cache_pipeline=getattr(data_config, "cpu_bf16_cache_pipeline", None),
         )
 
         val_ds = DatasetLoader(
@@ -1269,6 +1252,8 @@ def create_dataloaders(
             l2_map_size_bytes=map_size_bytes,
             l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
             l2_writer_queue=q,
+            l2_storage_dtype=getattr(data_config, "l2_storage_dtype", "bfloat16"),
+            cpu_bf16_cache_pipeline=getattr(data_config, "cpu_bf16_cache_pipeline", None),
         )
     else:
         # Sidecar JSON mode: scan per-image *.json recursively (shard-aware)
@@ -1303,6 +1288,8 @@ def create_dataloaders(
             l2_map_size_bytes=map_size_bytes,
             l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
             l2_writer_queue=q,
+            l2_storage_dtype=getattr(data_config, "l2_storage_dtype", "bfloat16"),
+            cpu_bf16_cache_pipeline=getattr(data_config, "cpu_bf16_cache_pipeline", None),
             random_flip_prob=random_flip_prob,
             orientation_handler=_handler,
             flip_overrides_path=flip_overrides_path,
@@ -1323,6 +1310,8 @@ def create_dataloaders(
             l2_map_size_bytes=map_size_bytes,
             l2_max_readers=getattr(data_config, "l2_max_readers", 4096),
             l2_writer_queue=q,
+            l2_storage_dtype=getattr(data_config, "l2_storage_dtype", "bfloat16"),
+            cpu_bf16_cache_pipeline=getattr(data_config, "cpu_bf16_cache_pipeline", None),
             random_flip_prob=0.0,          # keep val deterministic
             orientation_handler=_handler,  # still needed to encode swapped tags if you ever TTA
             flip_overrides_path=None,

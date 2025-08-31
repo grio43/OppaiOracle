@@ -106,6 +106,8 @@ data:
   l2_cache_enabled: true
   l2_cache_path: "./l2_cache"
   l2_max_size_gb: 14336.0
+  l2_storage_dtype: "bfloat16"
+  cpu_bf16_cache_pipeline: true
 
   # Augmentation (from augmentation.yaml)
   augmentation_enabled: true

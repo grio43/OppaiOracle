@@ -22,6 +22,14 @@ Key Abbreviations
 - Vocabulary: Always use a real `vocabulary.json` (no `tag_###` placeholders). The system fails fast when placeholders are detected.
 - Logging: Set `log_dir` and ensure disk space; TB dir defaults to `<output_root>/<experiment_name>`.
 
+bf16-only cache pipeline requirements
+- The data pipeline normalizes tensors and stores L2 cache entries in `bfloat16` without fallback.
+- Recommended minimums for CPU-side bf16 tensor ops and torchvision transforms:
+  - PyTorch 2.x (bf16 math on CPU and autocast are mature and widely supported)
+  - TorchVision 0.15+ (Normalize and ToTensor interop well with bf16 tensors)
+- GPU: modern NVIDIA architectures support bf16 well via AMP; set `training.use_amp: true` and `training.amp_dtype: bfloat16`.
+- If your environment predates these versions, upgrade is required (the pipeline does not convert tensors back to fp32).
+
 2) Daily Training Operations
 - Start/Resume Training
   - Command: `python train_direct.py --config configs/unified_config.yaml`

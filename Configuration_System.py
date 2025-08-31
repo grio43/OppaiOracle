@@ -575,6 +575,8 @@ class DataConfig(BaseConfig):
     l2_max_readers: int = field(default=2048, metadata={"help": "Max readers for LMDB"})
     cache_precision: str = field(default='uint8', metadata={"help": "Precision for cached images ('uint8', 'float16', 'bfloat16', 'float32')"})
     canonical_cache_dtype: str = field(default='uint8', metadata={"help": "Canonical dtype for cache storage"})
+    l2_storage_dtype: str = field(default='bfloat16', metadata={"help": "Storage dtype for L2 cache ('float16','bfloat16','float32','uint8')"})
+    cpu_bf16_cache_pipeline: bool = field(default=True, metadata={"help": "Process normalization on CPU in bf16 when populating L2"})
 
     # Dataset behavior (from dataset_loader.py usage)
     patch_size: int = field(default=16, metadata={"help": "Patch size for vision transformer"})
@@ -709,6 +711,8 @@ class DataConfig(BaseConfig):
         valid_precisions = ["uint8", "float16", "bfloat16", "float32"]
         if self.cache_precision not in valid_precisions:
             errors.append(f"Invalid cache_precision: {self.cache_precision}. Must be one of {valid_precisions}")
+        if self.l2_storage_dtype not in valid_precisions:
+            errors.append(f"Invalid l2_storage_dtype: {self.l2_storage_dtype}. Must be one of {valid_precisions}")
 
         if errors:
             raise ConfigValidationError("Data config validation failed:\n" + "\n".join(errors))
