@@ -835,6 +835,12 @@ class TrainingConfig(BaseConfig):
     # Early stopping
     early_stopping_patience: int = 10
     early_stopping_threshold: float = 0.0001
+    # Ignore the first N epochs for early-stopping decisions.
+    # After burn-in, reset the early-stopping baseline to a robust summary
+    # of the burn-in window to avoid outlier first-epoch spikes.
+    early_stopping_burn_in_epochs: int = 0
+    # One of: 'median', 'mean', 'last', 'max'
+    early_stopping_burn_in_strategy: str = "median"
 
     # Knowledge distillation (from training_config.yaml comments)
     use_distillation: bool = False
@@ -892,6 +898,15 @@ class TrainingConfig(BaseConfig):
         valid_devices = ["cuda", "cpu", "mps"]
         if not any(self.device.startswith(d) for d in valid_devices):
             errors.append(f"Unknown device: {self.device}. Must start with one of {valid_devices}")
+
+        # Early-stopping burn-in
+        if self.early_stopping_burn_in_epochs is None or int(self.early_stopping_burn_in_epochs) < 0:
+            errors.append("early_stopping_burn_in_epochs must be >= 0")
+        allowed_es_strategies = {"median", "mean", "last", "max"}
+        if str(self.early_stopping_burn_in_strategy).lower() not in allowed_es_strategies:
+            errors.append(
+                f"early_stopping_burn_in_strategy must be one of {sorted(allowed_es_strategies)}"
+            )
         
         if errors:
             raise ConfigValidationError("Training config validation failed:\n" + "\n".join(errors))
