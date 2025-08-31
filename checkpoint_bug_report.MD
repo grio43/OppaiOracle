@@ -1,30 +1,29 @@
 Checkpointing Bugs To Fix
 
-- Resume overrides best metric incorrectly: `train_direct.py:575`
-  - Bug: After loading `training_state` from the checkpoint, code overwrites `training_state.best_metric` with the current checkpoint's `metrics['val_f1_macro']`. This loses the historical best stored in `training_state` and can break early stopping and best-model detection after resume.
-  - Needs fix: Do not overwrite `training_state.best_metric`; rely on the value inside loaded `training_state` or only update if the loaded metrics are explicitly marked as best.
+- validation_loop uses num_tags before init: In `validation_loop.py:343`, `_load_model()` sets `model_config['num_tags'] = self.num_tags` before `self.num_tags` is defined (set later in `__init__` after vocabulary load at `validation_loop.py:256`). This can raise an AttributeError and/or build a model with the wrong head size.
+  - Impact: Validation can crash or load an incorrectly sized head when only a checkpoint is provided.
+  - Evidence: `validation_loop.py:343`, `validation_loop.py:256`.
+  - Fix direction (for code owners): Load vocabulary (or infer tags from checkpoint `state_dict`) before creating the model, or read `num_tags/num_classes` from checkpoint metadata/state.
 
-- `save_best_only` semantics are wrong/non-functional for retention: `training_utils.py:622`, `train_direct.py:832`
-  - Bug: Config field `training.save_best_only` is wired to `keep_best` (copying a `best_model.pt`) but does not suppress periodic checkpoint saves. Despite the name, non-best checkpoints are still written at cadence, so "best only" is not enforced.
-  - Needs fix: Either (a) implement true best-only retention (skip cadence saves unless `is_best`), or (b) rename config to reflect actual behavior (e.g., `keep_best_copy`) and add a separate switch for best-only saving.
+- Config key mismatch for model config in checkpoints: Consumers expect `checkpoint['config']['model_config']`, but training saves `config.to_dict()` with a `model` section, not `model_config`.
+  - Impact: `validation_loop.py` falls back to defaults (`VisionTransformerConfig`) when exporting/validating with a checkpoint that lacks `config.model_config`, risking shape mismatches or subtle behavior drift.
+  - Evidence: reader paths at `validation_loop.py:330-336`, `ONNX_Export.py:471-477`; writer at `training_utils.py:516-520` sets `checkpoint['config'] = config` (which contains `model`, not `model_config`).
+  - Fix direction: Either embed a `model_config` block alongside `config`, or update consumers to read from `config['model']` when `model_config` is absent.
 
-- Unused parameters/fields in `CheckpointManager`: `training_utils.py:439`, `training_utils.py:455`
-  - Bug: `save_frequency` and `best_metric` are defined but never used. This confuses behavior and maintenance.
-  - Needs fix: Remove unused fields or wire them into logic (e.g., enforce `save_frequency`).
+- Lightning checkpoints are incompatible with safe loader: `train_lightning.py` uses PyTorch Lightning `.ckpt` files (pickled objects), while the rest of the stack expects plain `.pt` state_dict checkpoints via `safe_checkpoint.safe_load_checkpoint`.
+  - Impact: `.ckpt` files are not consumable by `validation_loop.py` and other tools that intentionally reject pickled models.
+  - Evidence: Lightning save/resume at `train_lightning.py:103-131`; strict rejection in `validation_loop.py:384-388`.
+  - Fix direction: Document format differences clearly and/or add a converter path to extract a plain state_dict from Lightning checkpoints.
 
-- Missing error handling for `InvalidCheckpointError` in convenience loaders: `training_utils.py:757`, `training_utils.py:767`
-  - Bug: `load_latest_checkpoint` only catches `FileNotFoundError` and `ValueError`. `safe_load_checkpoint` can raise `InvalidCheckpointError`, which will bubble up and crash unexpectedly here.
-  - Needs fix: Catch `InvalidCheckpointError` consistently in both `load_latest_checkpoint` and `load_best_checkpoint` (and log a clear warning).
+- GradScaler state not persisted: Training saves optimizer/scheduler states but not AMP GradScaler state when using fp16 (`train_direct.py`).
+  - Impact: On resume with fp16, scaler restarts from defaults; usually minor but can transiently affect stability.
+  - Evidence: Save code in `training_utils.py:557-562` lacks scaler; GradScaler used in `train_direct.py:506-519`, but no scaler state is attached to the checkpoint.
+  - Fix direction: Persist and restore scaler state in checkpoints when fp16 is active.
 
-- Vocabulary embedding error policy contradicts fail-fast guidance: `model_metadata.py:58-66`, `training_utils.py:540-564`
-  - Bug: When placeholders are detected, `embed_vocabulary` raises then catches its own exception and returns the checkpoint without an embedded vocabulary. This silently produces non self-contained checkpoints, diverging from the documented "fail fast" behavior on corrupted vocabularies.
-  - Needs fix: Propagate the error (do not swallow it) or make `save_checkpoint` enforce a hard failure when vocab embedding fails, in line with project guidance.
+- Minor security gap on older PyTorch: `safe_checkpoint.safe_load_checkpoint` falls back to `torch.load(..., weights_only=False)` when `weights_only` is unavailable.
+  - Impact: On legacy PyTorch, unpickling occurs before structural validation, which is less safe than weights-only loads.
+  - Evidence: `safe_checkpoint.py:33-38`.
+  - Fix direction: Consider guarding with a restricted pickle module or requiring newer PyTorch for critical paths.
 
-- Unreachable code after raise: `model_metadata.py:65`
-  - Bug: `return checkpoint` sits immediately after a `raise ValueError`, making it dead code.
-  - Needs fix: Remove the unreachable return.
-
-- Latest checkpoint selection inconsistency: `training_utils.py:739-741` vs. `training_utils.py:753-756`
-  - Bug: `get_latest_checkpoint` returns the last in-memory path, which may be stale if files change on disk. The loader path computes latest by mtime. This inconsistency can cause resume to pick an older file.
-  - Needs fix: Either refresh/sort by mtime in `get_latest_checkpoint` or have callers use the mtime-based loader consistently.
-
+Notes
+- The following prior concerns appear resolved: atomic writes for `last.pt` and numbered checkpoints (`training_utils.py:613-639`), metadata embedding for vocabulary and preprocessing (`training_utils.py:540-606`, `model_metadata.py:24-170`), and resume policy in `train_direct.py:537-584`.
