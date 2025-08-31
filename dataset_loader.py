@@ -118,30 +118,51 @@ class DatasetLoader(Dataset):
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
 
-        # Compute a short hash of preprocessing parameters for L2 cache versioning.
+        # Compute a hash of preprocessing parameters.  Include image size, pad
+        # colour, normalization, cache dtype and a schema version so that any
+        # change invalidates stale cache entries.
         try:
-            cfg_str = f"{self.image_size}|{self.pad_color}|{self.normalize_mean}|{self.normalize_std}"
+            cfg_fields = {
+                "image_size": self.image_size,
+                "pad_color": self.pad_color,
+                "normalize_mean": self.normalize_mean,
+                "normalize_std": self.normalize_std,
+                "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
+                "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
+            }
+            cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
             self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
         except Exception:
             self._l2_cfg_hash = "00000000"
 
-        # --- Compute a short hash of preprocessing parameters for L2 cache versioning ---
-        # Include image size, pad colour and normalization statistics so changes
-        # to these values invalidate the L2 cache via different keys.
+        # --- Compute a hash of preprocessing parameters for L2 cache versioning ---
         try:
-            cfg_str = f"{self.image_size}|{self.pad_color}|{self.normalize_mean}|{self.normalize_std}"
+            cfg_fields = {
+                "image_size": self.image_size,
+                "pad_color": self.pad_color,
+                "normalize_mean": self.normalize_mean,
+                "normalize_std": self.normalize_std,
+                "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
+                "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
+            }
+            cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
             self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
         except Exception:
             self._l2_cfg_hash = "00000000"
 
-        # --- Compute a short hash of preprocessing parameters for L2 cache versioning ---
-        # Include image size, pad colour and normalization statistics so changes
-        # to these values invalidate the L2 cache via different keys.
+        # --- Compute a hash of preprocessing parameters for L2 cache versioning ---
         try:
-            cfg_str = f"{self.image_size}|{self.pad_color}|{self.normalize_mean}|{self.normalize_std}"
+            cfg_fields = {
+                "image_size": self.image_size,
+                "pad_color": self.pad_color,
+                "normalize_mean": self.normalize_mean,
+                "normalize_std": self.normalize_std,
+                "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
+                "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
+            }
+            cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
             self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
         except Exception:
-            # Fall back to a constant to avoid crashing during initialization
             self._l2_cfg_hash = "00000000"
 
         # Properly initialise background validator (opt-out via env or param)
@@ -161,9 +182,17 @@ class DatasetLoader(Dataset):
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
         self._last_qfull_warn: float = 0.0
 
-        # Compute a short hash of preprocessing parameters for L2 cache versioning.
+        # Compute a hash of preprocessing parameters for L2 cache versioning.
         try:
-            cfg_str = f"{self.image_size}|{self.pad_color}|{self.normalize_mean}|{self.normalize_std}"
+            cfg_fields = {
+                "image_size": self.image_size,
+                "pad_color": self.pad_color,
+                "normalize_mean": self.normalize_mean,
+                "normalize_std": self.normalize_std,
+                "cache_storage_dtype": getattr(self, "canonical_cache_dtype", getattr(self, "_l1_dtype_str", "float32")),
+                "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
+            }
+            cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
             self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
         except Exception:
             self._l2_cfg_hash = "00000000"
@@ -330,10 +359,15 @@ class DatasetLoader(Dataset):
                 if payload is not None:
                     try:
                         t = _tensor_from_bytes(payload)
-                        # Fail fast if cached tensor shape does not match current configuration
-                        if t.dim() != 3 or t.shape[-2] != int(self.image_size) or t.shape[-1] != int(self.image_size):
+                        # Require channel‑first tensors with 3 channels; reject HWC or wrong channel counts
+                        if (
+                            t.dim() != 3
+                            or t.shape[0] != 3
+                            or t.shape[1] != int(self.image_size)
+                            or t.shape[2] != int(self.image_size)
+                        ):
                             raise ValueError(
-                                f"L2 cached tensor shape {t.shape} does not match expected {(3, self.image_size, self.image_size)}"
+                                f"L2 cached tensor shape {t.shape} does not match expected (3, {self.image_size}, {self.image_size})"
                             )
 
                         # Try explicit mask first; fall back to heuristic reconstruction for legacy caches
@@ -719,9 +753,18 @@ class SidecarJsonDataset(Dataset):
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
         self._last_qfull_warn: float = 0.0
 
-        # Compute a short hash of preprocessing parameters for L2 cache versioning.
+        # Compute a hash of preprocessing parameters for L2 cache versioning.
         try:
-            cfg_str = f"{self.image_size}|{self.pad_color}|{self.normalize_mean}|{self.normalize_std}"
+            cfg_fields = {
+                "image_size": self.image_size,
+                "pad_color": self.pad_color,
+                "normalize_mean": self.normalize_mean,
+                "normalize_std": self.normalize_std,
+                # Sidecar dataset does not use L1 dtype, but keep field for parity
+                "cache_storage_dtype": getattr(self, "canonical_cache_dtype", "float32"),
+                "schema_version": os.getenv("CACHE_SCHEMA_VERSION", "v1"),
+            }
+            cfg_str = "|".join(f"{k}={v}" for k, v in cfg_fields.items())
             self._l2_cfg_hash = hashlib.sha256(cfg_str.encode("utf-8")).hexdigest()[:8]
         except Exception:
             self._l2_cfg_hash = "00000000"

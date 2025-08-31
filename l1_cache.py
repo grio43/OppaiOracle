@@ -87,7 +87,8 @@ class ByteLRU:
             # If TTL enabled, purge expired entry on access
             if self.ttl is not None:
                 exp = self._expires.get(key)
-                if exp is not None and time.time() >= exp:
+                now = time.monotonic()  # monotonic clock
+                if exp is not None and now >= exp:
                     entry = self._m.pop(key, None)
                     if entry is not None:
                         self._size -= entry.nbytes
@@ -105,7 +106,7 @@ class ByteLRU:
             self._m.move_to_end(key)
             # update sliding TTL expiry
             if self.ttl is not None:
-                self._expires[key] = time.time() + self.ttl
+                self._expires[key] = time.monotonic() + self.ttl
             if self.track_stats:
                 self._hits += 1
             return e.value.detach().clone()
@@ -113,9 +114,9 @@ class ByteLRU:
     def put(self, key: bytes, value: torch.Tensor) -> None:
         if self.capacity <= 0:
             return
-        # store CPU contiguous tensors
-        v = value.detach().cpu().contiguous()
-        nbytes = self._nbytes(v)
+        # convert to canonical dtype on CPU for accurate byte accounting
+        v = value.detach().cpu().contiguous().to(_canon_dtype(self.dtype_str))
+        nbytes = int(v.numel() * v.element_size())
         if nbytes > self.capacity:
             return
         with self._lock:
@@ -124,7 +125,7 @@ class ByteLRU:
                 self._size -= old.nbytes
             self._m[key] = _Entry(v, nbytes)
             if self.ttl is not None:
-                self._expires[key] = time.time() + self.ttl
+                self._expires[key] = time.monotonic() + self.ttl
             self._size += nbytes
             while self._size > self.capacity and self._m:
                 k_old, ev = self._m.popitem(last=False)
