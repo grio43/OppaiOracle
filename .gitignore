@@ -1,8 +1,22 @@
-.venv
-vocabulary
-processed_data
+# Ignore large, generated, or environment-specific artifacts
+
+# LMDB L2 cache directory (sparse, can be multi-terabyte)
+l2_cache/
+
+# Logs, runs, checkpoints (adjust if you want to track metadata only)
+logs/
+experiments/
+outputs/
+
+# Python caches
 __pycache__/
-utils/__pycache__
-*.log
-logs/*
-!logs/.gitkeep
+*.py[cod]
+*.pyo
+
+# Virtual envs
+.venv/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
