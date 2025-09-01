@@ -1229,6 +1229,11 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
+            # L1 (in-memory) cache controls
+            use_memory_cache=bool(getattr(data_config, "use_memory_cache", True)),
+            l1_per_worker_mb=int(getattr(data_config, "l1_per_worker_mb", 256)),
+            canonical_cache_dtype=str(getattr(data_config, "canonical_cache_dtype", "uint8")),
+            preload_files=int(getattr(data_config, "preload_files", 0)),
             l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
             l2_cache_path=getattr(data_config, "l2_cache_path", None),
             l2_map_size_bytes=map_size_bytes,
@@ -1247,6 +1252,11 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
+            # L1 (in-memory) cache controls
+            use_memory_cache=bool(getattr(data_config, "use_memory_cache", True)),
+            l1_per_worker_mb=int(getattr(data_config, "l1_per_worker_mb", 256)),
+            canonical_cache_dtype=str(getattr(data_config, "canonical_cache_dtype", "uint8")),
+            preload_files=int(getattr(data_config, "preload_files", 0)),
             l2_enabled=bool(getattr(data_config, "l2_cache_enabled", False)),
             l2_cache_path=getattr(data_config, "l2_cache_path", None),
             l2_map_size_bytes=map_size_bytes,
