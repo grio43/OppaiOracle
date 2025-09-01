@@ -8,6 +8,7 @@ except ModuleNotFoundError:
     lmdb = None  # optional dependency
 import torch
 from cache_codec import encode_tensor as _tensor_to_bytes, decode_tensor as _tensor_from_bytes
+from utils.cache_monitor import monitor
 
 # Small helper to reduce readonly-open races before the writer has created files.
 def _wait_for_env_files(path: str, *, timeout_s: float = 2.0, poll_ms: int = 50) -> None:
@@ -60,7 +61,12 @@ class LMDBReader:
     def get(self, key: bytes) -> Optional[bytes]:
         # short-lived read txns so the writer never waits on us
         with self.env.begin(write=False) as txn:
-            return txn.get(key)
+            v = txn.get(key)
+            if v is None:
+                monitor.l2_miss()
+            else:
+                monitor.l2_hit()
+            return v
 
     def close(self) -> None:
         try:

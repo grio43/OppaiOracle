@@ -5,6 +5,7 @@ from typing import Optional, Dict
 import threading
 import time
 import torch
+from utils.cache_monitor import monitor
 
 _DTYPE_MAP = {
     "uint8": torch.uint8,
@@ -98,11 +99,15 @@ class ByteLRU:
                     if self.track_stats:
                         self._expired += 1
                         self._misses += 1
+                    # Monitor: treat expiry as a miss and expired event
+                    monitor.l1_expired()
+                    monitor.l1_miss()
                     return None
             e = self._m.get(key)
             if e is None:
                 if self.track_stats:
                     self._misses += 1
+                monitor.l1_miss()
                 return None
             # update MRU order
             self._m.move_to_end(key)
@@ -111,6 +116,7 @@ class ByteLRU:
                 self._expires[key] = time.monotonic() + self.ttl
             if self.track_stats:
                 self._hits += 1
+            monitor.l1_hit()
             return e.value.detach().clone()
 
     def put(self, key: bytes, value: torch.Tensor) -> None:
@@ -129,6 +135,7 @@ class ByteLRU:
             if self.ttl is not None:
                 self._expires[key] = time.monotonic() + self.ttl
             self._size += nbytes
+            monitor.l1_put(nbytes)
             while self._size > self.capacity and self._m:
                 k_old, ev = self._m.popitem(last=False)
                 self._size -= ev.nbytes
@@ -151,14 +158,17 @@ def build_l1_cache(
     capacity_mb: int,
     dtype: str,
     ttl_seconds: Optional[float] = None,
-    track_stats: bool = False,
+    track_stats: Optional[bool] = None,
 ) -> ByteLRU:
-    """Create a ByteLRU with the given size and optional TTL/stats flags."""
+    """Create a ByteLRU with the given size and optional TTL/stats flags.
+
+    If track_stats is None, it follows the global cache monitor enable flag.
+    """
     return ByteLRU(
         capacity_mb * 1024 * 1024,
         dtype=dtype,
         ttl_seconds=ttl_seconds,
-        track_stats=track_stats,
+        track_stats=(monitor.enabled if track_stats is None else bool(track_stats)),
     )
 
 # -- helpers exported for callers (dataset) --
