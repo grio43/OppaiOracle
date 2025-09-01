@@ -40,6 +40,7 @@ from utils.metadata_ingestion import parse_tags_field
 from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
 from utils.cache_keys import compute_l2_cfg_hash
 from l1_cache import build_l1_cache, encode_l1_image_01, decode_l1_image_01
+from utils.cache_monitor import monitor
 
 # Pillow resampling compatibility and truncated image handling
 try:  # Pillow ≥10
@@ -564,8 +565,12 @@ class DatasetLoader(Dataset):
             if self._l2_enabled and self._l2_writer_q is not None:
                 try:
                     # Write normalized image in configured L2 dtype and explicit padding mask
-                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(sample["images"].to(self._l2_dtype))))
-                    self._l2_writer_q.put_nowait((self._l2_mask_key(raw_image_id, flipped=False), _tensor_to_bytes(sample["padding_mask"].to(torch.uint8))))
+                    _img_bytes = _tensor_to_bytes(sample["images"].to(self._l2_dtype))
+                    self._l2_writer_q.put_nowait((l2_key, _img_bytes))
+                    monitor.l2_put_enqueued(len(_img_bytes))
+                    _mask_bytes = _tensor_to_bytes(sample["padding_mask"].to(torch.uint8))
+                    self._l2_writer_q.put_nowait((self._l2_mask_key(raw_image_id, flipped=False), _mask_bytes))
+                    monitor.l2_put_enqueued(len(_mask_bytes))
                 except queue.Full:
                     # Drop, but surface a rate-limited warning for visibility.
                     now = time.time()
@@ -1046,8 +1051,12 @@ class SidecarJsonDataset(Dataset):
             if self._l2_enabled and self._l2_writer_q is not None:
                 try:
                     # Store the normalized image in L2 dtype and explicit padding mask
-                    self._l2_writer_q.put_nowait((l2_key, _tensor_to_bytes(img.to(self._l2_dtype))))
-                    self._l2_writer_q.put_nowait((mask_key, _tensor_to_bytes(pmask.to(torch.uint8))))
+                    _img_bytes = _tensor_to_bytes(img.to(self._l2_dtype))
+                    self._l2_writer_q.put_nowait((l2_key, _img_bytes))
+                    monitor.l2_put_enqueued(len(_img_bytes))
+                    _mask_bytes = _tensor_to_bytes(pmask.to(torch.uint8))
+                    self._l2_writer_q.put_nowait((mask_key, _mask_bytes))
+                    monitor.l2_put_enqueued(len(_mask_bytes))
                 except queue.Full:
                     now = time.time()
                     if (now - self._last_qfull_warn) > 5.0:

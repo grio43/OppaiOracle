@@ -27,6 +27,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torchmetrics.classification import MultilabelF1Score, MultilabelAveragePrecision
 import numpy as np
 from Monitor_log import MonitorConfig, TrainingMonitor
+from utils.cache_monitor import monitor as cache_monitor
 from evaluation_metrics import MetricComputer
 
 # Project paths
@@ -40,6 +41,9 @@ logger = logging.getLogger(__name__)
 
 # Import the orientation handler
 from orientation_handler import OrientationHandler, OrientationMonitor
+
+# Hardcoded cache monitor interval (steps). Adjust here as needed.
+CACHE_MONITOR_EVERY_STEPS = 3000
 
 # Import base modules with error handling
 try:
@@ -758,6 +762,13 @@ def train_with_orientation_tracking(config: FullConfig):
                             monitor.log_param_and_grad_histograms(model, global_step)
                         except Exception:
                             pass
+
+                # Periodic cache summary (hardcoded interval)
+                if cache_monitor.enabled and (global_step % CACHE_MONITOR_EVERY_STEPS == 0):
+                    try:
+                        logging.getLogger('cache_monitor').info(cache_monitor.format_summary())
+                    except Exception:
+                        pass
 
                 # Orientation health check (writes/refreshes unmapped_orientation_tags.txt)
                 try:
