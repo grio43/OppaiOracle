@@ -409,7 +409,7 @@ class ModelConfig(BaseConfig):
     
     # Vision specific
     image_size: int = 640
-    patch_size: int = 16
+    patch_size: int = 32
     num_channels: int = 3
     
     # Special tokens
