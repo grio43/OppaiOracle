@@ -184,13 +184,12 @@ class DatasetLoader(Dataset):
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
         self._last_qfull_warn: float = 0.0
 
-        # Compute L2 cfg hash once (after L1 settings are known)
+        # Compute L2 cfg hash once (depends only on L2-relevant preprocessing config)
         self._l2_cfg_hash = compute_l2_cfg_hash(
             image_size=self.image_size,
             pad_color=self.pad_color,
             normalize_mean=self.normalize_mean,
             normalize_std=self.normalize_std,
-            l1_dtype_str=self._l1_dtype_str,
             l2_dtype_str=self._l2_dtype_str,
         )
 
@@ -770,13 +769,12 @@ class SidecarJsonDataset(Dataset):
         self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
         self._last_qfull_warn: float = 0.0
 
-        # Compute L2 cfg hash once for sidecar dataset (no L1 here, pass a placeholder)
+        # Compute L2 cfg hash once for sidecar dataset (L2-relevant preprocessing only)
         self._l2_cfg_hash = compute_l2_cfg_hash(
             image_size=self.image_size,
             pad_color=self.pad_color,
             normalize_mean=self.normalize_mean,
             normalize_std=self.normalize_std,
-            l1_dtype_str="float32",
             l2_dtype_str=self._l2_dtype_str,
         )
 
