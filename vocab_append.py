@@ -32,6 +32,7 @@ from Configuration_System import load_config
 from vocabulary import TagVocabulary, verify_vocabulary_integrity
 from utils.metadata_ingestion import parse_tags_field
 from vocab_utils import compute_vocab_hash
+from pathlib import Path as _PathAlias
 
 logger = logging.getLogger("vocab_append")
 
@@ -164,6 +165,15 @@ def main() -> None:
     # Save vocabulary
     vocab.save_vocabulary(vocab_file)
 
+    # Also mirror to SQLite (same directory, file name 'vocab.sqlite')
+    try:
+        from vocab_sqlite import save_vocabulary_to_sqlite
+        sqlite_path = _PathAlias(vocab_file).with_name('vocab.sqlite')
+        save_vocabulary_to_sqlite(vocab, sqlite_path)
+        logger.info(f"Mirrored vocabulary to SQLite at {sqlite_path}")
+    except Exception as e:
+        logger.warning(f"Could not mirror vocabulary to SQLite: {e}")
+
     # Report summary
     ordered = _ordered_vocab_list(vocab)
     sha = compute_vocab_hash(ordered)
@@ -183,4 +193,3 @@ def main() -> None:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     main()
-

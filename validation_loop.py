@@ -234,14 +234,12 @@ class ValidationRunner:
             logger.info("Loading vocabulary from external file")
             vocab_path = Path(config.vocab_path)
             if vocab_path.exists():
-                if vocab_path.suffix == '.json':
-                    self.vocab = TagVocabulary(vocab_path)
-                else:
-                    self.vocab = load_vocabulary_for_training(vocab_path)
+                # Use centralized loader which prefers SQLite sidecar for speed
+                self.vocab = load_vocabulary_for_training(vocab_path)
             else:
                 for path in [DEFAULT_VOCAB_PATH, PROJECT_ROOT / "vocabulary/vocabulary.json"]:
                     if path.exists():
-                        self.vocab = TagVocabulary(path)
+                        self.vocab = load_vocabulary_for_training(path)
                         vocab_path = path
                         break
                 else:
