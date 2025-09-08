@@ -310,6 +310,14 @@ def train_with_orientation_tracking(config: FullConfig):
             rebuilt_vocab = create_vocabulary_from_datasets([active_data_path])
             vocab_file = (vocab_dest / "vocabulary.json") if vocab_dest.is_dir() else vocab_dest
             rebuilt_vocab.save_vocabulary(vocab_file)
+            # Also mirror to SQLite to reduce future I/O
+            try:
+                from vocab_sqlite import save_vocabulary_to_sqlite  # local import to avoid hard dep at import time
+                sqlite_path = (vocab_file.parent / 'vocab.sqlite')
+                save_vocabulary_to_sqlite(rebuilt_vocab, sqlite_path)
+                logger.info("Vocabulary mirrored to SQLite -> %s", sqlite_path)
+            except Exception as e:
+                logger.warning("Vocabulary rebuilt but failed to write SQLite sidecar: %s", e)
             logger.info("Vocabulary rebuilt with %d tags -> %s",
                         len(rebuilt_vocab.tag_to_index), vocab_file)
         except Exception as e:

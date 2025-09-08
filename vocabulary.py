@@ -414,6 +414,31 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
     # Check if direct file path
     if vocab_path.is_file():
         if vocab_path.suffix == '.json':
+            # Prefer a SQLite sidecar when present to cut startup I/O
+            try:
+                from vocab_sqlite import load_vocabulary_from_sqlite  # local import; optional backend
+                json_mtime = vocab_path.stat().st_mtime
+                candidates = [
+                    vocab_path.with_name('vocab.sqlite'),
+                    vocab_path.with_suffix('.sqlite'),
+                    vocab_path.with_suffix('.db'),
+                ]
+                for cand in candidates:
+                    if cand.exists():
+                        # Heuristic: prefer SQLite if it's at least as new as JSON
+                        try:
+                            if cand.stat().st_mtime + 1e-3 >= json_mtime:  # small epsilon
+                                vocab = load_vocabulary_from_sqlite(cand)
+                                _verify_vocabulary_integrity(vocab, cand)
+                                logger.info(f"Loaded vocabulary from SQLite sidecar for faster startup: {cand}")
+                                return vocab
+                        except Exception:
+                            # If anything goes wrong, fall back to JSON below
+                            pass
+            except Exception:
+                # Backend unavailable; fall through to JSON load
+                pass
+            # JSON fallback (canonical source of truth)
             vocab = TagVocabulary()
             vocab.load_vocabulary(vocab_path)
             # Verify the loaded vocabulary is valid
@@ -421,6 +446,18 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
             return vocab
         elif vocab_path.suffix == '.txt':
             vocab = TagVocabulary.from_file(vocab_path)
+            _verify_vocabulary_integrity(vocab, vocab_path)
+            return vocab
+        elif vocab_path.suffix in ('.sqlite', '.db'):
+            # Load from SQLite backend
+            try:
+                from vocab_sqlite import load_vocabulary_from_sqlite  # local import to avoid hard dep at import time
+            except Exception as e:
+                raise ImportError(
+                    f"SQLite vocabulary backend unavailable: {e}. "
+                    f"Install SQLite (stdlib) and ensure vocab_sqlite.py exists."
+                )
+            vocab = load_vocabulary_from_sqlite(vocab_path)
             _verify_vocabulary_integrity(vocab, vocab_path)
             return vocab
 
@@ -442,11 +479,24 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
             _verify_vocabulary_integrity(vocab, vocab_file)
             return vocab
 
+        # Try SQLite format
+        for candidate in (vocab_path / "vocab.sqlite", vocab_path / "vocabulary.sqlite", vocab_path / "vocab.db"):
+            if candidate.exists():
+                try:
+                    from vocab_sqlite import load_vocabulary_from_sqlite
+                except Exception as e:
+                    raise ImportError(
+                        f"SQLite vocabulary backend unavailable: {e}. "
+                        f"Ensure vocab_sqlite.py is present."
+                    )
+                vocab = load_vocabulary_from_sqlite(candidate)
+                _verify_vocabulary_integrity(vocab, candidate)
+                return vocab
+
     # Fail loudly if vocabulary not found - no dummy fallback
     raise FileNotFoundError(
-        f"Vocabulary file not found at {vocab_path}. "
-        f"Tried: vocabulary.json and tags.txt. "
-        f"Please ensure vocabulary.json exists at the specified location."
+        f"Vocabulary not found at {vocab_path}. "
+        f"Tried: vocabulary.json, tags.txt, and SQLite (vocab.sqlite)."
     )
 
 
@@ -506,7 +556,7 @@ def create_dataset_config(vocab: TagVocabulary) -> Dict:
 def create_vocabulary_from_datasets(
     dataset_path: Optional[List[Path]] = None,
     *,
-    min_frequency: int = 4,
+    min_frequency: int = 50,
     top_k: int = 100_000,
 ):
     """Create vocabulary from datasets (for training).
@@ -531,7 +581,14 @@ def create_vocabulary_from_datasets(
 
     vocab.save_vocabulary(VOCAB_PATH)
 
-    logger.info(f"Created vocabulary with {len(vocab)} tags and saved to {VOCAB_PATH}")
+    # Also build a SQLite sidecar next to vocabulary.json to reduce I/O in downstream tools
+    try:
+        from vocab_sqlite import save_vocabulary_to_sqlite  # local import to avoid hard dep at import time
+        sqlite_path = VOCAB_PATH.with_name('vocab.sqlite')
+        save_vocabulary_to_sqlite(vocab, sqlite_path)
+        logger.info(f"Created vocabulary with {len(vocab)} tags and wrote JSON+SQLite -> {VOCAB_PATH}, {sqlite_path}")
+    except Exception as e:
+        logger.warning(f"Vocabulary JSON saved but failed to write SQLite sidecar: {e}")
 
     return vocab
 

@@ -28,6 +28,8 @@ except Exception:  # keep backward compatible
     T = None
     tv_tensors = None
 from vocabulary import load_vocabulary_for_training, TagVocabulary
+from pathlib import Path as _PathAlias
+import hashlib as _hl
 
 # Orientation-aware flipping (optional; keeps file usable in legacy setups)
 try:
@@ -83,6 +85,49 @@ class DataLoader(_TorchDataLoader):  # keep public name the same
             kwargs.pop("prefetch_factor", None)
             kwargs["persistent_workers"] = False
         super().__init__(*args, **kwargs)
+
+
+# --- JSON sidecar split caching to reduce startup I/O -----------------------
+_PROJ_ROOT = Path(__file__).resolve().parent
+
+def _split_cache_paths(root: Path) -> tuple[Path, Path]:
+    """Return cache file paths for train/val splits for a given dataset root.
+
+    Files live under ./logs/splits/<sha1(root)>.{train|val}.txt and contain
+    absolute JSON file paths, one per line.
+    """
+    splits_dir = _PROJ_ROOT / "logs" / "splits"
+    splits_dir.mkdir(parents=True, exist_ok=True)
+    key = _hl.sha1(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+    return (
+        splits_dir / f"{key}.train.txt",
+        splits_dir / f"{key}.val.txt",
+    )
+
+def _try_load_cached_split(root: Path) -> Optional[tuple[list[Path], list[Path]]]:
+    train_file, val_file = _split_cache_paths(root)
+    if train_file.exists() and val_file.exists():
+        try:
+            train_list = [Path(line.strip()) for line in train_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+            val_list = [Path(line.strip()) for line in val_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+            # Basic sanity: ensure paths exist; if too many missing, discard cache
+            miss = sum(1 for p in train_list[:100] if not p.exists()) + sum(1 for p in val_list[:100] if not p.exists())
+            if miss <= 1:
+                logging.getLogger(__name__).info(
+                    f"Using cached JSON split lists (train={len(train_list)}, val={len(val_list)})"
+                )
+                return train_list, val_list
+        except Exception:
+            pass
+    return None
+
+def _write_cached_split(root: Path, train_list: list[Path], val_list: list[Path]) -> None:
+    train_file, val_file = _split_cache_paths(root)
+    try:
+        train_file.write_text("\n".join(str(p) for p in train_list), encoding="utf-8")
+        val_file.write_text("\n".join(str(p) for p in val_list), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _make_worker_init(log_queue):
@@ -1276,20 +1321,25 @@ def create_dataloaders(
         # Sidecar JSON mode: scan per-image *.json recursively (shard-aware)
         logger.info("Manifest not found; entering sidecar JSON mode (scanning .json next to images)")
 
-        all_jsons = sorted(root.rglob("*.json")) if root.exists() else []
-        if not all_jsons:
-            raise FileNotFoundError(
-                f"No annotation JSON files found under {root}. Expected per-image JSON sidecars."
-            )
+        cached = _try_load_cached_split(root)
+        if cached is not None:
+            train_list, val_list = cached
+        else:
+            all_jsons = sorted(root.rglob("*.json")) if root.exists() else []
+            if not all_jsons:
+                raise FileNotFoundError(
+                    f"No annotation JSON files found under {root}. Expected per-image JSON sidecars."
+                )
 
-        # Deterministic split
-        import random as _random
-        rng = _random.Random(int(seed))
-        rng.shuffle(all_jsons)
-        split_ratio = 0.95
-        n_train = max(1, int(len(all_jsons) * split_ratio))
-        train_list = all_jsons[:n_train]
-        val_list = all_jsons[n_train:] if n_train < len(all_jsons) else all_jsons[-max(1, len(all_jsons)//20):]
+            # Deterministic split
+            import random as _random
+            rng = _random.Random(int(seed))
+            rng.shuffle(all_jsons)
+            split_ratio = 0.95
+            n_train = max(1, int(len(all_jsons) * split_ratio))
+            train_list = all_jsons[:n_train]
+            val_list = all_jsons[n_train:] if n_train < len(all_jsons) else all_jsons[-max(1, len(all_jsons)//20):]
+            _write_cached_split(root, train_list, val_list)
 
         train_ds = SidecarJsonDataset(
             root_dir=root,
