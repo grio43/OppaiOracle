@@ -159,6 +159,7 @@ class DatasetLoader(Dataset):
         self,
         annotations_path,
         image_dir,
+        dataset_root: Optional[str] = None,
         transform=None,
         joint_transforms=None,  # NEW: torchvision v2 transforms applied to (image, mask) together
         max_retries=3,
@@ -197,6 +198,8 @@ class DatasetLoader(Dataset):
         self.retry_counts = {}
         self.failed_samples = set()
         self.logger = logging.getLogger(__name__)
+        # For manifest mode, allow symlink targets to resolve within this dataset root
+        self.dataset_root = dataset_root
 
         # Image pipeline settings
         self.image_size = int(image_size)
@@ -499,7 +502,13 @@ class DatasetLoader(Dataset):
                         )
 
             # --- Cache miss: load + transform (confined path) ---
-            img_path = validate_image_path(Path(self.image_dir), image_id)
+            # Use the sanitized image identifier we derived above.
+            # Allow symlink targets to live under the dataset root (manifest symlinks → shard files)
+            img_path = validate_image_path(
+                Path(self.image_dir),
+                raw_image_id,
+                allowed_external_roots=([Path(self.dataset_root)] if self.dataset_root else None),
+            )
             # Fully decode while file is open; fix EXIF rotations.
             with Image.open(img_path) as pil_img:
                 pil_img.load()
@@ -709,7 +718,11 @@ class BackgroundValidator(Thread):
             # Confine and locate image file safely
             try:
                 image_id = sanitize_identifier(str(annotation["image_id"]))
-                image_path = validate_image_path(Path(self.dataset_loader.image_dir), image_id)
+                image_path = validate_image_path(
+                    Path(self.dataset_loader.image_dir),
+                    image_id,
+                    allowed_external_roots=([Path(self.dataset_loader.dataset_root)] if getattr(self.dataset_loader, 'dataset_root', None) else None),
+                )
             except Exception as e:
                 logging.warning(f"Invalid image_id for item {idx}: {e}")
                 return False
@@ -1283,6 +1296,7 @@ def create_dataloaders(
         train_ds = DatasetLoader(
             annotations_path=str(manifest_train),
             image_dir=str(images_dir),
+            dataset_root=str(root),
             transform=transform,
             num_classes=num_tags,
             image_size=image_size,
@@ -1306,6 +1320,7 @@ def create_dataloaders(
         val_ds = DatasetLoader(
             annotations_path=str(manifest_val),
             image_dir=str(images_dir),
+            dataset_root=str(root),
             transform=transform,
             num_classes=num_tags,
             image_size=image_size,
