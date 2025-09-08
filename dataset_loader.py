@@ -398,7 +398,15 @@ class DatasetLoader(Dataset):
             if self._l2_enabled:
                 self._ensure_l2_reader()
                 payload = self._l2_reader.get(l2_key) if self._l2_reader else None
-                mask_payload = self._l2_reader.get(self._l2_mask_key(raw_image_id, flipped=False)) if self._l2_reader else None
+                # Prefer a mask that matches the flip state; fall back to legacy flip0 masks
+                mask_payload = None
+                if self._l2_reader:
+                    try:
+                        mask_payload = self._l2_reader.get(self._l2_mask_key(raw_image_id, flipped=flipped))
+                        if mask_payload is None:
+                            mask_payload = self._l2_reader.get(self._l2_mask_key(raw_image_id, flipped=False))
+                    except Exception:
+                        mask_payload = None
                 if payload is not None:
                     try:
                         t = _tensor_from_bytes(payload)
