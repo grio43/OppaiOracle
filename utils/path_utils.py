@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+from typing import Optional, Sequence
 import re
 
 DEFAULT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -26,21 +27,63 @@ def safe_join(root: Path, *parts: str) -> Path:
 def validate_image_path(
     root: Path,
     stem: str,
-    allowed_exts=(".jpg", ".jpeg", ".png", ".webp"),
+    allowed_exts: Sequence[str] = (".jpg", ".jpeg", ".png", ".webp"),
+    *,
+    allowed_external_roots: Optional[Sequence[Path]] = None,
 ) -> Path:
+    """
+    Find an image by sanitized stem under a directory, allowing symlink targets
+    to live under additional trusted roots.
+
+    - root: directory that holds the expected image file (e.g., <dataset>/images)
+    - stem: filename without extension; only [A-Za-z0-9_.-] allowed
+    - allowed_external_roots: optional additional roots within which a symlink
+      target may resolve. If None, targets must resolve under 'root'.
+    """
     stem = sanitize_identifier(Path(stem).stem)
+    roots: list[Path] = [root.resolve()]
+    if allowed_external_roots:
+        roots.extend([Path(r).resolve() for r in allowed_external_roots])
+
+    def _within_any(p: Path) -> bool:
+        pr = p.resolve()
+        for r in roots:
+            try:
+                pr.relative_to(r)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _check_and_return(p: Path) -> Optional[Path]:
+        if not p.exists():
+            return None
+        # If it's a symlink (or any path), ensure its resolved target is within
+        # at least one trusted root.
+        try:
+            target = p.resolve()
+        except FileNotFoundError:
+            return None
+        if not _within_any(target):
+            raise PathTraversalError(f"Path escapes dataset root: {target}")
+        return p
+
     # direct matches
     for ext in allowed_exts:
-        p = safe_join(root, f"{stem}{ext}")
-        if p.exists():
-            return p
+        cand = root / f"{stem}{ext}"
+        out = _check_and_return(cand)
+        if out is not None:
+            return out
     # case-insensitive fallback
     try:
-        lower_map = {f.name.lower(): f for f in root.iterdir() if f.is_file()}
+        entries = list(root.iterdir())
+        lower_map = {f.name.lower(): f for f in entries if f.is_file() or f.is_symlink()}
         for ext in allowed_exts:
             alt = lower_map.get(f"{stem}{ext}".lower())
             if alt:
-                return safe_join(root, alt.name)
+                out = _check_and_return(root / alt.name)
+                if out is not None:
+                    return out
     except FileNotFoundError:
         pass
     raise FileNotFoundError(f"Image not found under {root}: {stem}")
