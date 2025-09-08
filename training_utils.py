@@ -141,6 +141,7 @@ class TrainingState:
     """Maintains complete training state"""
     epoch: int = 0
     global_step: int = 0
+    optimizer_updates: int = 0
     best_metric: float = float('-inf')
     best_epoch: int = 0
     
