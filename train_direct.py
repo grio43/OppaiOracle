@@ -19,6 +19,7 @@ from datetime import datetime
 import torch.distributed as dist
 from dataclasses import dataclass
 from contextlib import nullcontext
+import signal
 
 import shutil
 import torch
@@ -234,6 +235,23 @@ def train_with_orientation_tracking(config: FullConfig):
     import tempfile
 
     logger = logging.getLogger(__name__)
+    
+    # --- Soft stop support (signals + sentinel files) -----------------------
+    # Save a checkpoint at the next safe point (optimizer step) and exit.
+    soft_stop = {"requested": False}
+
+    def _soft_stop_handler(signum, frame):
+        try:
+            soft_stop["requested"] = True
+        except Exception:
+            pass
+        logger.warning("Soft stop requested via signal %s; will save at next safe point.", signum)
+
+    try:
+        signal.signal(signal.SIGINT, _soft_stop_handler)
+        signal.signal(signal.SIGTERM, _soft_stop_handler)
+    except Exception as _e:
+        logger.debug("Signal handler install skipped: %s", _e)
     
     # Seeding & determinism
     seed, deterministic_mode = setup_seed(config.training.seed, config.training.deterministic)
@@ -570,6 +588,10 @@ def train_with_orientation_tracking(config: FullConfig):
     _burn_in_vals = []  # collect val metric during burn-in window
     global_step = 0
     start_epoch = 0
+    # Soft-stop sentinel files (located in log_dir)
+    stop_sentinel = Path(config.log_dir) / "STOP_TRAINING"
+    save_sentinel = Path(config.log_dir) / "SAVE_CHECKPOINT"
+    early_exit = False
 
     # --- Resume logic controlled by config.training.resume_from ---
     resume_opt = str(getattr(config.training, "resume_from", "latest")).strip().lower()
@@ -619,6 +641,11 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.info("Resumed from %s (epoch=%s, step=%s)", ckpt_path, start_epoch, global_step)
         except Exception as e:
             logger.exception("Failed to load checkpoint from %s; starting fresh. Error: %s", ckpt_path, e)
+
+    # Track optimizer updates (optimizer steps), distinct from micro-steps (batches)
+    # Maintain in training_state for resume compatibility
+    if not hasattr(training_state, 'optimizer_updates'):
+        training_state.optimizer_updates = 0
 
     for epoch in range(start_epoch, config.training.num_epochs):
         # Ensure distinct shuffles across epochs in distributed mode
@@ -752,8 +779,89 @@ def train_with_orientation_tracking(config: FullConfig):
                         # keep training even if a rare scheduler state issue occurs
                         pass
 
+                    # Count optimizer updates and handle periodic checkpointing
+                    try:
+                        training_state.optimizer_updates += 1
+                        save_every = int(getattr(getattr(config, 'training', {}), 'save_steps', 0) or 0)
+                    except Exception:
+                        save_every = 0
+
+                    if save_every > 0 and (training_state.optimizer_updates % save_every == 0):
+                        # Snapshot current train loss estimate for metadata
+                        try:
+                            current_train_loss = (running_loss + loss.item()) / max(1, (step + 1))
+                        except Exception:
+                            current_train_loss = float('nan')
+
+                        training_state.epoch = epoch + 1
+                        training_state.global_step = global_step
+                        training_state.train_loss = float(current_train_loss) if np.isfinite(current_train_loss) else current_train_loss
+
+                        try:
+                            checkpoint_manager.save_checkpoint(
+                                model=model,
+                                optimizer=optimizer,
+                                scheduler=scheduler,
+                                epoch=epoch + 1,
+                                step=global_step,
+                                metrics={'train_loss': float(current_train_loss) if np.isfinite(current_train_loss) else current_train_loss},
+                                training_state=training_state,
+                                is_best=False,
+                                config=config.to_dict()
+                            )
+                            logger.info(
+                                "Periodic save: optimizer_update=%s, global_step=%s",
+                                training_state.optimizer_updates,
+                                global_step,
+                            )
+                        except Exception as e:
+                            logger.warning("Periodic save failed: %s", e)
+
                 running_loss += loss.item()
                 global_step += 1
+
+                # --- Soft stop / Save-now handling (safe point: after optimizer step) ---
+                if ((step + 1) % accum == 0):
+                    stop_now = bool(soft_stop.get("requested")) or stop_sentinel.exists()
+                    save_now = save_sentinel.exists()
+                    if stop_now or save_now:
+                        try:
+                            current_train_loss = running_loss / max(1, (step + 1))
+                        except Exception:
+                            current_train_loss = float('nan')
+
+                        # Update training state snapshot before saving
+                        training_state.epoch = epoch + 1
+                        training_state.global_step = global_step
+                        training_state.train_loss = float(current_train_loss) if np.isfinite(current_train_loss) else current_train_loss
+
+                        # Save checkpoint (updates last.pt atomically)
+                        try:
+                            checkpoint_manager.save_checkpoint(
+                                model=model,
+                                optimizer=optimizer,
+                                scheduler=scheduler,
+                                epoch=epoch + 1,
+                                step=global_step,
+                                metrics={'train_loss': float(current_train_loss) if np.isfinite(current_train_loss) else current_train_loss},
+                                training_state=training_state,
+                                is_best=False,
+                                config=config.to_dict()
+                            )
+                            logger.info("Soft stop/save: checkpoint written at step %s.", global_step)
+                        except Exception as e:
+                            logger.warning("Soft stop: failed to write checkpoint: %s", e)
+
+                        # Clear the one-shot save sentinel if present
+                        if save_now:
+                            try:
+                                save_sentinel.unlink()
+                            except Exception:
+                                pass
+
+                        if stop_now:
+                            early_exit = True
+                            break
 
                 # Log every N steps (throttled) and ensure first-step write
                 if global_step == 1 or (global_step % config.training.logging_steps == 0):
@@ -819,6 +927,11 @@ def train_with_orientation_tracking(config: FullConfig):
                         monitor.log_augmentations(global_step, sd)
 
             # Logging moved into inner loop (above) to avoid missing epoch-boundary steps.
+
+        # If a soft stop was requested, exit training before validation
+        if early_exit:
+            logger.info("Soft stop engaged. Exiting training loop before validation.")
+            break
 
         avg_train_loss = running_loss / len(train_loader)
         
@@ -935,9 +1048,8 @@ def train_with_orientation_tracking(config: FullConfig):
                 training_state.patience_counter += 1
 
         # Respect "save_best_only": skip cadence saves unless this is a new best.
-        keep_best_only = bool(getattr(config.training, "save_best_only", False))
-        should_save = (not keep_best_only and (global_step % config.training.save_steps == 0)) or is_best
-        if should_save:
+        # Only handle best-at-epoch saves here; periodic saves happen in-loop
+        if is_best:
             checkpoint_manager.save_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -946,7 +1058,7 @@ def train_with_orientation_tracking(config: FullConfig):
                 step=global_step,
                 metrics={'train_loss': avg_train_loss, 'val_loss': avg_val_loss, 'val_f1_macro': val_f1_macro, 'val_mAP': val_mAP},
                 training_state=training_state,
-                is_best=is_best,
+                is_best=True,
                 config=config.to_dict()
             )
 
