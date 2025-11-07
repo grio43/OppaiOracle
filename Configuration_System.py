@@ -15,7 +15,7 @@ try:
     # It aliases to typing.Union in Python 3.14+, but older versions return
     # a distinct class. Capture it if available to allow cross-version checks.
     _UnionType = getattr(_types, "UnionType", None)
-except Exception:
+except (ImportError, AttributeError):
     _UnionType = None
 
 def _is_union_origin(origin: _typing.Any) -> bool:
@@ -39,6 +39,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Type, TypeVar, get_type_hints, get_origin, get_args
 from dataclasses import dataclass, field, asdict, fields, is_dataclass
 from enum import Enum
+
+# Type alias for JSON-serializable values
+JsonSerializable = Union[None, bool, int, float, str, List['JsonSerializable'], Dict[str, 'JsonSerializable'], Tuple['JsonSerializable', ...]]
 import argparse
 import sys
 from datetime import datetime
@@ -82,7 +85,7 @@ class ConfigType(Enum):
     FULL = "full"
 
 
-def _object_to_dict(obj: Any, exclude_private: bool = True, preserve_tuples: bool = True) -> Any:
+def _object_to_dict(obj: Any, exclude_private: bool = True, preserve_tuples: bool = True) -> JsonSerializable:
     """Recursively convert an object to a serializable structure.
 
     Unlike ``dataclasses.asdict`` this helper preserves tuple types by
@@ -91,8 +94,9 @@ def _object_to_dict(obj: Any, exclude_private: bool = True, preserve_tuples: boo
     dataclass instances.
 
     Args:
-        obj: The object to convert.
+        obj: The object to convert (dataclass, dict, list, tuple, or primitive).
         exclude_private: Whether to omit private fields from nested dataclasses.
+        preserve_tuples: If True, preserve tuple types; if False, convert to lists.
 
     Returns:
         A structure composed of ``dict``, ``list``, ``tuple`` and primitive
@@ -151,27 +155,96 @@ class BaseConfig:
             preserve_tuples: if True, tuple values are preserved in the emitted YAML;
                 if False, tuples are converted to lists for portability.
             **kwargs: additional arguments passed through to ``yaml.safe_dump``.
+
+        Raises:
+            OSError: If file cannot be written (disk full, permissions, etc.)
+            ConfigError: If configuration cannot be serialized
         """
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, 'w', encoding='utf-8') as f:
-            yaml.safe_dump(
-                self.to_dict(exclude_private=True, preserve_tuples=preserve_tuples),
-                f,
-                sort_keys=sort_keys,
-                default_flow_style=False,
-                **kwargs
-            )
-        logger.info(f"Saved config to {p}")
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise ConfigError(f"Cannot create directory {p.parent}: {e}") from e
+
+        # Use atomic write pattern: write to temp file, then rename
+        temp_path = p.with_suffix(p.suffix + '.tmp')
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                yaml.safe_dump(
+                    self.to_dict(exclude_private=True, preserve_tuples=preserve_tuples),
+                    f,
+                    sort_keys=sort_keys,
+                    default_flow_style=False,
+                    **kwargs
+                )
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data is written to disk
+
+            # Verify temp file was written
+            if not temp_path.exists() or temp_path.stat().st_size == 0:
+                raise ConfigError(f"Failed to write config to {temp_path}: file is empty")
+
+            # Atomic rename
+            temp_path.replace(p)
+            logger.info(f"Successfully saved config to {p} ({p.stat().st_size} bytes)")
+
+        except OSError as e:
+            # Clean up temp file if it exists
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            raise ConfigError(f"Failed to save config to {p}: {e}") from e
+        except Exception as e:
+            # Clean up temp file on any error
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            raise ConfigError(f"Error serializing config to {p}: {e}") from e
     
     def to_json(self, path: Union[str, Path], **kwargs):
-        """Save config to JSON file"""
+        """Save config to JSON file.
+
+        Raises:
+            OSError: If file cannot be written
+            ConfigError: If configuration cannot be serialized
+        """
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(path, 'w') as f:
-            json.dump(self.to_dict(), f, indent=2, **kwargs)
-        logger.info(f"Saved config to {path}")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise ConfigError(f"Cannot create directory {path.parent}: {e}") from e
+
+        temp_path = path.with_suffix(path.suffix + '.tmp')
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(self.to_dict(), f, indent=2, **kwargs)
+                f.flush()
+                os.fsync(f.fileno())
+
+            if not temp_path.exists() or temp_path.stat().st_size == 0:
+                raise ConfigError(f"Failed to write config to {temp_path}: file is empty")
+
+            temp_path.replace(path)
+            logger.info(f"Successfully saved config to {path} ({path.stat().st_size} bytes)")
+
+        except OSError as e:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            raise ConfigError(f"Failed to save config to {path}: {e}") from e
+        except Exception as e:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            raise ConfigError(f"Error serializing config to {path}: {e}") from e
     
     @classmethod
     def from_dict(cls: Type[T], data: Dict[str, Any]) -> T:
@@ -220,7 +293,8 @@ class BaseConfig:
                                     kwargs[key] = t(value)
                             assigned = True
                             break
-                        except Exception as e:
+                        except (TypeError, ValueError, AttributeError) as e:
+                            # These are expected during type coercion attempts
                             last_err = e
                     if not assigned:
                         # None of the variants matched; raise a useful error
@@ -255,11 +329,19 @@ class BaseConfig:
         unknown = set(updates) - set(allowed)
         if unknown:
             raise AttributeError(f"Unknown config field(s): {sorted(unknown)}")
+
+        # First pass: coerce all values without modifying state
+        coerced_updates = {}
         for name, raw in updates.items():
             ftype = allowed[name]
+            # Initialize coerced to avoid UnboundLocalError
+            coerced = None
+            coerced_assigned = False
+
             # Coerce nested dataclasses
             if is_dataclass(ftype) and isinstance(raw, dict):
                 coerced = ftype.from_dict(raw)  # type: ignore[attr-defined]
+                coerced_assigned = True
             else:
                 origin = get_origin(ftype)
                 # Handle Union/Optional types using the helper
@@ -267,9 +349,9 @@ class BaseConfig:
                     args = get_args(ftype)
                     if raw is None:
                         coerced = None
+                        coerced_assigned = True
                     else:
                         last_err = None
-                        assigned = False
                         for t in args:
                             if t is type(None):
                                 continue
@@ -282,17 +364,42 @@ class BaseConfig:
                                         coerced = raw
                                     else:
                                         coerced = t(raw)
-                                assigned = True
+                                coerced_assigned = True
                                 break
-                            except Exception as e:
+                            except (TypeError, ValueError, AttributeError) as e:
+                                # Expected during type coercion attempts
                                 last_err = e
-                        if not assigned:
+                        if not coerced_assigned:
                             raise TypeError(f"Cannot coerce {name}={raw!r} to {ftype}") from last_err
                 else:
                     coerced = raw
-            setattr(self, name, coerced)
+                    coerced_assigned = True
+
+            # Sanity check before adding to updates dict
+            if not coerced_assigned:
+                raise RuntimeError(f"Internal error: failed to coerce value for {name}")
+
+            coerced_updates[name] = coerced
+
+        # Validate with temporary updates if requested
         if validate:
-            self.validate()
+            # Create temporary snapshot for validation
+            original_values = {name: getattr(self, name) for name in coerced_updates}
+            try:
+                # Apply updates temporarily
+                for name, value in coerced_updates.items():
+                    setattr(self, name, value)
+                # Validate
+                self.validate()
+            except Exception:
+                # Rollback on validation failure
+                for name, value in original_values.items():
+                    setattr(self, name, value)
+                raise
+        else:
+            # No validation, apply directly
+            for name, value in coerced_updates.items():
+                setattr(self, name, value)
 
     def with_updates(self, **kwargs):
         """Return a new instance with validated updates applied.
@@ -337,7 +444,8 @@ class BaseConfig:
                                             validated[name] = t(raw)
                                     assigned = True
                                     break
-                                except Exception as e:
+                                except (TypeError, ValueError, AttributeError) as e:
+                                    # Expected during type coercion attempts
                                     last_err = e
                             if not assigned:
                                 raise TypeError(f"Cannot coerce {name}={raw!r} to {ftype}") from last_err
@@ -352,43 +460,102 @@ class BaseConfig:
     def get_nested(self, path: str, default: Any = None) -> Any:
         """
         Get nested configuration value using dot notation
-        
+
         Args:
-            path: Dot-separated path (e.g., 'model.hidden_size')
+            path: Dot-separated path (e.g., 'model.hidden_size').
+                  Empty string returns self.
             default: Default value if path doesn't exist
+
+        Returns:
+            The value at the specified path, or default if not found
+
+        Raises:
+            ValueError: If path contains empty parts (e.g., 'model..size')
+            TypeError: If path is not a string
         """
+        if not path:
+            # Empty path - return self as special case
+            return self
+
+        if not isinstance(path, str):
+            raise TypeError(f"Path must be a string, got {type(path)}")
+
         parts = path.split('.')
+
+        # Check for empty parts (e.g., "model..hidden_size" or ".model")
+        if any(not part for part in parts):
+            raise ValueError(
+                f"Invalid path '{path}': contains empty parts. "
+                f"Use 'model.hidden_size', not 'model..hidden_size'"
+            )
+
         current = self
-        
         for part in parts:
             if hasattr(current, part):
                 current = getattr(current, part)
             else:
                 return default
-        
+
         return current
     
     def set_nested(self, path: str, value: Any):
         """
         Set nested configuration value using dot notation
-        
+
         Args:
             path: Dot-separated path (e.g., 'model.hidden_size')
             value: Value to set
+
+        Raises:
+            ValueError: If path is empty or contains empty parts
+            TypeError: If path is not a string
+            ConfigError: If path doesn't exist
         """
+        if not path:
+            raise ValueError("Cannot set value with empty path")
+
+        if not isinstance(path, str):
+            raise TypeError(f"Path must be a string, got {type(path)}")
+
         parts = path.split('.')
+
+        # Check for empty parts
+        if any(not part for part in parts):
+            raise ValueError(
+                f"Invalid path '{path}': contains empty parts. "
+                f"Use 'model.hidden_size', not 'model..hidden_size'"
+            )
+
+        if len(parts) == 1:
+            # Direct attribute set
+            if hasattr(self, parts[0]):
+                setattr(self, parts[0], value)
+            else:
+                raise ConfigError(f"Field not found: {parts[0]}")
+            return
+
+        # Navigate to parent
         current = self
-        
-        for part in parts[:-1]:
+        for i, part in enumerate(parts[:-1]):
             if hasattr(current, part):
                 current = getattr(current, part)
             else:
-                raise ConfigError(f"Path not found: {path}")
-        
-        if hasattr(current, parts[-1]):
-            setattr(current, parts[-1], value)
+                traversed = '.'.join(parts[:i+1])
+                raise ConfigError(
+                    f"Path not found: '{path}'. "
+                    f"Failed at '{traversed}' - attribute '{part}' does not exist"
+                )
+
+        # Set final attribute
+        final_attr = parts[-1]
+        if hasattr(current, final_attr):
+            setattr(current, final_attr, value)
         else:
-            raise ConfigError(f"Field not found: {parts[-1]}")
+            parent_path = '.'.join(parts[:-1])
+            raise ConfigError(
+                f"Field not found: '{path}'. "
+                f"Parent '{parent_path}' exists but has no attribute '{final_attr}'"
+            )
     
     def __eq__(self, other):
         """Check equality based on dict representation"""
@@ -475,8 +642,11 @@ class ModelConfig(BaseConfig):
             if not 0 <= prob_value <= 1:
                 errors.append(f"{prob_name} must be in [0, 1], got {prob_value}")
 
-        if not 0 <= self.drop_path_rate < 1:
-            errors.append(f"drop_path_rate must be in [0, 1), got {self.drop_path_rate}")
+        if not 0 <= self.drop_path_rate <= 0.8:
+            errors.append(
+                f"drop_path_rate must be in [0, 0.8], got {self.drop_path_rate}. "
+                "Values above 0.8 would drop too many gradient paths and prevent training."
+            )
         elif self.drop_path_rate > 0.5:
             warnings.warn(
                 f"drop_path_rate={self.drop_path_rate} is unusually high; "
@@ -577,6 +747,9 @@ class DataConfig(BaseConfig):
     canonical_cache_dtype: str = field(default='uint8', metadata={"help": "Canonical dtype for cache storage"})
     l2_storage_dtype: str = field(default='bfloat16', metadata={"help": "Storage dtype for L2 cache ('float16','bfloat16','float32','uint8')"})
     cpu_bf16_cache_pipeline: bool = field(default=True, metadata={"help": "Process normalization on CPU in bf16 when populating L2"})
+    # When the async L2 writer queue is full, wait up to this many milliseconds
+    # before dropping the write. 0 means drop immediately (non‑blocking behavior).
+    l2_writer_full_wait_ms: int = field(default=0, metadata={"help": "Max ms to wait when L2 writer queue is full before dropping"})
 
     # Dataset behavior (from dataset_loader.py usage)
     patch_size: int = field(default=16, metadata={"help": "Patch size for vision transformer"})
@@ -622,7 +795,8 @@ class DataConfig(BaseConfig):
                 # Only check priority uniqueness for enabled locations
                 if storage_loc.enabled:
                     priorities.append(storage_loc.priority)
-            except Exception as e:
+            except (TypeError, ValueError, ConfigValidationError) as e:
+                # Expected validation errors
                 errors.append(f"Storage location {i}: {str(e)}")
         # Unique priority validation for enabled locations only
         if priorities and len(priorities) != len(set(priorities)):
@@ -670,27 +844,22 @@ class DataConfig(BaseConfig):
             )
 
         # Orientation mapping checks (strict mode only, and only if flips enabled)
+        # Only validate config values, not actual orientation mappings
         try:
-            rfp = float(getattr(self, "random_flip_prob", 0.0) or 0.0)
-        except Exception:
+            rfp = getattr(self, "random_flip_prob", 0.0) or 0.0
+            rfp = float(rfp)
+        except (TypeError, ValueError):
             rfp = 0.0
 
-        try:
-            if bool(getattr(self, "strict_orientation_validation", False)) and rfp > 0:
-                from pathlib import Path
-                from orientation_handler import OrientationHandler
-                handler = OrientationHandler(
-                    mapping_file=Path(self.orientation_map_path) if self.orientation_map_path else None,
-                    random_flip_prob=rfp,
-                    strict_mode=True,
-                    safety_mode=self.orientation_safety_mode,
-                    skip_unmapped=bool(getattr(self, "skip_unmapped", False)),
+        if bool(getattr(self, "strict_orientation_validation", False)) and rfp > 0:
+            if self.orientation_map_path and not Path(self.orientation_map_path).exists():
+                errors.append(f"orientation_map_path does not exist: {self.orientation_map_path}")
+
+            valid_modes = {"conservative", "balanced", "permissive"}
+            if self.orientation_safety_mode not in valid_modes:
+                errors.append(
+                    f"orientation_safety_mode must be one of {valid_modes}, got {self.orientation_safety_mode}"
                 )
-                mapping_issues = handler.validate_mappings()
-                if mapping_issues:
-                    errors.append(f"orientation_mapping issues: {mapping_issues}")
-        except Exception as e:
-            errors.append(f"orientation_mapping_error: {e}")
 
         scale_min, scale_max = self.random_crop_scale
         if not (0 < scale_min <= scale_max <= 1):
@@ -714,8 +883,53 @@ class DataConfig(BaseConfig):
         if self.l2_storage_dtype not in valid_precisions:
             errors.append(f"Invalid l2_storage_dtype: {self.l2_storage_dtype}. Must be one of {valid_precisions}")
 
+        # Bounds for L2 writer full wait time
+        try:
+            if int(self.l2_writer_full_wait_ms) < 0:
+                errors.append(f"l2_writer_full_wait_ms must be >= 0, got {self.l2_writer_full_wait_ms}")
+        except (TypeError, ValueError):
+            errors.append(f"l2_writer_full_wait_ms must be an integer, got {self.l2_writer_full_wait_ms!r}")
+
         if errors:
             raise ConfigValidationError("Data config validation failed:\n" + "\n".join(errors))
+
+    def validate_orientation_mappings(self) -> List[str]:
+        """Perform deep validation of orientation mappings.
+
+        This requires importing and initializing the OrientationHandler.
+        Call this separately from validate() if you need to verify the actual
+        mapping file contents.
+
+        Returns:
+            List of validation error messages, empty if valid
+        """
+        errors = []
+        try:
+            rfp = float(getattr(self, "random_flip_prob", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return ["random_flip_prob must be a valid float"]
+
+        if not (bool(getattr(self, "strict_orientation_validation", False)) and rfp > 0):
+            return []  # Validation not needed
+
+        try:
+            from orientation_handler import OrientationHandler
+            handler = OrientationHandler(
+                mapping_file=Path(self.orientation_map_path) if self.orientation_map_path else None,
+                random_flip_prob=rfp,
+                strict_mode=True,
+                safety_mode=self.orientation_safety_mode,
+                skip_unmapped=bool(getattr(self, "skip_unmapped", False)),
+            )
+            mapping_issues = handler.validate_mappings()
+            if mapping_issues:
+                errors.append(f"orientation_mapping issues: {mapping_issues}")
+        except ImportError as e:
+            errors.append(f"Cannot import orientation_handler: {e}")
+        except (TypeError, ValueError, AttributeError, RuntimeError) as e:
+            errors.append(f"orientation_handler initialization error: {e}")
+
+        return errors
 
 
 @dataclass
@@ -805,6 +1019,10 @@ class TrainingConfig(BaseConfig):
     resume_from: str = "latest"
     eval_steps: int = 1000
     logging_steps: int = 100
+    # Resume-aware reseeding: when true, change RNG streams per (checkpoint, epoch)
+    # to avoid replaying the same early-epoch examples after a resume.
+    # Deterministic per checkpoint; set false to preserve strict reproducibility across resumes.
+    resume_reseed: bool = True
     
     # Loss configuration
     tag_loss: LossConfig = field(default_factory=LossConfig)
@@ -854,11 +1072,15 @@ class TrainingConfig(BaseConfig):
     def validate(self):
         """Validate training configuration"""
         errors = []
-        
+
         # cuDNN benchmark can conflict with deterministic execution
         if self.deterministic and self.benchmark:
-            logger.warning("deterministic=True forces benchmark=False to ensure repeatability")
-            self.benchmark = False
+            errors.append(
+                "Cannot have both deterministic=True and benchmark=True. "
+                "cuDNN benchmark mode uses non-deterministic algorithms. "
+                "Set benchmark=False for deterministic training, or "
+                "set deterministic=False to use benchmark mode for speed."
+            )
         
         # AMP backend note
         if self.use_amp and self.amp_opt_level:
@@ -1136,10 +1358,11 @@ def resolve_opset(requested: int | None = None) -> int:
         max_o = getattr(_c, "ONNX_TORCHSCRIPT_EXPORTER_MAX_OPSET", None)
         if max_o is None:
             max_o = getattr(_c, "ONNX_MAX_OPSET", 17)
-    except Exception:
+    except (ImportError, AttributeError):
         # Conservative defaults when constants are unavailable
         min_o, max_o = 7, 21
-    target = requested if requested is not None else ExportConfig.opset_version
+    # Use a sensible default (19 aligns with ExportConfig default) when requested is None
+    target = requested if requested is not None else 19
     if target < min_o:
         return min_o
     if target > max_o:
@@ -1465,8 +1688,12 @@ class ConfigManager:
             raise ConfigError(f"Failed to parse YAML file: {e}")
         except json.JSONDecodeError as e:
             raise ConfigError(f"Failed to parse JSON file: {e}")
-        except Exception as e:
+        except (OSError, TypeError, ValueError, AttributeError, ConfigValidationError) as e:
             raise ConfigError(f"Failed to load config: {e}")
+        except Exception as e:
+            # Unexpected error - log details and re-raise as ConfigError
+            logger.error(f"Unexpected error loading config from {path}", exc_info=True)
+            raise ConfigError(f"Unexpected error loading config: {e}")
     
     def save_to_file(self, path: Union[str, Path], backup: bool = True):
         """
@@ -1550,8 +1777,15 @@ class ConfigManager:
             self.config.validate()
             logger.info(f"Updated config from {len(updates)} environment sections")
     
-    def _parse_env_value(self, value: str) -> Any:
-        """Parse environment variable value to appropriate type"""
+    def _parse_env_value(self, value: str) -> Union[bool, int, float, str, List[Any], Dict[str, Any], None]:
+        """Parse environment variable value to appropriate type.
+
+        Args:
+            value: String value from environment variable
+
+        Returns:
+            Parsed value as bool, int, float, str, list, dict, or None
+        """
         # Boolean
         if value.lower() in ('true', 'yes', '1'):
             return True
@@ -1559,6 +1793,12 @@ class ConfigManager:
             return False
 
         # Try JSON for complex types (only if it looks like JSON)
+        # SECURITY NOTE JSON parsing from environment variables without size/depth limits
+        # would normally be a security concern. However, this application uses only locally created
+        # configuration files and environment variables under direct user control. There is no
+        # external/untrusted input to environment variables in the deployment context.
+        # This is acceptable for local-only applications. If deployment model changes to accept
+        # external env vars (containers, cloud, CI/CD), add validation per CR-002 recommendations.
         if value.strip().startswith(('[', '{')):
             try:
                 return json.loads(value)

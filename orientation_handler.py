@@ -383,15 +383,27 @@ class OrientationHandler:
         if not skip_safety_check and self.should_skip_flip(tags):
             return tags, False
 
-        # Swap all tags
+        # Swap all tags - disable per-tag stats recording to batch updates
         swapped_tags: list[str] = []
         for tag in tags:
-            swapped_tags.append(self.swap_tag(tag, record_stats=record_stats))
+            swapped_tags.append(self.swap_tag(tag, record_stats=False))
 
-        # Update flip counter
+        # Batch stats update: acquire lock once and update all stats together
         if record_stats:
             with self._stats_lock:
                 self.stats['total_flips'] += 1
+                # Re-record stats for swapped tags
+                for orig_tag, swapped_tag in zip(tags, swapped_tags):
+                    if swapped_tag != orig_tag:
+                        self.stats['mapped_tags'].add(orig_tag)
+                    elif any(keyword in orig_tag for keyword in ['left', 'right']):
+                        # Check if this is an unmapped orientation tag
+                        if not any(skip in orig_tag for skip in ['asymmetric', 'asymmetrical', 'bright',
+                                                                  'upright', 'straight', 'light', 'fight',
+                                                                  'copyright', 'single_']):
+                            self.stats['unmapped_tags'].add(orig_tag)
+                            self.stats['unmapped_tag_frequency'][orig_tag] = \
+                                self.stats['unmapped_tag_frequency'].get(orig_tag, 0) + 1
 
         return swapped_tags, True
     

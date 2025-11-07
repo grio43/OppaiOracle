@@ -87,7 +87,7 @@ data:
   pad_color: [114, 114, 114]
 
   # Data loading (from dataloader.yaml)
-  batch_size: 8  # Increased further after enabling gradient checkpointing
+  batch_size: 20  # Increased further after enabling gradient checkpointing
   num_workers: 8
   pin_memory: true
   prefetch_factor: 2   # NOTE: effective only when num_workers > 0
@@ -98,7 +98,7 @@ data:
   cache_size_gb: 120.0
   l1_per_worker_mb: 8192   # 8 GB per worker -> 64 GB total with 8 workers
   preload_files: 2
-  use_memory_cache: true
+  use_memory_cache: false
   cache_precision: "bfloat16"
   canonical_cache_dtype: "bfloat16"
   
@@ -108,6 +108,9 @@ data:
   l2_max_size_gb: 14336.0
   l2_storage_dtype: "bfloat16"
   cpu_bf16_cache_pipeline: true
+  # When the LMDB L2 writer queue is full, wait this long before dropping
+  # the write (0 = drop immediately, non-blocking).
+  l2_writer_full_wait_ms: 590
 
   # Augmentation (from augmentation.yaml)
   augmentation_enabled: true
@@ -188,6 +191,8 @@ training:
 
     eval_steps: 1000
     logging_steps: 3000
+    # Resume-aware reseeding: avoid replaying the same early-epoch order after resume
+    resume_reseed: true
 
     # Loss configuration
     tag_loss:

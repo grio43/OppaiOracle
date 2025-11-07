@@ -1,22 +1,21 @@
-# Ignore large, generated, or environment-specific artifacts
-
-# LMDB L2 cache directory (sparse, can be multi-terabyte)
-l2_cache/
-
-# Logs, runs, checkpoints (adjust if you want to track metadata only)
-logs/
-experiments/
-outputs/
-
-# Python caches
+.venv
+vocabulary
+processed_data
 __pycache__/
-*.py[cod]
-*.pyo
+utils/__pycache__
+*.log
+logs/*
+!logs/.gitkeep
 
-# Virtual envs
-.venv/
-venv/
+# Large cache and experiment directories
+l2_cache/
+tensorboard/
+experiments/
 
-# OS files
-.DS_Store
-Thumbs.db
+# SQLite database files
+*.sqlite
+
+# IDE and tool configs
+.claude/
+.code-review/
+.vscode/
