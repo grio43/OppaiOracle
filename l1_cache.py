@@ -1,11 +1,27 @@
 from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional, Dict, TypedDict
 import threading
 import time
 import torch
-from utils.cache_monitor import monitor
+
+# Try to import monitor, fall back to no-op if unavailable
+try:
+    from utils.cache_monitor import monitor
+except ImportError:
+    # Fallback: create a no-op monitor for when utils.cache_monitor is unavailable
+    class _NoOpMonitor:
+        """No-op monitor for when utils.cache_monitor is unavailable."""
+        def l1_hit(self) -> None:
+            pass
+        def l1_miss(self) -> None:
+            pass
+        def l1_put(self, nbytes: int) -> None:
+            pass
+        def l1_evict(self, nbytes: int) -> None:
+            pass
+    monitor = _NoOpMonitor()
 
 _DTYPE_MAP = {
     "uint8": torch.uint8,
@@ -43,6 +59,25 @@ def _from_canonical_01(x: torch.Tensor) -> torch.Tensor:
 class _Entry:
     value: torch.Tensor
     nbytes: int
+
+# CR-044: TypedDict for cache_info return type
+class CacheInfo(TypedDict):
+    """Structure returned by ByteLRU.cache_info().
+
+    Fields:
+        capacity_bytes: Maximum cache size in bytes
+        size_bytes: Current cache size in bytes
+        items: Number of items currently in cache
+        hits: Number of cache hits (None if track_stats=False)
+        misses: Number of cache misses (None if track_stats=False)
+        expired: Number of expired entries (None if track_stats=False)
+    """
+    capacity_bytes: int
+    size_bytes: int
+    items: int
+    hits: Optional[int]
+    misses: Optional[int]
+    expired: Optional[int]
 
 class ByteLRU:
     """
@@ -120,11 +155,40 @@ class ByteLRU:
             return e.value.detach().clone()
 
     def put(self, key: bytes, value: torch.Tensor) -> None:
+        """Store a tensor in the cache.
+
+        Args:
+            key: Unique identifier (must be bytes)
+            value: Tensor to cache (any device, any dtype)
+
+        Note:
+            - Input tensor is automatically detached, moved to CPU, and converted to canonical dtype
+            - If tensor is larger than cache capacity, it will not be stored
+            - LRU eviction occurs automatically when capacity is exceeded
+            - Thread-safe operation
+
+        Raises:
+            TypeError: If key is not bytes or value is not a torch.Tensor
+        """
         if self.capacity <= 0:
             return
+
+        # Input validation
+        if not isinstance(key, bytes):
+            raise TypeError(
+                f"key must be of type bytes, got {type(key).__name__}. "
+                f"Convert your key to bytes before calling put()."
+            )
+
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"value must be a torch.Tensor, got {type(value).__name__}. "
+                f"Ensure you're passing a PyTorch tensor to the cache."
+            )
+
         # convert to canonical dtype on CPU for accurate byte accounting
         v = value.detach().cpu().contiguous().to(_canon_dtype(self.dtype_str))
-        nbytes = int(v.numel() * v.element_size())
+        nbytes = self._nbytes(v)
         if nbytes > self.capacity:
             return
         with self._lock:
@@ -142,8 +206,12 @@ class ByteLRU:
                 if self.ttl is not None:
                     self._expires.pop(k_old, None)
 
-    def cache_info(self) -> dict:
-        """Return a snapshot of cache statistics (hits, misses, expired)."""
+    def cache_info(self) -> CacheInfo:
+        """Return a snapshot of cache statistics (hits, misses, expired).
+
+        Returns:
+            Dictionary with cache statistics. See CacheInfo for field descriptions.
+        """
         with self._lock:
             return {
                 "capacity_bytes": self.capacity,

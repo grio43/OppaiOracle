@@ -22,20 +22,35 @@ def load_vocab(path: str) -> List[str]:
         path: Path to the vocabulary JSON file.
     Returns:
         Ordered list of tag names.
+    Raises:
+        ValueError: If JSON is invalid, encoding error, or unsupported format
+        RuntimeError: If file cannot be read
     """
     p = Path(path)
     if not p.exists():
         return []
-    data = json.loads(p.read_text())
+
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in vocabulary file {path}: {e}")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"Encoding error in vocabulary file {path}: {e}. Expected UTF-8.")
+    except Exception as e:
+        raise RuntimeError(f"Failed to read vocabulary file {path}: {e}")
+
     # Accept either a list or a dict mapping tag to index.  In the latter case
     # reconstruct the list by sorting by index.
     if isinstance(data, list):
         return list(data)
     elif isinstance(data, dict):
         # assume {tag: index}
-        return [tag for tag, _ in sorted(data.items(), key=lambda kv: kv[1])]
+        try:
+            return [tag for tag, _ in sorted(data.items(), key=lambda kv: kv[1])]
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid vocabulary dict structure in {path}: {e}")
     else:
-        raise ValueError(f"Unsupported vocabulary format in {path}: {type(data)}")
+        raise ValueError(f"Unsupported vocabulary format in {path}: expected list or dict, got {type(data)}")
 
 
 def save_vocab(vocab: List[str], path: str) -> None:

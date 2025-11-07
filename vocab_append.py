@@ -66,7 +66,12 @@ def _find_active_data_root(config) -> Path:
         try:
             enabled = bool(loc.get("enabled", False)) if isinstance(loc, dict) else bool(getattr(loc, "enabled", False))
             path = loc.get("path") if isinstance(loc, dict) else getattr(loc, "path", None)
-        except Exception:
+        except AttributeError:
+            # Expected if object doesn't have 'enabled' or 'path'
+            enabled, path = False, None
+        except (TypeError, ValueError) as e:
+            # Unexpected type or value errors
+            logger.warning(f"Invalid storage location configuration: {e}")
             enabled, path = False, None
         if enabled and path:
             return Path(str(path))

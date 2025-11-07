@@ -12,13 +12,13 @@ import time
 import logging
 from pathlib import Path
 import yaml
-from typing import Dict, List, Optional, Tuple, Union, Any, Callable, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, Union, Any, Callable, TYPE_CHECKING, NamedTuple
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 import warnings
 import traceback
 from contextlib import contextmanager
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 import threading
 import queue
 import argparse
@@ -71,18 +71,25 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Allow truncated images if requested via env (opt-in)
-if bool(int(os.environ.get("OO_ALLOW_TRUNCATED", "0"))):
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
-
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
 def _load_vocab_path() -> Path:
     """Resolve vocabulary path via unified_config.yaml, with sensible fallbacks."""
     try:
         cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
-    except Exception:
+    except FileNotFoundError:
+        logger.warning("unified_config.yaml not found, using default vocabulary path")
         cfg = {}
+    except yaml.YAMLError as e:
+        logger.error(f"Failed to parse unified_config.yaml: {e}")
+        cfg = {}
+    except PermissionError as e:
+        logger.error(f"Permission denied reading unified_config.yaml: {e}")
+        cfg = {}
+    except Exception as e:
+        logger.error(f"Unexpected error loading unified_config.yaml: {e}")
+        cfg = {}
+
     data = (cfg.get("data") or {})
     p = cfg.get("vocab_path") or data.get("vocab_path")
     if p:
@@ -95,7 +102,17 @@ DEFAULT_VOCAB_PATH = _load_vocab_path()
 def _load_orientation_map_path() -> Optional[Path]:
     try:
         cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
-    except Exception:
+    except FileNotFoundError:
+        logger.warning("unified_config.yaml not found, using default orientation map path")
+        cfg = {}
+    except yaml.YAMLError as e:
+        logger.error(f"Failed to parse unified_config.yaml: {e}")
+        cfg = {}
+    except PermissionError as e:
+        logger.error(f"Permission denied reading unified_config.yaml: {e}")
+        cfg = {}
+    except Exception as e:
+        logger.error(f"Unexpected error loading unified_config.yaml: {e}")
         cfg = {}
     data = (cfg.get("data") or {})
     p = data.get("orientation_map_path")
@@ -228,15 +245,19 @@ class ImagePreprocessor:
             with Image.open(image) as img:
                 img.load()
                 img = ImageOps.exif_transpose(img)
+
                 # Handle transparency by compositing onto neutral gray
                 if img.mode in ("RGBA", "LA") or ("transparency" in img.info):
                     rgba = img.convert("RGBA")
                     bg = Image.new("RGB", rgba.size, (114, 114, 114))
                     alpha = rgba.getchannel("A")
                     bg.paste(rgba, mask=alpha)
-                    image = bg
+                    img = bg
                 else:
-                    image = img.convert('RGB')
+                    img = img.convert('RGB')
+
+                # Assign after all processing is done
+                image = img
         elif isinstance(image, np.ndarray):
             image = Image.fromarray(image)
 
@@ -245,40 +266,62 @@ class ImagePreprocessor:
         # Apply tensor + normalize
         return self.transform(lb)
     
-    def preprocess_batch(self, images: List[Union[str, np.ndarray, Image.Image]]) -> torch.Tensor:
-        """Preprocess a batch of images"""
+    def preprocess_batch(self, images: List[Union[str, np.ndarray, Image.Image]]) -> Tuple[torch.Tensor, List[bool]]:
+        """Preprocess a batch of images
+
+        Returns:
+            tuple: (tensor of shape [N, 3, H, W], list of bool indicating valid images)
+        """
         processed = []
+        valid_flags = []
+
         for img in images:
             try:
                 processed.append(self.preprocess_image(img))
+                valid_flags.append(True)
             except Exception as e:
-                logger.error(f"Failed to preprocess image: {e}")
-                # Add black image as placeholder
+                logger.error(f"Failed to preprocess image {img}: {e}")
+                # Add black image as placeholder to maintain batch shape
                 processed.append(torch.zeros(3, self.config.image_size, self.config.image_size))
-        
-        return torch.stack(processed)
+                valid_flags.append(False)
+
+        return torch.stack(processed), valid_flags
+
+
+class DatasetItem(NamedTuple):
+    """Item returned by InferenceDataset"""
+    image: torch.Tensor
+    path: str
+    is_valid: bool
 
 
 class InferenceDataset(Dataset):
     """Dataset for batch inference"""
-    
+
     def __init__(self, image_paths: List[str], preprocessor: ImagePreprocessor):
         self.image_paths = image_paths
         self.preprocessor = preprocessor
-        
+
     def __len__(self):
         return len(self.image_paths)
-    
-    def __getitem__(self, idx):
+
+    def __getitem__(self, idx) -> DatasetItem:
+        """Load and preprocess an image.
+
+        Returns:
+            DatasetItem: Contains image tensor, path, and validity flag.
+                        If loading fails, returns zero tensor with is_valid=False.
+                        Consumers MUST check is_valid flag!
+        """
         path = self.image_paths[idx]
         try:
             image = self.preprocessor.preprocess_image(path)
-            return image, path, True
+            return DatasetItem(image, path, True)
         except Exception as e:
             logger.error(f"Failed to load {path}: {e}")
-            # Return black image on error
-            return (
-                torch.zeros(3, self.preprocessor.config.image_size, self.preprocessor.config.image_size),
+            return DatasetItem(
+                torch.zeros(3, self.preprocessor.config.image_size,
+                           self.preprocessor.config.image_size),
                 path,
                 False
             )
@@ -434,8 +477,24 @@ class ModelWrapper:
             vit_config = VisionTransformerConfig(**vit_config_dict)
             self.model = SimplifiedTagger(vit_config)
 
-            # Load weights
-            self.model.load_state_dict(state_dict)
+            # Load weights with explicit strict checking
+            try:
+                missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=True)
+
+                if missing_keys:
+                    logger.warning(f"Missing keys in checkpoint: {missing_keys}")
+                if unexpected_keys:
+                    logger.warning(f"Unexpected keys in checkpoint: {unexpected_keys}")
+
+            except RuntimeError as e:
+                logger.error(f"Failed to load model state dict: {e}")
+                logger.error(f"Model architecture may not match checkpoint")
+                logger.error(f"Checkpoint path: {self.config.model_path}")
+                logger.error(f"Expected num_tags: {vit_config.num_tags}")
+                raise ValueError(
+                    f"Model architecture mismatch. Cannot load checkpoint from {self.config.model_path}. "
+                    f"This usually means the model architecture has changed since the checkpoint was created."
+                ) from e
             
             self.model = self.model.to(self.device)
             if getattr(self.config, "memory_format", "contiguous") == "channels_last":
@@ -661,10 +720,10 @@ class ResultProcessor:
 
 class InferenceCache:
     """LRU cache for inference results with TTL support."""
-    
+
     def __init__(self, max_size: int = 1000, ttl_seconds: int = 3600):
-        self.cache = {}
-        self.access_order = deque()
+        self.cache = OrderedDict()  # Maintains insertion order
+        self.timestamps = {}  # Separate dict for timestamps
         self.max_size = max_size
         self.ttl = timedelta(seconds=ttl_seconds) if ttl_seconds > 0 else None
         self.hits = 0
@@ -676,27 +735,20 @@ class InferenceCache:
         """Get item from cache, checking TTL if applicable."""
         with self.lock:
             if key in self.cache:
-                value, timestamp = self.cache[key]
-
                 # Check if item has expired
-                if self.ttl and (datetime.now() - timestamp > self.ttl):
-                    self.expired += 1
-                    # Remove expired item
-                    del self.cache[key]
-                    # This is tricky because key is still in access_order.
-                    # We will do a lazy removal.
-                    # A better approach might be a background cleanup thread,
-                    # but for now, we'll handle it lazily.
-                    # To avoid breaking deque.remove(), we will just leave it.
-                    # It will be eventually pushed out.
-                    self.misses += 1
-                    return None
+                if self.ttl:
+                    timestamp = self.timestamps[key]
+                    if datetime.now() - timestamp > self.ttl:
+                        self.expired += 1
+                        del self.cache[key]
+                        del self.timestamps[key]
+                        self.misses += 1
+                        return None
 
                 self.hits += 1
-                # Move to end to signify recent use
-                self.access_order.remove(key)
-                self.access_order.append(key)
-                return value
+                # Move to end (O(1) operation in OrderedDict)
+                self.cache.move_to_end(key)
+                return self.cache[key]
 
             self.misses += 1
             return None
@@ -704,18 +756,19 @@ class InferenceCache:
     def put(self, key: str, value: Any):
         """Put item in cache, evicting if necessary."""
         with self.lock:
-            # If key exists, remove it to update its position
+            # If key exists, move to end
             if key in self.cache:
-                self.access_order.remove(key)
+                self.cache.move_to_end(key)
             # If cache is full, evict the least recently used item
             elif len(self.cache) >= self.max_size and self.max_size > 0:
-                oldest_key = self.access_order.popleft()
-                if oldest_key in self.cache:
-                    del self.cache[oldest_key]
-            
+                oldest_key = next(iter(self.cache))  # First key
+                del self.cache[oldest_key]
+                if oldest_key in self.timestamps:
+                    del self.timestamps[oldest_key]
+
             # Add the new item
-            self.cache[key] = (value, datetime.now())
-            self.access_order.append(key)
+            self.cache[key] = value
+            self.timestamps[key] = datetime.now()
 
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""

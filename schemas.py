@@ -7,7 +7,10 @@ from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, asdict
 import hashlib
 import json
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -80,24 +83,34 @@ class PredictionOutput:
 def compute_vocab_sha256(vocab_path: Optional[Path] = None,
                         vocab_data: Optional[Dict] = None) -> str:
     """Compute SHA256 hash of vocabulary.
-    
+
     Args:
         vocab_path: Path to vocabulary file
         vocab_data: Vocabulary data dict (if already loaded)
-    
+
     Returns:
-        SHA256 hash as hex string
+        SHA256 hash as hex string, or "unknown" if computation fails
     """
-    if vocab_data:
-        # Hash the vocabulary data directly
-        vocab_json = json.dumps(vocab_data, sort_keys=True)
-        return hashlib.sha256(vocab_json.encode()).hexdigest()
-    elif vocab_path and vocab_path.exists():
-        # Hash the file contents
-        with open(vocab_path, 'rb') as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    else:
+    try:
+        if vocab_data:
+            # Hash the vocabulary data directly
+            vocab_json = json.dumps(vocab_data, sort_keys=True)
+            return hashlib.sha256(vocab_json.encode()).hexdigest()
+        elif vocab_path and vocab_path.exists():
+            # Hash the file contents
+            with open(vocab_path, 'rb') as f:
+                return hashlib.sha256(f.read()).hexdigest()
+    except PermissionError as e:
+        logger.warning(f"Permission denied reading vocabulary for hash: {vocab_path}: {e}")
         return "unknown"
+    except IOError as e:
+        logger.warning(f"I/O error reading vocabulary for hash: {vocab_path}: {e}")
+        return "unknown"
+    except Exception as e:
+        logger.error(f"Unexpected error computing vocabulary hash: {e}", exc_info=True)
+        return "unknown"
+
+    return "unknown"
 
 
 def validate_schema(data: Union[Dict, Path, str]) -> bool:
@@ -111,16 +124,29 @@ def validate_schema(data: Union[Dict, Path, str]) -> bool:
 
     Raises:
         ValueError: If schema validation fails with details
+        FileNotFoundError: If file path doesn't exist
     """
     # Load data if needed
     if isinstance(data, (Path, str)):
-        if isinstance(data, str) and data.startswith('{'):
-            # JSON string
-            data = json.loads(data)
-        else:
-            # File path
-            with open(data) as f:
-                data = json.load(f)
+        try:
+            if isinstance(data, str) and data.startswith('{'):
+                # JSON string
+                data = json.loads(data)
+            else:
+                # File path
+                path = Path(data)
+                if not path.exists():
+                    raise FileNotFoundError(f"Schema file not found: {path}")
+                with open(path) as f:
+                    data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in schema data: {e}")
+        except PermissionError as e:
+            raise ValueError(f"Permission denied reading schema file {data}: {e}")
+        except FileNotFoundError:
+            raise  # Re-raise FileNotFoundError as-is
+        except Exception as e:
+            raise ValueError(f"Failed to load schema data: {type(e).__name__}: {e}")
 
     # Check top-level structure
     if not isinstance(data, dict):

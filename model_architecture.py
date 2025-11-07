@@ -16,6 +16,36 @@ from mask_utils import ensure_pixel_padding_mask, pixel_to_token_ignore
 from custom_drop_path import SafeDropPath
 
 
+def _check_flash_attention_available() -> bool:
+    """Check if flash attention (SDPA) is available and properly supported.
+
+    Returns:
+        True if scaled_dot_product_attention is available and the PyTorch version
+        is recent enough to support it reliably.
+    """
+    if not hasattr(F, 'scaled_dot_product_attention'):
+        return False
+
+    # Check PyTorch version - SDPA was added in 2.0, stabilized in 2.1
+    try:
+        torch_version = tuple(map(int, torch.__version__.split('.')[:2]))
+    except (ValueError, AttributeError):
+        # Cannot parse version, assume not supported
+        return False
+
+    if torch_version < (2, 0):
+        return False
+
+    # Warn if using older version with potential issues
+    if torch_version < (2, 1):
+        warnings.warn(
+            f"PyTorch {torch.__version__} has scaled_dot_product_attention "
+            "but it may not be fully stable. Consider upgrading to 2.1+."
+        )
+
+    return True
+
+
 class LayerNormFp32(nn.LayerNorm):
     """
     LayerNorm that casts to float32 before calling the original LayerNorm.
@@ -46,6 +76,11 @@ class VisionTransformerConfig:
     # Enable gradient checkpointing by default to reduce memory usage
     gradient_checkpointing: bool = True
     drop_path_rate: float = 0.0
+    # Enable numerical stability checking (for debugging only)
+    check_numerical_stability: bool = False
+    # Logit clamping for numerical stability (None to disable)
+    # exp(15) ≈ 3.3M which is safe for softmax in float16/bfloat16
+    logit_clamp_value: Optional[float] = 15.0
 
     def __post_init__(self):
         assert 0.0 <= self.drop_path_rate < 1.0, (
@@ -66,7 +101,14 @@ class TransformerBlock(nn.Module):
         self.norm1 = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps)
 
         # Use flash attention if available and requested
-        self.use_flash = config.use_flash_attention and hasattr(F, 'scaled_dot_product_attention')
+        self.use_flash = config.use_flash_attention and _check_flash_attention_available()
+
+        if config.use_flash_attention and not self.use_flash:
+            warnings.warn(
+                "Flash attention was requested but is not available. "
+                "Falling back to standard attention. "
+                f"PyTorch version: {torch.__version__}"
+            )
         
         if self.use_flash:
             # For flash attention, we need separate projection layers
@@ -113,7 +155,9 @@ class TransformerBlock(nn.Module):
             # Invert it for SDPA.
             attn_mask = None
             if key_padding_mask is not None:
-                # If any sample masks all positions, fail fast (skip inside tracing)
+                # If any sample masks all positions, fail fast
+                # Note: During tracing, this check is skipped to avoid control flow issues.
+                # The model can still handle this case since CLS token is never masked.
                 if not torch.jit.is_tracing():
                     if key_padding_mask.all(dim=1).any().item():
                         raise RuntimeError("key_padding_mask masks all keys for at least one sample.")
@@ -196,6 +240,55 @@ class SimplifiedTagger(nn.Module):
             if module.bias is not None:
                 module.bias.data.zero_()
 
+    def _check_numerical_stability(
+        self,
+        tag_logits: torch.Tensor,
+        rating_logits: torch.Tensor
+    ) -> None:
+        """Check for NaN/Inf in logits and log statistics.
+
+        This method is only called when config.check_numerical_stability=True.
+        It helps diagnose numerical instability issues during training/inference.
+        """
+        # Check for non-finite values before clamping
+        tag_has_nan = torch.isnan(tag_logits).any().item()
+        tag_has_inf = torch.isinf(tag_logits).any().item()
+        rating_has_nan = torch.isnan(rating_logits).any().item()
+        rating_has_inf = torch.isinf(rating_logits).any().item()
+
+        if tag_has_nan or tag_has_inf:
+            warnings.warn(
+                f"Numerical instability in tag_logits: "
+                f"NaN={tag_has_nan}, Inf={tag_has_inf}. "
+                f"Stats: min={tag_logits.min():.2f}, max={tag_logits.max():.2f}, "
+                f"mean={tag_logits.mean():.2f}, std={tag_logits.std():.2f}"
+            )
+
+        if rating_has_nan or rating_has_inf:
+            warnings.warn(
+                f"Numerical instability in rating_logits: "
+                f"NaN={rating_has_nan}, Inf={rating_has_inf}"
+            )
+
+        # Check if values exceed clamping thresholds
+        clamp_threshold = 15.0
+        tag_needs_clamp = (tag_logits.abs() > clamp_threshold).any().item()
+        rating_needs_clamp = (rating_logits.abs() > clamp_threshold).any().item()
+
+        if tag_needs_clamp:
+            num_clamped = (tag_logits.abs() > clamp_threshold).sum().item()
+            warnings.warn(
+                f"Clamping {num_clamped} tag logits "
+                f"(max abs value: {tag_logits.abs().max():.2f})"
+            )
+
+        if rating_needs_clamp:
+            num_clamped = (rating_logits.abs() > clamp_threshold).sum().item()
+            warnings.warn(
+                f"Clamping {num_clamped} rating logits "
+                f"(max abs value: {rating_logits.abs().max():.2f})"
+            )
+
     def forward(
         self,
         pixel_values: torch.Tensor,
@@ -204,8 +297,24 @@ class SimplifiedTagger(nn.Module):
         B = pixel_values.shape[0]
         # Patch embedding (force fp32 for numerical stability under AMP)
         if pixel_values.dtype in (torch.float16, torch.bfloat16):
-            with torch.autocast(device_type='cuda', enabled=False):
+            # Detect device type dynamically to support cuda/cpu/mps
+            device_type = pixel_values.device.type
+            # Autocast is only supported on certain device types
+            supported_devices = {'cuda', 'cpu', 'mps', 'xpu'}
+
+            if device_type in supported_devices:
+                # Use autocast to disable AMP for this operation
+                with torch.autocast(device_type=device_type, enabled=False):
+                    x = self.patch_embed(pixel_values.float())
+            else:
+                # Fallback: Just convert to float32 without autocast context
+                # This works on all devices but doesn't interact with AMP
+                warnings.warn(
+                    f"Device type '{device_type}' doesn't support autocast. "
+                    f"Using fallback path for patch embedding."
+                )
                 x = self.patch_embed(pixel_values.float())
+
             x = x.to(pixel_values.dtype)
         else:
             x = self.patch_embed(pixel_values)
@@ -240,6 +349,8 @@ class SimplifiedTagger(nn.Module):
                 # This is to fix the CheckpointError where recomputed values have different metadata.
                 if attn_kpm is not None:
                     # checkpoint requires tensor args; pass mask explicitly
+                    # Lambda creates new function object each call, but overhead is negligible
+                    # compared to the checkpoint recomputation cost
                     x = torch.utils.checkpoint.checkpoint(
                         lambda _x, _m: block(_x, key_padding_mask=_m), x, attn_kpm,
                         use_reentrant=True
@@ -256,10 +367,15 @@ class SimplifiedTagger(nn.Module):
         tag_logits = self.tag_head(cls_output)
         rating_logits = self.rating_head(cls_output)
 
-        # Clamp logits to prevent numerical instability with mixed precision.
-        # This is the PRIMARY FIX for the non-finite error.
-        tag_logits = torch.clamp(tag_logits, min=-15.0, max=15.0)
-        rating_logits = torch.clamp(rating_logits, min=-15.0, max=15.0)
+        # Monitor for numerical issues (optional, controlled by config)
+        if self.config.check_numerical_stability:
+            self._check_numerical_stability(tag_logits, rating_logits)
+
+        # Clamp logits to prevent numerical instability with mixed precision
+        if self.config.logit_clamp_value is not None:
+            clamp_val = self.config.logit_clamp_value
+            tag_logits = torch.clamp(tag_logits, min=-clamp_val, max=clamp_val)
+            rating_logits = torch.clamp(rating_logits, min=-clamp_val, max=clamp_val)
 
         return {
             'tag_logits': tag_logits,
@@ -282,13 +398,40 @@ class SimplifiedTagger(nn.Module):
         return torch.zeros(batch_size, 3, self.config.image_size, self.config.image_size, device=device)
 
 
-def create_model(**kwargs):
-    """Create model from configuration arguments."""
-    # Get the names of the fields in the VisionTransformerConfig dataclass
-    config_fields = {f.name for f in fields(VisionTransformerConfig)}
+def create_model(config: Optional[VisionTransformerConfig] = None, **kwargs) -> SimplifiedTagger:
+    """Create model from configuration.
 
-    # Filter kwargs to only include keys that are in the config_fields
-    filtered_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+    Args:
+        config: VisionTransformerConfig instance. If provided, kwargs are ignored.
+        **kwargs: Alternative to config - specify config fields as keyword arguments.
+                 See VisionTransformerConfig for details on each parameter.
 
-    config = VisionTransformerConfig(**filtered_kwargs)
+    Returns:
+        SimplifiedTagger instance with the specified configuration.
+
+    Examples:
+        # Using config object
+        config = VisionTransformerConfig(image_size=640, num_tags=10000)
+        model = create_model(config=config)
+
+        # Using kwargs
+        model = create_model(image_size=640, num_tags=10000)
+    """
+    if config is None:
+        # Get the names of the fields in the VisionTransformerConfig dataclass
+        config_fields = {f.name for f in fields(VisionTransformerConfig)}
+
+        # Filter kwargs to only include keys that are in the config_fields
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+
+        # Warn if kwargs contains invalid keys
+        invalid_keys = set(kwargs.keys()) - config_fields
+        if invalid_keys:
+            warnings.warn(
+                f"Ignoring unknown configuration parameters: {sorted(invalid_keys)}. "
+                f"Valid parameters: {sorted(config_fields)}"
+            )
+
+        config = VisionTransformerConfig(**filtered_kwargs)
+
     return SimplifiedTagger(config)

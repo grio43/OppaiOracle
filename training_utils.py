@@ -78,20 +78,188 @@ def setup_seed(user_seed: Optional[int], deterministic: bool) -> tuple[int, bool
     return user_seed, bool(deterministic)
 
 
-def log_sample_order_hash(dataloader, epoch: int, N: int = 128):
-    """Log sha1 over first N sample 'paths' to prove shuffle changed."""
+def log_sample_order_hash(dataloader, epoch: int, N: int = 128, max_batches: int = 8):
+    """Log sha1 over first N sample identifiers to verify shuffle changed.
+
+    Tries, in order:
+      - batch['meta']['paths'] or ['image_paths'] if present
+      - batch['image_id'] list
+
+    Reads at most ``max_batches`` batches to avoid scanning a whole epoch when
+    metadata is unavailable.
+    """
     try:
         it = iter(dataloader)
-        acc = []
-        while len(acc) < N:
+        acc: list[str] = []
+        batches_seen = 0
+        while len(acc) < N and batches_seen < max_batches:
             batch = next(it)
-            meta = batch.get("meta", {})
-            paths = meta.get("paths") or meta.get("image_paths") or []
-            acc.extend(map(str, paths))
-        h = hashlib.sha1("|".join(acc[:N]).encode()).hexdigest()
-        logger.info(f"epoch={epoch} sample_hash={h}")
+            batches_seen += 1
+            meta = batch.get("meta", {}) if isinstance(batch, dict) else {}
+            paths = []
+            if isinstance(meta, dict):
+                paths = meta.get("paths") or meta.get("image_paths") or []
+            if not paths:
+                ids = None
+                if isinstance(batch, dict):
+                    ids = batch.get("image_id")
+                if ids is not None:
+                    if isinstance(ids, (list, tuple)):
+                        paths = [str(x) for x in ids]
+                    else:
+                        paths = [str(ids)]
+            if paths:
+                acc.extend(map(str, paths))
+        if acc:
+            h = hashlib.sha1("|".join(acc[:N]).encode()).hexdigest()
+            logger.info(f"epoch={epoch} sample_hash={h}")
+        else:
+            logger.debug("sample_hash skipped: no identifiers found in first %d batches", max_batches)
     except Exception as e:
         logger.debug(f"sample_hash logging skipped: {e}")
+
+
+def _save_rng_states():
+    """Capture Python, NumPy, Torch CPU and CUDA RNG states."""
+    py = random.getstate()
+    np_state = np.random.get_state()
+    torch_cpu = torch.get_rng_state()
+    cuda = None
+    try:
+        if torch.cuda.is_available():
+            try:
+                cuda = torch.cuda.get_rng_state_all()
+            except Exception:
+                cuda = torch.cuda.get_rng_state()
+    except Exception:
+        cuda = None
+    return py, np_state, torch_cpu, cuda
+
+
+def _restore_rng_states(states):
+    """Restore Python, NumPy, Torch CPU and CUDA RNG states.
+
+    Expects a tuple of (py_state, np_state, torch_cpu_state, cuda_state).
+    The NumPy state may be packed via _pack_np_state; callers should
+    pass the unpacked form when available.
+    """
+    py, np_state, torch_cpu, cuda = states
+    try:
+        random.setstate(py)
+    except Exception:
+        pass
+    try:
+        import numpy as _np  # local import
+        # Accept both native NumPy state and packed state
+        if isinstance(np_state, (tuple, list)) and len(np_state) >= 5 and not hasattr(np_state[1], "dtype"):
+            # Looks like packed form; rebuild ndarray then set state
+            bitgen = np_state[0]
+            state_list = np_state[1]
+            pos = int(np_state[2])
+            has_gauss = int(np_state[3])
+            cached = float(np_state[4])
+            try:
+                arr = _np.array(state_list, dtype=_np.uint32)
+            except Exception:
+                arr = _np.array(state_list)
+            _np.random.set_state((bitgen, arr, pos, has_gauss, cached))
+        else:
+            _np.random.set_state(np_state)  # type: ignore[arg-type]
+    except Exception:
+        pass
+    try:
+        torch.set_rng_state(torch_cpu)
+    except Exception:
+        pass
+    try:
+        if cuda is not None and torch.cuda.is_available():
+            if isinstance(cuda, list):
+                torch.cuda.set_rng_state_all(cuda)
+            else:
+                torch.cuda.set_rng_state(cuda)
+    except Exception:
+        pass
+
+
+def _pack_np_state(np_state: tuple) -> tuple:
+    """Convert NumPy RNG state to a pickle-safe tuple of builtins.
+
+    NumPy returns (bit_generator: str, state: ndarray, pos: int, has_gauss: int, cached_gaussian: float).
+    Replace the ndarray with a plain Python list to avoid dependency on NumPy object pickling semantics
+    when loading with safe checkpoints.
+    """
+    try:
+        import numpy as _np  # local import
+        if isinstance(np_state, tuple) and len(np_state) >= 5:
+            bitgen = np_state[0]
+            state_arr = np_state[1]
+            pos = np_state[2]
+            has_gauss = np_state[3]
+            cached = np_state[4]
+            try:
+                state_list = state_arr.tolist() if hasattr(state_arr, "tolist") else list(state_arr)
+            except Exception:
+                # Best-effort fallback
+                state_list = [int(x) for x in state_arr]
+            return (bitgen, state_list, int(pos), int(has_gauss), float(cached))
+    except Exception:
+        pass
+    return np_state
+
+
+def _unpack_np_state(packed_state: tuple) -> tuple:
+    """Rebuild NumPy RNG state tuple from packed builtins.
+
+    Restores the second element back to an ndarray of dtype uint32/int64 as required by NumPy.
+    """
+    try:
+        import numpy as _np  # local import
+        if isinstance(packed_state, (tuple, list)) and len(packed_state) >= 5:
+            bitgen = packed_state[0]
+            state_list = packed_state[1]
+            pos = packed_state[2]
+            has_gauss = packed_state[3]
+            cached = packed_state[4]
+            try:
+                arr = _np.array(state_list, dtype=_np.uint32)
+            except Exception:
+                arr = _np.array(state_list)
+            return (bitgen, arr, int(pos), int(has_gauss), float(cached))
+    except Exception:
+        pass
+    return packed_state
+
+
+def log_index_order_hash(dataloader, epoch: int, N: int = 128):
+    """Log sha1 over first N indices from the DataLoader's sampler.
+
+    - Avoids any data I/O by iterating the sampler (indices only).
+    - Wraps with RNG save/restore to avoid perturbing global RNG state.
+    """
+    try:
+        sampler = getattr(dataloader, 'sampler', None)
+        if sampler is None:
+            logger.debug("index_hash skipped: no sampler attached to dataloader")
+            return
+        # Save RNG states so consuming sampler RNG doesn't affect training order
+        states = _save_rng_states()
+        try:
+            it = iter(sampler)
+            acc_idx = []
+            for _ in range(N):
+                try:
+                    acc_idx.append(int(next(it)))
+                except StopIteration:
+                    break
+            if acc_idx:
+                h = hashlib.sha1("|".join(map(str, acc_idx)).encode()).hexdigest()
+                logger.info(f"epoch={epoch} index_hash={h}")
+            else:
+                logger.debug("index_hash skipped: sampler yielded no indices")
+        finally:
+            _restore_rng_states(states)
+    except Exception as e:
+        logger.debug(f"index_hash logging skipped: {e}")
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -144,7 +312,16 @@ class TrainingState:
     optimizer_updates: int = 0
     best_metric: float = float('-inf')
     best_epoch: int = 0
-    
+
+    # CR-046: Epoch tracking for proper resume semantics
+    # epoch: Current epoch index (0-based) being trained or just completed
+    # completed_epochs: Number of fully completed epochs (for unambiguous resume)
+    # is_epoch_boundary: True if checkpoint saved at end of epoch, False if mid-epoch
+    # batch_in_epoch: Position within current epoch (for mid-epoch resume)
+    completed_epochs: int = 0
+    is_epoch_boundary: bool = True
+    batch_in_epoch: int = 0
+
     # Loss tracking
     train_loss: float = 0.0
     val_loss: float = 0.0
@@ -528,6 +705,28 @@ class CheckpointManager:
         
         if config is not None:
             checkpoint['config'] = config
+
+        # Embed RNG states to enable exact stream continuation on resume
+        try:
+            py_state, np_state, torch_cpu_state, cuda_state = _save_rng_states()
+            # Pack numpy state into builtins to avoid object pickling concerns
+            np_packed = _pack_np_state(np_state)
+            # cuda_state can be a list (set_rng_state_all) or a tensor
+            checkpoint['rng_states'] = {
+                'py': py_state,
+                'np': np_packed,
+                'torch_cpu': torch_cpu_state,
+                'cuda': cuda_state,
+            }
+        except Exception as _rng_e:
+            logger.debug("RNG state capture skipped: %s", _rng_e)
+
+        # Provide a deterministic salt hint derived from stable checkpoint content
+        try:
+            salt_src = f"{int(epoch)}|{int(step)}|{str(checkpoint['timestamp'])}"
+            checkpoint['resume_salt_hint'] = int(hashlib.sha1(salt_src.encode()).hexdigest()[:8], 16)
+        except Exception:
+            pass
 
         # CRITICAL: Embed vocabulary and preprocessing directly into checkpoint
         if hasattr(model, 'module'):
