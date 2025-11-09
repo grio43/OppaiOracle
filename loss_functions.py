@@ -62,35 +62,76 @@ class AsymmetricFocalLoss(nn.Module):
 
         Args:
             logits: (B, num_classes) raw logits.
-            targets: (B, num_classes) binary targets.
+            targets: (B, num_classes) binary targets or (B,) class indices.
             sample_weights: (B,) optional per‑sample weights.
 
         Returns:
             Loss value.
+
+        Raises:
+            ValueError: If shapes are incompatible or values are invalid.
         """
+        # Validate logits shape
+        if logits.dim() != 2:
+            raise ValueError(
+                f"AsymmetricFocalLoss expects 2D logits (batch, classes), "
+                f"got shape {logits.shape}"
+            )
+
+        batch_size, num_classes = logits.shape
+
         # Detach targets to prevent gradient flow
         targets = targets.detach()
 
         # Ensure targets have shape (B, C). If provided as class indices (B,),
         # convert to one-hot suitable for BCE-with-logits.
         if targets.dim() == 1:
+            # Validate batch size matches
+            if targets.size(0) != batch_size:
+                raise ValueError(
+                    f"Batch size mismatch: logits have {batch_size} samples "
+                    f"but targets have {targets.size(0)} samples. "
+                    f"Logits shape: {logits.shape}, targets shape: {targets.shape}"
+                )
+
             # Treat as single-label class indices
-            num_classes = logits.size(1)
             if targets.dtype not in (torch.long, torch.int64, torch.int32):
                 # Attempt safe cast to long for one-hot encoding
                 targets = targets.to(torch.long)
+
+            # Validate indices are in valid range
             if torch.any(targets < 0) or torch.any(targets >= num_classes):
+                min_val, max_val = targets.min().item(), targets.max().item()
                 raise ValueError(
-                    f"AsymmetricFocalLoss: target indices out of range 0..{num_classes-1}"
+                    f"AsymmetricFocalLoss: target indices out of range [0, {num_classes-1}]. "
+                    f"Got values in range [{min_val}, {max_val}]. "
+                    f"This indicates a mismatch between model output size and target labels."
                 )
+
             targets = F.one_hot(targets, num_classes=num_classes).to(dtype=logits.dtype)
+
         elif targets.dim() == 2:
-            # If provided as floating multi-hot/probabilities, ensure dtype matches
+            # Validate shape matches exactly
+            if targets.shape != logits.shape:
+                raise ValueError(
+                    f"Shape mismatch: logits shape {logits.shape} != targets shape {targets.shape}. "
+                    f"For multi-label targets, shapes must match exactly."
+                )
             targets = targets.to(dtype=logits.dtype)
+
         else:
             raise ValueError(
-                f"AsymmetricFocalLoss expects targets with dim 1 or 2, got {targets.dim()}"
+                f"AsymmetricFocalLoss expects targets with 1 or 2 dimensions, "
+                f"got {targets.dim()} dimensions (shape: {targets.shape})"
             )
+
+        # Validate sample_weights if provided
+        if sample_weights is not None:
+            if sample_weights.dim() != 1 or sample_weights.size(0) != batch_size:
+                raise ValueError(
+                    f"sample_weights must have shape ({batch_size},), "
+                    f"got shape {sample_weights.shape}"
+                )
 
         # Optionally ignore one class (e.g., pad index for tags)
         if self.ignore_index is not None:
@@ -178,7 +219,42 @@ class MultiTaskLoss(nn.Module):
             tag_targets: (B, num_tags) binary targets for tags.
             rating_targets: (B,) or (B, num_ratings) targets for ratings.
             sample_weights: Optional per‑sample weights.
+
+        Raises:
+            ValueError: If required inputs are None or invalid type.
         """
+        # Validate required inputs
+        if tag_logits is None:
+            raise ValueError(
+                "tag_logits cannot be None. "
+                "This indicates a model output issue - check forward() implementation."
+            )
+        if tag_targets is None:
+            raise ValueError(
+                "tag_targets cannot be None. "
+                "This indicates a dataloader issue - check batch preparation."
+            )
+        if rating_logits is None:
+            raise ValueError(
+                "rating_logits cannot be None. "
+                "This indicates a model output issue - check forward() implementation."
+            )
+        if rating_targets is None:
+            raise ValueError(
+                "rating_targets cannot be None. "
+                "This indicates a dataloader issue - check batch preparation."
+            )
+
+        # Validate types
+        if not isinstance(tag_logits, torch.Tensor):
+            raise TypeError(f"tag_logits must be torch.Tensor, got {type(tag_logits)}")
+        if not isinstance(tag_targets, torch.Tensor):
+            raise TypeError(f"tag_targets must be torch.Tensor, got {type(tag_targets)}")
+        if not isinstance(rating_logits, torch.Tensor):
+            raise TypeError(f"rating_logits must be torch.Tensor, got {type(rating_logits)}")
+        if not isinstance(rating_targets, torch.Tensor):
+            raise TypeError(f"rating_targets must be torch.Tensor, got {type(rating_targets)}")
+
         tag_loss = self.tag_loss_fn(tag_logits, tag_targets, sample_weights)
         # Compute rating loss
         if isinstance(self.rating_loss_fn, AsymmetricFocalLoss):
@@ -205,6 +281,11 @@ class FrequencyWeightedSampler:
 
     Used during training to balance common vs rare tags.  Tags with high
     frequency receive lower weights, while rare tags receive higher weights.
+
+    Note: Weights are computed during __init__. For large vocabularies (10K+ tags),
+    avoid creating multiple instances with the same frequencies. Instead, create
+    the sampler once and reuse it, or compute the weights once and reuse them.
+    This design prioritizes simplicity over caching complexity.
     """
 
     def __init__(

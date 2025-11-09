@@ -138,6 +138,8 @@ class ONNXExportConfig:
     model_version: str = "1.0"
     # Require explicit opt-in to rebuild head on mismatch
     force_rebuild_head: bool = False
+    # Fail if vocabulary can't be embedded (recommended for production exports)
+    require_embedded_vocabulary: bool = True
     
     def __post_init__(self):
         # Back-compat: if old configs specify vocab_dir, honor it.
@@ -185,15 +187,22 @@ class InferenceWrapper(nn.Module):
         # 1. Type Conversion and Permutation
         image_f32 = image_uint8.permute(0, 3, 1, 2).float() / 255.0  # (B, 3, H, W)
 
-        # 2. Get dynamic shape as a tensor
-        # This uses a non-public ATen operator, which is a common practice for this specific problem in ONNX export.
-        shape = torch.ops.aten.shape_as_tensor(image_f32)
-        b, c, h, w = shape[0], shape[1], shape[2], shape[3]
+        # 2. Get dynamic shape using ONNX-safe operations
+        # Extract dimensions - ONNX export converts these to Shape + Gather ops
+        batch_dim = image_f32.size(0)
+        channel_dim = image_f32.size(1)
+        height_dim = image_f32.size(2)
+        width_dim = image_f32.size(3)
+
+        # Convert to int64 tensors for subsequent operations
+        # In tracing mode, .size() returns tensors; in eager mode, returns ints
+        h = height_dim if torch.jit.is_tracing() or isinstance(height_dim, torch.Tensor) else torch.tensor(height_dim, dtype=torch.int64, device=image_f32.device)
+        w = width_dim if torch.jit.is_tracing() or isinstance(width_dim, torch.Tensor) else torch.tensor(width_dim, dtype=torch.int64, device=image_f32.device)
 
         # 3. Downscale-only letterbox to target size without stretching
         # Compute uniform scale factor: min(target/h, target/w), clamped to <= 1.0
-        h_f = h.to(torch.float32)
-        w_f = w.to(torch.float32)
+        h_f = h.to(torch.float32) if isinstance(h, torch.Tensor) else torch.tensor(float(h), dtype=torch.float32, device=image_f32.device)
+        w_f = w.to(torch.float32) if isinstance(w, torch.Tensor) else torch.tensor(float(w), dtype=torch.float32, device=image_f32.device)
         tgt = torch.tensor(float(self.target_size), dtype=torch.float32, device=image_f32.device)
         eps = torch.tensor(1.0, dtype=torch.float32, device=image_f32.device)  # for clamp denominator
         ratio_h = tgt / torch.maximum(h_f, eps)
@@ -211,8 +220,14 @@ class InferenceWrapper(nn.Module):
         )
 
         # 4. Pad to fixed target canvas with pad_color
-        rshape = torch.ops.aten.shape_as_tensor(resized)  # (B,C,H',W')
-        rh, rw = rshape[2], rshape[3]
+        # Get resized dimensions using ONNX-safe operations
+        resized_height = resized.size(2)
+        resized_width = resized.size(3)
+
+        # Convert to int64 tensors (works in both eager and tracing modes)
+        rh = resized_height if torch.jit.is_tracing() or isinstance(resized_height, torch.Tensor) else torch.tensor(resized_height, dtype=torch.int64, device=image_f32.device)
+        rw = resized_width if torch.jit.is_tracing() or isinstance(resized_width, torch.Tensor) else torch.tensor(resized_width, dtype=torch.int64, device=image_f32.device)
+
         target_i64 = torch.tensor(self.target_size, dtype=torch.int64, device=image_f32.device)
         pad_h = target_i64 - rh
         pad_w = target_i64 - rw
@@ -300,20 +315,18 @@ class ONNXExporter:
                 
                 # Validate vocabulary path before attempting to use it
                 if not vocab_path.exists():
-                    # Try canonical fallback path
+                    # Try canonical fallback path (script directory)
                     canonical_path = Path(os.path.dirname(__file__)) / "vocabulary.json"
                     if canonical_path.exists():
                         logger.info(f"Using canonical vocabulary path: {canonical_path}")
                         vocab_path = canonical_path
 
                 if not vocab_path.exists():
-                    logger.warning(f"Vocabulary not found at {vocab_path}, trying canonical path")
-                    vocab_path = Path("/media/andrewk/qnap-public/workspace/OppaiOracle/vocabulary.json")
-
-                if not vocab_path.exists():
                     raise FileNotFoundError(
-                        f"Vocabulary file not found at {vocab_path}. "
-                        f"Cannot export model without valid vocabulary."
+                        f"Vocabulary file not found at {vocab_path}.\n"
+                        f"Cannot export model without valid vocabulary.\n"
+                        f"Please provide vocabulary using:\n"
+                        f"  --vocab_path /path/to/vocabulary.json"
                     )
 
                 logger.info(f"Loading vocabulary from {vocab_path}")
@@ -496,17 +509,14 @@ class ONNXExporter:
         if hasattr(model, 'tag_head'):
             tag_head_out_features = model.tag_head.out_features
             if tag_head_out_features != num_tags:
-                msg = (
+                raise RuntimeError(
                     f"Model tag_head output size ({tag_head_out_features}) doesn't match "
-                    f"vocabulary size ({num_tags})."
+                    f"vocabulary size ({num_tags}). This checkpoint is incompatible with "
+                    f"the vocabulary file. Please use:\n"
+                    f"  1. The correct vocabulary that was used during training, OR\n"
+                    f"  2. A checkpoint that was trained with this vocabulary.\n"
+                    f"Cannot export model with mismatched vocabulary."
                 )
-                if not self.config.force_rebuild_head:
-                    raise RuntimeError(msg + " Pass --force-rebuild-head to proceed.")
-                logger.warning(msg + " Recreating tag_head due to --force-rebuild-head.")
-                if hasattr(model, 'config'):
-                    model.config.num_tags = num_tags
-                model.tag_head = nn.Linear(model.tag_head.in_features, num_tags)
-                logger.info(f"Recreated tag_head with {num_tags} outputs")
 
         
         # Handle DDP weights
@@ -586,12 +596,17 @@ class ONNXExporter:
         try:
             # Create dummy input for the new InferenceWrapper
             # Input is a raw image: (B, H, W, C) with dtype=uint8
+            # Use small size for faster export - exact size doesn't matter with dynamic axes
+            dummy_batch_size = max(1, self.config.batch_size)
+            dummy_height = 256  # Small representative size for faster export
+            dummy_width = 256
             dummy_input = torch.randint(
                 0, 255,
-                (self.config.batch_size, 768, 512, 3), # Example dynamic H, W
+                (dummy_batch_size, dummy_height, dummy_width, 3),
                 dtype=torch.uint8,
                 device=self.device
             )
+            logger.debug(f"Using dummy input shape for export: ({dummy_batch_size}, {dummy_height}, {dummy_width}, 3)")
 
             # The model is internally converted to float32 for processing
             logger.info("Ensuring model is in float32 for export")
@@ -868,7 +883,13 @@ class ONNXExporter:
                     logger.info(f"Embedded vocabulary from loaded vocab with {len(self.vocab.tag_to_index)} tags")
 
                 except Exception as e:
-                    logger.warning(f"Failed to embed loaded vocabulary: {e}")
+                    logger.error(f"Failed to embed loaded vocabulary: {e}")
+                    if self.config.require_embedded_vocabulary:
+                        raise RuntimeError(
+                            f"Failed to embed vocabulary in ONNX model: {e}\n"
+                            f"Cannot export model without embedded vocabulary.\n"
+                            f"To export anyway (not recommended), set require_embedded_vocabulary=False"
+                        ) from e
 
             # Fallback: try to load from file if not already embedded
             if not vocab_embedded_successfully:
@@ -895,6 +916,21 @@ class ONNXExporter:
                             logger.warning(f"Failed to validate embedded vocabulary: {e}")
                 else:
                     logger.warning(f"Vocabulary file not found at {vocab_path}, model will require external vocabulary")
+
+            # Check if embedding succeeded
+            if not vocab_embedded_successfully:
+                if self.config.require_embedded_vocabulary:
+                    raise RuntimeError(
+                        "No vocabulary available for embedding.\n"
+                        "ONNX export requires embedded vocabulary for reproducible inference.\n"
+                        "Please provide vocabulary via --vocab_path or ensure checkpoint has embedded vocab.\n"
+                        "To export anyway (not recommended), set require_embedded_vocabulary=False"
+                    )
+                else:
+                    logger.warning(
+                        "Exporting model without embedded vocabulary. "
+                        "Inference will require external vocabulary file!"
+                    )
 
             # Add metadata
             metadata = {

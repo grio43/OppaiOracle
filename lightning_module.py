@@ -1,3 +1,4 @@
+import logging
 import torch
 import pytorch_lightning as pl
 from typing import Any, Dict, Tuple
@@ -13,6 +14,8 @@ try:
     from evaluation_metrics import MetricComputer  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     MetricComputer = None
+
+logger = logging.getLogger(__name__)
 
 
 class LitOppai(pl.LightningModule):
@@ -97,6 +100,23 @@ class LitOppai(pl.LightningModule):
         tag_targets = targets.get("tag")
         rating_targets = targets.get("rating")
 
+        # Validate we have at least tag predictions (required)
+        if tag_logits is None:
+            available_keys = list(outputs.keys())
+            raise RuntimeError(
+                f"Model outputs missing tag predictions. "
+                f"Expected 'tag_logits' or 'tag', but got keys: {available_keys}. "
+                f"This usually indicates a model architecture mismatch."
+            )
+
+        if tag_targets is None:
+            available_keys = list(targets.keys())
+            raise RuntimeError(
+                f"Batch targets missing tag labels. "
+                f"Expected 'tag' key, but got keys: {available_keys}. "
+                f"This indicates a dataloader issue."
+            )
+
         loss, _ = self.criterion(tag_logits, rating_logits, tag_targets, rating_targets)
 
         # Update metrics for tag predictions if present
@@ -118,6 +138,21 @@ class LitOppai(pl.LightningModule):
         rating_logits = outputs.get("rating_logits") or outputs.get("rating")
         tag_targets = targets.get("tag")
         rating_targets = targets.get("rating")
+
+        # Validate we have at least tag predictions (required)
+        if tag_logits is None:
+            available_keys = list(outputs.keys())
+            raise RuntimeError(
+                f"Validation: Model outputs missing tag predictions. "
+                f"Expected 'tag_logits' or 'tag', but got keys: {available_keys}"
+            )
+
+        if tag_targets is None:
+            available_keys = list(targets.keys())
+            raise RuntimeError(
+                f"Validation: Batch targets missing tag labels. "
+                f"Expected 'tag' key, but got keys: {available_keys}"
+            )
 
         loss, _ = self.criterion(tag_logits, rating_logits, tag_targets, rating_targets)
 
@@ -144,25 +179,73 @@ class LitOppai(pl.LightningModule):
         return optimizer
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """Remove mismatched shape entries from the checkpoint state dict."""
+        """Remove mismatched shape entries from the checkpoint state dict.
+
+        This method validates shape mismatches and drops parameters that are safe
+        to reinitialize (e.g., classification heads when vocab_size changes).
+        Unexpected mismatches trigger warnings to help catch configuration errors.
+        """
         if not self.drop_shape_mismatches or self.strict_loading:
             return
+
+        # Define patterns for parameters that are safe to drop on shape mismatch
+        # These are typically the final classification heads that change with vocab_size
+        SAFE_MISMATCH_PATTERNS = [
+            'tag_head',      # Tag classification head
+            'rating_head',   # Rating classification head
+            'fc.weight',     # Final FC layer
+            'fc.bias',
+            'classifier',    # Generic classifier layer
+        ]
+
+        def is_safe_to_drop(key: str) -> bool:
+            """Check if a parameter key is safe to drop on shape mismatch."""
+            return any(pattern in key for pattern in SAFE_MISMATCH_PATTERNS)
+
         state_dict = checkpoint.get("state_dict", {})
         current_state = self.state_dict()
-        removed_keys: list[str] = []
+        safe_removed: list[str] = []
+        unsafe_mismatches: list[tuple[str, tuple, tuple]] = []
+
         for k in list(state_dict.keys()):
             if k in current_state:
                 ckpt_tensor = state_dict[k]
                 current_tensor = current_state[k]
                 if ckpt_tensor.shape != current_tensor.shape:
-                    removed_keys.append(k)
-                    del state_dict[k]
-        if removed_keys:
-            self.log(
-                "resume/mismatched_keys_dropped",
-                len(removed_keys),
-                prog_bar=False,
-                logger=True,
-                on_step=False,
-                on_epoch=True,
+                    if is_safe_to_drop(k):
+                        logger.info(
+                            f"Dropping expected shape mismatch in '{k}': "
+                            f"checkpoint={ckpt_tensor.shape} -> current={current_tensor.shape}"
+                        )
+                        safe_removed.append(k)
+                        del state_dict[k]
+                    else:
+                        # Unexpected mismatch - this might indicate a problem
+                        unsafe_mismatches.append((k, tuple(ckpt_tensor.shape), tuple(current_tensor.shape)))
+                        # Still drop it since drop_shape_mismatches=True
+                        del state_dict[k]
+
+        # Report unsafe mismatches with detailed guidance
+        if unsafe_mismatches:
+            warning_msg = (
+                f"Found {len(unsafe_mismatches)} shape mismatch(es) in unexpected layer(s). "
+                f"These will be DROPPED and randomly reinitialized:\n"
+            )
+            for key, ckpt_shape, curr_shape in unsafe_mismatches:
+                warning_msg += f"  - {key}: {ckpt_shape} -> {curr_shape}\n"
+            warning_msg += (
+                "\nThis may indicate:\n"
+                "  1. Intentional architecture change (expected)\n"
+                "  2. Corrupted checkpoint (check file integrity)\n"
+                "  3. Wrong checkpoint for this model (verify paths)\n"
+                "\nIf this is intentional, you can ignore this warning. "
+                "Otherwise, fix the architecture mismatch or use strict_loading=True to fail fast."
+            )
+            logger.warning(warning_msg)
+
+        total_removed = len(safe_removed) + len(unsafe_mismatches)
+        if total_removed > 0:
+            logger.info(
+                f"Dropped {total_removed} parameter(s) during checkpoint load "
+                f"({len(safe_removed)} expected, {len(unsafe_mismatches)} unexpected)"
             )

@@ -97,13 +97,73 @@ class OrientationHandler:
             logger.info("Horizontal flips disabled (random_flip_prob=0)")
     
     def _load_mappings(self, mapping_file: Path) -> None:
-        """Load orientation mappings from JSON file."""
+        """Load orientation mappings from JSON file.
+
+        Args:
+            mapping_file: Path to orientation_map.json
+
+        Raises:
+            ValueError: If strict_mode=True and loading fails
+        """
         try:
             with open(mapping_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
+
+        except FileNotFoundError:
+            # Expected - file doesn't exist yet
+            msg = (
+                f"Orientation mapping file not found: {mapping_file}. "
+                f"Using minimal default mappings."
+            )
+            if self.strict_mode:
+                raise ValueError(msg)
+            logger.warning(msg)
+            self._load_default_mappings()
+            return
+
+        except PermissionError as e:
+            # Unexpected - can't read file
+            msg = (
+                f"Permission denied reading orientation mappings: {mapping_file}. "
+                f"Check file permissions."
+            )
+            if self.strict_mode:
+                raise ValueError(msg) from e
+            logger.error(msg)
+            self._load_default_mappings()
+            return
+
+        except json.JSONDecodeError as e:
+            # Error - file is corrupted
+            msg = (
+                f"Invalid JSON in orientation mappings file {mapping_file}: {e}. "
+                f"File is corrupted or malformed."
+            )
+            if self.strict_mode:
+                raise ValueError(msg) from e
+            logger.error(msg)
+            logger.error("Using minimal default mappings. Fix the JSON file to use custom mappings.")
+            self._load_default_mappings()
+            return
+
+        except OSError as e:
+            # Error - I/O problem
+            msg = f"I/O error reading orientation mappings {mapping_file}: {e}"
+            if self.strict_mode:
+                raise ValueError(msg) from e
+            logger.error(msg)
+            self._load_default_mappings()
+            return
+
+        # File loaded successfully, now parse it
+        try:
             # Load explicit mappings
             self.explicit_mappings = data.get('explicit_mappings', {})
+            if not isinstance(self.explicit_mappings, dict):
+                raise ValueError(
+                    f"'explicit_mappings' must be a dict, got {type(self.explicit_mappings).__name__}"
+                )
+
             # Build reverse map with collision detection (only keep bijective pairs)
             self.reverse_mappings.clear()
             self.duplicate_mappings.clear()
@@ -113,9 +173,15 @@ class OrientationHandler:
                     self.duplicate_mappings.setdefault(v, []).append(k)
                 else:
                     self.reverse_mappings[v] = k
-            
+
             # Load regex patterns
-            for pattern_data in data.get('regex_patterns', []):
+            patterns_data = data.get('regex_patterns', [])
+            if not isinstance(patterns_data, list):
+                raise ValueError(
+                    f"'regex_patterns' must be a list, got {type(patterns_data).__name__}"
+                )
+
+            for pattern_data in patterns_data:
                 try:
                     pattern = re.compile(pattern_data['pattern'])
                     self.regex_patterns.append({
@@ -124,31 +190,70 @@ class OrientationHandler:
                         'description': pattern_data.get('description', '')
                     })
                 except re.error as e:
-                    logger.error(f"Invalid regex pattern: {pattern_data['pattern']}: {e}")
-            
+                    logger.error(
+                        f"Invalid regex pattern '{pattern_data.get('pattern', '')}': {e}. "
+                        f"Skipping this pattern."
+                    )
+                except KeyError as e:
+                    logger.error(
+                        f"Regex pattern missing required field {e}: {pattern_data}. "
+                        f"Skipping this pattern."
+                    )
+
             # Load symmetric tags (don't need swapping)
-            self.symmetric_tags = set(data.get('symmetric_tags', []))
-            
+            symmetric_data = data.get('symmetric_tags', [])
+            if not isinstance(symmetric_data, list):
+                raise ValueError(
+                    f"'symmetric_tags' must be a list, got {type(symmetric_data).__name__}"
+                )
+            self.symmetric_tags = set(symmetric_data)
+
             # Load tags that should skip flipping
-            self.skip_flip_tags = set(data.get('skip_flip_tags', []))
-            
+            skip_data = data.get('skip_flip_tags', [])
+            if not isinstance(skip_data, list):
+                raise ValueError(
+                    f"'skip_flip_tags' must be a list, got {type(skip_data).__name__}"
+                )
+            self.skip_flip_tags = set(skip_data)
+
             # Load complex asymmetric tags
-            self.complex_tags = data.get('complex_asymmetric_tags', {})
-            
+            complex_data = data.get('complex_asymmetric_tags', {})
+            if not isinstance(complex_data, dict):
+                raise ValueError(
+                    f"'complex_asymmetric_tags' must be a dict, got {type(complex_data).__name__}"
+                )
+            self.complex_tags = complex_data
+
             logger.info(
-                f"Loaded orientation mappings: "
+                f"✓ Loaded orientation mappings from {mapping_file}: "
                 f"{len(self.explicit_mappings)} explicit, "
                 f"{len(self.regex_patterns)} regex patterns, "
                 f"{len(self.symmetric_tags)} symmetric, "
                 f"{len(self.skip_flip_tags)} skip tags"
             )
-            
-        except Exception as e:
+
+        except (ValueError, TypeError, KeyError) as e:
+            # Error - valid JSON but wrong structure
+            msg = (
+                f"Invalid structure in orientation mappings file {mapping_file}: {e}. "
+                f"File has correct JSON syntax but wrong field types or missing fields."
+            )
             if self.strict_mode:
-                raise ValueError(f"Failed to load orientation mappings from {mapping_file}: {e}")
-            else:
-                logger.error(f"Failed to load orientation mappings: {e}. Using defaults.")
-                self._load_default_mappings()
+                raise ValueError(msg) from e
+            logger.error(msg)
+            logger.error("Using minimal default mappings. Fix the file structure to use custom mappings.")
+            self._load_default_mappings()
+            return
+
+        except Exception as e:
+            # Unexpected error - bug in code or truly unexpected condition
+            msg = f"Unexpected error loading orientation mappings from {mapping_file}: {e}"
+            logger.error(msg, exc_info=True)
+            if self.strict_mode:
+                raise ValueError(msg) from e
+            logger.error("Using minimal default mappings.")
+            self._load_default_mappings()
+            return
     
     def _load_default_mappings(self):
         """Load minimal default mappings as fallback."""
@@ -280,37 +385,6 @@ class OrientationHandler:
         
         return False
     
-    def _find_unmapped_orientation_tags(self, tags: list[str]) -> set[str]:
-        """Find orientation tags that don't have mappings.
-        NOTE: This method is being phased out in favor of can_safely_flip."""
-        unmapped = set()
-        # Only tags with explicit left/right directionality need mapping
-        # Tags like 'asymmetric', 'single_', etc. don't change meaning when flipped
-        # so they don't need mappings at all
-        orientation_keywords = ['left', 'right']
-        
-        for tag in tags:
-            # Skip if it's symmetric or already has explicit mapping
-            if tag in self.symmetric_tags or tag in self.explicit_mappings:
-                continue
-            
-            # Check if tag contains orientation keywords
-            if any(keyword in tag for keyword in orientation_keywords):
-                # Skip tags that contain left/right but are actually style descriptors
-                # that don't change with orientation
-                if any(skip in tag for skip in ['asymmetric', 'asymmetrical', 'single_']):
-                    continue
-                matched = False
-                for regex_data in self.regex_patterns:
-                    if regex_data['pattern'].match(tag):
-                        matched = True
-                        break
-                
-                if not matched and tag not in self.explicit_mappings:
-                    unmapped.add(tag)
-        
-        return unmapped
-    
     def swap_tag(self, tag: str, *, record_stats: bool = True) -> str:
         """
         Swap a single tag for horizontal flip.
@@ -383,27 +457,44 @@ class OrientationHandler:
         if not skip_safety_check and self.should_skip_flip(tags):
             return tags, False
 
-        # Swap all tags - disable per-tag stats recording to batch updates
-        swapped_tags: list[str] = []
-        for tag in tags:
-            swapped_tags.append(self.swap_tag(tag, record_stats=False))
+        # Pre-compile filter check for efficiency (avoids duplicating logic from swap_tag)
+        def is_unmapped_orientation(tag: str) -> bool:
+            return (
+                any(keyword in tag for keyword in ['left', 'right']) and
+                not any(skip in tag for skip in ['asymmetric', 'asymmetrical', 'bright',
+                                                  'upright', 'straight', 'light', 'fight',
+                                                  'copyright', 'single_'])
+            )
 
-        # Batch stats update: acquire lock once and update all stats together
+        # Swap tags and collect stats in single pass (avoids second iteration)
+        swapped_tags: list[str] = []
+        mapped_tags = []
+        unmapped_tags = []
+
+        for tag in tags:
+            swapped = self.swap_tag(tag, record_stats=False)
+            swapped_tags.append(swapped)
+
+            if swapped != tag:
+                # Tag was mapped
+                mapped_tags.append(tag)
+            elif is_unmapped_orientation(tag):
+                # Tag is unmapped orientation
+                unmapped_tags.append(tag)
+
+        # Batch stats update - single lock acquisition with minimal work under lock
         if record_stats:
             with self._stats_lock:
                 self.stats['total_flips'] += 1
-                # Re-record stats for swapped tags
-                for orig_tag, swapped_tag in zip(tags, swapped_tags):
-                    if swapped_tag != orig_tag:
-                        self.stats['mapped_tags'].add(orig_tag)
-                    elif any(keyword in orig_tag for keyword in ['left', 'right']):
-                        # Check if this is an unmapped orientation tag
-                        if not any(skip in orig_tag for skip in ['asymmetric', 'asymmetrical', 'bright',
-                                                                  'upright', 'straight', 'light', 'fight',
-                                                                  'copyright', 'single_']):
-                            self.stats['unmapped_tags'].add(orig_tag)
-                            self.stats['unmapped_tag_frequency'][orig_tag] = \
-                                self.stats['unmapped_tag_frequency'].get(orig_tag, 0) + 1
+
+                # Update mapped tags
+                self.stats['mapped_tags'].update(mapped_tags)
+
+                # Update unmapped tags
+                self.stats['unmapped_tags'].update(unmapped_tags)
+                for tag in unmapped_tags:
+                    self.stats['unmapped_tag_frequency'][tag] = \
+                        self.stats['unmapped_tag_frequency'].get(tag, 0) + 1
 
         return swapped_tags, True
     
@@ -796,8 +887,14 @@ class OrientationMonitor:
 
     def _write_unmapped_file(self, stats: dict[str, Any], handler: Optional['OrientationHandler'] = None) -> None:
         """Write (or overwrite) unmapped_orientation_tags.txt atomically."""
+        import os
+
         unmapped_file = self.out_dir / "unmapped_orientation_tags.txt"
-        tmp = unmapped_file.with_suffix('.tmp')
+
+        # Use process-specific temp file to avoid collisions with concurrent processes
+        pid = os.getpid()
+        tmp = self.out_dir / f"unmapped_orientation_tags.{pid}.tmp"
+
         try:
             suggestions = handler.suggest_mappings() if handler else {}
             with tmp.open('w', encoding='utf-8', newline='\n') as f:
@@ -813,6 +910,13 @@ class OrientationMonitor:
             tmp.replace(unmapped_file)  # atomic on POSIX/NT
         except Exception as e:
             logger.error(f"Failed to write {unmapped_file}: {e}")
+        finally:
+            # Clean up temp file if it still exists
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass  # Ignore cleanup errors
 
 
 def test_orientation_handler():

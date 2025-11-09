@@ -212,26 +212,40 @@ class TagVocabulary:
             try:
                 with open(json_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                #for entry in data: # loop is redundant
-                tags_field = data['tags']
-                if not tags_field:
-                    continue
-                # Accept both space‑delimited strings and lists
-                tags_list: List[str]
-                if isinstance(tags_field, str):
-                    tags_list = tags_field.split()
-                elif isinstance(tags_field, list):
-                    tags_list = tags_field
-                else:
-                    continue
 
-                for tag in tags_list:
-                    # Skip ignored tags entirely when building the vocabulary
-                    if tag in self.ignored_tags:
+                # Handle both single entry (dict) and multiple entries (list)
+                entries = data if isinstance(data, list) else [data]
+
+                for entry in entries:
+                    # Extract tags field from entry
+                    if not isinstance(entry, dict):
+                        logger.debug(f"Skipping non-dict entry in {json_file}")
                         continue
-                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
-            except Exception as e:
+
+                    tags_field = entry.get('tags')
+                    if not tags_field:
+                        continue
+
+                    # Accept both space‑delimited strings and lists
+                    tags_list: List[str]
+                    if isinstance(tags_field, str):
+                        tags_list = tags_field.split()
+                    elif isinstance(tags_field, list):
+                        tags_list = tags_field
+                    else:
+                        logger.debug(f"Skipping entry with non-string/list tags in {json_file}")
+                        continue
+
+                    for tag in tags_list:
+                        # Skip ignored tags entirely when building the vocabulary
+                        if tag in self.ignored_tags:
+                            continue
+                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+            except (KeyError, json.JSONDecodeError) as e:
                 logger.warning(f"Failed to parse {json_file}: {e}")
+            except Exception as e:
+                logger.warning(f"Unexpected error parsing {json_file}: {e}")
         
         # Sort tags by frequency and cut to top_k
         sorted_tags = sorted(
@@ -253,9 +267,11 @@ class TagVocabulary:
             self.tag_frequencies[tag] = tag_counts[tag]
 
         # Update ignored tag indices
-        self.ignored_tag_indices = [self.tag_to_index.get(tag) for tag in self.ignored_tags if tag in self.tag_to_index]
-        # Filter out any None values (in case an ignored tag did not make it into the vocab)
-        self.ignored_tag_indices = [i for i in self.ignored_tag_indices if i is not None]
+        # Note: Some ignored tags may not be in vocabulary (if below min_frequency or filtered by top_k)
+        self.ignored_tag_indices = [
+            self.tag_to_index[tag] for tag in self.ignored_tags
+            if tag in self.tag_to_index
+        ]
         
         # Update tags list for compatibility
         self.tags = sorted_tags
@@ -318,9 +334,11 @@ class TagVocabulary:
                      if tag not in (self.pad_token, self.unk_token)]
         
         # Compute ignored tag indices based on the loaded vocabulary.
-        self.ignored_tag_indices = [self.tag_to_index.get(tag) for tag in self.ignored_tags if tag in self.tag_to_index]
-        # Filter out missing tags (None values) in case ignored tags are absent
-        self.ignored_tag_indices = [i for i in self.ignored_tag_indices if i is not None]
+        # Note: Some ignored tags may not be in vocabulary
+        self.ignored_tag_indices = [
+            self.tag_to_index[tag] for tag in self.ignored_tags
+            if tag in self.tag_to_index
+        ]
 
         _verify_vocabulary_integrity(self, vocab_path)
         logger.info(f"Loaded vocabulary with {len(self.tag_to_index)} tags from {vocab_path}")
@@ -336,13 +354,14 @@ class TagVocabulary:
     @classmethod
     def from_json(cls, json_str: str) -> 'TagVocabulary':
         """Create vocabulary from a JSON string.
-        
+
         Raises:
             ValueError: If json_str is empty or contains only whitespace
             json.JSONDecodeError: If json_str is not valid JSON
         """
         if not json_str or not json_str.strip():
-            raise ValueError("Cannot create vocabulary from empty or whitespace-only JSON string")
+            detail = "empty" if not json_str else f"whitespace-only (length {len(json_str)})"
+            raise ValueError(f"Cannot create vocabulary from {detail} JSON string")
         data = json.loads(json_str)
         vocab = cls()
         vocab.tag_to_index = {k: int(v) for k, v in data['tag_to_index'].items()}
@@ -359,9 +378,9 @@ class TagVocabulary:
         vocab.unk_index = vocab.tag_to_index.get(vocab.unk_token, 1)
         vocab.tags = [t for t in vocab.tag_to_index.keys() if t not in (vocab.pad_token, vocab.unk_token)]
         vocab.ignored_tag_indices = [
-            vocab.tag_to_index.get(t) for t in vocab.ignored_tags if t in vocab.tag_to_index
+            vocab.tag_to_index[t] for t in vocab.ignored_tags
+            if t in vocab.tag_to_index
         ]
-        vocab.ignored_tag_indices = [i for i in vocab.ignored_tag_indices if i is not None]
 
         _verify_vocabulary_integrity(vocab, Path('embedded'))
         return vocab
@@ -417,27 +436,60 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
             # Prefer a SQLite sidecar when present to cut startup I/O
             try:
                 from vocab_sqlite import load_vocabulary_from_sqlite  # local import; optional backend
-                json_mtime = vocab_path.stat().st_mtime
+
+                # Get JSON metadata atomically
+                try:
+                    json_stat = vocab_path.stat()
+                    json_mtime = json_stat.st_mtime
+                except OSError as e:
+                    logger.error(f"Cannot stat JSON vocabulary file {vocab_path}: {e}")
+                    raise
+
                 candidates = [
                     vocab_path.with_name('vocab.sqlite'),
                     vocab_path.with_suffix('.sqlite'),
                     vocab_path.with_suffix('.db'),
                 ]
+
                 for cand in candidates:
-                    if cand.exists():
-                        # Heuristic: prefer SQLite if it's at least as new as JSON
-                        try:
-                            if cand.stat().st_mtime + 1e-3 >= json_mtime:  # small epsilon
-                                vocab = load_vocabulary_from_sqlite(cand)
-                                _verify_vocabulary_integrity(vocab, cand)
-                                logger.info(f"Loaded vocabulary from SQLite sidecar for faster startup: {cand}")
-                                return vocab
-                        except Exception:
-                            # If anything goes wrong, fall back to JSON below
-                            pass
-            except Exception:
-                # Backend unavailable; fall through to JSON load
-                pass
+                    try:
+                        # Atomic stat check (both exist and mtime in one syscall)
+                        cand_stat = cand.stat()
+
+                        # Security: Only use SQLite if it's newer (prevents stale cache attacks)
+                        # Use strict comparison to avoid epsilon ambiguity
+                        if cand_stat.st_mtime >= json_mtime:
+                            logger.info(f"Attempting to load SQLite sidecar: {cand}")
+
+                            # Load with validation
+                            vocab = load_vocabulary_from_sqlite(cand)
+
+                            # CRITICAL: Verify integrity before trusting
+                            _verify_vocabulary_integrity(vocab, cand)
+
+                            logger.info(f"Loaded vocabulary from verified SQLite sidecar: {cand}")
+                            return vocab
+                        else:
+                            logger.debug(f"Skipping stale SQLite sidecar {cand} (older than JSON)")
+
+                    except FileNotFoundError:
+                        # File was deleted between candidates iteration - continue to next
+                        logger.debug(f"SQLite candidate {cand} not found")
+                        continue
+                    except PermissionError as e:
+                        logger.warning(f"Cannot read SQLite candidate {cand}: {e}")
+                        continue
+                    except Exception as e:
+                        # Log specific error for security monitoring
+                        logger.warning(f"Failed to load SQLite sidecar {cand}: {type(e).__name__}: {e}")
+                        continue
+
+            except ImportError:
+                # Backend unavailable - expected
+                logger.debug("SQLite vocabulary backend not available")
+            except Exception as e:
+                # Unexpected error in sidecar loading logic
+                logger.error(f"Unexpected error in SQLite sidecar loading: {e}", exc_info=True)
             # JSON fallback (canonical source of truth)
             vocab = TagVocabulary()
             vocab.load_vocabulary(vocab_path)

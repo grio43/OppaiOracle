@@ -25,15 +25,33 @@ class MultiTensorApply(object):
     warned = False
 
     def __init__(self, chunk_size):
-        try:
-            MultiTensorApply.available = True
-            self.chunk_size = chunk_size
-        except ImportError as err:
-            MultiTensorApply.available = False
-            MultiTensorApply.import_err = err
+        MultiTensorApply.available = True
+        self.chunk_size = chunk_size
 
     def __call__(self, op, noop_flag_buffer, tensor_lists, *args):
         return op(self.chunk_size, noop_flag_buffer, tensor_lists, *args)
+
+
+def _check_fused_available():
+    """Check if fused adan extension is available."""
+    try:
+        import fused_adan
+    except ImportError as exc:
+        if torch.cuda.is_available():
+            # The module should be available but isn't. Try to
+            # help the user in this case.
+            raise ImportError((
+                str(exc)
+                + (
+                    '\nThis could be caused by not having compiled '
+                    'the CUDA extension during package installation. '
+                    'Please try to re-install the package with '
+                    'the environment flag `FORCE_CUDA=1` set.'
+                )
+            ))
+        else:
+            raise ImportError(
+                str(exc) + '\nFused Adan does not support CPU.')
 
 
 class Adan(Optimizer):
@@ -131,23 +149,35 @@ class Adan(Optimizer):
                 loss = closure()
 
         if self.defaults['max_grad_norm'] > 0:
-            device = self.param_groups[0]['params'][0].device
-            global_grad_norm = torch.zeros(1, device=device)
-
-            max_grad_norm = torch.tensor(self.defaults['max_grad_norm'],
-                                         device=device)
+            # Find first parameter with gradient to determine device
+            device = None
             for group in self.param_groups:
-
                 for p in group['params']:
                     if p.grad is not None:
-                        grad = p.grad
-                        global_grad_norm.add_(grad.pow(2).sum())
+                        device = p.grad.device
+                        break
+                if device is not None:
+                    break
 
-            global_grad_norm = torch.sqrt(global_grad_norm)
+            if device is None:
+                # No parameters with gradients, skip clipping
+                clip_global_grad_norm = 1.0
+            else:
+                global_grad_norm = torch.zeros(1, device=device)
+                max_grad_norm = torch.tensor(self.defaults['max_grad_norm'],
+                                             device=device)
 
-            clip_global_grad_norm = torch.clamp(
-                max_grad_norm / (global_grad_norm + group['eps']),
-                max=1.0).item()
+                for group in self.param_groups:
+                    for p in group['params']:
+                        if p.grad is not None:
+                            grad = p.grad
+                            global_grad_norm.add_(grad.pow(2).sum())
+
+                global_grad_norm = torch.sqrt(global_grad_norm)
+
+                clip_global_grad_norm = torch.clamp(
+                    max_grad_norm / (global_grad_norm + self.defaults['eps']),
+                    max=1.0).item()
         else:
             clip_global_grad_norm = 1.0
 
@@ -446,24 +476,3 @@ def _fused_adan_single_tensor(
                 clip_global_grad_norm,
             )
         neg_grad.zero_().add_(grad, alpha=-1.0)
-
-
-def _check_fused_available():
-    try:
-        import fused_adan
-    except ImportError as exc:
-        if torch.cuda.is_available():
-            # The module should be available but isn't. Try to
-            # help the user in this case.
-            raise ImportError((
-                str(exc)
-                + (
-                    '\nThis could be caused by not having compiled '
-                    'the CUDA extension during package installation. '
-                    'Please try to re-install the package with '
-                    'the environment flag `FORCE_CUDA=1` set.'
-                )
-            ))
-        else:
-            raise ImportError(
-                str(exc) + '\nFused Adan does not support CPU.')

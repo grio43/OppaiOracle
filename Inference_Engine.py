@@ -202,11 +202,19 @@ def load_inference_config(path: Path = PROJECT_ROOT / "configs" / "inference_con
 
 class ImagePreprocessor:
     """Handles image preprocessing for inference"""
-    
+
     def __init__(self, config: InferenceConfig):
         self.config = config
         self.transform = self._build_transform()
-        
+        # Define allowed base directories for path validation
+        # Use current working directory if input_dir not specified
+        self.allowed_dirs = []
+        if hasattr(config, 'input_dir') and config.input_dir:
+            self.allowed_dirs.append(Path(config.input_dir).resolve())
+        else:
+            # Allow current working directory as fallback
+            self.allowed_dirs.append(Path.cwd().resolve())
+
     def _build_transform(self):
         """Build tensor + normalize transform (geometry handled manually to avoid stretching/upscale)."""
         return transforms.Compose([
@@ -216,6 +224,54 @@ class ImagePreprocessor:
                 std=self.config.normalize_std
             )
         ])
+
+    def _validate_image_path(self, path: str) -> Path:
+        """Validate image path to prevent path traversal.
+
+        Args:
+            path: String path to image file
+
+        Returns:
+            Validated absolute Path object
+
+        Raises:
+            ValueError: If path is unsafe or invalid
+        """
+        try:
+            # Resolve to absolute path
+            abs_path = Path(path).resolve()
+
+            # Check if path is in allowed directories
+            is_allowed = any(
+                abs_path.is_relative_to(allowed)
+                for allowed in self.allowed_dirs
+            )
+
+            if not is_allowed:
+                raise ValueError(
+                    f"Image path {path} is outside allowed directories"
+                )
+
+            # Check file exists
+            if not abs_path.exists():
+                raise FileNotFoundError(f"Image not found: {path}")
+
+            # Check it's a file, not a directory
+            if not abs_path.is_file():
+                raise ValueError(f"Path is not a file: {path}")
+
+            # Check extension
+            if abs_path.suffix.lower() not in self.config.input_image_extensions:
+                raise ValueError(
+                    f"Invalid image extension: {abs_path.suffix}. "
+                    f"Allowed: {self.config.input_image_extensions}"
+                )
+
+            return abs_path
+
+        except Exception as e:
+            logger.error(f"Invalid image path {path}: {e}")
+            raise
 
     @staticmethod
     def _letterbox_downscale_only(img: Image.Image, target: int, pad_color=(114, 114, 114)) -> Image.Image:
@@ -242,7 +298,9 @@ class ImagePreprocessor:
         """Preprocess a single image"""
         # Load image if path
         if isinstance(image, str):
-            with Image.open(image) as img:
+            # Validate path to prevent path traversal
+            validated_path = self._validate_image_path(image)
+            with Image.open(validated_path) as img:
                 img.load()
                 img = ImageOps.exif_transpose(img)
 
@@ -325,6 +383,18 @@ class InferenceDataset(Dataset):
                 path,
                 False
             )
+
+
+def inference_collate_fn(batch):
+    """Custom collate function for inference dataset.
+
+    Properly handles DatasetItem namedtuples to ensure batch_valid
+    is a list of booleans instead of a tuple.
+    """
+    images = torch.stack([item.image for item in batch])
+    paths = [item.path for item in batch]
+    valid_flags = [item.is_valid for item in batch]
+    return images, paths, valid_flags
 
 
 class ModelWrapper:
@@ -585,8 +655,20 @@ class ModelWrapper:
             # Orientation-aware averaging if we have a mapping
             if isinstance(outputs, dict):
                 if 'tag_logits' in outputs and self._tta_index_map is not None:
-                    tags_f = outputs_flipped['tag_logits'].index_select(dim=1, index=self._tta_index_map)
+                    # Use advanced indexing to reorder flipped outputs
+                    # self._tta_index_map[i] = index of tag in flipped image that corresponds to tag i in original
+                    batch_size = outputs_flipped['tag_logits'].shape[0]
+
+                    # Create batch indices
+                    batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(1)
+
+                    # Reorder flipped predictions using index map
+                    # tags_f[b, i] = outputs_flipped[b, index_map[i]]
+                    tags_f = outputs_flipped['tag_logits'][batch_idx, self._tta_index_map.unsqueeze(0)]
+
+                    # Average original and reordered flipped
                     outputs['tag_logits'] = 0.5 * (outputs['tag_logits'] + tags_f)
+
                     # Ratings are orientation-invariant; average directly if present
                     if 'rating_logits' in outputs and 'rating_logits' in outputs_flipped:
                         outputs['rating_logits'] = 0.5 * (outputs['rating_logits'] + outputs_flipped['rating_logits'])
@@ -629,7 +711,63 @@ class ResultProcessor:
                 self._th_by_idx = {i: float(th_map.get(t, self.config.threshold)) for i, t in enumerate(tag_names)}
             except Exception as e:
                 print(f"Warning: failed to load thresholds: {e}")
-        
+
+    def _get_special_token_indices(self, vocab) -> tuple:
+        """Get PAD and UNK token indices with proper error handling.
+
+        Returns:
+            tuple: (pad_idx, unk_idx)
+        """
+        # Default indices (standard convention)
+        default_pad = 0
+        default_unk = 1
+
+        if vocab is None:
+            logger.warning("No vocabulary available, using default special token indices")
+            return default_pad, default_unk
+
+        try:
+            # Try to get PAD token
+            pad_token = getattr(vocab, "pad_token", "<PAD>")
+            if not isinstance(pad_token, str):
+                logger.warning(f"pad_token is not a string: {type(pad_token)}, using default")
+                pad_idx = default_pad
+            else:
+                pad_idx = vocab.tag_to_index.get(pad_token, default_pad)
+                if pad_idx != default_pad:
+                    logger.debug(f"Using non-standard PAD index: {pad_idx}")
+
+            # Try to get UNK token
+            # First check if vocabulary has explicit unk_index
+            if hasattr(vocab, "unk_index") and isinstance(vocab.unk_index, int):
+                unk_idx = vocab.unk_index
+            else:
+                # Fall back to looking up token
+                unk_token = getattr(vocab, "unk_token", "<UNK>")
+                if not isinstance(unk_token, str):
+                    logger.warning(f"unk_token is not a string: {type(unk_token)}, using default")
+                    unk_idx = default_unk
+                else:
+                    unk_idx = vocab.tag_to_index.get(unk_token, default_unk)
+                    if unk_idx != default_unk:
+                        logger.debug(f"Using non-standard UNK index: {unk_idx}")
+
+            return pad_idx, unk_idx
+
+        except AttributeError as e:
+            logger.error(f"Vocabulary missing required attributes: {e}")
+            return default_pad, default_unk
+        except KeyError as e:
+            logger.error(f"Vocabulary lookup failed: {e}")
+            return default_pad, default_unk
+        except Exception as e:
+            # This should not happen - log and investigate
+            logger.error(
+                f"Unexpected error getting special token indices: {e}",
+                exc_info=True
+            )
+            return default_pad, default_unk
+
     def process_predictions(
         self,
         predictions: torch.Tensor,
@@ -657,14 +795,8 @@ class ResultProcessor:
 
             # Drop special tokens (<PAD>=0, <UNK>=1) regardless of score
             vocab = getattr(self.model_wrapper, "vocabulary", None)
-            if vocab is not None:
-                try:
-                    pad_idx = vocab.tag_to_index.get(getattr(vocab, "pad_token", "<PAD>"), 0)
-                except Exception:
-                    pad_idx = 0
-                unk_idx = getattr(vocab, "unk_index",
-                                  vocab.tag_to_index.get(getattr(vocab, "unk_token", "<UNK>"), 1))
-                above = [i for i in above if i not in (pad_idx, unk_idx)]
+            pad_idx, unk_idx = self._get_special_token_indices(vocab)
+            above = [i for i in above if i not in (pad_idx, unk_idx)]
 
             items = [(self.tag_names[i], float(pred[i].item())) for i in above if i < len(self.tag_names)]
             if self.config.eye_color_exclusive and self._eye_idx:
@@ -726,36 +858,48 @@ class InferenceCache:
         self.timestamps = {}  # Separate dict for timestamps
         self.max_size = max_size
         self.ttl = timedelta(seconds=ttl_seconds) if ttl_seconds > 0 else None
-        self.hits = 0
-        self.misses = 0
-        self.expired = 0
-        self.lock = threading.Lock()
+
+        # Separate locks for data and stats to reduce contention
+        self.cache_lock = threading.RLock()  # For cache operations
+        self.stats_lock = threading.Lock()   # For stats updates
+
+        # Stats with protected access
+        self._hits = 0
+        self._misses = 0
+        self._expired = 0
 
     def get(self, key: str) -> Optional[Any]:
         """Get item from cache, checking TTL if applicable."""
-        with self.lock:
-            if key in self.cache:
-                # Check if item has expired
-                if self.ttl:
-                    timestamp = self.timestamps[key]
-                    if datetime.now() - timestamp > self.ttl:
-                        self.expired += 1
-                        del self.cache[key]
-                        del self.timestamps[key]
-                        self.misses += 1
-                        return None
+        with self.cache_lock:
+            if key not in self.cache:
+                # Fast path: not in cache
+                with self.stats_lock:
+                    self._misses += 1
+                return None
 
-                self.hits += 1
-                # Move to end (O(1) operation in OrderedDict)
-                self.cache.move_to_end(key)
-                return self.cache[key]
+            # Check TTL
+            if self.ttl:
+                timestamp = self.timestamps[key]
+                if datetime.now() - timestamp > self.ttl:
+                    del self.cache[key]
+                    del self.timestamps[key]
+                    with self.stats_lock:
+                        self._expired += 1
+                        self._misses += 1
+                    return None
 
-            self.misses += 1
-            return None
+            # Cache hit
+            value = self.cache[key]
+            self.cache.move_to_end(key)
+
+            with self.stats_lock:
+                self._hits += 1
+
+            return value
 
     def put(self, key: str, value: Any):
         """Put item in cache, evicting if necessary."""
-        with self.lock:
+        with self.cache_lock:
             # If key exists, move to end
             if key in self.cache:
                 self.cache.move_to_end(key)
@@ -772,15 +916,22 @@ class InferenceCache:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""
-        with self.lock:
-            total = self.hits + self.misses
-            return {
-                'hits': self.hits,
-                'misses': self.misses,
-                'expired': self.expired,
-                'hit_rate': self.hits / total if total > 0 else 0,
-                'size': len(self.cache)
-            }
+        with self.stats_lock:
+            hits = self._hits
+            misses = self._misses
+            expired = self._expired
+
+        with self.cache_lock:
+            size = len(self.cache)
+
+        total = hits + misses
+        return {
+            'hits': hits,
+            'misses': misses,
+            'expired': expired,
+            'hit_rate': hits / total if total > 0 else 0,
+            'size': size
+        }
 
 
 class InferenceEngine:
@@ -927,26 +1078,27 @@ class InferenceEngine:
             
             # Process uncached images
             if uncached_images:
-                # Preprocess batch
-                processed = self.preprocessor.preprocess_batch(uncached_images)
-                # Predict
-                predictions = self.model_wrapper.predict(processed)
-                
-                # Process results
+                # Preprocess batch - GET VALIDITY FLAGS
+                processed_tensor, valid_flags = self.preprocessor.preprocess_batch(uncached_images)
+
+                # Predict - pass tensor
+                predictions = self.model_wrapper.predict(processed_tensor)
+
+                # Process results - USE ACTUAL VALIDITY FLAGS
                 batch_results = self.result_processor.process_predictions(
                     predictions,
-                    [img if isinstance(img, str) else f"array_{i}" 
+                    [img if isinstance(img, str) else f"array_{i}"
                      for i, img in enumerate(uncached_images)],
-                    [True] * len(uncached_images)
+                    valid_flags  # Use actual flags, not always True!
                 )
-                
+
                 # Add timing and cache
                 for i, (idx, result) in enumerate(zip(uncached_indices, batch_results)):
                     result.processing_time = ((time.time() - start_time) / len(images)) * 1000  # ms
                     results[idx] = result
-                    
-                    # Cache if applicable
-                    if self.cache and isinstance(uncached_images[i], str):
+
+                    # Only cache valid results
+                    if self.cache and isinstance(uncached_images[i], str) and valid_flags[i]:
                         self.cache.put(uncached_images[i], result)
             
             # Log to monitor
@@ -1013,23 +1165,24 @@ class InferenceEngine:
         dataloader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
+            collate_fn=inference_collate_fn,  # Use custom collate function
             **_worker_kwargs,
         )
-        
+
         # Process batches
         all_results = []
         start_time = time.time()
-        
+
         try:
             for batch_images, batch_paths, batch_valid in dataloader:
                 # Run inference
                 predictions = self.model_wrapper.predict(batch_images)
-                
-                # Process results
+
+                # Process results - batch_valid is already a list
                 batch_results = self.result_processor.process_predictions(
                     predictions,
                     batch_paths,
-                    batch_valid.tolist()
+                    batch_valid  # Already a list from custom collate function
                 )
                 
                 all_results.extend(batch_results)
@@ -1108,16 +1261,58 @@ class InferenceEngine:
     
     def cleanup(self):
         """Cleanup resources"""
+        # Close monitor first
         if self.monitor:
-            self.monitor.close()
-        
-        # Clear cache
+            try:
+                self.monitor.close()
+            except Exception as e:
+                logger.warning(f"Error closing monitor: {e}")
+            self.monitor = None
+
+        # Clear cache and log stats
         if self.cache:
-            logger.info(f"Cache stats at cleanup: {self.cache.get_stats()}")
-        
+            try:
+                logger.info(f"Cache stats at cleanup: {self.cache.get_stats()}")
+                self.cache.cache.clear()
+                self.cache.timestamps.clear()
+            except Exception as e:
+                logger.warning(f"Error clearing cache: {e}")
+            self.cache = None
+
+        # Move model to CPU and delete
+        if hasattr(self, 'model_wrapper') and self.model_wrapper:
+            try:
+                if hasattr(self.model_wrapper, 'model') and self.model_wrapper.model:
+                    # Move to CPU first
+                    self.model_wrapper.model.cpu()
+                    # Delete model
+                    del self.model_wrapper.model
+                del self.model_wrapper
+            except Exception as e:
+                logger.warning(f"Error cleaning up model: {e}")
+            self.model_wrapper = None
+
+        # Clear any cached preprocessed images
+        if hasattr(self, 'preprocessor') and self.preprocessor:
+            self.preprocessor = None
+
+        # Clear result processor
+        if hasattr(self, 'result_processor') and self.result_processor:
+            self.result_processor = None
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+
         # Clear CUDA cache if using GPU
         if self.config.device == "cuda":
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+                # Synchronize to ensure all operations complete
+                torch.cuda.synchronize()
+                logger.info("GPU memory released")
+            except Exception as e:
+                logger.warning(f"Error clearing CUDA cache: {e}")
 
 
 # Example usage

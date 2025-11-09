@@ -120,19 +120,38 @@ def log_sample_order_hash(dataloader, epoch: int, N: int = 128, max_batches: int
 
 
 def _save_rng_states():
-    """Capture Python, NumPy, Torch CPU and CUDA RNG states."""
+    """Capture Python, NumPy, Torch CPU and CUDA RNG states.
+
+    Returns:
+        Tuple of (py_state, np_state, torch_cpu_state, cuda_state).
+        cuda_state is None if CUDA unavailable or errors occur.
+    """
     py = random.getstate()
     np_state = np.random.get_state()
     torch_cpu = torch.get_rng_state()
     cuda = None
+
+    if not torch.cuda.is_available():
+        return py, np_state, torch_cpu, cuda
+
+    # Try to capture CUDA state for all devices
     try:
-        if torch.cuda.is_available():
-            try:
-                cuda = torch.cuda.get_rng_state_all()
-            except Exception:
-                cuda = torch.cuda.get_rng_state()
-    except Exception:
+        cuda = torch.cuda.get_rng_state_all()
+        logger.debug(f"Captured CUDA RNG state for {len(cuda)} devices")
+    except RuntimeError as e:
+        # CUDA runtime error - try single device fallback
+        logger.warning(f"Failed to capture all CUDA RNG states: {e}, trying single device")
+        try:
+            cuda = torch.cuda.get_rng_state()
+            logger.debug("Captured CUDA RNG state for current device")
+        except RuntimeError as e2:
+            logger.error(f"Failed to capture CUDA RNG state: {e2}. RNG reproducibility may be affected.")
+            cuda = None
+    except Exception as e:
+        # Unexpected error - log and continue
+        logger.error(f"Unexpected error capturing CUDA RNG state: {type(e).__name__}: {e}")
         cuda = None
+
     return py, np_state, torch_cpu, cuda
 
 
@@ -140,19 +159,28 @@ def _restore_rng_states(states):
     """Restore Python, NumPy, Torch CPU and CUDA RNG states.
 
     Expects a tuple of (py_state, np_state, torch_cpu_state, cuda_state).
-    The NumPy state may be packed via _pack_np_state; callers should
-    pass the unpacked form when available.
+    Logs warnings for any restoration failures.
+
+    Returns:
+        Dict[str, bool]: Success status for each component
     """
     py, np_state, torch_cpu, cuda = states
+    success = {}
+
+    # Restore Python RNG
     try:
         random.setstate(py)
-    except Exception:
-        pass
+        success['python'] = True
+    except Exception as e:
+        logger.warning(f"Failed to restore Python RNG state: {type(e).__name__}: {e}")
+        success['python'] = False
+
+    # Restore NumPy RNG
     try:
-        import numpy as _np  # local import
+        import numpy as _np
         # Accept both native NumPy state and packed state
         if isinstance(np_state, (tuple, list)) and len(np_state) >= 5 and not hasattr(np_state[1], "dtype"):
-            # Looks like packed form; rebuild ndarray then set state
+            # Packed form; rebuild ndarray then set state
             bitgen = np_state[0]
             state_list = np_state[1]
             pos = int(np_state[2])
@@ -165,20 +193,46 @@ def _restore_rng_states(states):
             _np.random.set_state((bitgen, arr, pos, has_gauss, cached))
         else:
             _np.random.set_state(np_state)  # type: ignore[arg-type]
-    except Exception:
-        pass
+        success['numpy'] = True
+    except Exception as e:
+        logger.warning(f"Failed to restore NumPy RNG state: {type(e).__name__}: {e}")
+        success['numpy'] = False
+
+    # Restore PyTorch CPU RNG
     try:
         torch.set_rng_state(torch_cpu)
-    except Exception:
-        pass
+        success['torch_cpu'] = True
+    except Exception as e:
+        logger.warning(f"Failed to restore PyTorch CPU RNG state: {type(e).__name__}: {e}")
+        success['torch_cpu'] = False
+
+    # Restore CUDA RNG
     try:
         if cuda is not None and torch.cuda.is_available():
             if isinstance(cuda, list):
                 torch.cuda.set_rng_state_all(cuda)
+                logger.debug(f"Restored CUDA RNG state for {len(cuda)} devices")
             else:
                 torch.cuda.set_rng_state(cuda)
-    except Exception:
-        pass
+                logger.debug("Restored CUDA RNG state for current device")
+            success['cuda'] = True
+        else:
+            success['cuda'] = None  # Not applicable
+    except RuntimeError as e:
+        logger.warning(f"Failed to restore CUDA RNG state: {e}. Training may not be reproducible.")
+        success['cuda'] = False
+    except Exception as e:
+        logger.error(f"Unexpected error restoring CUDA RNG state: {type(e).__name__}: {e}")
+        success['cuda'] = False
+
+    # Log summary
+    failed = [k for k, v in success.items() if v is False]
+    if failed:
+        logger.warning(f"RNG state restoration incomplete. Failed components: {', '.join(failed)}")
+    else:
+        logger.debug("RNG state fully restored")
+
+    return success
 
 
 def _pack_np_state(np_state: tuple) -> tuple:
@@ -290,18 +344,27 @@ LOG_DIR = Path(_paths_cfg["log_dir"])
 DEFAULT_OUTPUT_DIR = Path(_paths_cfg["default_output_dir"])
 
 # Optional runtime toggles (determinism, CuBLAS/CuDNN, quiet logging)
+# Default to empty dict for safety
+_RUNTIME = {}
+
 def _apply_runtime_config():
+    global _RUNTIME
     try:
         cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "runtime.yaml").read_text(encoding="utf-8")) or {}
-    except Exception:
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.debug(f"Failed to load runtime.yaml, using defaults: {e}")
         cfg = {}
     rcfg = cfg.get("runtime", {}) or {}
     if rcfg.get("cublas_workspace_config"):
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", str(rcfg["cublas_workspace_config"]))
     if rcfg.get("quiet_mode"):
         logging.getLogger().setLevel(logging.WARNING)
+    _RUNTIME = rcfg  # Update global
     return rcfg
-_RUNTIME = _apply_runtime_config()
+
+# Initialize runtime config at module load
+_apply_runtime_config()
 
 
 @dataclass
@@ -683,10 +746,65 @@ class CheckpointManager:
     ) -> Optional[Path]:
         """Save a checkpoint"""
 
+        # VALIDATION FIRST - fail fast before any work
         if not self._is_primary_process():
             return None
 
-        # Prepare checkpoint data
+        # Validate config is provided
+        if config is None:
+            raise RuntimeError(
+                "Configuration must be provided to save_checkpoint to embed preprocessing parameters. "
+                "Please pass a config dict with the following required keys: "
+                "normalize_mean, normalize_std, image_size, patch_size. "
+                "This ensures checkpoints contain the exact preprocessing used during training."
+            )
+
+        # Validate required preprocessing parameters are present
+        required_params = ['normalize_mean', 'normalize_std', 'image_size', 'patch_size']
+
+        def get_param(cfg: Dict[str, Any], key: str):
+            if key in cfg:
+                return cfg[key]
+            for section in ('data', 'model', 'inference', 'export', 'training'):
+                sub = cfg.get(section)
+                if isinstance(sub, dict) and key in sub:
+                    return sub[key]
+            return None
+
+        missing_params = [p for p in required_params if get_param(config, p) is None]
+        if missing_params:
+            raise RuntimeError(
+                f"Missing required preprocessing parameters in config: {', '.join(missing_params)}. "
+                f"All of {required_params} must be explicitly provided to ensure correct preprocessing."
+            )
+
+        # Validate preprocessing parameter types and values
+        try:
+            normalize_mean = tuple(get_param(config, 'normalize_mean'))
+            normalize_std = tuple(get_param(config, 'normalize_std'))
+            if len(normalize_mean) != 3 or len(normalize_std) != 3:
+                raise ValueError("normalize_mean and normalize_std must have exactly 3 values")
+
+            image_size = int(get_param(config, 'image_size'))
+            patch_size = int(get_param(config, 'patch_size'))
+
+            if image_size <= 0 or patch_size <= 0:
+                raise ValueError("image_size and patch_size must be positive")
+            if image_size % patch_size != 0:
+                raise ValueError(f"image_size ({image_size}) must be divisible by patch_size ({patch_size})")
+
+        except (TypeError, ValueError) as e:
+            raise RuntimeError(f"Invalid preprocessing parameters in config: {e}")
+
+        # Validate vocabulary path exists
+        vocab_path = Path(config.get('vocab_path', VOCAB_PATH) if config else VOCAB_PATH)
+        if not vocab_path.exists():
+            raise RuntimeError(
+                f"Vocabulary file not found at {vocab_path}. "
+                "Refusing to save a non self-contained checkpoint (fail-fast)."
+            )
+
+        # NOW proceed with checkpoint preparation
         checkpoint = {
             'epoch': epoch,
             'step': step,
@@ -723,9 +841,33 @@ class CheckpointManager:
 
         # Provide a deterministic salt hint derived from stable checkpoint content
         try:
-            salt_src = f"{int(epoch)}|{int(step)}|{str(checkpoint['timestamp'])}"
+            # Validate timestamp format before using it (prevents injection)
+            timestamp_str = checkpoint.get('timestamp', '')
+            if not isinstance(timestamp_str, str):
+                timestamp_str = ''
+
+            # Validate ISO format (prevents injection)
+            from datetime import datetime
+            try:
+                # This will raise ValueError if format is invalid
+                datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                validated_timestamp = timestamp_str
+            except (ValueError, AttributeError):
+                # Invalid timestamp, use current time
+                validated_timestamp = datetime.now().isoformat()
+                logger.debug(f"Invalid timestamp in checkpoint, using current time")
+
+            # Create salt from validated components
+            salt_components = [
+                str(int(epoch)),
+                str(int(step)),
+                validated_timestamp
+            ]
+            salt_src = '|'.join(salt_components)
             checkpoint['resume_salt_hint'] = int(hashlib.sha1(salt_src.encode()).hexdigest()[:8], 16)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to create resume salt hint: {e}")
+            # Don't include salt if validation fails
             pass
 
         # CRITICAL: Embed vocabulary and preprocessing directly into checkpoint
@@ -734,66 +876,17 @@ class CheckpointManager:
         else:
             model_to_check = model
 
-        # Load and embed vocabulary if available
-        vocab_path = Path(config.get('vocab_path', VOCAB_PATH) if config else VOCAB_PATH)
-        if vocab_path.exists():
-            checkpoint = ModelMetadata.embed_vocabulary(checkpoint, vocab_path)
-        else:
-            raise RuntimeError(
-                f"Vocabulary file not found at {vocab_path}. "
-                "Refusing to save a non self-contained checkpoint (fail-fast)."
-            )
+        # Load and embed vocabulary (already validated at function start)
+        checkpoint = ModelMetadata.embed_vocabulary(checkpoint, vocab_path)
 
-        # Embed preprocessing parameters - require explicit config
-        if config is None:
-            raise RuntimeError(
-                "Configuration must be provided to save_checkpoint to embed preprocessing parameters. "
-                "Please pass a config dict with the following required keys: "
-                "normalize_mean, normalize_std, image_size, patch_size. "
-                "This ensures checkpoints contain the exact preprocessing used during training."
-            )
-
-        # Validate required preprocessing parameters are present.
-        # These keys might be nested under sections like "data" or "model" when
-        # a full configuration dictionary is provided. Perform a nested lookup so
-        # callers can pass ``FullConfig.to_dict()`` directly.
-        required_params = ['normalize_mean', 'normalize_std', 'image_size', 'patch_size']
-
-        def get_param(cfg: Dict[str, Any], key: str):
-            if key in cfg:
-                return cfg[key]
-            for section in ('data', 'model', 'inference', 'export', 'training'):
-                sub = cfg.get(section)
-                if isinstance(sub, dict) and key in sub:
-                    return sub[key]
-            return None
-
-        missing_params = [p for p in required_params if get_param(config, p) is None]
-        if missing_params:
-            raise RuntimeError(
-                f"Missing required preprocessing parameters in config: {', '.join(missing_params)}. "
-                f"All of {required_params} must be explicitly provided to ensure correct preprocessing."
-            )
-
-        # Validate and extract preprocessing parameters
-        try:
-            normalize_mean = tuple(get_param(config, 'normalize_mean'))
-            normalize_std = tuple(get_param(config, 'normalize_std'))
-            if len(normalize_mean) != 3 or len(normalize_std) != 3:
-                raise ValueError("normalize_mean and normalize_std must have exactly 3 values")
-
-            image_size = int(get_param(config, 'image_size'))
-            patch_size = int(get_param(config, 'patch_size'))
-
-            checkpoint = ModelMetadata.embed_preprocessing_params(
-                checkpoint,
-                normalize_mean=normalize_mean,
-                normalize_std=normalize_std,
-                image_size=image_size,
-                patch_size=patch_size,
-            )
-        except (TypeError, ValueError) as e:
-            raise RuntimeError(f"Invalid preprocessing parameters in config: {e}")
+        # Embed preprocessing parameters (already validated at function start)
+        checkpoint = ModelMetadata.embed_preprocessing_params(
+            checkpoint,
+            normalize_mean=normalize_mean,
+            normalize_std=normalize_std,
+            image_size=image_size,
+            patch_size=patch_size,
+        )
 
         # Backwards compatibility info
         if hasattr(model_to_check, 'config'):
@@ -815,12 +908,35 @@ class CheckpointManager:
         wrote_numbered = False
         if not (self.keep_best and not is_best):
             fd, temp_path = tempfile.mkstemp(suffix='.tmp', prefix='checkpoint_', dir=self.checkpoint_dir)
+
+            # Close fd immediately - we only needed mkstemp for unique name
             try:
+                os.close(fd)
+            except Exception:
+                pass  # If close fails, continue anyway
+
+            try:
+                # Now torch.save() is the only process with file open
                 torch.save(checkpoint, temp_path)
+                # Atomic rename - should work on all platforms
                 os.replace(temp_path, checkpoint_path)
                 wrote_numbered = True
+            except Exception as e:
+                logger.error(f"Failed to save checkpoint to {checkpoint_path}: {e}")
+                # Clean up temp file
+                try:
+                    if Path(temp_path).exists():
+                        Path(temp_path).unlink()
+                except Exception:
+                    pass
+                raise
             finally:
-                os.close(fd)
+                # Ensure temp file is cleaned up if replace failed
+                try:
+                    if Path(temp_path).exists():
+                        Path(temp_path).unlink()
+                except Exception:
+                    pass
 
             if wrote_numbered:
                 self.checkpoints.append(checkpoint_path)
@@ -832,13 +948,31 @@ class CheckpointManager:
         if self.save_last:
             last_path = self.checkpoint_dir / LAST_CKPT_NAME
             fd_last, temp_last = tempfile.mkstemp(suffix='.tmp', prefix='last_', dir=self.checkpoint_dir)
+
+            # Close fd immediately
+            try:
+                os.close(fd_last)
+            except Exception:
+                pass
+
             try:
                 torch.save(checkpoint, temp_last)
                 os.replace(temp_last, last_path)
             except Exception as e:
                 logger.warning("Failed to update %s: %s", last_path, e)
+                # Clean up temp file
+                try:
+                    if Path(temp_last).exists():
+                        Path(temp_last).unlink()
+                except Exception:
+                    pass
             finally:
-                os.close(fd_last)
+                # Ensure temp file is cleaned up
+                try:
+                    if Path(temp_last).exists():
+                        Path(temp_last).unlink()
+                except Exception:
+                    pass
         
         # Save best model if applicable
         if is_best and self.keep_best and wrote_numbered:
@@ -934,21 +1068,23 @@ class CheckpointManager:
 
         # Load optimizer state
         if optimizer is not None and 'optimizer_state_dict' in meta:
-            # Check if optimizer has state before trying to move it
-            if hasattr(optimizer, 'state') and optimizer.state:
+            try:
+                # Load state dict (optimizer creates state entries as needed)
                 optimizer.load_state_dict(meta['optimizer_state_dict'])
 
-                # Move optimizer state to device
-                for state in optimizer.state.values():
-                    for k, v in state.items():
-                        if isinstance(v, torch.Tensor):
-                            state[k] = v.to(device)
-            else:
-                # Some optimizers might not have state yet
-                try:
-                    optimizer.load_state_dict(meta['optimizer_state_dict'])
-                except Exception as e:
-                    logger.warning(f"Could not load optimizer state: {e}")
+                # Move optimizer state to device if it exists
+                if hasattr(optimizer, 'state') and optimizer.state:
+                    for state in optimizer.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.to(device)
+                    logger.debug(f"Moved optimizer state to {device}")
+                else:
+                    logger.debug("Optimizer state loaded but empty (no tensors to migrate)")
+
+            except Exception as e:
+                logger.warning(f"Failed to load optimizer state: {type(e).__name__}: {e}")
+                # Continue training with fresh optimizer state
 
         # Load scheduler state
         if scheduler is not None and 'scheduler_state_dict' in meta:

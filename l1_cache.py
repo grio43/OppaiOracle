@@ -12,7 +12,11 @@ try:
 except ImportError:
     # Fallback: create a no-op monitor for when utils.cache_monitor is unavailable
     class _NoOpMonitor:
-        """No-op monitor for when utils.cache_monitor is unavailable."""
+        """No-op monitor for when utils.cache_monitor is unavailable.
+
+        This fallback must implement all methods of the real monitor to prevent
+        AttributeError at runtime. Keep synchronized with utils.cache_monitor.
+        """
         def l1_hit(self) -> None:
             pass
         def l1_miss(self) -> None:
@@ -20,6 +24,8 @@ except ImportError:
         def l1_put(self, nbytes: int) -> None:
             pass
         def l1_evict(self, nbytes: int) -> None:
+            pass
+        def l1_expired(self) -> None:
             pass
     monitor = _NoOpMonitor()
 
@@ -195,6 +201,8 @@ class ByteLRU:
             old = self._m.pop(key, None)
             if old is not None:
                 self._size -= old.nbytes
+                # Track eviction of replaced entry
+                monitor.l1_evict(old.nbytes)
             self._m[key] = _Entry(v, nbytes)
             if self.ttl is not None:
                 self._expires[key] = time.monotonic() + self.ttl
@@ -205,6 +213,8 @@ class ByteLRU:
                 self._size -= ev.nbytes
                 if self.ttl is not None:
                     self._expires.pop(k_old, None)
+                # Track LRU eviction for monitoring
+                monitor.l1_evict(ev.nbytes)
 
     def cache_info(self) -> CacheInfo:
         """Return a snapshot of cache statistics (hits, misses, expired).

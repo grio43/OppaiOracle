@@ -30,25 +30,26 @@ class ModelMetadata:
 
         Returns:
             Modified checkpoint with embedded vocabulary
+
+        Raises:
+            FileNotFoundError: If vocabulary file doesn't exist
+            ValueError: If vocabulary is invalid or contains placeholders
+            json.JSONDecodeError: If vocabulary file is not valid JSON
         """
         if not vocab_path.exists():
-            logger.warning(f"Vocabulary file not found: {vocab_path}")
-            return checkpoint
+            raise FileNotFoundError(f"Vocabulary file not found: {vocab_path}")
 
         try:
-            # Verify the vocabulary file itself is valid before embedding
-            with open(vocab_path, 'r', encoding='utf-8') as f:
-                test_load = json.load(f)
-                if not test_load.get('tag_to_index') or not test_load.get('index_to_tag'):
-                    logger.error(f"Invalid vocabulary file structure at {vocab_path}")
-                    return checkpoint
-
+            # Load and validate vocabulary
             with open(vocab_path, 'r', encoding='utf-8') as f:
                 vocab_data = json.load(f)
 
-            # Verify vocabulary is valid
+            # Verify vocabulary structure
             if 'tag_to_index' not in vocab_data or 'index_to_tag' not in vocab_data:
-                raise ValueError("Invalid vocabulary format")
+                raise ValueError(
+                    f"Invalid vocabulary structure at {vocab_path}: "
+                    f"missing required keys 'tag_to_index' or 'index_to_tag'"
+                )
 
             # Check for placeholder tags
             placeholder_count = sum(
@@ -56,12 +57,11 @@ class ModelMetadata:
                 if tag.startswith("tag_") and tag[4:].isdigit()
             )
             if placeholder_count > 0:
-                logger.error(f"Vocabulary contains {placeholder_count} placeholder tags - not embedding!")
-                logger.error(
-                    f"Examples: {[t for t in list(vocab_data['tag_to_index'].keys())[:10] if t.startswith('tag_')]}"
-                )
+                examples = [t for t in list(vocab_data['tag_to_index'].keys())[:10]
+                           if t.startswith('tag_')]
                 raise ValueError(
-                    f"Vocabulary contains {placeholder_count} placeholder tags! Will not embed corrupted vocabulary."
+                    f"Vocabulary contains {placeholder_count} placeholder tags! "
+                    f"Will not embed corrupted vocabulary. Examples: {examples}"
                 )
 
             # Compress vocabulary
@@ -79,8 +79,10 @@ class ModelMetadata:
             logger.info(f"Embedded vocabulary with {len(vocab_data['tag_to_index'])} tags")
             return checkpoint
 
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in vocabulary file {vocab_path}: {e}") from e
         except Exception as e:
-            logger.error("Failed to embed vocabulary: %s", e)
+            logger.error(f"Failed to embed vocabulary from {vocab_path}: {e}")
             raise
 
     @staticmethod

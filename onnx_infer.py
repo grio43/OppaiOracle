@@ -118,11 +118,6 @@ def _preprocess(image_path: str) -> tuple[np.ndarray, bool]:
     return arr, was_composited
 
 
-def _preprocess_simple(image_path: str, image_size: int, mean, std):
-    """Simple preprocessing for backward compatibility"""
-    return _preprocess(image_path, image_size, mean, std, session=None)
-
-
 def main():
     from utils.logging_setup import setup_logging
     listener = setup_logging()
@@ -190,48 +185,66 @@ def main():
                 inp, was_composited = _preprocess(path)
             except Exception as e:
                 logger.error(f"Preprocessing failed for {path}: {e}")
+                # Add failed result instead of skipping
+                results.append(ImagePrediction(
+                    image=path,
+                    tags=[],
+                    processing_time=int((time.time() - start) * 1000),
+                    error=str(e)
+                ))
                 continue
 
-            outputs = session.run(None, {input_name: inp})
-
-            if len(outputs) == 1:
-                scores = outputs[0][0]
-            else:
-                scores = outputs[-1][0]
-
-            idxs = np.argsort(scores)[::-1][:args.top_k]
-            # Resolve special-token indices once
             try:
-                pad_idx = vocab.tag_to_index.get(getattr(vocab, "pad_token", "<PAD>"), 0)
-            except Exception:
-                pad_idx = 0
-            unk_idx = getattr(vocab, "unk_index",
-                              vocab.tag_to_index.get(getattr(vocab, "unk_token", "<UNK>"), 1))
+                outputs = session.run(None, {input_name: inp})
 
-            tags = []
-            for idx in idxs:
-                score = float(scores[idx])
-                if score < args.threshold:
-                    continue
-                # Skip special tokens (padding/unknown)
-                if int(idx) in (pad_idx, unk_idx):
-                    continue
+                if len(outputs) == 1:
+                    scores = outputs[0][0]
+                else:
+                    scores = outputs[-1][0]
+
+                idxs = np.argsort(scores)[::-1][:args.top_k]
+                # Resolve special-token indices once
                 try:
-                    tag_name = vocab.get_tag_from_index(int(idx))
-                except ValueError:
-                    # Defensive: ignore corrupted/placeholder tags
-                    continue
-                tags.append(TagPrediction(name=tag_name, score=score))
+                    pad_idx = vocab.tag_to_index.get(getattr(vocab, "pad_token", "<PAD>"), 0)
+                except Exception:
+                    pad_idx = 0
+                unk_idx = getattr(vocab, "unk_index",
+                                  vocab.tag_to_index.get(getattr(vocab, "unk_token", "<UNK>"), 1))
 
-            # Conditionally filter the gray_background tag if we added it
-            if was_composited:
-                tags = [tag for tag in tags if tag.name != 'gray_background']
+                tags = []
+                for idx in idxs:
+                    score = float(scores[idx])
+                    if score < args.threshold:
+                        continue
+                    # Skip special tokens (padding/unknown)
+                    if int(idx) in (pad_idx, unk_idx):
+                        continue
+                    try:
+                        tag_name = vocab.get_tag_from_index(int(idx))
+                    except ValueError:
+                        # Defensive: ignore corrupted/placeholder tags
+                        continue
+                    tags.append(TagPrediction(name=tag_name, score=score))
 
-            results.append(ImagePrediction(
-                image=path,
-                tags=tags,
-                processing_time=int((time.time() - start) * 1000)
-            ))
+                # Conditionally filter the gray_background tag if we added it
+                if was_composited:
+                    tags = [tag for tag in tags if tag.name != 'gray_background']
+
+                results.append(ImagePrediction(
+                    image=path,
+                    tags=tags,
+                    processing_time=int((time.time() - start) * 1000)
+                ))
+
+            except Exception as e:
+                logger.error(f"Inference failed for {path}: {e}")
+                # Add failed result
+                results.append(ImagePrediction(
+                    image=path,
+                    tags=[],
+                    processing_time=int((time.time() - start) * 1000),
+                    error=str(e)
+                ))
 
         metadata = RunMetadata(
             top_k=args.top_k,

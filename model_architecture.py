@@ -4,6 +4,7 @@ Model Architecture for Anime Image Tagger - Direct Training (modified)
 Vision Transformer adjusted for orientation-aware tagger
 """
 
+import functools
 import math
 import warnings
 from dataclasses import dataclass, fields
@@ -26,11 +27,30 @@ def _check_flash_attention_available() -> bool:
     if not hasattr(F, 'scaled_dot_product_attention'):
         return False
 
-    # Check PyTorch version - SDPA was added in 2.0, stabilized in 2.1
+    # Parse PyTorch version robustly
     try:
-        torch_version = tuple(map(int, torch.__version__.split('.')[:2]))
-    except (ValueError, AttributeError):
-        # Cannot parse version, assume not supported
+        version_str = torch.__version__
+
+        # Strip common suffixes: +cu118, +rocm5.2, a0+git123, etc.
+        # Keep only the numeric version: "2.1.0+cu118" -> "2.1.0"
+        version_clean = version_str.split('+')[0]  # Remove + and everything after
+
+        # Handle dev/alpha/beta versions: "2.1.0a0" -> "2.1.0"
+        for suffix in ['a', 'b', 'rc', 'dev']:
+            if suffix in version_clean:
+                version_clean = version_clean.split(suffix)[0]
+
+        # Parse major.minor only
+        parts = version_clean.split('.')[:2]
+        torch_version = tuple(int(p) for p in parts)
+
+    except (ValueError, AttributeError, IndexError) as e:
+        # Log the parsing failure for diagnostics
+        warnings.warn(
+            f"Failed to parse PyTorch version '{torch.__version__}': {e}. "
+            f"Assuming flash attention is not supported. "
+            f"If you believe this is an error, please report it."
+        )
         return False
 
     if torch_version < (2, 0):
@@ -58,7 +78,7 @@ class LayerNormFp32(nn.LayerNorm):
 class VisionTransformerConfig:
     """Configuration for the Vision Transformer used in direct training."""
     image_size: int = 640
-    # Ensure the patch size divides the image size evenly (e.g. 16) to avoid losing border information
+    # Patch size must divide image_size evenly to avoid losing border information (validated in __post_init__)
     patch_size: int = 16
     num_channels: int = 3
     hidden_size: int = 1280
@@ -83,6 +103,7 @@ class VisionTransformerConfig:
     logit_clamp_value: Optional[float] = 15.0
 
     def __post_init__(self):
+        # Validate drop_path_rate
         assert 0.0 <= self.drop_path_rate < 1.0, (
             f"drop_path_rate must be in [0, 1), got {self.drop_path_rate}"
         )
@@ -90,6 +111,51 @@ class VisionTransformerConfig:
             warnings.warn(
                 f"drop_path_rate={self.drop_path_rate} is unusually high; "
                 "values between 0.08 and 0.3 are typical for ViT."
+            )
+
+        # Validate image_size and patch_size
+        if self.image_size <= 0:
+            raise ValueError(
+                f"image_size must be positive, got {self.image_size}"
+            )
+
+        if self.patch_size <= 0:
+            raise ValueError(
+                f"patch_size must be positive, got {self.patch_size}"
+            )
+
+        if self.image_size % self.patch_size != 0:
+            # Calculate valid alternatives
+            valid_sizes = [
+                s for s in [224, 256, 384, 448, 512, 576, 640, 768, 896, 1024]
+                if s % self.patch_size == 0 and abs(s - self.image_size) < 200
+            ]
+
+            raise ValueError(
+                f"image_size ({self.image_size}) must be evenly divisible by "
+                f"patch_size ({self.patch_size}). "
+                f"Current: {self.image_size} % {self.patch_size} = {self.image_size % self.patch_size}. "
+                f"\n\nSuggested fixes:"
+                f"\n  1. Use a standard image size: {valid_sizes if valid_sizes else 'N/A'}"
+                f"\n  2. Change patch_size to a factor of {self.image_size}: "
+                f"{[d for d in [8, 14, 16, 20, 32] if self.image_size % d == 0]}"
+                f"\n  3. Adjust image_size to nearest multiple of {self.patch_size}: "
+                f"{(self.image_size // self.patch_size) * self.patch_size} or "
+                f"{((self.image_size // self.patch_size) + 1) * self.patch_size}"
+            )
+
+        # Validate computed values make sense
+        num_patches = (self.image_size // self.patch_size) ** 2
+        if num_patches < 4:
+            warnings.warn(
+                f"Very few patches ({num_patches}) with image_size={self.image_size} "
+                f"and patch_size={self.patch_size}. Model may underperform."
+            )
+
+        if num_patches > 10000:
+            warnings.warn(
+                f"Very many patches ({num_patches}) with image_size={self.image_size} "
+                f"and patch_size={self.patch_size}. May cause memory issues."
             )
 
 
@@ -155,10 +221,10 @@ class TransformerBlock(nn.Module):
             # Invert it for SDPA.
             attn_mask = None
             if key_padding_mask is not None:
-                # If any sample masks all positions, fail fast
+                # Only validate in debug mode to avoid expensive GPU-CPU synchronization
                 # Note: During tracing, this check is skipped to avoid control flow issues.
                 # The model can still handle this case since CLS token is never masked.
-                if not torch.jit.is_tracing():
+                if self.config.check_numerical_stability and not torch.jit.is_tracing():
                     if key_padding_mask.all(dim=1).any().item():
                         raise RuntimeError("key_padding_mask masks all keys for at least one sample.")
                 # Invert for SDPA: True=keep, False=mask
@@ -337,8 +403,9 @@ class SimplifiedTagger(nn.Module):
             attn_kpm = torch.cat([cls_keep, token_ignore], dim=1) # (B, 1+Lp) True=IGNORE
 
         if attn_kpm is not None:
-            # If any sample masks all positions, fail fast (skip inside tracing)
-            if not torch.jit.is_tracing():
+            # Only validate in debug mode to avoid expensive GPU-CPU synchronization
+            # (skip inside tracing to avoid control flow issues)
+            if self.config.check_numerical_stability and not torch.jit.is_tracing():
                 if attn_kpm.all(dim=1).any().item():
                     raise RuntimeError("attn_kpm masks all keys for at least one sample.")
 
@@ -349,11 +416,10 @@ class SimplifiedTagger(nn.Module):
                 # This is to fix the CheckpointError where recomputed values have different metadata.
                 if attn_kpm is not None:
                     # checkpoint requires tensor args; pass mask explicitly
-                    # Lambda creates new function object each call, but overhead is negligible
-                    # compared to the checkpoint recomputation cost
+                    # Use functools.partial to avoid creating new lambda on each iteration
+                    wrapper = functools.partial(block, key_padding_mask=attn_kpm)
                     x = torch.utils.checkpoint.checkpoint(
-                        lambda _x, _m: block(_x, key_padding_mask=_m), x, attn_kpm,
-                        use_reentrant=True
+                        wrapper, x, use_reentrant=True
                     )
                 else:
                     x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=True)
