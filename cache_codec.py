@@ -58,11 +58,20 @@ def decode_tensor(b: bytes, key: Optional[bytes | str] = None) -> torch.Tensor:
             raise ValueError("HMAC verification failed")
         data = payload
         return load(data)["t"]
+    # Non-HMAC: try direct load, then legacy fallback
     try:
         return load(data)["t"]
-    except Exception:
-        # legacy fallback: skip digest prefix
-        return load(data[_DIGEST_SIZE:])["t"]
+    except (RuntimeError, KeyError) as e:
+        # safetensors.load raises RuntimeError for invalid format
+        # KeyError if "t" key missing
+        # Try legacy fallback if data is long enough
+        if len(data) > _DIGEST_SIZE:
+            try:
+                return load(data[_DIGEST_SIZE:])["t"]
+            except (RuntimeError, KeyError):
+                pass  # Fallback failed
+        # Re-raise original error
+        raise ValueError(f"Failed to decode cache entry: {e}") from e
 
 
 __all__ = ["encode_tensor", "decode_tensor"]

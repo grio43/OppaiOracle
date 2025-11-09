@@ -98,24 +98,33 @@ class DanbooruDataPreprocessor:
             if ignored_tags:
                 logger.info(f"Ignoring {len(ignored_tags)} additional tags specified in code")
         
-        # Load vocabulary (using pickle for speed): changed to json for compatibility
-        vocab_pkl = vocab_path / 'vocabulary.json'
-        
-        # Also check if vocab_path itself is the JSON file
-        if not vocab_pkl.exists() and vocab_path.suffix == '.json' and vocab_path.exists():
-            vocab_pkl = vocab_path
-        
-        if vocab_pkl.exists():
-            #with open(vocab_pkl, 'rb') as f:
-                #vocab_data = pickle.load(f)
-            with open(vocab_pkl, 'r', encoding="utf-8") as f:
+        # Load and validate vocabulary
+        vocab_file = self._resolve_vocab_file(vocab_path)
+
+        if not vocab_file.exists():
+            raise FileNotFoundError(
+                f"Vocabulary file not found at {vocab_file}. "
+                f"Run vocabulary building script first."
+            )
+
+        try:
+            with open(vocab_file, 'r', encoding="utf-8") as f:
                 vocab_data = json.load(f)
-                self.tag_to_index = vocab_data['tag_to_index']
-                self.index_to_tag = vocab_data['index_to_tag']
-                self.tag_counts = vocab_data['tag_frequencies']
-                # self.frequency_buckets = vocab_data['frequency_buckets']
-        else:
-            raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Invalid JSON in vocabulary file {vocab_file}: {e}"
+            ) from e
+
+        # Validate structure
+        self._validate_vocabulary_structure(vocab_data, vocab_file)
+
+        # Load validated data
+        self.tag_to_index = vocab_data['tag_to_index']
+        self.index_to_tag = vocab_data['index_to_tag']
+        self.tag_counts = vocab_data.get('tag_frequencies', {})
+
+        # Validate consistency
+        self._validate_vocabulary_consistency(vocab_file)
 
         self.vocab_size = len(self.tag_to_index)
         logger.info(f"Loaded vocabulary with {self.vocab_size} tags")
@@ -128,7 +137,18 @@ class DanbooruDataPreprocessor:
             'questionable': 2,
             'explicit': 3
         }
-        
+
+        # Pre-compute quality indicators (once, not per batch)
+        self.quality_indicators = {
+            'best_quality', 'high_quality', 'masterpiece',
+            'highres', 'absurdres', 'incredibly_absurdres'
+        }
+
+        self.negative_indicators = {
+            'low_quality', 'worst_quality', 'bad_anatomy',
+            'bad_proportions', 'error', 'missing_limbs'
+        }
+
         # Statistics tracking
         self.batch_stats = {
             'total_duplicates_removed': 0,
@@ -136,7 +156,149 @@ class DanbooruDataPreprocessor:
             'files_with_all_oov': 0,
             'total_oov_tags': 0
         }
-    
+
+    def _resolve_vocab_file(self, vocab_path: Path) -> Path:
+        """Resolve vocabulary file path."""
+        vocab_path = Path(vocab_path)
+
+        # If path is a directory, look for vocabulary.json inside
+        if vocab_path.is_dir():
+            return vocab_path / 'vocabulary.json'
+
+        # If path is a JSON file, use it
+        if vocab_path.suffix == '.json' and vocab_path.exists():
+            return vocab_path
+
+        # Try appending .json if no extension
+        if vocab_path.suffix == '':
+            candidate = vocab_path.with_suffix('.json')
+            if candidate.exists():
+                return candidate
+
+        # Try looking for vocabulary.json in the same directory
+        candidate = vocab_path / 'vocabulary.json'
+        if candidate.exists():
+            return candidate
+
+        # Return original path (will fail with clear error in caller)
+        return vocab_path
+
+    def _validate_vocabulary_structure(self, vocab_data: dict, vocab_file: Path) -> None:
+        """Validate that vocabulary JSON has correct structure.
+
+        Args:
+            vocab_data: Loaded JSON data
+            vocab_file: Path to vocabulary file (for error messages)
+
+        Raises:
+            ValueError: If structure is invalid
+        """
+        # Check required fields
+        required_fields = ['tag_to_index', 'index_to_tag']
+        missing_fields = [f for f in required_fields if f not in vocab_data]
+
+        if missing_fields:
+            raise ValueError(
+                f"Vocabulary file {vocab_file} is missing required fields: {missing_fields}. "
+                f"Expected fields: {required_fields}"
+            )
+
+        # Validate tag_to_index is a dict with string keys and int values
+        tag_to_index = vocab_data['tag_to_index']
+        if not isinstance(tag_to_index, dict):
+            raise ValueError(
+                f"Vocabulary field 'tag_to_index' must be a dict, "
+                f"got {type(tag_to_index).__name__}"
+            )
+
+        # Check a sample of entries for correct types
+        sample_size = min(10, len(tag_to_index))
+        for tag, idx in list(tag_to_index.items())[:sample_size]:
+            if not isinstance(tag, str):
+                raise ValueError(
+                    f"Vocabulary 'tag_to_index' keys must be strings, "
+                    f"found {type(tag).__name__}: {tag}"
+                )
+            if not isinstance(idx, int):
+                raise ValueError(
+                    f"Vocabulary 'tag_to_index' values must be integers, "
+                    f"found {type(idx).__name__} for tag '{tag}'"
+                )
+
+        # Validate index_to_tag is a dict with string keys (will be converted to int) and string values
+        index_to_tag = vocab_data['index_to_tag']
+        if not isinstance(index_to_tag, dict):
+            raise ValueError(
+                f"Vocabulary field 'index_to_tag' must be a dict, "
+                f"got {type(index_to_tag).__name__}"
+            )
+
+        # Convert string keys to integers (JSON converts int keys to strings)
+        try:
+            # Validate that keys can be converted to integers
+            for key in list(index_to_tag.keys())[:sample_size]:
+                int(key)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Vocabulary 'index_to_tag' keys must be integer-convertible strings, "
+                f"found non-numeric key: {key}"
+            ) from e
+
+        # Check values are strings
+        for key, tag in list(index_to_tag.items())[:sample_size]:
+            if not isinstance(tag, str):
+                raise ValueError(
+                    f"Vocabulary 'index_to_tag' values must be strings, "
+                    f"found {type(tag).__name__} for index {key}"
+                )
+
+        # Validate tag_frequencies if present
+        if 'tag_frequencies' in vocab_data:
+            tag_frequencies = vocab_data['tag_frequencies']
+            if not isinstance(tag_frequencies, dict):
+                raise ValueError(
+                    f"Vocabulary field 'tag_frequencies' must be a dict, "
+                    f"got {type(tag_frequencies).__name__}"
+                )
+
+    def _validate_vocabulary_consistency(self, vocab_file: Path) -> None:
+        """Validate that vocabulary mappings are consistent.
+
+        Args:
+            vocab_file: Path to vocabulary file (for error messages)
+
+        Raises:
+            ValueError: If mappings are inconsistent
+        """
+        # Convert index_to_tag keys to integers
+        self.index_to_tag = {int(k): v for k, v in self.index_to_tag.items()}
+
+        # Check that mappings are inverses (sample check for performance)
+        sample_size = min(100, len(self.tag_to_index))
+        sample_tags = list(self.tag_to_index.keys())[:sample_size]
+
+        inconsistencies = []
+        for tag in sample_tags:
+            idx = self.tag_to_index[tag]
+
+            # Check reverse mapping
+            if idx not in self.index_to_tag:
+                inconsistencies.append(
+                    f"Tag '{tag}' maps to index {idx}, "
+                    f"but index {idx} not in index_to_tag"
+                )
+            elif self.index_to_tag[idx] != tag:
+                inconsistencies.append(
+                    f"Tag '{tag}' maps to index {idx}, "
+                    f"but index {idx} maps back to '{self.index_to_tag[idx]}'"
+                )
+
+        if inconsistencies:
+            raise ValueError(
+                f"Vocabulary file {vocab_file} has inconsistent mappings:\n" +
+                "\n".join(f"  - {inc}" for inc in inconsistencies[:10])
+            )
+
     def process_metadata_batch(self, json_files: List[Path]) -> Dict:
         """Process a batch of JSON metadata files - FIXED VERSION"""
         # Reset batch statistics for this batch
@@ -154,16 +316,11 @@ class DanbooruDataPreprocessor:
             'tag_counts': [],  # Number of tags per image
             'quality_scores': []  # Based on tag count and presence of quality tags
         }
-        
-        quality_indicators = {
-            'best_quality', 'high_quality', 'masterpiece', 
-            'highres', 'absurdres', 'incredibly_absurdres'
-        }
-        
-        negative_indicators = {
-            'low_quality', 'worst_quality', 'bad_anatomy',
-            'bad_proportions', 'error', 'missing_limbs'
-        }
+
+        # Use instance variables instead of recreating sets
+        tag_to_index = self.tag_to_index
+        quality_indicators = self.quality_indicators
+        negative_indicators = self.negative_indicators
         
         for json_file in json_files:
             try:
@@ -221,13 +378,14 @@ class DanbooruDataPreprocessor:
                         batch_stats['files_with_duplicates'] += 1
                         logger.debug(f"Removed {dedupe_count} duplicate tags from {filename}")
                     
-                    # Convert tags to indices
+                    # Convert tags to indices (optimized with .get())
                     tag_indices = []
                     oov_count = 0
-                    
+
                     for tag in tags_list:
-                        if tag in self.tag_to_index:
-                            tag_indices.append(self.tag_to_index[tag])
+                        idx = tag_to_index.get(tag)
+                        if idx is not None:
+                            tag_indices.append(idx)
                         else:
                             # ISSUE-010 FIX: Track OOV tags
                             oov_count += 1
@@ -244,15 +402,14 @@ class DanbooruDataPreprocessor:
                         logger.warning(f"Skipping {filename}: all {len(tags_list)} tags are OOV")
                         continue
                     
-                    # Calculate quality score
+                    # Calculate quality score (optimized with set intersection)
                     quality_score = len(tag_indices) * 0.1  # Base score from tag count
-                    
-                    for tag in tags_list:
-                        if tag in quality_indicators:
-                            quality_score += 2.0
-                        elif tag in negative_indicators:
-                            quality_score -= 1.0
-                    
+
+                    tags_set = set(tags_list)
+                    quality_bonus = len(tags_set & quality_indicators) * 2.0
+                    quality_penalty = len(tags_set & negative_indicators) * 1.0
+
+                    quality_score += quality_bonus - quality_penalty
                     quality_score = max(0.1, min(10.0, quality_score))  # Clamp between 0.1 and 10
                     
                     # Store results
@@ -271,10 +428,9 @@ class DanbooruDataPreprocessor:
                 logger.error(f"Error processing {json_file}: {e}")
                 continue
 
-            # Return both results and stats
-            results['batch_stats'] = batch_stats
+        # Attach batch stats after processing all files
+        results['batch_stats'] = batch_stats
 
-        
         return results
     
     def prepare_training_data(self, 

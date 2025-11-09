@@ -8,10 +8,14 @@ Lightning settings with the unified configuration.
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
+from typing import Any
 
 import pytorch_lightning as pl
 from safetensors.torch import save_file
+
+logger = logging.getLogger(__name__)
 import torch
 
 from Configuration_System import load_config
@@ -32,23 +36,62 @@ class OppaiDataModule(pl.LightningDataModule):
     def setup(self, stage: str | None = None) -> None:
         from dataset_loader import create_dataloaders  # lazy import to avoid side effects at import-time
 
-        data_cfg = getattr(self.config, "data", None)
-        val_cfg = getattr(self.config, "validation", None)
+        # Validate config structure early
+        if not hasattr(self.config, "data"):
+            raise ValueError(
+                "Configuration missing 'data' section. "
+                "Please provide valid unified_config.yaml"
+            )
 
-        # Pick first enabled storage location
+        data_cfg = self.config.data
+
+        if not hasattr(self.config, "validation"):
+            raise ValueError(
+                "Configuration missing 'validation' section. "
+                "Please provide valid unified_config.yaml"
+            )
+
+        val_cfg = self.config.validation
+
+        # Validate storage locations
+        if not hasattr(data_cfg, "storage_locations"):
+            raise ValueError(
+                "Configuration missing data.storage_locations. "
+                "Please specify data storage paths in config."
+            )
+
+        storage_locations = data_cfg.storage_locations
+
+        if not storage_locations:
+            raise ValueError(
+                "No storage locations configured. "
+                "Please add at least one storage location to config.data.storage_locations"
+            )
+
+        # Find enabled storage location
         active_data_path: str | None = None
-        storage_locations = getattr(data_cfg, "storage_locations", []) or []
-        for loc in storage_locations:
-            try:
-                enabled = bool(loc.get("enabled", False)) if isinstance(loc, dict) else bool(getattr(loc, "enabled", False))
-                path = loc.get("path") if isinstance(loc, dict) else getattr(loc, "path", None)
-            except Exception:
-                enabled, path = False, None
-            if enabled and path:
-                active_data_path = str(path)
+
+        for i, loc in enumerate(storage_locations):
+            # Validate location structure
+            if not hasattr(loc, "enabled"):
+                raise ValueError(
+                    f"Storage location {i} missing 'enabled' field"
+                )
+            if not hasattr(loc, "path"):
+                raise ValueError(
+                    f"Storage location {i} missing 'path' field"
+                )
+
+            if loc.enabled:
+                active_data_path = str(loc.path)
+                logger.info(f"Using storage location: {active_data_path}")
                 break
+
         if not active_data_path:
-            raise RuntimeError("No enabled storage location found in config.data.storage_locations")
+            raise ValueError(
+                "No enabled storage location found in config.data.storage_locations. "
+                "Please enable at least one storage location."
+            )
 
         vocab_path = getattr(self.config, "vocab_path", None)
         if not vocab_path:

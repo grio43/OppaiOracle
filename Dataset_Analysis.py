@@ -320,9 +320,9 @@ class ImageAnalyzer:
         return stats
     
     def _compute_file_hash(self, path: Path) -> str:
-        """Compute file hash"""
+        """Compute file hash using SHA-256"""
         try:
-            hasher = hashlib.md5()
+            hasher = hashlib.sha256()
             with open(path, 'rb') as f:
                 for chunk in iter(lambda: f.read(65536), b''):
                     hasher.update(chunk)
@@ -730,15 +730,22 @@ class DatasetAnalyzer:
             self._flush_stats_buffer()
 
     def _analyze_images_parallel(self, image_paths: List[Path]):
-        """Analyze images in parallel"""
+        """Analyze images in parallel with proper resource cleanup."""
         from itertools import repeat
+        import concurrent.futures
+
         n = len(image_paths)
         max_outstanding = max(self.config.num_workers * 4, self.config.num_workers)
-        with ProcessPoolExecutor(max_workers=self.config.num_workers) as executor:
+
+        executor = ProcessPoolExecutor(max_workers=self.config.num_workers)
+        futures = {}
+
+        try:
             # Prime a bounded window of futures to avoid memory spikes
             it = iter(path.as_posix() for path in image_paths)
             futures = {executor.submit(_analyze_single_image_worker, p, self.config): p
                        for p in islice(it, max_outstanding)}
+
             with tqdm(total=n, desc="Analyzing images (parallel)") as pbar:
                 while futures:
                     # Recreate as_completed each loop so newly-submitted tasks are tracked
@@ -752,6 +759,9 @@ class DatasetAnalyzer:
                             if stats:
                                 self.image_stats_buffer.append(stats)
                                 self.duplicate_detector.add_image(stats)
+                        except concurrent.futures.TimeoutError:
+                            logger.error(f"Timeout analyzing {path_str}")
+                            fut.cancel()  # Cancel the timed-out future
                         except Exception as e:
                             logger.error(f"Error analyzing {path_str}: {e}")
                         finally:
@@ -762,6 +772,20 @@ class DatasetAnalyzer:
                                 futures[executor.submit(_analyze_single_image_worker, next_path, self.config)] = next_path
                             # break to refresh as_completed() with the updated set
                             break
+        except KeyboardInterrupt:
+            logger.info("Interrupted, cancelling remaining tasks...")
+            for fut in futures:
+                fut.cancel()
+            raise
+        except Exception as e:
+            logger.error(f"Error in parallel processing: {e}")
+            # Cancel remaining futures
+            for fut in futures:
+                fut.cancel()
+            raise
+        finally:
+            # Ensure executor shuts down cleanly
+            executor.shutdown(wait=True, cancel_futures=True)
     
     def _analyze_single_image_safe(self, path: Path) -> Optional[ImageStats]:
         """Safely analyze a single image (for parallel processing)"""
@@ -783,13 +807,14 @@ def _analyze_single_image_worker(path_str: str, config: AnalysisConfig) -> Optio
     except Exception:
         # Workers shouldn't be too chatty; the main process logs failures on result retrieval.
         return None
-    
-    def _flush_stats_buffer(self):
-        """Flush stats buffer to main list"""
-        self.image_stats.extend(self.image_stats_buffer)
-        self.image_stats_buffer.clear()
-    
-    def _analyze_tags(self, image_paths: List[Path]) -> Dict[str, Any]:
+
+# --- Rest of DatasetAnalyzer methods (was incorrectly indented inside worker function) ---
+def _flush_stats_buffer(self):
+    """Flush stats buffer to main list"""
+    self.image_stats.extend(self.image_stats_buffer)
+    self.image_stats_buffer.clear()
+
+def _analyze_tags(self, image_paths: List[Path]) -> Dict[str, Any]:
         """Analyze tag distributions"""
         logger.info("Analyzing tags...")
         
@@ -1149,6 +1174,7 @@ def _analyze_single_image_worker(path_str: str, config: AnalysisConfig) -> Optio
         html.append("""<!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <title>Dataset Analysis Report</title>
     <style>
         body { font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }
@@ -1234,7 +1260,7 @@ def _analyze_single_image_worker(path_str: str, config: AnalysisConfig) -> Optio
         
         # Save report
         output_path = self.output_dir / 'analysis_report.html'
-        with open(output_path, 'w') as f:
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(html))
         
         logger.info(f"Saved HTML report to {output_path}")
@@ -1255,17 +1281,47 @@ def _analyze_single_image_worker(path_str: str, config: AnalysisConfig) -> Optio
     
     def save_cache(self):
         """Save analysis cache for faster re-analysis"""
-        cache_file = self.cache_dir / 'analysis_cache.json'
-        cache_data = {
-            'schema': 1,
-            'image_stats': [asdict(s) for s in self.image_stats],
-            'dataset_stats': asdict(self.dataset_stats),
-            'tag_counts': dict(self.tag_analyzer.tag_counts),
-            'timestamp': datetime.now().isoformat()
-        }
+        try:
+            cache_file = self.cache_dir / 'analysis_cache.json'
 
-        cache_file.write_text(json.dumps(cache_data), encoding='utf-8')
-        logger.info("Saved cache to %s", cache_file)
+            # Convert image stats with proper serialization
+            def convert_stats(stats) -> dict:
+                d = asdict(stats)
+                # Convert tuples to lists for JSON
+                if d.get('mean_color'):
+                    d['mean_color'] = list(d['mean_color'])
+                if d.get('std_color'):
+                    d['std_color'] = list(d['std_color'])
+                # Convert numpy types and tuples to JSON-serializable types
+                for key, value in d.items():
+                    if isinstance(value, tuple):
+                        d[key] = list(value)
+                    elif hasattr(value, 'item'):  # numpy scalar
+                        d[key] = value.item()
+                    elif isinstance(value, (np.floating, np.complexfloating)):
+                        d[key] = float(value)
+                    elif isinstance(value, (np.integer, np.unsignedinteger)):
+                        d[key] = int(value)
+                return d
+
+            cache_data = {
+                'schema': 1,
+                'image_stats': [convert_stats(s) for s in self.image_stats],
+                'dataset_stats': asdict(self.dataset_stats),
+                'tag_counts': dict(self.tag_analyzer.tag_counts),
+                'timestamp': datetime.now().isoformat()
+            }
+
+            # Use custom encoder for any remaining issues
+            cache_file.write_text(
+                json.dumps(cache_data, indent=2, default=str),
+                encoding='utf-8'
+            )
+            logger.info("Saved cache to %s", cache_file)
+        except (OSError, IOError) as e:
+            logger.error(f"Failed to save cache: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error saving cache: {e}")
     
     def load_cache(self) -> bool:
         """Load analysis cache if available"""

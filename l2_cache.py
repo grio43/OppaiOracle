@@ -37,6 +37,8 @@ class LMDBReader:
         # Retry readonly open with backoff to avoid races with writer bootstrapping
         attempts = 3
         env = None
+        last_error: Optional[Exception] = None
+
         for i in range(attempts):
             try:
                 _wait_for_env_files(path)
@@ -51,12 +53,25 @@ class LMDBReader:
                     max_dbs=1,
                 )
                 break
-            except lmdb.Error:
+            except lmdb.Error as e:
+                last_error = e
                 if i < attempts - 1:
                     time.sleep(0.05)
-                else:
-                    raise
-        self.env = env
+            except Exception as e:
+                # Catch non-LMDB errors (OSError, PermissionError, etc.)
+                last_error = e
+                if i < attempts - 1:
+                    time.sleep(0.05)
+
+        # Ensure env was successfully opened
+        if env is None:
+            raise RuntimeError(
+                f"Failed to open LMDB environment at {path} after {attempts} attempts. "
+                f"Last error: {last_error}. "
+                f"Check that the path exists, is readable, and is a valid LMDB database."
+            )
+
+        self.env: lmdb.Environment = env
 
     def get(self, key: bytes) -> Optional[bytes]:
         # short-lived read txns so the writer never waits on us
@@ -98,17 +113,20 @@ class _WriterProc(mp.Process):
         q: mp.Queue,
         batch_items: int = 512,
         batch_bytes: int = 64 << 20,   # 64MB
-        flush_ms: int = 50
+        flush_ms: int = 50,
+        max_map_size_multiplier: int = 10  # Maximum growth factor
     ):
         super().__init__(daemon=True)
         self.path = path
         self.map_size_bytes = map_size_bytes
+        self.max_map_size = map_size_bytes * max_map_size_multiplier
         self.q = q
         self.batch_items = batch_items
         self.batch_bytes = batch_bytes
         self.flush_s = flush_ms / 1000.0
         self._running = mp.Event()
         self._running.set()
+        self._in_flush = False  # Guard against re-entrant flush calls
 
     def run(self) -> None:
         env = lmdb.open(
@@ -132,28 +150,76 @@ class _WriterProc(mp.Process):
             nonlocal pending, pending_bytes, last_flush
             if not pending:
                 return
+
+            # Guard against re-entry (e.g., from signal handler)
+            if self._in_flush:
+                logging.warning("flush_pending called re-entrantly, skipping")
+                return
+
+            self._in_flush = True
             try:
                 with env.begin(write=True) as txn:
                     for k, v in pending:
                         txn.put(k, v, overwrite=True)
             except lmdb.MapFullError:
                 info = env.info()
-                new_size = int(max(self.map_size_bytes, info.get("map_size", self.map_size_bytes)) * 2)
-                env.set_mapsize(new_size)
-                with env.begin(write=True) as txn:
-                    for k, v in pending:
-                        txn.put(k, v, overwrite=True)
-            pending.clear()
-            pending_bytes = 0
-            last_flush = time.monotonic()
+                current_size = info.get("map_size", self.map_size_bytes)
+                new_size = int(max(self.map_size_bytes, current_size) * 2)
+
+                # Check against maximum
+                if new_size > self.max_map_size:
+                    logging.error(
+                        f"L2 cache map size would exceed maximum: "
+                        f"current={current_size / (1024**3):.2f}GB, "
+                        f"requested={new_size / (1024**3):.2f}GB, "
+                        f"max={self.max_map_size / (1024**3):.2f}GB. "
+                        f"Consider increasing max_map_size or reducing cache usage."
+                    )
+                    # Try setting to max instead of failing entirely
+                    new_size = self.max_map_size
+
+                    # Last chance: try with max size
+                    try:
+                        env.set_mapsize(new_size)
+                        with env.begin(write=True) as txn:
+                            for k, v in pending:
+                                txn.put(k, v, overwrite=True)
+                    except lmdb.MapFullError:
+                        # Can't grow anymore, cache is truly full
+                        logging.critical(
+                            f"L2 cache is full and cannot grow beyond "
+                            f"{new_size / (1024**3):.2f}GB. "
+                            f"Writes will be dropped. "
+                            f"Increase max_map_size or clear the cache."
+                        )
+                        # Drop the batch to avoid blocking
+                        return
+
+                else:
+                    # Log resize warnings for significant growth
+                    growth_factor = new_size / self.map_size_bytes
+                    if growth_factor >= 4:
+                        logging.warning(
+                            f"L2 cache map size growing significantly: "
+                            f"{current_size / (1024**3):.2f}GB → {new_size / (1024**3):.2f}GB "
+                            f"({growth_factor:.1f}x initial size). "
+                            f"This may indicate excessive cache usage."
+                        )
+
+                    env.set_mapsize(new_size)
+                    with env.begin(write=True) as txn:
+                        for k, v in pending:
+                            txn.put(k, v, overwrite=True)
+
+            finally:
+                pending.clear()
+                pending_bytes = 0
+                last_flush = time.monotonic()
+                self._in_flush = False
 
         def _shutdown(*_):
-            # flush pending writes and stop
+            """Signal handler: just set flag, don't do work."""
             self._running.clear()
-            try:
-                flush_pending()
-            except Exception as e:
-                logging.warning(f"L2 cache writer shutdown flush failed: {e}")
 
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
@@ -179,20 +245,23 @@ class _WriterProc(mp.Process):
             ):
                 flush_pending()
 
-        # Final flush
-        try:
-            flush_pending()
-            env.close()
-        except Exception as e:
-            logging.warning(f"L2 cache writer final flush failed: {e}")
+        # Final flush (only if not already flushing from signal)
+        if not self._in_flush:
+            try:
+                flush_pending()
+                env.close()
+            except Exception as e:
+                logging.warning(f"L2 cache writer final flush failed: {e}")
 
-def start_l2_writer(path: str, map_size_bytes: int) -> Tuple[mp.Queue, mp.Process]:
+def start_l2_writer(path: str, map_size_bytes: int, max_map_size_multiplier: int = 10) -> Tuple[mp.Queue, mp.Process]:
     """
     Starts and returns a dedicated L2 cache writer process and its command queue.
 
     Args:
         path: The directory path for the LMDB environment.
         map_size_bytes: The initial size of the LMDB memory map.
+        max_map_size_multiplier: Maximum growth factor for map size (default: 10x).
+            For example, if map_size_bytes=100GB and multiplier=10, max is 1TB.
 
     Returns:
         A tuple containing the multiprocessing queue for commands and the
@@ -209,7 +278,7 @@ def start_l2_writer(path: str, map_size_bytes: int) -> Tuple[mp.Queue, mp.Proces
     q_max = int(_os.environ.get("L2_WRITER_QUEUE_MAX", "1024"))
     # Keep a floor to avoid pathological tiny queues.
     q: mp.Queue = ctx.Queue(maxsize=max(64, q_max))
-    proc = _WriterProc(path=path, map_size_bytes=map_size_bytes, q=q)
+    proc = _WriterProc(path=path, map_size_bytes=map_size_bytes, q=q, max_map_size_multiplier=max_map_size_multiplier)
     proc.start()
 
     def _stop():

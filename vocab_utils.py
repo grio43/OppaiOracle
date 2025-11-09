@@ -12,32 +12,42 @@ from pathlib import Path
 from typing import List, Dict
 
 
-def load_vocab(path: str) -> List[str]:
+def load_vocab(path: str, allow_missing: bool = True) -> List[str]:
     """
     Load a vocabulary from a JSON file.  The vocabulary is expected to be a
-    list of tag strings.  If the file does not exist, an empty list is
-    returned.
+    list of tag strings.
 
     Args:
         path: Path to the vocabulary JSON file.
+        allow_missing: If True, return empty list for missing files;
+                      if False, raise FileNotFoundError
     Returns:
         Ordered list of tag names.
     Raises:
+        FileNotFoundError: If file doesn't exist and allow_missing=False
         ValueError: If JSON is invalid, encoding error, or unsupported format
-        RuntimeError: If file cannot be read
+        PermissionError: If file cannot be read due to permissions
+        OSError: If file cannot be read due to I/O error
     """
     p = Path(path)
     if not p.exists():
-        return []
+        if allow_missing:
+            return []
+        raise FileNotFoundError(f"Vocabulary file not found: {path}")
 
     try:
-        data = json.loads(p.read_text(encoding='utf-8'))
+        content = p.read_text(encoding='utf-8')
+    except PermissionError as e:
+        raise PermissionError(f"Permission denied reading vocabulary file {path}: {e}") from e
+    except OSError as e:
+        raise OSError(f"I/O error reading vocabulary file {path}: {e}") from e
+
+    try:
+        data = json.loads(content)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in vocabulary file {path}: {e}")
+        raise ValueError(f"Invalid JSON in vocabulary file {path}: {e}") from e
     except UnicodeDecodeError as e:
-        raise ValueError(f"Encoding error in vocabulary file {path}: {e}. Expected UTF-8.")
-    except Exception as e:
-        raise RuntimeError(f"Failed to read vocabulary file {path}: {e}")
+        raise ValueError(f"Encoding error in vocabulary file {path}: {e}. Expected UTF-8.") from e
 
     # Accept either a list or a dict mapping tag to index.  In the latter case
     # reconstruct the list by sorting by index.

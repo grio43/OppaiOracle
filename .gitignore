@@ -19,3 +19,4 @@ experiments/
 .claude/
 .code-review/
 .vscode/
+sensitive_config.py

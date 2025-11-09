@@ -2,6 +2,7 @@
 # Mirrors the behavior of pl_bolts.optimizers.lr_scheduler.LinearWarmupCosineAnnealingLR
 # so you don't need the pl_bolts package.
 import math
+import warnings
 from typing import List
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
@@ -32,6 +33,18 @@ class LinearWarmupCosineLR(_LRScheduler):
         if warmup_epochs > max_epochs:
             raise ValueError("warmup_epochs cannot exceed max_epochs")
 
+        # Warn about edge case
+        if warmup_epochs == max_epochs:
+            warnings.warn(
+                f"warmup_epochs ({warmup_epochs}) equals max_epochs ({max_epochs}). "
+                f"This means the entire training will be warmup with no cosine annealing. "
+                f"Learning rate will reach base_lr but never anneal to eta_min={eta_min}. "
+                f"This is likely a configuration error. "
+                f"Consider setting warmup_epochs < max_epochs to enable cosine schedule.",
+                UserWarning,
+                stacklevel=2
+            )
+
         self.wwarm = int(warmup_epochs)
         self.max_epochs = int(max_epochs)
         self.warmup_start_lr = float(warmup_start_lr)
@@ -58,7 +71,14 @@ class LinearWarmupCosineLR(_LRScheduler):
             ]
 
         # Cosine phase: from base_lr -> eta_min across remaining epochs
-        total_cosine = max(1, self.max_epochs - self.warmup_epochs)
+        total_cosine = self.max_epochs - self.warmup_epochs
+
+        # Edge case: No cosine phase (warmup == max_epochs)
+        if total_cosine <= 0:
+            # Just return base_lr (warmup completed)
+            return list(base_lrs)
+
+        # Normal cosine schedule
         t = (e - self.warmup_epochs + 1) / total_cosine  # 0..1 over cosine schedule
         t = min(max(t, 0.0), 1.0)
         return [

@@ -9,15 +9,27 @@ import torch
 import torch.nn.functional as F
 
 @torch.no_grad()
-def ensure_pixel_padding_mask(mask: torch.Tensor) -> Optional[torch.Tensor]:
+def ensure_pixel_padding_mask(
+    mask: torch.Tensor,
+    mask_semantics: str = 'auto'
+) -> Optional[torch.Tensor]:
     """
     (mask) -> (B,1,H,W,bool, True=PAD)
     Accepts (B,H,W) or (B,1,H,W) of {bool,uint8,int,float}.
-    Heuristic to flip legacy 'True=valid' masks: if the fraction of True
-    exceeds 0.5 on median sample, assume it's a valid-mask and invert.
+
+    Args:
+        mask: Input mask tensor
+        mask_semantics: Interpretation of True values:
+            - 'auto': Heuristic detection (legacy, unreliable)
+            - 'pad': True means padding (no inversion needed)
+            - 'valid': True means valid pixels (will be inverted)
+
+    Returns:
+        Standardized mask with True=PAD semantics
     """
     if mask is None:
         return None
+
     if mask.dim() == 3:
         mask = mask.unsqueeze(1)  # (B,1,H,W)
     if mask.dim() != 4:
@@ -27,13 +39,28 @@ def ensure_pixel_padding_mask(mask: torch.Tensor) -> Optional[torch.Tensor]:
     if mask.dtype is not torch.bool:
         mask = (mask > 0.5)
 
-    # Detect legacy semantics (True=valid) and invert once here
-    B = mask.shape[0]
-    frac_true = mask.flatten(1).float().mean(dim=1)  # per-sample fraction
-    # If most samples are mostly True, it's almost surely "valid" -> invert
-    # Use torch.where to make this tracer-friendly
-    should_invert = torch.median(frac_true) > 0.5
-    mask = torch.where(should_invert, ~mask, mask)
+    # Apply semantics
+    if mask_semantics == 'valid':
+        # Invert: True=valid -> True=pad
+        mask = ~mask
+    elif mask_semantics == 'pad':
+        # Already correct semantics
+        pass
+    elif mask_semantics == 'auto':
+        # Legacy heuristic (unreliable, deprecated)
+        frac_true = mask.flatten(1).float().mean(dim=1)
+        should_invert = torch.median(frac_true) > 0.5
+        mask = torch.where(should_invert, ~mask, mask)
+        # Log warning in non-tracing mode
+        if not torch.jit.is_tracing():
+            import logging
+            logging.getLogger(__name__).warning(
+                "Using 'auto' mask semantics detection is unreliable. "
+                "Please specify mask_semantics='pad' or 'valid' explicitly."
+            )
+    else:
+        raise ValueError(f"Invalid mask_semantics: {mask_semantics}. Use 'auto', 'pad', or 'valid'.")
+
     return mask
 
 @torch.no_grad()

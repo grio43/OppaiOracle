@@ -5,6 +5,7 @@ from torch.utils.data.distributed import DistributedSampler
 import logging.handlers
 import queue
 import time
+import threading
 from threading import Thread
 
 from pathlib import Path
@@ -18,13 +19,13 @@ from PIL import Image, ImageOps, ImageFile
 # Make torchvision optional at import time; raise only when actually used.
 try:
     from torchvision import transforms  # type: ignore
-except Exception:
+except (ImportError, ModuleNotFoundError):
     transforms = None  # resolved lazily
 # Torchvision v2 joint transforms (optional)
 try:
     from torchvision.transforms import v2 as T
     from torchvision import tv_tensors
-except Exception:  # keep backward compatible
+except (ImportError, ModuleNotFoundError, AttributeError):  # keep backward compatible
     T = None
     tv_tensors = None
 from vocabulary import load_vocabulary_for_training, TagVocabulary
@@ -34,7 +35,7 @@ import hashlib as _hl
 # Orientation-aware flipping (optional; keeps file usable in legacy setups)
 try:
     from orientation_handler import OrientationHandler  # noqa: F401
-except Exception:  # pragma: no cover
+except (ImportError, ModuleNotFoundError):  # pragma: no cover
     OrientationHandler = None  # type: ignore
 from utils.path_utils import sanitize_identifier, validate_image_path, resolve_and_confine
 from utils.metadata_ingestion import parse_tags_field
@@ -71,6 +72,30 @@ _DTYPE_MAP = {
 
 def _canon_dtype(s: str) -> torch.dtype:
     return _DTYPE_MAP.get(str(s).lower(), torch.bfloat16)
+
+# CPU BFloat16 support detection (cached globally)
+_CPU_BF16_SUPPORTED = None
+
+def _is_cpu_bf16_supported() -> bool:
+    """Check if CPU supports bfloat16 operations (cached).
+
+    Returns:
+        True if CPU supports BF16, False otherwise
+    """
+    global _CPU_BF16_SUPPORTED
+    if _CPU_BF16_SUPPORTED is None:
+        try:
+            # Try to create and operate on BF16 tensor
+            test_tensor = torch.tensor([1.0, 2.0], dtype=torch.float32)
+            bf16_tensor = test_tensor.to(torch.bfloat16)
+            # Try a simple operation to ensure it's actually supported
+            _ = bf16_tensor + bf16_tensor
+            _CPU_BF16_SUPPORTED = True
+            logging.getLogger(__name__).debug("CPU bfloat16 support detected")
+        except (RuntimeError, NotImplementedError):
+            _CPU_BF16_SUPPORTED = False
+            logging.getLogger(__name__).info("CPU does not support bfloat16 operations")
+    return _CPU_BF16_SUPPORTED
 
 ## moved to utils/cache_keys.py: compute_l2_cfg_hash
 
@@ -122,12 +147,40 @@ def _try_load_cached_split(root: Path) -> Optional[tuple[list[Path], list[Path]]
     return None
 
 def _write_cached_split(root: Path, train_list: list[Path], val_list: list[Path]) -> None:
+    """Write cached split files. Logs warning on failure but does not raise."""
     train_file, val_file = _split_cache_paths(root)
     try:
-        train_file.write_text("\n".join(str(p) for p in train_list), encoding="utf-8")
-        val_file.write_text("\n".join(str(p) for p in val_list), encoding="utf-8")
-    except Exception:
-        pass
+        # Atomic write pattern: write to temp then rename
+        train_tmp = train_file.with_suffix(".tmp")
+        val_tmp = val_file.with_suffix(".tmp")
+
+        train_tmp.write_text("\n".join(str(p) for p in train_list), encoding="utf-8")
+        val_tmp.write_text("\n".join(str(p) for p in val_list), encoding="utf-8")
+
+        train_tmp.rename(train_file)
+        val_tmp.rename(val_file)
+
+        logging.getLogger(__name__).debug(
+            f"Cached split files written (train={len(train_list)}, val={len(val_list)})"
+        )
+    except OSError as e:
+        # Disk full, permission denied, read-only filesystem
+        logging.getLogger(__name__).warning(
+            f"Failed to write cached split files to {train_file.parent}: {e}. "
+            "Splits will be re-scanned on next run."
+        )
+        # Clean up partial writes
+        for tmp in [train_file.with_suffix(".tmp"), val_file.with_suffix(".tmp")]:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+    except (UnicodeEncodeError, ValueError) as e:
+        # Path contains invalid characters or encoding issues
+        logging.getLogger(__name__).warning(
+            f"Failed to encode split paths: {e}. Cache disabled for this dataset."
+        )
 
 
 def _make_worker_init(log_queue):
@@ -211,17 +264,44 @@ class DatasetLoader(Dataset):
         # L2 storage dtype + CPU bf16 preference
         self._l2_dtype_str = str(l2_storage_dtype).lower()
         self._l2_dtype = _canon_dtype(self._l2_dtype_str)
-        self._cpu_bf16_cache = bool(cpu_bf16_cache_pipeline) if cpu_bf16_cache_pipeline is not None else (self._l2_dtype is torch.bfloat16)
+
+        # Check CPU BF16 support before enabling
+        requested_cpu_bf16 = bool(cpu_bf16_cache_pipeline) if cpu_bf16_cache_pipeline is not None else (self._l2_dtype is torch.bfloat16)
+
+        if requested_cpu_bf16:
+            if _is_cpu_bf16_supported():
+                self._cpu_bf16_cache = True
+                self.logger.debug("CPU BF16 cache pipeline enabled")
+            else:
+                self._cpu_bf16_cache = False
+                self.logger.warning(
+                    "CPU does not support bfloat16 operations. "
+                    "Falling back to float32 for cache operations. "
+                    "This may impact performance. "
+                    "To suppress this warning, set cpu_bf16_cache_pipeline=False in config."
+                )
+        else:
+            self._cpu_bf16_cache = False
 
         # Hash computed after L1 dtype is known (see below)
 
         # Properly initialise background validator (opt-out via env or param)
         if enable_background_validator is None:
             enable_background_validator = os.getenv("DATASET_BACKGROUND_VALIDATOR", "1") != "0"
+
+        # Check if we're in a worker process - if so, disable validator to avoid fork issues
+        worker_info = torch.utils.data.get_worker_info()
+        in_worker = worker_info is not None
+
+        # Only create validator in main process
         self.validator = None
-        if enable_background_validator:
+        if enable_background_validator and not in_worker:
             self.validator = BackgroundValidator(self)
             self.validator.start()
+        elif enable_background_validator and in_worker:
+            self.logger.debug(
+                "Disabled BackgroundValidator in DataLoader worker process"
+            )
 
         # --- L2 cache (read-only in workers) ---
         self._l2_enabled = bool(l2_enabled and l2_cache_path)
@@ -296,6 +376,77 @@ class DatasetLoader(Dataset):
         base = image_key + b"|sz" + sz + b"|flip" + flip
         return base + b"|raw", base + b"|m"
 
+    def _encode_labels(self, annotation: Dict[str, Any]) -> torch.Tensor:
+        """Encode tag labels from annotation to multi-hot vector.
+
+        Args:
+            annotation: Annotation dict with 'labels' field
+
+        Returns:
+            Multi-hot tensor of shape (num_classes,)
+        """
+        tag_indices = annotation.get("labels") or []
+
+        # Validate indices and create multi-hot vector
+        if (
+            isinstance(tag_indices, list)
+            and len(tag_indices) > 0
+            and isinstance(tag_indices[0], (int, float))
+            and self.num_classes
+        ):
+            # Filter invalid indices
+            valid_indices = [
+                int(i) for i in tag_indices
+                if 0 <= int(i) < self.num_classes
+            ]
+
+            tag_vec = torch.zeros(self.num_classes, dtype=torch.float32)
+            if valid_indices:
+                tag_vec.scatter_(
+                    0,
+                    torch.tensor(valid_indices, dtype=torch.long),
+                    1.0,
+                )
+        else:
+            # No valid labels - return zero vector
+            tag_vec = torch.zeros(self.num_classes or 1, dtype=torch.float32)
+
+        return tag_vec
+
+    def _build_sample_dict(
+        self,
+        image: torch.Tensor,
+        padding_mask: torch.Tensor,
+        annotation: Dict[str, Any],
+        image_id: str,
+        cached: bool = False,
+    ) -> Dict[str, Any]:
+        """Build the sample dictionary returned by __getitem__.
+
+        Args:
+            image: Preprocessed image tensor (C, H, W)
+            padding_mask: Boolean padding mask (H, W)
+            annotation: Annotation dict with labels and rating
+            image_id: Image identifier
+            cached: Whether data came from cache
+
+        Returns:
+            Sample dict for training
+        """
+        tag_vec = self._encode_labels(annotation)
+        rating_idx = _map_rating(annotation.get("rating", "unknown"))
+
+        return {
+            "images": image,
+            "padding_mask": padding_mask.to(torch.bool),
+            "tag_labels": tag_vec,
+            "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
+            "image_id": image_id,
+            "cached": cached,
+            "error": False,
+            "error_reason": "",
+        }
+
     def preload_first_n(self, n: int):
         n = int(max(0, n))
         if n == 0 or len(self) == 0:
@@ -304,8 +455,90 @@ class DatasetLoader(Dataset):
             _ = self[i]
 
     def _load_annotations(self, path):
-        with open(path, "r") as f:
-            return json.load(f)
+        """Load annotation JSON file with validation.
+
+        Args:
+            path: Path to annotations JSON file
+
+        Returns:
+            List of annotation dictionaries
+
+        Raises:
+            FileNotFoundError: If annotation file doesn't exist
+            ValueError: If JSON is malformed or has wrong structure
+            RuntimeError: For other I/O errors
+        """
+        path_obj = Path(path)
+
+        # Check file exists first for clearer error message
+        if not path_obj.exists():
+            raise FileNotFoundError(
+                f"Annotation file not found: {path}\n"
+                f"Please check the path and ensure the file exists."
+            )
+
+        # Check file is readable
+        if not path_obj.is_file():
+            raise ValueError(
+                f"Annotation path is not a file: {path}\n"
+                f"Expected a JSON file, got: {path_obj}"
+            )
+
+        try:
+            with open(path_obj, "r", encoding="utf-8") as f:
+                annotations = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Failed to parse annotation JSON file: {path}\n"
+                f"JSON syntax error at line {e.lineno}, column {e.colno}: {e.msg}\n"
+                f"Please validate the JSON file using a JSON linter."
+            ) from e
+        except UnicodeDecodeError as e:
+            raise ValueError(
+                f"Failed to decode annotation file: {path}\n"
+                f"File encoding error: {e}\n"
+                f"Expected UTF-8 encoded JSON file. Try opening in a text editor "
+                f"and saving as UTF-8."
+            ) from e
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to read annotation file: {path}\n"
+                f"I/O error: {e}\n"
+                f"Check file permissions and disk status."
+            ) from e
+
+        # Validate structure
+        if not isinstance(annotations, list):
+            raise ValueError(
+                f"Invalid annotation file structure: {path}\n"
+                f"Expected a JSON list, got: {type(annotations).__name__}\n"
+                f"Annotation files should contain a list of image metadata objects."
+            )
+
+        if len(annotations) == 0:
+            self.logger.warning(
+                f"Annotation file is empty: {path}\n"
+                f"No samples will be loaded from this dataset."
+            )
+
+        # Basic validation of first entry
+        if len(annotations) > 0:
+            sample = annotations[0]
+            if not isinstance(sample, dict):
+                raise ValueError(
+                    f"Invalid annotation entry in: {path}\n"
+                    f"First entry is {type(sample).__name__}, expected dict\n"
+                    f"Each annotation should be a JSON object with image_id, labels, etc."
+                )
+            if "image_id" not in sample:
+                raise ValueError(
+                    f"Missing required 'image_id' field in: {path}\n"
+                    f"First annotation entry: {sample}\n"
+                    f"Each annotation must have an 'image_id' field."
+                )
+
+        self.logger.info(f"Loaded {len(annotations)} annotations from {path}")
+        return annotations
 
     def __len__(self):
         return len(self.annotations)
@@ -361,41 +594,10 @@ class DatasetLoader(Dataset):
                                     rtol=0.0,
                                 ).all(dim=0)
 
-                        # labels (same as L2 path)
-                        tag_indices = annotation.get("labels") or []
-                        if (
-                            isinstance(tag_indices, list) and len(tag_indices) > 0 and isinstance(tag_indices[0], (int, float))
-                            and self.num_classes
-                        ):
-                            tag_vec = torch.zeros(self.num_classes, dtype=torch.float32)
-                            tag_vec.scatter_(
-                                0,
-                                torch.tensor(
-                                    [int(i) for i in tag_indices if 0 <= int(i) < self.num_classes], dtype=torch.long
-                                ),
-                                1.0,
-                            )
-                        else:
-                            tag_vec = torch.zeros(self.num_classes or 1, dtype=torch.float32)
-
-                        rating = annotation.get("rating", "unknown")
-                        rating_idx = 4
-                        if isinstance(rating, int):
-                            rating_idx = int(rating)
-                        elif isinstance(rating, str):
-                            r = rating.strip().lower()
-                            rating_idx = {"g":0,"general":0,"safe":0,"sensitive":1,"q":2,"questionable":2,"e":3,"explicit":3,"u":4,"unknown":4}.get(r, 4)
-
-                        return {
-                            "images": t,
-                            "padding_mask": pmask.to(torch.bool),
-                            "tag_labels": tag_vec,
-                            "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
-                            "image_id": raw_image_id,
-                            "cached": True,
-                            "error": False,
-                            "error_reason": "",
-                        }
+                        # Build sample using helper to avoid duplication
+                        return self._build_sample_dict(
+                            t, pmask, annotation, raw_image_id, cached=True
+                        )
 
             # --- L2 READ PATH ---
             if self._l2_enabled:
@@ -453,48 +655,10 @@ class DatasetLoader(Dataset):
                                     rtol=0.0,
                                 ).all(dim=0)
 
-                        # Prepare labels for training loop compatibility
-                        tag_indices = annotation.get("labels") or []
-                        if (
-                            isinstance(tag_indices, list) and len(tag_indices) > 0 and isinstance(tag_indices[0], (int, float))
-                            and self.num_classes
-                        ):
-                            tag_vec = torch.zeros(self.num_classes, dtype=torch.float32)
-                            tag_vec.scatter_(
-                                0,
-                                torch.tensor(
-                                    [int(i) for i in tag_indices if 0 <= int(i) < self.num_classes], dtype=torch.long
-                                ),
-                                1.0,
-                            )
-                        else:
-                            tag_vec = torch.zeros(self.num_classes or 1, dtype=torch.float32)
-
-                        rating = annotation.get("rating", "unknown")
-                        rating_idx = 4  # default 'unknown'
-                        if isinstance(rating, int):
-                            rating_idx = int(rating)
-                        elif isinstance(rating, str):
-                            r = rating.strip().lower()
-                            mapping = {
-                                "g": 0, "general": 0, "safe": 0,
-                                "sensitive": 1,
-                                "q": 2, "questionable": 2,
-                                "e": 3, "explicit": 3,
-                                "u": 4, "unknown": 4,
-                            }
-                            rating_idx = mapping.get(r, 4)
-
-                        return {
-                            "images": t,
-                            "padding_mask": pmask.to(torch.bool),
-                            "tag_labels": tag_vec,
-                            "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
-                            "image_id": raw_image_id,
-                            "cached": True,
-                            "error": False,
-                            "error_reason": "",
-                        }
+                        # Build sample using helper to avoid duplication
+                        return self._build_sample_dict(
+                            t, pmask, annotation, raw_image_id, cached=True
+                        )
                     except Exception as e:
                         # Treat as cache miss; skip bad/tampered records safely
                         self.logger.warning(
@@ -587,40 +751,10 @@ class DatasetLoader(Dataset):
             # Reset retry count on success
             self.retry_counts[idx] = 0
 
-            # Prepare labels for training loop compatibility
-            tag_indices = annotation.get("labels") or []
-            if isinstance(tag_indices, list) and len(tag_indices) > 0 and isinstance(tag_indices[0], (int, float)) and self.num_classes:
-                tag_vec = torch.zeros(self.num_classes, dtype=torch.float32)
-                tag_vec.scatter_(0, torch.tensor([int(i) for i in tag_indices if 0 <= int(i) < self.num_classes], dtype=torch.long), 1.0)
-            else:
-                # Fallback if no labels provided
-                tag_vec = torch.zeros(self.num_classes or 1, dtype=torch.float32)
-
-            rating = annotation.get("rating", "unknown")
-            rating_idx = 4  # default 'unknown'
-            if isinstance(rating, int):
-                rating_idx = int(rating)
-            elif isinstance(rating, str):
-                r = rating.strip().lower()
-                mapping = {
-                    "g": 0, "general": 0, "safe": 0,
-                    "sensitive": 1,
-                    "q": 2, "questionable": 2,
-                    "e": 3, "explicit": 3,
-                    "u": 4, "unknown": 4,
-                }
-                rating_idx = mapping.get(r, 4)
-
-            sample = {
-                "images": t,
-                "padding_mask": pmask,
-                "tag_labels": tag_vec,
-                "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
-                "image_id": raw_image_id,
-                "cached": False,
-                "error": False,
-                "error_reason": "",
-            }
+            # Build sample using helper to avoid duplication
+            sample = self._build_sample_dict(
+                t, pmask, annotation, raw_image_id, cached=False
+            )
 
             # Enqueue write but never block __getitem__
             if self._l2_enabled and self._l2_writer_q is not None:
@@ -687,28 +821,80 @@ class DatasetLoader(Dataset):
             "retry_counts": self.retry_counts,
         }
 
+    def close(self):
+        """Close LMDB reader and release resources."""
+        if hasattr(self, "_l2_reader") and self._l2_reader is not None:
+            try:
+                self._l2_reader.close()
+            except Exception as e:
+                logging.getLogger(__name__).debug(
+                    f"Error closing L2 reader: {e}"
+                )
+            finally:
+                self._l2_reader = None
+
+        # Also cleanup validator
+        if hasattr(self, "validator") and self.validator is not None:
+            try:
+                self.validator.stop()
+                # Give thread time to finish
+                if hasattr(self.validator, "join"):
+                    self.validator.join(timeout=2.0)
+            except Exception as e:
+                logging.getLogger(__name__).debug(
+                    f"Error stopping validator: {e}"
+                )
+            finally:
+                self.validator = None
+
+    def __del__(self):
+        """Fallback cleanup when object is garbage collected."""
+        try:
+            self.close()
+        except Exception:
+            pass  # Silently ignore errors in __del__
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - cleanup resources."""
+        self.close()
+        return False
+
 
 class BackgroundValidator(Thread):
     # HL003 Fix: Implement actual validation logic
     def __init__(self, dataset_loader):
         super().__init__(daemon=True)
         self.dataset_loader = dataset_loader
-        self.validation_queue = queue.Queue()
+        self.validation_queue = queue.Queue(maxsize=1000)  # Bounded queue to prevent memory growth
         self.running = True
+        self._stop_event = threading.Event()
+        self.logger = logging.getLogger(__name__)
 
     def run(self):
         """Background validation loop"""
-        while self.running:
+        self.logger.debug("BackgroundValidator thread started")
+        while self.running and not self._stop_event.is_set():
             try:
-                if not self.validation_queue.empty():
+                # Use timeout to check stop_event periodically
+                try:
                     item_idx = self.validation_queue.get(timeout=1.0)
-                    self.validate_item(item_idx)
-                else:
-                    time.sleep(0.1)
-            except queue.Empty:
-                continue
+                except queue.Empty:
+                    continue
+
+                if item_idx is None:  # Sentinel for shutdown
+                    break
+
+                self.validate_item(item_idx)
+                self.validation_queue.task_done()
+
             except Exception as e:
-                logging.error(f"Validation error: {e}")
+                self.logger.error(f"Validation error: {e}")
+
+        self.logger.debug("BackgroundValidator thread stopping")
 
     def validate_item(self, idx):
         """Perform actual validation of dataset items"""
@@ -752,9 +938,42 @@ class BackgroundValidator(Thread):
             logging.error(f"Validation failed for item {idx}: {e}")
             return False
 
-    def stop(self):
-        """Stop the validation thread"""
+    def stop(self, timeout=5.0):
+        """Stop the validation thread gracefully."""
+        if not self.running:
+            return  # Already stopped
+
+        self.logger.debug("Stopping BackgroundValidator...")
         self.running = False
+        self._stop_event.set()
+
+        # Send sentinel to unblock queue.get()
+        try:
+            self.validation_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+        # Wait for thread to finish
+        if self.is_alive():
+            self.join(timeout=timeout)
+            if self.is_alive():
+                self.logger.warning(
+                    f"BackgroundValidator did not stop within {timeout}s timeout"
+                )
+
+        # Clean up queue
+        try:
+            while not self.validation_queue.empty():
+                self.validation_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def __del__(self):
+        """Cleanup on garbage collection."""
+        try:
+            self.stop(timeout=1.0)
+        except Exception:
+            pass
 
 
 class AugmentationStats:
@@ -824,7 +1043,24 @@ class SidecarJsonDataset(Dataset):
         # L2 dtype + CPU bf16 preference
         self._l2_dtype_str = str(l2_storage_dtype).lower()
         self._l2_dtype = _canon_dtype(self._l2_dtype_str)
-        self._cpu_bf16_cache = bool(cpu_bf16_cache_pipeline) if cpu_bf16_cache_pipeline is not None else (self._l2_dtype is torch.bfloat16)
+
+        # Check CPU BF16 support before enabling
+        requested_cpu_bf16 = bool(cpu_bf16_cache_pipeline) if cpu_bf16_cache_pipeline is not None else (self._l2_dtype is torch.bfloat16)
+
+        if requested_cpu_bf16:
+            if _is_cpu_bf16_supported():
+                self._cpu_bf16_cache = True
+                self.logger.debug("CPU BF16 cache pipeline enabled")
+            else:
+                self._cpu_bf16_cache = False
+                self.logger.warning(
+                    "CPU does not support bfloat16 operations. "
+                    "Falling back to float32 for cache operations. "
+                    "This may impact performance. "
+                    "To suppress this warning, set cpu_bf16_cache_pipeline=False in config."
+                )
+        else:
+            self._cpu_bf16_cache = False
 
         # L2 cache
         self._l2_enabled = bool(l2_enabled and l2_cache_path)
@@ -951,6 +1187,41 @@ class SidecarJsonDataset(Dataset):
                 pass
         return "random" if self._deterministic_coin(image_id) else "none"
 
+    def _build_sample_dict(
+        self,
+        image: torch.Tensor,
+        padding_mask: torch.Tensor,
+        tag_vec: torch.Tensor,
+        rating: Any,
+        image_id: str,
+        cached: bool = False,
+    ) -> Dict[str, Any]:
+        """Build the sample dictionary returned by __getitem__.
+
+        Args:
+            image: Preprocessed image tensor (C, H, W)
+            padding_mask: Boolean padding mask (H, W)
+            tag_vec: Encoded tag vector
+            rating: Rating value (to be mapped)
+            image_id: Image identifier
+            cached: Whether data came from cache
+
+        Returns:
+            Sample dict for training
+        """
+        rating_idx = _map_rating(rating)
+
+        return {
+            "images": image,
+            "padding_mask": padding_mask.to(torch.bool),
+            "tag_labels": tag_vec,
+            "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
+            "image_id": image_id,
+            "cached": cached,
+            "error": False,
+            "error_reason": "",
+        }
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if idx in self.failed_samples:
             return self._error_sample(idx, "Previously failed sample")
@@ -1024,17 +1295,9 @@ class SidecarJsonDataset(Dataset):
                                 ).all(dim=0)
                         # Use tags that already reflect the flip decision
                         tag_vec = self.vocab.encode_tags(tags_now)
-                        rating_idx = _map_rating(ann.get("rating", "unknown"))
-                        return {
-                            "images": img_t,
-                            "padding_mask": pmask.to(torch.bool),
-                            "tag_labels": tag_vec,
-                            "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
-                            "image_id": image_id,
-                            "cached": True,
-                            "error": False,
-                            "error_reason": "",
-                        }
+                        return self._build_sample_dict(
+                            img_t, pmask, tag_vec, ann.get("rating", "unknown"), image_id, cached=True
+                        )
 
             # Cache miss: load from disk (resolve under the JSON's shard folder)
             img_root = ann.get("dir", self.root)
@@ -1109,7 +1372,6 @@ class SidecarJsonDataset(Dataset):
 
             # Encode labels (tags already account for flipping)
             tag_vec = self.vocab.encode_tags(tags_now)  # (V,)
-            rating_idx = _map_rating(ann.get("rating", "unknown"))
 
             # Enqueue write (non-blocking)
             if self._l2_enabled and self._l2_writer_q is not None:
@@ -1130,16 +1392,9 @@ class SidecarJsonDataset(Dataset):
                         )
 
             self.retry_counts[idx] = 0
-            return {
-                "images": img,
-                "padding_mask": pmask,
-                "tag_labels": tag_vec,
-                "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
-                "image_id": image_id,
-                "cached": False,
-                "error": False,
-                "error_reason": "",
-            }
+            return self._build_sample_dict(
+                img, pmask, tag_vec, ann.get("rating", "unknown"), image_id, cached=False
+            )
 
         except Exception as e:
             self.retry_counts[idx] += 1
@@ -1182,14 +1437,62 @@ class SidecarJsonDataset(Dataset):
             "error_reason": reason,
         }
 
+    def close(self):
+        """Close LMDB reader and release resources."""
+        if hasattr(self, "_l2_reader") and self._l2_reader is not None:
+            try:
+                self._l2_reader.close()
+            except Exception as e:
+                logging.getLogger(__name__).debug(
+                    f"Error closing L2 reader: {e}"
+                )
+            finally:
+                self._l2_reader = None
+
+    def __del__(self):
+        """Fallback cleanup when object is garbage collected."""
+        try:
+            self.close()
+        except Exception:
+            pass  # Silently ignore errors in __del__
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - cleanup resources."""
+        self.close()
+        return False
+
 
 def _map_rating(rating: Any) -> int:
     """Map dataset rating field to fixed indices used by the model.
 
-    Mapping: general/safe->0, sensitive->1, questionable->2, explicit->3, unknown->4
+    Mapping:
+        - general/safe/g -> 0
+        - sensitive -> 1
+        - questionable/q -> 2
+        - explicit/e -> 3
+        - unknown/u -> 4 (default)
+
+    Args:
+        rating: Rating value from dataset (int or str)
+
+    Returns:
+        Integer rating index (0-4)
     """
     if isinstance(rating, int):
-        return int(rating)
+        # Validate range
+        idx = int(rating)
+        if 0 <= idx <= 4:
+            return idx
+        else:
+            logging.getLogger(__name__).warning(
+                f"Invalid rating index {idx}, defaulting to 4 (unknown)"
+            )
+            return 4
+
     r = str(rating).strip().lower()
     mapping = {
         "g": 0, "general": 0, "safe": 0,

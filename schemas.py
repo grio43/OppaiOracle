@@ -29,13 +29,21 @@ class ImagePrediction:
     image: str  # Path or identifier
     tags: List[TagPrediction]
     processing_time: Optional[float] = None  # in milliseconds
-    
+    error: Optional[str] = None  # Error message if processing failed
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "image": self.image,
             "tags": [t.to_dict() for t in self.tags],
-            "processing_time": self.processing_time
         }
+        if self.processing_time is not None:
+            result["processing_time"] = self.processing_time
+        if self.error is not None:
+            result["error"] = self.error
+            result["status"] = "failed"
+        else:
+            result["status"] = "success"
+        return result
 
 
 @dataclass
@@ -90,25 +98,52 @@ def compute_vocab_sha256(vocab_path: Optional[Path] = None,
 
     Returns:
         SHA256 hash as hex string, or "unknown" if computation fails
+
+    Raises:
+        ValueError: If neither vocab_path nor vocab_data provided
+        TypeError: If vocab_data is not JSON-serializable
     """
+    if vocab_data is None and vocab_path is None:
+        raise ValueError("Must provide either vocab_path or vocab_data")
+
     try:
-        if vocab_data:
+        if vocab_data is not None:
             # Hash the vocabulary data directly
-            vocab_json = json.dumps(vocab_data, sort_keys=True)
+            try:
+                vocab_json = json.dumps(vocab_data, sort_keys=True)
+            except TypeError as e:
+                logger.error(f"Vocabulary data not JSON-serializable: {e}")
+                raise TypeError(f"Cannot hash non-serializable vocabulary: {e}") from e
+
             return hashlib.sha256(vocab_json.encode()).hexdigest()
-        elif vocab_path and vocab_path.exists():
+
+        elif vocab_path is not None:
+            # Validate path exists before attempting to read
+            if not vocab_path.exists():
+                logger.warning(f"Vocabulary file does not exist: {vocab_path}")
+                return "unknown"
+
             # Hash the file contents
-            with open(vocab_path, 'rb') as f:
-                return hashlib.sha256(f.read()).hexdigest()
-    except PermissionError as e:
-        logger.warning(f"Permission denied reading vocabulary for hash: {vocab_path}: {e}")
-        return "unknown"
-    except IOError as e:
-        logger.warning(f"I/O error reading vocabulary for hash: {vocab_path}: {e}")
-        return "unknown"
+            try:
+                with open(vocab_path, 'rb') as f:
+                    content = f.read()
+                return hashlib.sha256(content).hexdigest()
+
+            except PermissionError as e:
+                logger.warning(f"Permission denied reading vocabulary for hash: {vocab_path}: {e}")
+                return "unknown"
+
+            except OSError as e:  # Covers IOError, file system errors
+                logger.error(f"OS error reading vocabulary for hash: {vocab_path}: {e}", exc_info=True)
+                return "unknown"
+
+    except (TypeError, ValueError):
+        # Re-raise expected exceptions
+        raise
     except Exception as e:
-        logger.error(f"Unexpected error computing vocabulary hash: {e}", exc_info=True)
-        return "unknown"
+        # Truly unexpected error - log and re-raise for debugging
+        logger.critical(f"Critical error in compute_vocab_sha256: {type(e).__name__}: {e}", exc_info=True)
+        raise
 
     return "unknown"
 
@@ -139,14 +174,27 @@ def validate_schema(data: Union[Dict, Path, str]) -> bool:
                     raise FileNotFoundError(f"Schema file not found: {path}")
                 with open(path) as f:
                     data = json.load(f)
+
         except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in schema data: {e}")
-        except PermissionError as e:
-            raise ValueError(f"Permission denied reading schema file {data}: {e}")
+            # Invalid JSON - this is a validation error
+            raise ValueError(f"Invalid JSON in schema data: {e}") from e
+
         except FileNotFoundError:
-            raise  # Re-raise FileNotFoundError as-is
+            # File doesn't exist - re-raise as-is for specific handling
+            raise
+
+        except PermissionError:
+            # Permission denied - re-raise as-is for specific handling
+            # Don't wrap in ValueError, caller might want to retry with elevated permissions
+            raise
+
+        except OSError as e:
+            # Other I/O errors (disk full, network error, etc.)
+            raise ValueError(f"Failed to read schema file {data}: {e}") from e
+
         except Exception as e:
-            raise ValueError(f"Failed to load schema data: {type(e).__name__}: {e}")
+            # Truly unexpected errors (bugs)
+            raise ValueError(f"Unexpected error loading schema data: {type(e).__name__}: {e}") from e
 
     # Check top-level structure
     if not isinstance(data, dict):

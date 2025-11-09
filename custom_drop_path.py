@@ -13,8 +13,7 @@ class SafeDropPath(nn.Module):
         if not self.training or self.drop_prob == 0.0:
             return x
         keep_prob = 1.0 - self.drop_prob
-        if keep_prob == 0.0:
-            return x.new_zeros(x.shape)
+        # keep_prob is always > 0 due to __init__ validation
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
         random_tensor.floor_()

@@ -127,6 +127,9 @@ class ValidationConfig:
     device: str = "cuda"
     use_amp: bool = True
 
+    # Error handling
+    mismatch_strategy: str = "error"  # "error", "truncate", or "skip_batch"
+
 
 class ValidationRunner:
     """Main validation runner"""
@@ -147,40 +150,130 @@ class ValidationRunner:
         self._val_std: Optional[Tuple[float, float, float]] = None
         self._val_image_size = _DEFAULT_VAL_IMAGE_SIZE
         self._val_patch_size = 16
+        # Check config file exists with helpful error message
         if not UNIFIED_CONFIG_PATH.exists():
-            raise FileNotFoundError(f"Unified config not found at {UNIFIED_CONFIG_PATH}")
+            raise FileNotFoundError(
+                f"Unified configuration file not found at: {UNIFIED_CONFIG_PATH}\n"
+                f"\n"
+                f"This file is required for validation preprocessing settings.\n"
+                f"Please create it with the following structure:\n"
+                f"\n"
+                f"data:\n"
+                f"  normalize_mean: [0.485, 0.456, 0.406]\n"
+                f"  normalize_std: [0.229, 0.224, 0.225]\n"
+                f"  image_size: 640\n"
+                f"  patch_size: 16\n"
+                f"\n"
+                f"validation:\n"
+                f"  dataloader:\n"
+                f"    batch_size: 64\n"
+                f"    num_workers: 8\n"
+                f"  preprocessing:\n"
+                f"    # Optional overrides for data section\n"
+            )
+
+        # Load and validate config
+        try:
+            config_text = UNIFIED_CONFIG_PATH.read_text(encoding="utf-8")
+            unified = yaml.safe_load(config_text)
+        except yaml.YAMLError as e:
+            raise RuntimeError(
+                f"Failed to parse YAML in {UNIFIED_CONFIG_PATH}:\n{e}\n"
+                f"Please check for syntax errors in the configuration file."
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"Failed to read {UNIFIED_CONFIG_PATH}: {e}") from e
+
+        if unified is None:
+            unified = {}
+            logger.warning(f"{UNIFIED_CONFIG_PATH} is empty, using defaults where possible")
+
+        # Extract sections with type validation
+        validation_section = unified.get("validation", {})
+        data_section = unified.get("data", {})
+
+        if not isinstance(validation_section, dict):
+            raise ValueError(
+                f"'validation' section in config must be a dict, got {type(validation_section)}"
+            )
+        if not isinstance(data_section, dict):
+            raise ValueError(
+                f"'data' section in config must be a dict, got {type(data_section)}"
+            )
+
+        # Extract dataloader settings
+        dataloader_cfg = validation_section.get("dataloader", {})
+        if dataloader_cfg:
+            self.config.batch_size = int(dataloader_cfg.get("batch_size", self.config.batch_size))
+            self.config.num_workers = int(dataloader_cfg.get("num_workers", self.config.num_workers))
+
+        # Extract preprocessing settings
+        preprocessing_cfg = validation_section.get("preprocessing", {})
+
+        # Get normalization parameters (preprocessing overrides data)
+        mean = preprocessing_cfg.get("normalize_mean") or data_section.get("normalize_mean")
+        std = preprocessing_cfg.get("normalize_std") or data_section.get("normalize_std")
+
+        if not mean:
+            raise ValueError(
+                f"Missing 'normalize_mean' in {UNIFIED_CONFIG_PATH}.\n"
+                f"Add to either 'data.normalize_mean' or 'validation.preprocessing.normalize_mean'.\n"
+                f"Example: normalize_mean: [0.485, 0.456, 0.406]"
+            )
+
+        if not std:
+            raise ValueError(
+                f"Missing 'normalize_std' in {UNIFIED_CONFIG_PATH}.\n"
+                f"Add to either 'data.normalize_std' or 'validation.preprocessing.normalize_std'.\n"
+                f"Example: normalize_std: [0.229, 0.224, 0.225]"
+            )
+
+        # Validate mean format
+        if not isinstance(mean, (list, tuple)) or len(mean) != 3:
+            raise ValueError(
+                f"'normalize_mean' must be a list/tuple of 3 floats, got: {mean} (type: {type(mean)})\n"
+                f"Example: normalize_mean: [0.485, 0.456, 0.406]"
+            )
 
         try:
-            unified = yaml.safe_load(UNIFIED_CONFIG_PATH.read_text(encoding="utf-8")) or {}
-            v = (unified.get("validation") or {})
-            dl = (v.get("dataloader") or {})
-            pp = (v.get("preprocessing") or {})
-            data_cfg = unified.get("data") or {}
+            self._val_mean = tuple(float(x) for x in mean)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"'normalize_mean' values must be convertible to float, got: {mean}\n"
+                f"Error: {e}"
+            ) from e
 
-            # Map dataloader settings → ValidationConfig
-            self.config.batch_size = int(dl.get("batch_size", self.config.batch_size))
-            self.config.num_workers = int(dl.get("num_workers", self.config.num_workers))
+        # Validate std format
+        if not isinstance(std, (list, tuple)) or len(std) != 3:
+            raise ValueError(
+                f"'normalize_std' must be a list/tuple of 3 floats, got: {std} (type: {type(std)})\n"
+                f"Example: normalize_std: [0.229, 0.224, 0.225]"
+            )
 
-            # Preprocessing overrides (normalization, sizes)
-            mean = pp.get("normalize_mean") or data_cfg.get("normalize_mean")
-            std = pp.get("normalize_std") or data_cfg.get("normalize_std")
-            if not (mean and std):
-                raise ValueError("normalize_mean and normalize_std must be provided in unified_config.yaml")
+        try:
+            self._val_std = tuple(float(x) for x in std)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"'normalize_std' values must be convertible to float, got: {std}\n"
+                f"Error: {e}"
+            ) from e
 
-            if isinstance(mean, (list, tuple)) and len(mean) == 3:
-                self._val_mean = tuple(float(x) for x in mean)
-            else:
-                raise ValueError("normalize_mean must be a sequence of three floats")
+        # Get image and patch sizes with defaults
+        self._val_image_size = int(
+            preprocessing_cfg.get("image_size") or
+            data_section.get("image_size") or
+            self._val_image_size
+        )
+        self._val_patch_size = int(
+            preprocessing_cfg.get("patch_size") or
+            data_section.get("patch_size") or
+            self._val_patch_size
+        )
 
-            if isinstance(std, (list, tuple)) and len(std) == 3:
-                self._val_std = tuple(float(x) for x in std)
-            else:
-                raise ValueError("normalize_std must be a sequence of three floats")
-
-            self._val_image_size = int(pp.get("image_size", data_cfg.get("image_size", self._val_image_size)))
-            self._val_patch_size = int(pp.get("patch_size", data_cfg.get("patch_size", self._val_patch_size)))
-        except Exception as e:
-            raise RuntimeError(f"Failed to load unified validation config: {e}")
+        logger.info(
+            f"Loaded validation config: image_size={self._val_image_size}, "
+            f"patch_size={self._val_patch_size}, mean={self._val_mean}, std={self._val_std}"
+        )
 
         # Warn if legacy validation_config.yaml still exists (migration)
         legacy_val = PROJECT_ROOT / "configs" / "validation_config.yaml"
@@ -510,15 +603,28 @@ class ValidationRunner:
 
     def _cleanup_logging(self):
         """Clean up logging resources including QueueListener"""
+        # Stop the listener first
         if self._listener is not None:
             try:
                 self._listener.stop()
                 logger.info("QueueListener stopped successfully")
-                self._listener = None
             except Exception as e:
                 logger.warning(f"Error stopping QueueListener: {e}")
-        # Clear the queue reference
-        self._log_queue = None
+            finally:
+                self._listener = None
+
+        # Properly close the queue
+        if self._log_queue is not None:
+            try:
+                # Close the queue (no more items can be put)
+                self._log_queue.close()
+                # Join the background thread (wait for queue to flush)
+                self._log_queue.join_thread()
+                logger.debug("Log queue closed and joined successfully")
+            except Exception as e:
+                logger.warning(f"Error closing log queue: {e}")
+            finally:
+                self._log_queue = None
      
 
     def validate_full(self, dataloader: DataLoader) -> Dict[str, Any]:
@@ -565,11 +671,36 @@ class ValidationRunner:
                     logits = logits.reshape(B, -1)
                 # Make sure labels width matches model head (helpful when vocab/head disagree)
                 if tag_labels is not None and tag_labels.ndim == 2 and tag_labels.shape[1] != logits.shape[1]:
-                    raise RuntimeError(
-                        f"Prediction dim {logits.shape[1]} != target dim {tag_labels.shape[1]}. "
-                        "The checkpoint head and vocabulary/targets disagree. "
-                        "Rebuild the head or align the vocabulary."
-                    )
+                    pred_dim = logits.shape[1]
+                    target_dim = tag_labels.shape[1]
+
+                    if self.config.mismatch_strategy == "error":
+                        raise RuntimeError(
+                            f"Prediction dim {pred_dim} != target dim {target_dim}. "
+                            "The checkpoint head and vocabulary/targets disagree. "
+                            "Rebuild the head or align the vocabulary. "
+                            "Set mismatch_strategy='truncate' to continue anyway."
+                        )
+
+                    elif self.config.mismatch_strategy == "truncate":
+                        min_dim = min(pred_dim, target_dim)
+                        logger.warning(
+                            f"Dimension mismatch detected: predictions have {pred_dim} classes "
+                            f"but targets have {target_dim} classes. "
+                            f"Truncating to {min_dim} classes to continue validation."
+                        )
+                        logits = logits[:, :min_dim]
+                        tag_labels = tag_labels[:, :min_dim]
+
+                    elif self.config.mismatch_strategy == "skip_batch":
+                        logger.warning(
+                            f"Skipping batch {batch_idx} due to dimension mismatch: "
+                            f"predictions have {pred_dim} classes but targets have {target_dim} classes"
+                        )
+                        continue
+
+                    else:
+                        raise ValueError(f"Unknown mismatch_strategy: {self.config.mismatch_strategy}")
                 
                 # Convert to probabilities
                 predictions = torch.sigmoid(logits)
@@ -1093,23 +1224,29 @@ class ValidationRunner:
         logger.info(f"Saved standardized predictions to {save_path}")
     
     def _save_predictions(self, predictions: torch.Tensor, targets: torch.Tensor, metadata: List):
-        """Save raw predictions to file"""
+        """Save raw predictions to file using safe NPZ + JSON format"""
         logger.info("Saving predictions...")
-        
-        save_dict = {
-            'predictions': predictions.numpy(),
-            'targets': targets.numpy(),
-            'metadata': metadata,
-            'tag_names': [self.vocab.get_tag_from_index(i) for i in range(len(self.vocab.tag_to_index))],
-            'threshold': self.config.prediction_threshold
-        }
-        
-        # Save as pickle for easy loading
-        save_path = self.output_dir / 'predictions.pkl'
-        with open(save_path, 'wb') as f:
-            pickle.dump(save_dict, f)
-        
-        logger.info(f"Saved predictions to {save_path}")
+
+        # Save arrays with NumPy (safe)
+        npz_path = self.output_dir / 'predictions.npz'
+        np.savez_compressed(
+            npz_path,
+            predictions=predictions.numpy(),
+            targets=targets.numpy(),
+            threshold=np.array(self.config.prediction_threshold),
+        )
+
+        # Save metadata as JSON (safe)
+        metadata_path = self.output_dir / 'predictions_metadata.json'
+        with open(metadata_path, 'w') as f:
+            json.dump({
+                'metadata': metadata,
+                'tag_names': [self.vocab.get_tag_from_index(i)
+                             for i in range(len(self.vocab.tag_to_index))],
+                'threshold': self.config.prediction_threshold,
+            }, f, indent=2)
+
+        logger.info(f"Saved predictions to {npz_path} and {metadata_path}")
     
     def _save_per_image_results(self, predictions: torch.Tensor, targets: torch.Tensor, metadata: List):
         """Save per-image results to CSV"""

@@ -58,47 +58,228 @@ def _load_or_init_vocab(vocab_file: Path) -> TagVocabulary:
 
 
 def _find_active_data_root(config) -> Path:
+    """Find the first enabled storage location in configuration.
+
+    Args:
+        config: Configuration object with 'data' section
+
+    Returns:
+        Path to active data root
+
+    Raises:
+        RuntimeError: If no valid enabled storage location found
+        ValueError: If configuration format is invalid
+    """
     data_cfg = getattr(config, "data", None)
     if not data_cfg:
-        raise RuntimeError("Config has no 'data' section")
+        raise RuntimeError(
+            "Configuration has no 'data' section. "
+            "Check that configs/unified_config.yaml is properly formatted."
+        )
+
     storage_locations = getattr(data_cfg, "storage_locations", []) or []
-    for loc in storage_locations:
+
+    if not storage_locations:
+        raise RuntimeError(
+            "No storage locations defined in config.data.storage_locations. "
+            "Add at least one storage location with 'enabled: true' and 'path: ...'."
+        )
+
+    valid_locations = []
+    invalid_locations = []
+
+    for i, loc in enumerate(storage_locations):
         try:
-            enabled = bool(loc.get("enabled", False)) if isinstance(loc, dict) else bool(getattr(loc, "enabled", False))
-            path = loc.get("path") if isinstance(loc, dict) else getattr(loc, "path", None)
-        except AttributeError:
-            # Expected if object doesn't have 'enabled' or 'path'
-            enabled, path = False, None
-        except (TypeError, ValueError) as e:
-            # Unexpected type or value errors
-            logger.warning(f"Invalid storage location configuration: {e}")
-            enabled, path = False, None
-        if enabled and path:
-            return Path(str(path))
-    raise RuntimeError("No enabled storage location found in config.data.storage_locations")
+            # Parse location (support both dict and object formats)
+            if isinstance(loc, dict):
+                enabled = loc.get("enabled", False)
+                path = loc.get("path")
+            elif hasattr(loc, "enabled") and hasattr(loc, "path"):
+                enabled = getattr(loc, "enabled", False)
+                path = getattr(loc, "path", None)
+            else:
+                # Invalid format
+                invalid_locations.append(
+                    f"Location {i}: Invalid format (not dict or object with enabled/path)"
+                )
+                continue
+
+            # Validate types
+            if not isinstance(enabled, (bool, int)):
+                invalid_locations.append(
+                    f"Location {i}: 'enabled' must be boolean, got {type(enabled).__name__}"
+                )
+                continue
+
+            if path is not None and not isinstance(path, (str, Path)):
+                invalid_locations.append(
+                    f"Location {i}: 'path' must be string or Path, got {type(path).__name__}"
+                )
+                continue
+
+            # Convert to boolean
+            enabled = bool(enabled)
+
+            if enabled and path:
+                valid_locations.append((i, Path(str(path))))
+            elif enabled and not path:
+                logger.warning(
+                    f"Storage location {i} is enabled but has no path. Skipping."
+                )
+
+        except Exception as e:
+            # Unexpected error - log full details for debugging
+            logger.error(
+                f"Unexpected error processing storage location {i}: {e}",
+                exc_info=True
+            )
+            invalid_locations.append(
+                f"Location {i}: Unexpected error: {e}"
+            )
+            continue
+
+    # Report invalid locations
+    if invalid_locations:
+        error_msg = (
+            "Invalid storage location configurations:\n" +
+            "\n".join(f"  - {err}" for err in invalid_locations)
+        )
+        logger.error(error_msg)
+        # Continue processing, maybe some locations are valid
+
+    # Return first valid enabled location
+    if valid_locations:
+        index, path = valid_locations[0]
+        logger.info(f"Using storage location {index}: {path}")
+        return path
+
+    # No enabled locations found
+    if len(storage_locations) == len(invalid_locations):
+        # All locations were invalid
+        raise ValueError(
+            f"All {len(storage_locations)} storage locations have invalid format. "
+            f"See errors above."
+        )
+    else:
+        # Locations exist but none are enabled
+        raise RuntimeError(
+            f"No enabled storage location found. "
+            f"Found {len(storage_locations)} locations, {len(invalid_locations)} invalid. "
+            f"Set 'enabled: true' for at least one storage location."
+        )
 
 
 def _scan_tags(root: Path) -> Counter:
+    """Scan JSON files and count tags with proper error handling."""
     counts: Counter = Counter()
-    json_files: List[Path] = sorted(root.rglob("*.json")) if root.exists() else []
+
+    if not root.exists():
+        logger.warning(f"Dataset root does not exist: {root}")
+        return counts
+
+    json_files: List[Path] = sorted(root.rglob("*.json"))
+
+    if not json_files:
+        logger.warning(f"No JSON files found in {root}")
+        return counts
+
+    logger.info(f"Scanning {len(json_files)} JSON files in {root}...")
+
+    # Track errors for reporting
+    error_counts = {
+        'json_errors': 0,
+        'encoding_errors': 0,
+        'permission_errors': 0,
+        'other_errors': 0,
+        'files_with_no_tags': 0,
+        'successful': 0
+    }
+
     for jp in json_files:
         try:
             data = json.loads(jp.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        # Sidecar (dict with 'tags')
-        if isinstance(data, dict):
-            tags_raw = data.get("tags")
-            if tags_raw is not None:
-                for t in parse_tags_field(tags_raw):
-                    counts[t] += 1
-            continue
-        # Manifest-like (list of entries with 'tags')
-        if isinstance(data, list):
-            for entry in data:
-                if isinstance(entry, dict) and ("tags" in entry):
-                    for t in parse_tags_field(entry.get("tags")):
-                        counts[t] += 1
+            file_had_tags = False
+
+            # Sidecar (dict with 'tags')
+            if isinstance(data, dict):
+                tags_raw = data.get("tags")
+                if tags_raw is not None:
+                    tags = parse_tags_field(tags_raw)
+                    if tags:
+                        file_had_tags = True
+                        for t in tags:
+                            counts[t] += 1
+
+            # Manifest-like (list of entries with 'tags')
+            elif isinstance(data, list):
+                for entry in data:
+                    if isinstance(entry, dict) and ("tags" in entry):
+                        tags = parse_tags_field(entry.get("tags"))
+                        if tags:
+                            file_had_tags = True
+                            for t in tags:
+                                counts[t] += 1
+
+            if not file_had_tags:
+                error_counts['files_with_no_tags'] += 1
+                logger.debug(f"No tags found in {jp}")
+
+            error_counts['successful'] += 1
+
+        except json.JSONDecodeError as e:
+            error_counts['json_errors'] += 1
+            logger.debug(f"JSON decode error in {jp}: {e}")
+
+        except UnicodeDecodeError as e:
+            error_counts['encoding_errors'] += 1
+            logger.warning(f"Encoding error in {jp}: {e}")
+
+        except PermissionError as e:
+            error_counts['permission_errors'] += 1
+            logger.error(f"Permission denied reading {jp}: {e}")
+
+        except Exception as e:
+            error_counts['other_errors'] += 1
+            logger.error(f"Unexpected error reading {jp}: {e}", exc_info=True)
+
+    # Report summary
+    total_errors = (
+        error_counts['json_errors'] +
+        error_counts['encoding_errors'] +
+        error_counts['permission_errors'] +
+        error_counts['other_errors']
+    )
+
+    if total_errors > 0:
+        logger.warning(
+            f"Scanned {len(json_files)} files, "
+            f"{error_counts['successful']} successful, "
+            f"{total_errors} errors "
+            f"(JSON: {error_counts['json_errors']}, "
+            f"encoding: {error_counts['encoding_errors']}, "
+            f"permission: {error_counts['permission_errors']}, "
+            f"other: {error_counts['other_errors']})"
+        )
+
+        # Warn if high error rate
+        error_rate = total_errors / len(json_files)
+        if error_rate > 0.1:  # More than 10% errors
+            logger.error(
+                f"High error rate: {error_rate*100:.1f}% of files failed to parse. "
+                f"Check file permissions and JSON validity."
+            )
+    else:
+        logger.info(
+            f"Successfully scanned {error_counts['successful']} files, "
+            f"found {len(counts)} unique tags"
+        )
+
+    if error_counts['files_with_no_tags'] > 0:
+        logger.info(
+            f"Note: {error_counts['files_with_no_tags']} files had no tags "
+            f"(may be metadata-only files)"
+        )
+
     return counts
 
 
@@ -119,14 +300,53 @@ def main() -> None:
     vocab = _load_or_init_vocab(vocab_file)
 
     # Count tags from dataset
+    logger.info(f"Scanning tags in {data_root}...")
     counts = _scan_tags(data_root)
+
+    # First check: no tags found at all
     if not counts:
-        raise RuntimeError(f"No tags found while scanning JSON sidecars under {data_root}")
+        raise RuntimeError(
+            f"No tags found while scanning JSON sidecars under {data_root}. "
+            f"Check that your dataset path is correct and contains JSON metadata."
+        )
+
+    original_count = len(counts)
+    original_total = sum(counts.values())
+
+    logger.info(
+        f"Found {original_count} unique tags "
+        f"({original_total} total occurrences) in dataset"
+    )
 
     # Exclude ignored tags entirely
+    ignored_count = 0
+    ignored_occurrences = 0
+
     for ignored in list(vocab.ignored_tags):
         if ignored in counts:
+            ignored_occurrences += counts[ignored]
             del counts[ignored]
+            ignored_count += 1
+
+    if ignored_count > 0:
+        logger.info(
+            f"Filtered out {ignored_count} ignored tags "
+            f"({ignored_occurrences} occurrences)"
+        )
+
+    # Second check: no valid tags after filtering
+    if not counts:
+        raise RuntimeError(
+            f"No valid tags remaining after filtering. "
+            f"Dataset had {original_count} unique tags ({original_total} total occurrences), "
+            f"but all were in the ignore list. "
+            f"Check your ignore list configuration or dataset contents."
+        )
+
+    logger.info(
+        f"Proceeding with {len(counts)} valid tags "
+        f"({sum(counts.values())} total occurrences)"
+    )
 
     # Prepare append-only additions
     existing: Dict[str, int] = dict(vocab.tag_to_index)

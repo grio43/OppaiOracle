@@ -15,6 +15,7 @@ import time
 import threading
 import queue
 import concurrent.futures
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
@@ -44,10 +45,79 @@ try:
 except ImportError:  # pragma: no cover - fallback when file missing
     _DEFAULT_WEBHOOK = None
 import os
+from urllib.parse import urlparse
+
+
+def _validate_webhook_url(url: Optional[str]) -> Optional[str]:
+    """Validate and sanitize webhook URL.
+
+    Returns:
+        Validated URL or None if invalid
+    """
+    if not url:
+        return None
+
+    if not isinstance(url, str):
+        logger.error("Webhook URL must be a string")
+        return None
+
+    # Remove whitespace
+    url = url.strip()
+
+    # Basic format validation
+    if not url.startswith(('http://', 'https://')):
+        logger.error("Webhook URL must start with http:// or https://")
+        return None
+
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        logger.error(f"Invalid webhook URL format: {e}")
+        return None
+
+    # Check hostname is present
+    if not parsed.netloc:
+        logger.error("Webhook URL missing hostname")
+        return None
+
+    # Whitelist known webhook services
+    allowed_domains = [
+        'discord.com',
+        'discordapp.com',
+        'slack.com',
+        'hooks.slack.com',
+        # Add other trusted webhook services as needed
+    ]
+
+    hostname = parsed.netloc.lower()
+    # Remove port if present
+    hostname = hostname.split(':')[0]
+
+    # Check if domain or subdomain is allowed
+    is_allowed = False
+    for allowed_domain in allowed_domains:
+        if hostname == allowed_domain or hostname.endswith('.' + allowed_domain):
+            is_allowed = True
+            break
+
+    if not is_allowed:
+        logger.error(f"Webhook URL domain '{hostname}' is not in allowed list: {allowed_domains}")
+        return None
+
+    # Ensure HTTPS for production
+    if parsed.scheme != 'https':
+        logger.warning(f"Webhook URL should use HTTPS, got {parsed.scheme}")
+
+    return url
 
 
 def _resolve_webhook_url(cfg_value: Optional[str]) -> Optional[str]:
-    return cfg_value or os.getenv("OPPAI_ALERT_WEBHOOK") or _DEFAULT_WEBHOOK
+    """Resolve and validate webhook URL from multiple sources."""
+    # Try sources in order of priority
+    url = cfg_value or os.getenv("OPPAI_ALERT_WEBHOOK") or _DEFAULT_WEBHOOK
+
+    # Validate before returning
+    return _validate_webhook_url(url)
 
 # Optional imports with proper handling
 try:
@@ -216,27 +286,73 @@ class AlertSystem:
         )
         thread.start()
 
+    def _sanitize_webhook_content(self, content: str, max_length: int) -> str:
+        """Sanitize content for webhook transmission.
+
+        Args:
+            content: Raw content to sanitize
+            max_length: Maximum allowed length
+
+        Returns:
+            Sanitized and truncated content
+        """
+        if content is None:
+            return ""
+
+        content = str(content)
+
+        # Remove potentially sensitive information
+        # Redact file paths
+        content = re.sub(r'[A-Za-z]:\\[^\\:\*\?"<>\|]+', '[REDACTED_PATH]', content)
+        content = re.sub(r'/[/\w\-\.]+/[/\w\-\.]+', '[REDACTED_PATH]', content)
+
+        # Redact potential API keys or tokens
+        content = re.sub(r'[A-Za-z0-9]{32,}', '[REDACTED_TOKEN]', content)
+
+        # Remove control characters that could break JSON
+        content = ''.join(char for char in content if ord(char) >= 32 or char in '\n\t')
+
+        # Escape special characters for JSON
+        content = content.replace('\\', '\\\\')
+        content = content.replace('"', '\\"')
+        content = content.replace('\n', '\\n')
+        content = content.replace('\r', '\\r')
+        content = content.replace('\t', '\\t')
+
+        # Truncate to max length
+        if len(content) > max_length:
+            content = content[:max_length - 1] + '…'
+
+        return content
+
     def _execute_webhook_in_thread(self, alert: dict, webhook_url: str):
         """Send alert to webhook (Discord optimized) in a thread."""
         try:
             import requests
-            
+
+            # Sanitize all content
             title = f"[{alert['severity'].upper()}] {alert['title']}"
-            description = alert['message']
+            title = self._sanitize_webhook_content(title, MAX_TITLE)
+
+            description = self._sanitize_webhook_content(alert['message'], MAX_DESC)
+
+            timestamp = alert['timestamp']
+            if not isinstance(timestamp, str):
+                timestamp = str(timestamp)
 
             fields = [
-                {"name": "Time", "value": alert['timestamp'], "inline": True},
+                {"name": "Time", "value": self._sanitize_webhook_content(timestamp, MAX_FIELD_VALUE), "inline": True},
                 {"name": "Occurrence", "value": str(alert['count']), "inline": True},
             ]
 
             embed = {
-                "title": trim(title, MAX_TITLE),
-                "description": trim(description, MAX_DESC),
+                "title": title,
+                "description": description,
                 "color": int(self._get_severity_color(alert['severity']).lstrip('#'), 16),
                 "fields": [
                     {
-                        "name": trim(f["name"], MAX_FIELD_NAME),
-                        "value": trim(f["value"], MAX_FIELD_VALUE),
+                        "name": self._sanitize_webhook_content(f["name"], MAX_FIELD_NAME),
+                        "value": self._sanitize_webhook_content(f["value"], MAX_FIELD_VALUE),
                         "inline": bool(f.get("inline", False)),
                     }
                     for f in fields
@@ -245,7 +361,7 @@ class AlertSystem:
             }
 
             payload = {
-                "content": trim(f"Training Alert: {alert['title']}", MAX_CONTENT),
+                "content": self._sanitize_webhook_content(f"Training Alert: {alert['title']}", MAX_CONTENT),
                 "embeds": [embed],
             }
 
@@ -499,24 +615,27 @@ class SystemMonitor:
         with self._lock:
             if not self.running:
                 return
-            # 1. Signal shutdown first to interrupt any blocking operations
-            self._shutdown_event.set()
 
-            # 2. Mark as not running
+            # 1. Signal shutdown first - this will cause loop to exit
+            self._shutdown_event.set()
             self.running = False
             thread_to_join = self.thread
             self.thread = None
 
-        # 3. Wait for thread to exit (outside lock to avoid deadlock)
+        # 2. Wait for thread to exit (outside lock to avoid deadlock)
         if thread_to_join and thread_to_join.is_alive():
-            thread_to_join.join(timeout=2) 
+            thread_to_join.join(timeout=5)  # Increased timeout
             if thread_to_join.is_alive():
-                logger.warning("System monitor thread did not stop gracefully within timeout")
+                logger.warning("System monitor thread did not stop within timeout")
 
-        # 4. NOW shutdown executor after thread has exited
+        # 3. Shutdown executor with proper error handling
         if hasattr(self, '_executor'):
             try:
-                self._executor.shutdown(wait=True, timeout=1)
+                # Cancel any pending futures
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # Python < 3.9 doesn't have cancel_futures parameter
+                self._executor.shutdown(wait=False)
             except Exception as e:
                 logger.debug(f"Error shutting down executor: {e}")
 
@@ -524,21 +643,24 @@ class SystemMonitor:
     
     def _monitor_loop(self):
         """Main monitoring loop with error handling"""
-        while self.running:
+        while self.running and not self._shutdown_event.is_set():
             try:
-                # Check shutdown before submitting to executor
+                # Check shutdown before submitting
                 if self._shutdown_event.is_set():
+                    break
+
+                # Double-check executor is still available
+                if not hasattr(self, '_executor'):
+                    logger.warning("Executor not available, exiting monitor loop")
                     break
 
                 # Use executor with timeout for metric collection
                 try:
                     future = self._executor.submit(self._collect_metrics_safe)
-                except RuntimeError as e:
-                    # Executor was shut down, exit gracefully
-                    if "cannot schedule new futures after shutdown" in str(e):
-                        logger.debug("Executor shut down, exiting monitor loop")
-                        break
-                    raise
+                except RuntimeError:
+                    # Executor shut down, exit cleanly
+                    logger.debug("Executor unavailable, exiting monitor loop")
+                    break
 
                 try:
                     metrics = future.result(timeout=self.config.system_metrics_interval * 0.8)
@@ -677,17 +799,17 @@ class SystemMonitor:
                             if gpu is not None:  # Check each GPU object
                                 try:
                                     # Safely get all values with proper null handling
-                                    mem_total = getattr(gpu, 'memoryTotal', 0)
-                                    mem_used = getattr(gpu, 'memoryUsed', 0)
-                                    mem_free = getattr(gpu, 'memoryFree', 0)
-                                    gpu_load = getattr(gpu, 'load', 0)
-                                    
-                                    # Ensure numeric values
+                                    mem_total = getattr(gpu, 'memoryTotal', None)
+                                    mem_used = getattr(gpu, 'memoryUsed', None)
+                                    mem_free = getattr(gpu, 'memoryFree', None)
+                                    gpu_load = getattr(gpu, 'load', None)
+
+                                    # Ensure numeric values with proper None handling
                                     mem_total = float(mem_total) if mem_total is not None else 0
                                     mem_used = float(mem_used) if mem_used is not None else 0
                                     mem_free = float(mem_free) if mem_free is not None else 0
-                                    gpu_load = float(gpu_load) if gpu_load >= 0 else 0
-                                    
+                                    gpu_load = float(gpu_load) if gpu_load is not None else 0
+
                                     gpu_metrics = {
                                         'id': getattr(gpu, 'id', -1),
                                         'name': getattr(gpu, 'name', 'Unknown'),
@@ -695,7 +817,7 @@ class SystemMonitor:
                                         'memory_used_gb': mem_used / 1024 if mem_used > 0 else 0,
                                         'memory_free_gb': mem_free / 1024 if mem_free > 0 else 0,
                                         'memory_percent': (mem_used / mem_total * 100) if mem_total > 0 else 0,
-                                        'utilization': gpu_load * 100 if gpu_load >= 0 else 0,
+                                        'utilization': gpu_load * 100,  # Convert to percentage
                                         'temperature': getattr(gpu, 'temperature', 0) or 0
                                     }
                                     metrics['gpu'].append(gpu_metrics)
@@ -762,10 +884,33 @@ class TrainingMonitor:
         self.best_val_metric = float('inf')
         self._graph_logged = False
 
-        # Determine primary once; don't rely on an unset attribute
+        # Determine primary rank with proper error handling
         try:
-            self.is_primary = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
-        except Exception:
+            # Check if distributed is available (compiled with distributed support)
+            if not dist.is_available():
+                self.is_primary = True
+                logger.debug("Distributed training not available, assuming primary rank")
+            elif not dist.is_initialized():
+                # Distributed available but not initialized - assume primary
+                # This is the common case for single-GPU or non-distributed training
+                self.is_primary = True
+                logger.debug("Distributed training not initialized, assuming primary rank")
+            else:
+                # Distributed is initialized, get actual rank
+                rank = dist.get_rank()
+                self.is_primary = (rank == 0)
+                logger.debug(f"Distributed training initialized, rank={rank}, is_primary={self.is_primary}")
+        except RuntimeError as e:
+            # Distributed may raise RuntimeError if not properly set up
+            logger.warning(f"Error checking distributed rank: {e}, assuming primary")
+            self.is_primary = True
+        except ValueError as e:
+            # Invalid rank or world size
+            logger.warning(f"Invalid distributed configuration: {e}, assuming primary")
+            self.is_primary = True
+        except Exception as e:
+            # Unexpected error - log it but continue
+            logger.error(f"Unexpected error determining rank: {e}, assuming primary", exc_info=True)
             self.is_primary = True
 
         # Optional components
@@ -1569,62 +1714,73 @@ class TrainingMonitor:
 
     def close(self):
         """Cleanup and close all resources"""
-        # Prevent multiple cleanup calls
-        if hasattr(self, '_closed') and self._closed:
+        # Check if already closed
+        if getattr(self, '_closed', False):
             return
-        self._closed = True
 
-        # Set shutdown event early to signal all threads
-        if hasattr(self.system_monitor, '_shutdown_event'):
-            self.system_monitor._shutdown_event.set()        
-        
         logger.info("Closing training monitor...")
-        
-        # Stop system monitor
-        if self.system_monitor:
-            self.system_monitor.stop()
+        cleanup_errors = []
 
-        # Cleanup executor
-        if hasattr(self.system_monitor, '_executor'):
+        # Stop system monitor first (includes executor shutdown)
+        system_monitor = getattr(self, 'system_monitor', None)
+        if system_monitor:
             try:
-                self.system_monitor._executor.shutdown(wait=True, timeout=1)
-            except:
-                pass            
-            
+                system_monitor.stop()
+            except Exception as e:
+                logger.error(f"Error stopping system monitor: {e}")
+                cleanup_errors.append(('system_monitor', e))
+
         # Close profiler
-        if self.profiler:
+        profiler = getattr(self, 'profiler', None)
+        if profiler:
             try:
-                self.profiler.stop()
-            except:
-                pass
-        
+                profiler.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping profiler: {e}")
+                cleanup_errors.append(('profiler', e))
+
         # Save final metrics
-        try:
-            final_metrics_file = Path(self.config.log_dir) / "final_metrics.json"
-            self.metrics.save_metrics(str(final_metrics_file))
-            
-            # Save summary
-            summary_file = Path(self.config.log_dir) / "training_summary.json"
-            with open(summary_file, 'w') as f:
-                json.dump(self.get_summary(), f, indent=2, default=str)
-        except Exception as e:
-            logger.error(f"Failed to save final metrics: {e}")
-        
-        # Close TensorBoard writer
-        if self.writer:
+        config = getattr(self, 'config', None)
+        metrics = getattr(self, 'metrics', None)
+        if config and metrics:
             try:
-                self.writer.close()
-            except:
-                pass
-        
+                final_metrics_file = Path(config.log_dir) / "final_metrics.json"
+                metrics.save_metrics(str(final_metrics_file))
+
+                # Save summary
+                summary_file = Path(config.log_dir) / "training_summary.json"
+                with open(summary_file, 'w') as f:
+                    json.dump(self.get_summary(), f, indent=2, default=str)
+            except Exception as e:
+                logger.error(f"Failed to save final metrics: {e}")
+                cleanup_errors.append(('save_metrics', e))
+
+        # Close TensorBoard writer
+        writer = getattr(self, 'writer', None)
+        if writer:
+            try:
+                writer.flush()
+                writer.close()
+            except Exception as e:
+                logger.debug(f"Error closing TensorBoard writer: {e}")
+                cleanup_errors.append(('tensorboard', e))
+
         # Close wandb run
-        if self.wandb_run and WANDB_AVAILABLE:
+        wandb_run = getattr(self, 'wandb_run', None)
+        if wandb_run and WANDB_AVAILABLE:
             try:
                 wandb.finish()
-            except:
-                pass
-        
-        logger.info("Training monitor closed")
+            except Exception as e:
+                logger.debug(f"Error finishing wandb: {e}")
+                cleanup_errors.append(('wandb', e))
+
+        # Mark as closed only after attempting all cleanup
+        self._closed = True
+
+        if cleanup_errors:
+            logger.warning(f"Training monitor closed with {len(cleanup_errors)} errors: {cleanup_errors}")
+        else:
+            logger.info("Training monitor closed successfully")
 
 
 # Example usage
