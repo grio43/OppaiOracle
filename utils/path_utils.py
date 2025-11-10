@@ -9,8 +9,33 @@ class PathTraversalError(ValueError):
     """Raised when a candidate path escapes the allowed root."""
 
 def sanitize_identifier(s: str, pattern: re.Pattern[str] = DEFAULT_ID_RE) -> str:
+    """Sanitize an identifier to prevent path traversal attacks.
+
+    Args:
+        s: The identifier to sanitize
+        pattern: Regex pattern for allowlist validation (default: alphanumeric, _, ., -)
+
+    Returns:
+        The sanitized identifier
+
+    Raises:
+        ValueError: If identifier contains disallowed characters or path traversal sequences
+    """
     if not pattern.fullmatch(s):
         raise ValueError(f"Invalid identifier: {s!r}. Use only A–Z, a–z, 0–9, _ . -")
+
+    # Additional security checks for path traversal
+    if '..' in s:
+        raise ValueError(f"Path traversal sequence '..' not allowed in identifier: {s!r}")
+    if s.startswith('.') or s.startswith('-'):
+        raise ValueError(f"Identifier cannot start with '.' or '-': {s!r}")
+    if '/' in s or '\\' in s:
+        raise ValueError(f"Path separators not allowed in identifier: {s!r}")
+
+    # Verify no null bytes (can cause issues in C-based filesystem calls)
+    if '\x00' in s:
+        raise ValueError(f"Null bytes not allowed in identifier: {s!r}")
+
     return s
 
 

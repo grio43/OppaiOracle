@@ -149,15 +149,16 @@ class AsymmetricFocalLoss(nn.Module):
         # Use BCEWithLogitsLoss for numerical stability.
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
 
-        # Calculate probabilities for focal weights.
-        probs = torch.sigmoid(logits)
+        # Calculate focal weights using log-space math for numerical stability and
+        # gradient preservation (CR-008 fix)
+        # log_sigmoid(x) = -softplus(-x), where softplus(x) = log(1 + exp(x))
+        log_probs = -F.softplus(-logits)  # log(p) = log(sigmoid(logits))
+        log_one_minus_probs = -F.softplus(logits)  # log(1-p) = log(1 - sigmoid(logits))
 
-        # Clip probabilities for focal weights to prevent pow(0, gamma) issues.
-        probs = torch.clamp(probs, min=self.clip, max=1.0 - self.clip)
-
-        # Calculate focal weights
-        pos_weights = targets * torch.pow(1 - probs, self.gamma_pos)
-        neg_weights = (1 - targets) * torch.pow(probs, self.gamma_neg)
+        # Calculate focal weights using exp(gamma * log_prob) = prob^gamma
+        # This avoids pow(0, gamma) numerically while maintaining gradients everywhere
+        pos_weights = targets * torch.exp(self.gamma_pos * log_one_minus_probs)
+        neg_weights = (1 - targets) * torch.exp(self.gamma_neg * log_probs)
 
         # Apply focal weights with separate positive/negative weighting
         pos_loss = pos_weights * bce_loss

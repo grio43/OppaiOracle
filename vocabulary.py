@@ -279,23 +279,28 @@ class TagVocabulary:
         logger.info(f"Vocabulary built with {len(self.tag_to_index)} tags (incl. special tokens)")
     
     def save_vocabulary(self, vocab_path: Path) -> None:
-        """Save the vocabulary to a JSON file.
-        
+        """Save the vocabulary to a JSON file with type consistency.
+
         The file contains tag_to_index, index_to_tag, and tag_frequencies.
-        
+        All keys and values are explicitly converted to ensure type safety
+        during JSON serialization/deserialization.
+
         Args:
             vocab_path: Path to save vocabulary file
         """
         vocab_path = Path(vocab_path)
         vocab_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
+        # Ensure type consistency: tag_to_index has string keys and int values
+        # index_to_tag has string keys (will be converted back to int on load) and string values
         with open(vocab_path, 'w', encoding='utf-8') as f:
             json.dump({
-                'tag_to_index': self.tag_to_index,
-                'index_to_tag': self.index_to_tag,
-                'tag_frequencies': self.tag_frequencies,
+                'tag_to_index': {str(k): int(v) for k, v in self.tag_to_index.items()},
+                'index_to_tag': {str(k): str(v) for k, v in self.index_to_tag.items()},
+                'tag_frequencies': {str(k): int(v) if isinstance(v, (int, float)) else v
+                                   for k, v in self.tag_frequencies.items()},
             }, f, ensure_ascii=False, indent=2)
-        
+
         logger.info(f"Saved vocabulary to {vocab_path}")
     
     def save(self, filepath: Path) -> None:
@@ -307,16 +312,22 @@ class TagVocabulary:
         self.save_vocabulary(filepath)
 
     def load_vocabulary(self, vocab_path: Path) -> None:
-        """Load vocabulary from a JSON file.
-        
+        """Load vocabulary from a JSON file with type conversion and validation.
+
         Args:
             vocab_path: Path to vocabulary JSON file
+
+        Raises:
+            ValueError: If vocabulary has inconsistent bidirectional mappings
         """
         with open(vocab_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
-        self.tag_to_index = data['tag_to_index']
-        self.index_to_tag = {int(k): v for k, v in data['index_to_tag'].items()}
+
+        # Convert keys/values to correct types
+        # tag_to_index: string keys (tag names) -> int values (indices)
+        # index_to_tag: int keys (indices) -> string values (tag names)
+        self.tag_to_index = {str(k): int(v) for k, v in data['tag_to_index'].items()}
+        self.index_to_tag = {int(k): str(v) for k, v in data['index_to_tag'].items()}
         self.tag_frequencies = data.get('tag_frequencies', {})
         
         # Ensure special tokens are present
@@ -554,7 +565,7 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
 
 def verify_vocabulary_integrity(vocab: TagVocabulary, source_path: Optional[Path] = None,
                                max_placeholders: int = 10) -> None:
-    """Verify that a loaded vocabulary contains real tags, not placeholders.
+    """Verify that a loaded vocabulary contains real tags and has consistent bidirectional mappings.
 
     Args:
         vocab: TagVocabulary instance to verify
@@ -562,8 +573,9 @@ def verify_vocabulary_integrity(vocab: TagVocabulary, source_path: Optional[Path
         max_placeholders: Maximum allowed placeholder tags (default 10 for special tokens)
 
     Raises:
-        ValueError: If vocabulary contains too many placeholder tags
+        ValueError: If vocabulary contains too many placeholder tags or inconsistent mappings
     """
+    # Check for placeholder tags
     placeholder_count = sum(
         1 for tag in vocab.tag_to_index.keys()
         if tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit()
@@ -583,6 +595,43 @@ def verify_vocabulary_integrity(vocab: TagVocabulary, source_path: Optional[Path
             f"The model would learn meaningless labels if used in training or inference.\n"
             f"Please regenerate the vocabulary from your dataset annotations."
         )
+
+    # Verify bidirectional mapping consistency (addresses CR-004)
+    source_str = f" at {source_path}" if source_path else ""
+
+    # Check all indices in tag_to_index map back correctly
+    for tag, idx in vocab.tag_to_index.items():
+        if not isinstance(idx, int):
+            raise ValueError(
+                f"CRITICAL: Vocabulary{source_str} has non-integer index for tag '{tag}': {idx} (type: {type(idx).__name__})"
+            )
+        if idx not in vocab.index_to_tag:
+            raise ValueError(
+                f"CRITICAL: Vocabulary{source_str} inconsistent - "
+                f"tag_to_index['{tag}'] = {idx}, but {idx} not in index_to_tag"
+            )
+        if vocab.index_to_tag[idx] != tag:
+            raise ValueError(
+                f"CRITICAL: Vocabulary{source_str} inconsistent - "
+                f"tag_to_index['{tag}'] = {idx}, but index_to_tag[{idx}] = '{vocab.index_to_tag[idx]}'"
+            )
+
+    # Check all indices in index_to_tag map back correctly
+    for idx, tag in vocab.index_to_tag.items():
+        if not isinstance(idx, int):
+            raise ValueError(
+                f"CRITICAL: Vocabulary{source_str} has non-integer key in index_to_tag: {idx} (type: {type(idx).__name__})"
+            )
+        if tag not in vocab.tag_to_index:
+            raise ValueError(
+                f"CRITICAL: Vocabulary{source_str} inconsistent - "
+                f"index_to_tag[{idx}] = '{tag}', but '{tag}' not in tag_to_index"
+            )
+        if vocab.tag_to_index[tag] != idx:
+            raise ValueError(
+                f"CRITICAL: Vocabulary{source_str} inconsistent - "
+                f"index_to_tag[{idx}] = '{tag}', but tag_to_index['{tag}'] = {vocab.tag_to_index[tag]}"
+            )
 
 # Keep backward compatibility alias
 _verify_vocabulary_integrity = verify_vocabulary_integrity
