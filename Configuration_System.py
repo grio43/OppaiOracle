@@ -50,14 +50,57 @@ import time
 from collections import defaultdict
 import re
 import warnings
-
-# Import sensitive defaults
-try:
-    from sensitive_config import ALERT_WEBHOOK_URL
-except ImportError:  # pragma: no cover - fallback when file missing
-    ALERT_WEBHOOK_URL = None
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+# Import sensitive defaults
+ALLOWED_WEBHOOK_DOMAINS = [
+    'hooks.slack.com',
+    'discord.com',
+    'hooks.microsoft.com',  # Teams
+    'api.telegram.org',     # Telegram
+    # Add other trusted webhook providers here
+]
+
+def validate_webhook_url(url: str | None) -> str | None:
+    """Validate webhook URL for security.
+
+    Args:
+        url: The webhook URL to validate
+
+    Returns:
+        The validated URL or None if no URL provided
+
+    Raises:
+        ValueError: If URL is invalid or uses untrusted domain
+    """
+    if url is None:
+        return None
+
+    # Ensure HTTPS only (never plain HTTP)
+    parsed = urlparse(url)
+    if parsed.scheme != 'https':
+        raise ValueError(f"Webhook URL must use HTTPS, got: {parsed.scheme}")
+
+    # Check domain allowlist
+    if not any(parsed.netloc.endswith(domain) for domain in ALLOWED_WEBHOOK_DOMAINS):
+        raise ValueError(
+            f"Webhook domain '{parsed.netloc}' not in allowlist. "
+            f"Allowed domains: {ALLOWED_WEBHOOK_DOMAINS}"
+        )
+
+    logger.info(f"Validated webhook URL for domain: {parsed.netloc}")
+    return url
+
+try:
+    from sensitive_config import ALERT_WEBHOOK_URL as _ALERT_WEBHOOK_URL
+    ALERT_WEBHOOK_URL = validate_webhook_url(_ALERT_WEBHOOK_URL)
+except ImportError:  # pragma: no cover - fallback when file missing
+    ALERT_WEBHOOK_URL = None
+except ValueError as e:
+    logger.error(f"Invalid webhook URL in sensitive_config.py: {e}")
+    ALERT_WEBHOOK_URL = None
 
 # Type variable for generic config classes
 T = TypeVar('T', bound='BaseConfig')
@@ -189,20 +232,30 @@ class BaseConfig:
             logger.info(f"Successfully saved config to {p} ({p.stat().st_size} bytes)")
 
         except OSError as e:
-            # Clean up temp file if it exists
+            # Clean up temp file if it exists (CR-007 fix: improve logging)
             if temp_path.exists():
                 try:
                     temp_path.unlink()
-                except OSError:
-                    pass
+                    logger.debug(f"Cleaned up temp file: {temp_path}")
+                except OSError as cleanup_error:
+                    # Log failure instead of silent pass (CR-007)
+                    logger.warning(
+                        f"Failed to remove temp file {temp_path}: {cleanup_error}. "
+                        f"Manual cleanup may be required."
+                    )
             raise ConfigError(f"Failed to save config to {p}: {e}") from e
         except Exception as e:
-            # Clean up temp file on any error
+            # Clean up temp file on any error (CR-007 fix: improve logging)
             if temp_path.exists():
                 try:
                     temp_path.unlink()
-                except OSError:
-                    pass
+                    logger.debug(f"Cleaned up temp file: {temp_path}")
+                except OSError as cleanup_error:
+                    # Log failure instead of silent pass (CR-007)
+                    logger.warning(
+                        f"Failed to remove temp file {temp_path}: {cleanup_error}. "
+                        f"Manual cleanup may be required."
+                    )
             raise ConfigError(f"Error serializing config to {p}: {e}") from e
     
     def to_json(self, path: Union[str, Path], **kwargs):

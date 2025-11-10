@@ -128,6 +128,15 @@ class _WriterProc(mp.Process):
         self._running.set()
         self._in_flush = False  # Guard against re-entrant flush calls
 
+        # Cache statistics tracking (CR-006)
+        self.stats = {
+            'writes': 0,
+            'dropped_batches': 0,
+            'dropped_items': 0,
+            'cache_full_events': 0,
+        }
+        self.cache_full = False  # Backpressure signal
+
     def run(self) -> None:
         env = lmdb.open(
             self.path,
@@ -185,11 +194,17 @@ class _WriterProc(mp.Process):
                             for k, v in pending:
                                 txn.put(k, v, overwrite=True)
                     except lmdb.MapFullError:
-                        # Can't grow anymore, cache is truly full
+                        # Can't grow anymore, cache is truly full (CR-006)
+                        self.cache_full = True
+                        self.stats['cache_full_events'] += 1
+                        self.stats['dropped_batches'] += 1
+                        self.stats['dropped_items'] += len(pending)
+
                         logging.critical(
-                            f"L2 cache is full and cannot grow beyond "
-                            f"{new_size / (1024**3):.2f}GB. "
-                            f"Writes will be dropped. "
+                            f"L2 cache FULL: Dropped batch of {len(pending)} items. "
+                            f"Total dropped: {self.stats['dropped_items']} items in "
+                            f"{self.stats['dropped_batches']} batches. "
+                            f"Cache size: {new_size / (1024**3):.2f}GB. "
                             f"Increase max_map_size or clear the cache."
                         )
                         # Drop the batch to avoid blocking

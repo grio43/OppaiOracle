@@ -20,6 +20,7 @@ import torch.distributed as dist
 from dataclasses import dataclass
 from contextlib import nullcontext
 import signal
+import threading
 
 import shutil
 import torch
@@ -238,13 +239,13 @@ def train_with_orientation_tracking(config: FullConfig):
     
     # --- Soft stop support (signals + sentinel files) -----------------------
     # Save a checkpoint at the next safe point (optimizer step) and exit.
-    soft_stop = {"requested": False}
+    # Use threading.Event for signal-safe flag (CR-033)
+    soft_stop_event = threading.Event()
 
     def _soft_stop_handler(signum, frame):
-        try:
-            soft_stop["requested"] = True
-        except Exception:
-            pass
+        """Signal-safe handler - only sets atomic event."""
+        soft_stop_event.set()
+        # Note: Logging here is not strictly signal-safe but is generally OK for warnings
         logger.warning("Soft stop requested via signal %s; will save at next safe point.", signum)
 
     try:
@@ -297,10 +298,30 @@ def train_with_orientation_tracking(config: FullConfig):
         default=True  -> [Y/n]
         default=False -> [y/N]
         default=None  -> [y/n]
+
+        Environment variables (CR-001):
+        - OO_AUTO_REBUILD_VOCAB: "1", "true", "yes" for auto-rebuild
+        - OO_NON_INTERACTIVE: "1" to force non-interactive mode
         """
+        # Check environment variable override (CR-001 fix)
+        env_override = os.environ.get("OO_AUTO_REBUILD_VOCAB")
+        if env_override:
+            result = env_override.lower() in ("1", "true", "yes")
+            logger.info(f"Using environment variable OO_AUTO_REBUILD_VOCAB={env_override} -> {result}")
+            return result
+
+        # Force non-interactive mode via environment variable
+        if os.environ.get("OO_NON_INTERACTIVE", "").lower() in ("1", "true", "yes"):
+            result = bool(default) if default is not None else False
+            logger.info(f"Non-interactive mode via OO_NON_INTERACTIVE -> using default: {result}")
+            return result
+
         # Non-interactive (e.g., piped/cron) -> use default
         if not sys.stdin or not sys.stdin.isatty():
-            return bool(default) if default is not None else False
+            result = bool(default) if default is not None else False
+            logger.info(f"Non-TTY detected -> using default: {result}")
+            return result
+
         choices = " [Y/n] " if default is True else (" [y/N] " if default is False else " [y/n] ")
         ans = input(prompt + choices).strip().lower()
         if ans in ("y", "yes"): return True
@@ -822,7 +843,7 @@ def train_with_orientation_tracking(config: FullConfig):
 
                 # --- Soft stop / Save-now handling (safe point: after optimizer step) ---
                 if ((step + 1) % accum == 0):
-                    stop_now = bool(soft_stop.get("requested")) or stop_sentinel.exists()
+                    stop_now = soft_stop_event.is_set() or stop_sentinel.exists()
                     save_now = save_sentinel.exists()
                     if stop_now or save_now:
                         try:
