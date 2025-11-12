@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, time, atexit, signal, queue, logging
+import os, time, atexit, signal, queue, logging, threading
 import multiprocessing as mp
 from typing import Optional, Tuple
 try:
@@ -19,6 +19,37 @@ def _wait_for_env_files(path: str, *, timeout_s: float = 2.0, poll_ms: int = 50)
         time.sleep(poll_ms / 1000.0)
 
 # Serialization now lives in cache_codec.py (safetensors + optional HMAC)
+
+# Thread-local storage for batch read transactions
+_thread_local = threading.local()
+
+
+class _BatchReadContext:
+    """Context manager for batched LMDB reads using a single transaction."""
+
+    def __init__(self, reader: "LMDBReader"):
+        self.reader = reader
+        self.txn = None
+
+    def __enter__(self):
+        # Start a read transaction and store it in thread-local storage
+        self.txn = self.reader.env.begin(write=False)
+        if not hasattr(_thread_local, 'lmdb_txns'):
+            _thread_local.lmdb_txns = []
+        _thread_local.lmdb_txns.append(self.txn)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Close the transaction and remove from thread-local storage
+        if hasattr(_thread_local, 'lmdb_txns') and _thread_local.lmdb_txns:
+            _thread_local.lmdb_txns.pop()
+        if self.txn is not None:
+            try:
+                self.txn.__exit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                pass
+        return False
+
 
 # --- Read-only per-process cache handle ---
 class LMDBReader:
@@ -74,14 +105,85 @@ class LMDBReader:
         self.env: lmdb.Environment = env
 
     def get(self, key: bytes) -> Optional[bytes]:
-        # short-lived read txns so the writer never waits on us
-        with self.env.begin(write=False) as txn:
+        """Get a value from LMDB cache.
+
+        If called within a batch_context(), uses the shared transaction for
+        better performance. Otherwise creates a short-lived transaction.
+        """
+        # Check if we're in a batch context with an active transaction
+        if hasattr(_thread_local, 'lmdb_txns') and _thread_local.lmdb_txns:
+            # Use the current batch transaction
+            txn = _thread_local.lmdb_txns[-1]
             v = txn.get(key)
             if v is None:
                 monitor.l2_miss()
             else:
                 monitor.l2_hit()
             return v
+        else:
+            # Create short-lived read transaction (original behavior)
+            with self.env.begin(write=False) as txn:
+                v = txn.get(key)
+                if v is None:
+                    monitor.l2_miss()
+                else:
+                    monitor.l2_hit()
+                return v
+
+    def get_many(self, keys: list[bytes]) -> list[Optional[bytes]]:
+        """Get multiple keys in a single transaction for better performance.
+
+        This reduces transaction overhead from 50-100μs per key to amortized
+        cost across all keys in the batch.
+
+        Args:
+            keys: List of keys to retrieve
+
+        Returns:
+            List of values (or None for missing keys) in the same order as keys
+        """
+        if not keys:
+            return []
+
+        # Single transaction for all gets
+        results = []
+        with self.env.begin(write=False) as txn:
+            for key in keys:
+                v = txn.get(key)
+                results.append(v)
+                if v is None:
+                    monitor.l2_miss()
+                else:
+                    monitor.l2_hit()
+        return results
+
+    def batch_context(self):
+        """Context manager for keeping a transaction open across multiple gets.
+
+        Use this when you need to do multiple get() calls and want to amortize
+        transaction overhead. The transaction is shared via a thread-local variable.
+
+        ⚠️ WARNING: Do not hold this context for extended periods!
+        - Long-lived read transactions block LMDB writer from reclaiming pages
+        - Can cause MapFull errors if writer runs out of space
+        - Keep context lifetime under 100ms for safety
+        - For batch operations, prefer get_many() instead
+
+        Example:
+            # GOOD: Short-lived context
+            with reader.batch_context():
+                val1 = reader.get(key1)
+                val2 = reader.get(key2)
+
+            # BETTER: Use get_many for batch reads
+            vals = reader.get_many([key1, key2])
+
+            # BAD: Long-lived context blocks writer!
+            # with reader.batch_context():
+            #     for i in range(10000):
+            #         val = reader.get(keys[i])  # Don't do this!
+        """
+        return _BatchReadContext(self)
 
     def close(self) -> None:
         try:
@@ -114,7 +216,7 @@ class _WriterProc(mp.Process):
         batch_items: int = 512,
         batch_bytes: int = 64 << 20,   # 64MB
         flush_ms: int = 50,
-        max_map_size_multiplier: int = 10  # Maximum growth factor
+        max_map_size_multiplier: int = 2  # Maximum growth factor (2x = 17 TB max)
     ):
         super().__init__(daemon=True)
         self.path = path
@@ -126,7 +228,7 @@ class _WriterProc(mp.Process):
         self.flush_s = flush_ms / 1000.0
         self._running = mp.Event()
         self._running.set()
-        self._in_flush = False  # Guard against re-entrant flush calls
+        self._flush_lock = threading.Lock()  # Thread-safe flush guard (CR-012)
 
         # Cache statistics tracking (CR-006)
         self.stats = {
@@ -160,12 +262,11 @@ class _WriterProc(mp.Process):
             if not pending:
                 return
 
-            # Guard against re-entry (e.g., from signal handler)
-            if self._in_flush:
-                logging.warning("flush_pending called re-entrantly, skipping")
+            # Thread-safe guard against re-entry (CR-012)
+            if not self._flush_lock.acquire(blocking=False):
+                logging.debug("Flush already in progress, skipping")
                 return
 
-            self._in_flush = True
             try:
                 with env.begin(write=True) as txn:
                     for k, v in pending:
@@ -230,7 +331,7 @@ class _WriterProc(mp.Process):
                 pending.clear()
                 pending_bytes = 0
                 last_flush = time.monotonic()
-                self._in_flush = False
+                self._flush_lock.release()  # CR-012: Release lock properly
 
         def _shutdown(*_):
             """Signal handler: just set flag, don't do work."""
@@ -260,23 +361,22 @@ class _WriterProc(mp.Process):
             ):
                 flush_pending()
 
-        # Final flush (only if not already flushing from signal)
-        if not self._in_flush:
-            try:
-                flush_pending()
-                env.close()
-            except Exception as e:
-                logging.warning(f"L2 cache writer final flush failed: {e}")
+        # Final flush - flush_pending() will handle the lock itself
+        try:
+            flush_pending()
+            env.close()
+        except Exception as e:
+            logging.warning(f"L2 cache writer final flush failed: {e}")
 
-def start_l2_writer(path: str, map_size_bytes: int, max_map_size_multiplier: int = 10) -> Tuple[mp.Queue, mp.Process]:
+def start_l2_writer(path: str, map_size_bytes: int, max_map_size_multiplier: int = 2) -> Tuple[mp.Queue, mp.Process]:
     """
     Starts and returns a dedicated L2 cache writer process and its command queue.
 
     Args:
         path: The directory path for the LMDB environment.
         map_size_bytes: The initial size of the LMDB memory map.
-        max_map_size_multiplier: Maximum growth factor for map size (default: 10x).
-            For example, if map_size_bytes=100GB and multiplier=10, max is 1TB.
+        max_map_size_multiplier: Maximum growth factor for map size (default: 2x).
+            For example, if map_size_bytes=8.5TB and multiplier=2, max is 17TB.
 
     Returns:
         A tuple containing the multiprocessing queue for commands and the
@@ -298,13 +398,28 @@ def start_l2_writer(path: str, map_size_bytes: int, max_map_size_multiplier: int
 
     def _stop():
         try:
-            q.put_nowait(None)
+            q.put_nowait(None)  # Send poison pill to trigger graceful shutdown
         except Exception:
             pass
         try:
-            proc.join(timeout=2.0)
-        except Exception:
-            pass
+            # Adaptive timeout based on queue size
+            # Estimate: ~10ms per item for flush, with min 5s and max 30s
+            queue_size = q.qsize()
+            adaptive_timeout = max(5.0, min(30.0, queue_size * 0.01))
+
+            logging.info(f"L2 cache writer shutting down (queue size: {queue_size}, timeout: {adaptive_timeout:.1f}s)...")
+            proc.join(timeout=adaptive_timeout)
+
+            if proc.is_alive():
+                logging.warning(
+                    f"L2 cache writer did not finish in {adaptive_timeout:.1f}s "
+                    f"(queue had {queue_size} pending writes). Some writes may be lost. "
+                    f"Consider increasing the timeout or reducing write frequency."
+                )
+            else:
+                logging.info("L2 cache writer shutdown complete")
+        except Exception as e:
+            logging.warning(f"Error during L2 writer shutdown: {e}")
 
     atexit.register(_stop)
     return q, proc

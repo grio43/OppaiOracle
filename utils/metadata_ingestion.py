@@ -17,15 +17,15 @@ def parse_tags_field(tags_field) -> List[str]:
     """Turn a raw tags field into a list of tokens.
 
     Accepts None, string or iterable.  String values are split on
-    whitespace only (no punctuation stripping).  Empty or unsupported
+    commas, with whitespace stripped from each tag.  Empty or unsupported
     types yield an empty list.
     """
     if tags_field is None:
         return []
     if isinstance(tags_field, str):
-        return [p for p in tags_field.split() if p]
+        return [p.strip() for p in tags_field.split(',') if p.strip()]
     if isinstance(tags_field, (list, tuple)):
-        return [str(t) for t in tags_field if str(t)]
+        return [str(t).strip() for t in tags_field if str(t).strip()]
     return []
 
 def dedupe_preserve_order(items: Iterable[str]) -> List[str]:

@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 class ModelMetadata:
     """Manages model metadata including vocabulary and preprocessing params"""
 
+    # Class-level cache for vocabulary data to avoid repeated disk I/O
+    # Key: (vocab_path, mtime_ns) -> Value: (vocab_data, compressed_data)
+    _vocab_cache: Dict[Tuple[str, int], Tuple[Dict, Dict[str, str]]] = {}
+
     @staticmethod
     def embed_vocabulary(checkpoint: Dict, vocab_path: Path) -> Dict:
         """Embed vocabulary into checkpoint
@@ -40,7 +44,18 @@ class ModelMetadata:
             raise FileNotFoundError(f"Vocabulary file not found: {vocab_path}")
 
         try:
-            # Load and validate vocabulary
+            # Check cache first to avoid repeated disk I/O (50-200ms saved per checkpoint)
+            vocab_stat = vocab_path.stat()
+            cache_key = (str(vocab_path.resolve()), vocab_stat.st_mtime_ns)
+
+            if cache_key in ModelMetadata._vocab_cache:
+                # Cache hit: use cached compressed data
+                vocab_data, compressed_metadata = ModelMetadata._vocab_cache[cache_key]
+                checkpoint.update(compressed_metadata)
+                logger.debug(f"Using cached vocabulary ({len(vocab_data['tag_to_index'])} tags)")
+                return checkpoint
+
+            # Cache miss: load and validate vocabulary
             with open(vocab_path, 'r', encoding='utf-8') as f:
                 vocab_data = json.load(f)
 
@@ -64,19 +79,33 @@ class ModelMetadata:
                     f"Will not embed corrupted vocabulary. Examples: {examples}"
                 )
 
-            # Compress vocabulary
+            # Compress vocabulary (expensive operation, worth caching)
             vocab_json = json.dumps(vocab_data, ensure_ascii=False)
             vocab_bytes = vocab_json.encode('utf-8')
             vocab_compressed = gzip.compress(vocab_bytes)
             vocab_b64 = base64.b64encode(vocab_compressed).decode('utf-8')
             vocab_sha256 = hashlib.sha256(vocab_bytes).hexdigest()
 
-            # Embed in checkpoint
-            checkpoint['vocab_b64_gzip'] = vocab_b64
-            checkpoint['vocab_format_version'] = '1'
-            checkpoint['vocab_sha256'] = vocab_sha256
+            # Create metadata dict for caching
+            compressed_metadata = {
+                'vocab_b64_gzip': vocab_b64,
+                'vocab_format_version': '1',
+                'vocab_sha256': vocab_sha256,
+            }
 
-            logger.info(f"Embedded vocabulary with {len(vocab_data['tag_to_index'])} tags")
+            # Cache the result (limit cache size to prevent memory bloat)
+            # Keep only the most recent 3 vocabularies (sufficient for multi-GPU training)
+            if len(ModelMetadata._vocab_cache) >= 3:
+                # Remove oldest entry
+                oldest_key = next(iter(ModelMetadata._vocab_cache))
+                del ModelMetadata._vocab_cache[oldest_key]
+
+            ModelMetadata._vocab_cache[cache_key] = (vocab_data, compressed_metadata)
+
+            # Embed in checkpoint
+            checkpoint.update(compressed_metadata)
+
+            logger.info(f"Embedded vocabulary with {len(vocab_data['tag_to_index'])} tags (cached for reuse)")
             return checkpoint
 
         except json.JSONDecodeError as e:

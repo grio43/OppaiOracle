@@ -9,6 +9,10 @@ from torchmetrics.classification import MultilabelF1Score, MultilabelAveragePrec
 from model_architecture import create_model
 from loss_functions import MultiTaskLoss, AsymmetricFocalLoss
 try:
+    import bitsandbytes as bnb
+except ImportError:
+    bnb = None
+try:
     # MetricComputer is retained for backward compatibility.  If present,
     # downstream code can still compute other project-specific metrics.
     from evaluation_metrics import MetricComputer  # type: ignore
@@ -25,10 +29,11 @@ class LitOppai(pl.LightningModule):
     normalizes incoming batches from dict or tuple into (images, targets).
     """
 
-    def __init__(self, config: Any, vocab_size: int, *, drop_shape_mismatches: bool = True):
+    def __init__(self, config: Any, vocab_size: int, *, drop_shape_mismatches: bool = True, dataset_size: int = None):
         super().__init__()
         self.config = config
         self.drop_shape_mismatches = drop_shape_mismatches
+        self.dataset_size = dataset_size  # Store for adaptive optimizer config
         # Whether to require strict key matching when loading checkpoints
         self.strict_loading = bool(getattr(getattr(config, "training", None), "resume_strict", False))
 
@@ -174,8 +179,61 @@ class LitOppai(pl.LightningModule):
         self.train_metrics.reset()
 
     def configure_optimizers(self):
-        lr = getattr(getattr(self.config, "training", None), "learning_rate", 1e-4)
-        optimizer = torch.optim.AdamW(self.parameters(), lr=lr)
+        if bnb is None:
+            raise ImportError(
+                "bitsandbytes is required for AdamW8bit optimizer. "
+                "Install it with: pip install bitsandbytes"
+            )
+
+        # Get training config
+        training_cfg = getattr(self.config, "training", None)
+        data_cfg = getattr(self.config, "data", None)
+
+        # Extract parameters with defaults
+        batch_size = getattr(data_cfg, "batch_size", 32)
+        num_epochs = getattr(training_cfg, "num_epochs", 50)
+        grad_accum = getattr(training_cfg, "gradient_accumulation_steps", 1)
+
+        # Use adaptive optimizer configuration if dataset_size is available
+        if self.dataset_size is not None and self.dataset_size > 0:
+            try:
+                from optimizer_config import get_adamw8bit_config
+
+                lr, optim_kwargs, warmup_steps = get_adamw8bit_config(
+                    dataset_size=self.dataset_size,
+                    batch_size=batch_size,
+                    num_epochs=num_epochs,
+                    gradient_accumulation_steps=grad_accum,
+                    num_gpus=torch.cuda.device_count() if torch.cuda.is_available() else 1,
+                )
+
+                # Store warmup_steps for potential scheduler use
+                self.warmup_steps = warmup_steps
+
+                logger.info(f"Using adaptive AdamW8bit config: lr={lr:.6f}, warmup={warmup_steps}")
+                optimizer = bnb.optim.AdamW8bit(self.parameters(), lr=lr, **optim_kwargs)
+
+            except ImportError as e:
+                logger.warning(f"Could not import optimizer_config: {e}. Using fallback configuration.")
+                lr = getattr(training_cfg, "learning_rate", 1e-4)
+                optimizer = bnb.optim.AdamW8bit(self.parameters(), lr=lr)
+        else:
+            # Fallback to config-based learning rate
+            logger.info("Dataset size not provided, using config learning rate")
+            lr = getattr(training_cfg, "learning_rate", 1e-4)
+            weight_decay = getattr(training_cfg, "weight_decay", 0.01)
+            beta1 = getattr(training_cfg, "adam_beta1", 0.9)
+            beta2 = getattr(training_cfg, "adam_beta2", 0.999)
+            eps = getattr(training_cfg, "adam_epsilon", 1e-8)
+
+            optimizer = bnb.optim.AdamW8bit(
+                self.parameters(),
+                lr=lr,
+                betas=(beta1, beta2),
+                eps=eps,
+                weight_decay=weight_decay
+            )
+
         return optimizer
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:

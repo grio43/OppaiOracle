@@ -6,6 +6,7 @@ This module provides a unified TagVocabulary class that handles tag vocabulary
 management for both training and inference, eliminating code duplication.
 """
 
+import atexit
 import json
 import logging
 from pathlib import Path
@@ -18,6 +19,17 @@ logger = logging.getLogger(__name__)
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
 VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+
+# Global vocabulary cache to avoid reloading same vocabulary
+_VOCAB_CACHE: Dict[str, 'TagVocabulary'] = {}
+
+def _clear_vocab_cache():
+    """Clear the vocabulary cache (called on exit)."""
+    global _VOCAB_CACHE
+    _VOCAB_CACHE.clear()
+
+# Register cleanup on exit
+atexit.register(_clear_vocab_cache)
 
 # ---------------------------------------------------------------------------
 # Ignore tag handling
@@ -36,7 +48,7 @@ VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
 # propagate to worker processes.
 
 def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:
-    """Load ignore tags from a plain text file.
+    """Load ignore tags from a plain text file with validation (CR-013).
 
     If ``ignore_file`` is not provided, this attempts to locate a
     ``Tags_ignore.txt`` file in the same directory as this module.  Each
@@ -50,18 +62,47 @@ def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:
     if ignore_file is None:
         module_path = Path(__file__).resolve()
         ignore_file = module_path.parent / 'Tags_ignore.txt'
+
     ignored: Set[str] = set()
+
+    # Validate file exists (CR-013)
+    if not ignore_file.exists():
+        logger.debug(f"Ignored tags file not found: {ignore_file}")
+        return ignored
+
+    # Prevent DoS: check file size (CR-013)
     try:
-        if ignore_file and ignore_file.exists():
-            with open(ignore_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    tag = line.strip()
-                    # Skip blank lines or comments
-                    if not tag or tag.startswith('#'):
-                        continue
-                    ignored.add(tag)
+        file_size = ignore_file.stat().st_size
+        if file_size > 10 * 1024 * 1024:  # 10MB limit
+            logger.error(f"Ignored tags file too large: {file_size} bytes (max 10MB)")
+            return ignored
     except Exception as e:
-        logger.warning(f"Failed to load ignore tags from {ignore_file}: {e}")
+        logger.error(f"Error checking file size for {ignore_file}: {e}")
+        return ignored
+
+    try:
+        with open(ignore_file, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                tag = line.strip()
+                # Skip blank lines or comments
+                if not tag or tag.startswith('#'):
+                    continue
+
+                # Validate tag format (CR-013)
+                if len(tag) > 200:  # Reasonable tag length
+                    logger.warning(f"Suspicious tag length at line {line_num}: {len(tag)} chars")
+                    continue
+
+                if not tag.isprintable():
+                    logger.warning(f"Non-printable characters in tag at line {line_num}: {tag!r}")
+                    continue
+
+                ignored.add(tag)
+
+        logger.info(f"Loaded {len(ignored)} ignored tags from {ignore_file}")
+    except Exception as e:
+        logger.error(f"Failed to load ignore tags from {ignore_file}: {e}")
+
     return ignored
 
 
@@ -81,15 +122,17 @@ class TagVocabulary:
                  min_frequency: int = 1,
                  ignore_file: Optional[Path] = None,
                  pad_token: str = "<PAD>",
-                 unk_token: str = "<UNK>") -> None:
+                 unk_token: str = "<UNK>",
+                 tag_vector_dtype: str = "bfloat16") -> None:
         """Initialize vocabulary, optionally loading from file.
-        
+
         Args:
             vocab_path: Optional path to vocabulary file to load
             min_frequency: Minimum frequency for tags to be included when building vocabulary
             ignore_file: Path to a file containing tags to ignore
             pad_token: The token to use for padding
             unk_token: The token to use for unknown tags
+            tag_vector_dtype: Dtype for tag vectors ('float16', 'bfloat16', 'float32')
         """
         self.tag_to_index: Dict[str, int] = {}
         self.index_to_tag: Dict[int, str] = {}
@@ -110,7 +153,15 @@ class TagVocabulary:
         # The unk token (index 1) represents unknown or rare tags.
         self.pad_token = pad_token
         self.unk_token = unk_token
-        
+
+        # Tag vector dtype configuration
+        dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+        self._tag_vector_dtype = dtype_map.get(str(tag_vector_dtype).lower(), torch.bfloat16)
+
         # Rating classes (fixed)
         self.rating_to_index: Dict[str, int] = {
             "general": 0,
@@ -154,7 +205,7 @@ class TagVocabulary:
         Returns:
             Multi-hot tensor of shape (vocab_size,)
         """
-        vector = torch.zeros(len(self.tag_to_index), dtype=torch.float32)
+        vector = torch.zeros(len(self.tag_to_index), dtype=self._tag_vector_dtype)
         # Skip any tags that are marked as ignored.  Ignored tags are not
         # encoded at all; they do not contribute to the label vector and
         # therefore produce no training signal.  Unknown tags are still
@@ -226,12 +277,12 @@ class TagVocabulary:
                     if not tags_field:
                         continue
 
-                    # Accept both space‑delimited strings and lists
+                    # Accept both comma‑delimited strings and lists
                     tags_list: List[str]
                     if isinstance(tags_field, str):
-                        tags_list = tags_field.split()
+                        tags_list = [tag.strip() for tag in tags_field.split(',') if tag.strip()]
                     elif isinstance(tags_field, list):
-                        tags_list = tags_field
+                        tags_list = [str(tag).strip() for tag in tags_field if str(tag).strip()]
                     else:
                         logger.debug(f"Skipping entry with non-string/list tags in {json_file}")
                         continue
@@ -303,19 +354,12 @@ class TagVocabulary:
 
         logger.info(f"Saved vocabulary to {vocab_path}")
     
-    def save(self, filepath: Path) -> None:
-        """Save vocabulary (alias for save_vocabulary for compatibility).
-        
-        Args:
-            filepath: Path to save vocabulary file
-        """
-        self.save_vocabulary(filepath)
-
-    def load_vocabulary(self, vocab_path: Path) -> None:
+    def load_vocabulary(self, vocab_path: Path, skip_validation: bool = False) -> None:
         """Load vocabulary from a JSON file with type conversion and validation.
 
         Args:
             vocab_path: Path to vocabulary JSON file
+            skip_validation: If True, skip integrity validation (faster for trusted sources)
 
         Raises:
             ValueError: If vocabulary has inconsistent bidirectional mappings
@@ -323,11 +367,20 @@ class TagVocabulary:
         with open(vocab_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        # Convert keys/values to correct types
-        # tag_to_index: string keys (tag names) -> int values (indices)
-        # index_to_tag: int keys (indices) -> string values (tag names)
-        self.tag_to_index = {str(k): int(v) for k, v in data['tag_to_index'].items()}
-        self.index_to_tag = {int(k): str(v) for k, v in data['index_to_tag'].items()}
+        # Optimized type conversion: avoid dict comprehension overhead for large vocabs
+        # Pre-allocate dictionaries and use direct assignment
+        tag_to_index_raw = data['tag_to_index']
+        index_to_tag_raw = data['index_to_tag']
+
+        # Type conversions cached to avoid repeated work
+        if isinstance(next(iter(tag_to_index_raw.values())), int):
+            # Already correct types, shallow copy is sufficient
+            self.tag_to_index = dict(tag_to_index_raw)
+        else:
+            self.tag_to_index = {str(k): int(v) for k, v in tag_to_index_raw.items()}
+
+        # index_to_tag needs int keys (JSON uses string keys)
+        self.index_to_tag = {int(k): str(v) for k, v in index_to_tag_raw.items()}
         self.tag_frequencies = data.get('tag_frequencies', {})
         
         # Ensure special tokens are present
@@ -351,7 +404,10 @@ class TagVocabulary:
             if tag in self.tag_to_index
         ]
 
-        _verify_vocabulary_integrity(self, vocab_path)
+        # Validate vocabulary integrity unless skipped (for trusted/cached sources)
+        if not skip_validation:
+            _verify_vocabulary_integrity(self, vocab_path)
+
         logger.info(f"Loaded vocabulary with {len(self.tag_to_index)} tags from {vocab_path}")
 
     def to_json(self) -> str:
@@ -427,140 +483,87 @@ class TagVocabulary:
         return vocab
 
 
-def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH) -> TagVocabulary:
-    """Load vocabulary from directory or file (for backward compatibility).
+def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH, use_cache: bool = True) -> TagVocabulary:
+    """Load vocabulary from directory or file with caching support.
 
-    First tries to load from vocabulary.json, then tags.txt, otherwise
-    creates a dummy vocabulary.
+    First tries to load from vocabulary.json, then tags.txt. Uses an in-memory
+    cache to avoid reloading the same vocabulary repeatedly in a single process.
 
     Args:
         vocab_dir: Directory containing vocabulary files OR direct path to vocabulary file
+        use_cache: If True, use cached vocabulary if available (default: True)
 
     Returns:
         TagVocabulary instance
+
+    Raises:
+        FileNotFoundError: If vocabulary file not found
+        ValueError: If vocabulary is invalid
     """
-    vocab_path = Path(vocab_dir)
+    vocab_path = Path(vocab_dir).resolve()
 
-    # Check if direct file path
-    if vocab_path.is_file():
-        if vocab_path.suffix == '.json':
-            # Prefer a SQLite sidecar when present to cut startup I/O
-            try:
-                from vocab_sqlite import load_vocabulary_from_sqlite  # local import; optional backend
+    # Check cache first if enabled
+    cache_key = str(vocab_path)
+    if use_cache and cache_key in _VOCAB_CACHE:
+        logger.debug(f"Using cached vocabulary from {vocab_path}")
+        return _VOCAB_CACHE[cache_key]
 
-                # Get JSON metadata atomically
-                try:
-                    json_stat = vocab_path.stat()
-                    json_mtime = json_stat.st_mtime
-                except OSError as e:
-                    logger.error(f"Cannot stat JSON vocabulary file {vocab_path}: {e}")
-                    raise
+    vocab = None
+    source_path = None
 
-                candidates = [
-                    vocab_path.with_name('vocab.sqlite'),
-                    vocab_path.with_suffix('.sqlite'),
-                    vocab_path.with_suffix('.db'),
-                ]
+    try:
+        # Check if direct file path
+        if vocab_path.is_file():
+            if vocab_path.suffix == '.json':
+                # Load JSON vocabulary directly
+                vocab = TagVocabulary()
+                vocab.load_vocabulary(vocab_path)
+                source_path = vocab_path
+            elif vocab_path.suffix == '.txt':
+                vocab = TagVocabulary.from_file(vocab_path)
+                source_path = vocab_path
+            else:
+                raise ValueError(f"Unsupported vocabulary file format: {vocab_path.suffix}")
 
-                for cand in candidates:
-                    try:
-                        # Atomic stat check (both exist and mtime in one syscall)
-                        cand_stat = cand.stat()
+        # Otherwise treat as directory
+        elif vocab_path.is_dir():
+            # Try JSON format first
+            vocab_json = vocab_path / "vocabulary.json"
+            if vocab_json.exists():
+                vocab = TagVocabulary()
+                vocab.load_vocabulary(vocab_json)
+                source_path = vocab_json
+            else:
+                # Try text format
+                vocab_file = vocab_path / "tags.txt"
+                if vocab_file.exists():
+                    vocab = TagVocabulary.from_file(vocab_file)
+                    source_path = vocab_file
 
-                        # Security: Only use SQLite if it's newer (prevents stale cache attacks)
-                        # Use strict comparison to avoid epsilon ambiguity
-                        if cand_stat.st_mtime >= json_mtime:
-                            logger.info(f"Attempting to load SQLite sidecar: {cand}")
+        # Validate result
+        if vocab is None or source_path is None:
+            raise FileNotFoundError(
+                f"Vocabulary not found at {vocab_path}. "
+                f"Tried: vocabulary.json and tags.txt"
+            )
 
-                            # Load with validation
-                            vocab = load_vocabulary_from_sqlite(cand)
+        # Verify vocabulary integrity
+        _verify_vocabulary_integrity(vocab, source_path)
 
-                            # CRITICAL: Verify integrity before trusting
-                            _verify_vocabulary_integrity(vocab, cand)
+        # Cache the loaded vocabulary
+        if use_cache:
+            _VOCAB_CACHE[cache_key] = vocab
+            logger.debug(f"Cached vocabulary from {vocab_path}")
 
-                            logger.info(f"Loaded vocabulary from verified SQLite sidecar: {cand}")
-                            return vocab
-                        else:
-                            logger.debug(f"Skipping stale SQLite sidecar {cand} (older than JSON)")
+        return vocab
 
-                    except FileNotFoundError:
-                        # File was deleted between candidates iteration - continue to next
-                        logger.debug(f"SQLite candidate {cand} not found")
-                        continue
-                    except PermissionError as e:
-                        logger.warning(f"Cannot read SQLite candidate {cand}: {e}")
-                        continue
-                    except Exception as e:
-                        # Log specific error for security monitoring
-                        logger.warning(f"Failed to load SQLite sidecar {cand}: {type(e).__name__}: {e}")
-                        continue
-
-            except ImportError:
-                # Backend unavailable - expected
-                logger.debug("SQLite vocabulary backend not available")
-            except Exception as e:
-                # Unexpected error in sidecar loading logic
-                logger.error(f"Unexpected error in SQLite sidecar loading: {e}", exc_info=True)
-            # JSON fallback (canonical source of truth)
-            vocab = TagVocabulary()
-            vocab.load_vocabulary(vocab_path)
-            # Verify the loaded vocabulary is valid
-            _verify_vocabulary_integrity(vocab, vocab_path)
-            return vocab
-        elif vocab_path.suffix == '.txt':
-            vocab = TagVocabulary.from_file(vocab_path)
-            _verify_vocabulary_integrity(vocab, vocab_path)
-            return vocab
-        elif vocab_path.suffix in ('.sqlite', '.db'):
-            # Load from SQLite backend
-            try:
-                from vocab_sqlite import load_vocabulary_from_sqlite  # local import to avoid hard dep at import time
-            except Exception as e:
-                raise ImportError(
-                    f"SQLite vocabulary backend unavailable: {e}. "
-                    f"Install SQLite (stdlib) and ensure vocab_sqlite.py exists."
-                )
-            vocab = load_vocabulary_from_sqlite(vocab_path)
-            _verify_vocabulary_integrity(vocab, vocab_path)
-            return vocab
-
-    # Otherwise treat as directory
-    if vocab_path.is_dir():
-        # Try JSON format first
-        vocab_json = vocab_path / "vocabulary.json"
-        if vocab_json.exists():
-            vocab = TagVocabulary()
-            vocab.load_vocabulary(vocab_json)
-            # Verify the loaded vocabulary is valid
-            _verify_vocabulary_integrity(vocab, vocab_json)
-            return vocab
-
-        # Try text format
-        vocab_file = vocab_path / "tags.txt"
-        if vocab_file.exists():
-            vocab = TagVocabulary.from_file(vocab_file)
-            _verify_vocabulary_integrity(vocab, vocab_file)
-            return vocab
-
-        # Try SQLite format
-        for candidate in (vocab_path / "vocab.sqlite", vocab_path / "vocabulary.sqlite", vocab_path / "vocab.db"):
-            if candidate.exists():
-                try:
-                    from vocab_sqlite import load_vocabulary_from_sqlite
-                except Exception as e:
-                    raise ImportError(
-                        f"SQLite vocabulary backend unavailable: {e}. "
-                        f"Ensure vocab_sqlite.py is present."
-                    )
-                vocab = load_vocabulary_from_sqlite(candidate)
-                _verify_vocabulary_integrity(vocab, candidate)
-                return vocab
-
-    # Fail loudly if vocabulary not found - no dummy fallback
-    raise FileNotFoundError(
-        f"Vocabulary not found at {vocab_path}. "
-        f"Tried: vocabulary.json, tags.txt, and SQLite (vocab.sqlite)."
-    )
+    except FileNotFoundError:
+        # Re-raise file not found errors directly
+        raise
+    except Exception as e:
+        # Wrap other errors with context
+        logger.error(f"Failed to load vocabulary from {vocab_path}: {e}")
+        raise ValueError(f"Failed to load vocabulary from {vocab_path}: {e}") from e
 
 
 def verify_vocabulary_integrity(vocab: TagVocabulary, source_path: Optional[Path] = None,
@@ -681,15 +684,7 @@ def create_vocabulary_from_datasets(
     vocab.build_from_annotations([Path(f) for f in json_files], top_k=top_k)
 
     vocab.save_vocabulary(VOCAB_PATH)
-
-    # Also build a SQLite sidecar next to vocabulary.json to reduce I/O in downstream tools
-    try:
-        from vocab_sqlite import save_vocabulary_to_sqlite  # local import to avoid hard dep at import time
-        sqlite_path = VOCAB_PATH.with_name('vocab.sqlite')
-        save_vocabulary_to_sqlite(vocab, sqlite_path)
-        logger.info(f"Created vocabulary with {len(vocab)} tags and wrote JSON+SQLite -> {VOCAB_PATH}, {sqlite_path}")
-    except Exception as e:
-        logger.warning(f"Vocabulary JSON saved but failed to write SQLite sidecar: {e}")
+    logger.info(f"Created vocabulary with {len(vocab)} tags at {VOCAB_PATH}")
 
     return vocab
 

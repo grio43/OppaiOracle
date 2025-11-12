@@ -302,7 +302,7 @@ def main() -> None:
     logger.info("Dataset root: %s", root)
     logger.info("Images dir: %s (mode=%s)", images_dir, args.link_mode)
 
-    # Load vocabulary (prefers SQLite sidecar when present)
+    # Load vocabulary (JSON format with caching)
     vocab_path = Path(getattr(cfg, "vocab_path", "./vocabulary.json"))
     vocab = load_vocabulary_for_training(vocab_path)
     verify_vocabulary_integrity(vocab, vocab_path)

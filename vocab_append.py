@@ -389,15 +389,7 @@ def main() -> None:
 
     # Save vocabulary
     vocab.save_vocabulary(vocab_file)
-
-    # Also mirror to SQLite (same directory, file name 'vocab.sqlite')
-    try:
-        from vocab_sqlite import save_vocabulary_to_sqlite
-        sqlite_path = _PathAlias(vocab_file).with_name('vocab.sqlite')
-        save_vocabulary_to_sqlite(vocab, sqlite_path)
-        logger.info(f"Mirrored vocabulary to SQLite at {sqlite_path}")
-    except Exception as e:
-        logger.warning(f"Could not mirror vocabulary to SQLite: {e}")
+    logger.info(f"Saved vocabulary to {vocab_file}")
 
     # Report summary
     ordered = _ordered_vocab_list(vocab)

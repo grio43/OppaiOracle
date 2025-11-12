@@ -448,10 +448,27 @@ class OrientationHandler:
     
     def swap_tags(self, tags: list[str], *, skip_safety_check: bool = False, record_stats: bool = True) -> tuple[list[str], bool]:
         """
-        Swap all orientation-sensitive tags in a list.
+        Swap all orientation-sensitive tags in a list atomically.
 
-        Set skip_safety_check=True if a safety decision has already been made
-        upstream (e.g. by a dataset component) to avoid double-counting stats.
+        CR-017: This method guarantees atomic tag swapping by building a complete
+        new list of swapped tags before returning. The caller receives either:
+        - The complete swapped list (all tags processed), OR
+        - The original list unchanged (if flip was skipped)
+        Never a partial swap, even in multithreaded scenarios.
+
+        Args:
+            tags: Original list of tags (not modified in-place)
+            skip_safety_check: Skip safety checks if already validated upstream
+            record_stats: Whether to record statistics (default True)
+
+        Returns:
+            Tuple of (swapped_tags, flip_applied):
+                - swapped_tags: New list with all tags swapped (or original if skipped)
+                - flip_applied: True if flip was applied, False if skipped
+
+        Thread Safety:
+            Multiple threads can safely call this method concurrently.
+            Stats updates are protected by lock, tag swapping is lock-free.
         """
         # Optionally respect the safety decision upstream to avoid double-veto and stat drift
         if not skip_safety_check and self.should_skip_flip(tags):
@@ -466,8 +483,9 @@ class OrientationHandler:
                                                   'copyright', 'single_'])
             )
 
+        # CR-017: Build complete swapped list before returning (atomic from caller perspective)
         # Swap tags and collect stats in single pass (avoids second iteration)
-        swapped_tags: list[str] = []
+        swapped_tags: list[str] = []  # New list - original 'tags' never modified
         mapped_tags = []
         unmapped_tags = []
 
@@ -481,6 +499,10 @@ class OrientationHandler:
             elif is_unmapped_orientation(tag):
                 # Tag is unmapped orientation
                 unmapped_tags.append(tag)
+
+        # CR-017: Validate atomicity - ensure we processed all tags
+        assert len(swapped_tags) == len(tags), \
+            f"Tag swap incomplete: {len(swapped_tags)} swapped vs {len(tags)} original"
 
         # Batch stats update - single lock acquisition with minimal work under lock
         if record_stats:
