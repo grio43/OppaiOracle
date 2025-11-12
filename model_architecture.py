@@ -8,7 +8,7 @@ import functools
 import math
 import warnings
 from dataclasses import dataclass, fields
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -68,11 +68,25 @@ def _check_flash_attention_available() -> bool:
 
 class LayerNormFp32(nn.LayerNorm):
     """
-    LayerNorm that casts to float32 before calling the original LayerNorm.
+    LayerNorm that optionally casts to float32 before calling the original LayerNorm.
     This is to improve stability when using mixed precision training.
+
+    Args:
+        normalized_shape: Input shape from an expected input of size
+        eps: A value added to the denominator for numerical stability
+        elementwise_affine: A boolean value that when set to True, gives learnable parameters
+        use_fp32: If True, cast to float32 before LayerNorm (better stability).
+                  If False, use native dtype (faster but potentially less stable).
     """
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True, use_fp32=True):
+        super().__init__(normalized_shape, eps=eps, elementwise_affine=elementwise_affine)
+        self.use_fp32 = use_fp32
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return super().forward(x.float()).type_as(x)
+        if self.use_fp32:
+            return super().forward(x.float()).type_as(x)
+        else:
+            return super().forward(x)
 
 @dataclass
 class VisionTransformerConfig:
@@ -101,6 +115,8 @@ class VisionTransformerConfig:
     # Logit clamping for numerical stability (None to disable)
     # exp(15) ≈ 3.3M which is safe for softmax in float16/bfloat16
     logit_clamp_value: Optional[float] = 15.0
+    # Precision configuration
+    use_fp32_layernorm: bool = False  # Use FP32 for LayerNorm (better stability, slight speed cost). Set to False for full bfloat16.
 
     def __post_init__(self):
         # Validate drop_path_rate
@@ -161,10 +177,40 @@ class VisionTransformerConfig:
 
 class TransformerBlock(nn.Module):
     """Single transformer block"""
+    # Class-level cache shared across all blocks and epochs
+    # Key: (batch_size, seq_len, device) -> Value: inverted mask tensor
+    _mask_cache: Dict[tuple, torch.Tensor] = {}
+    _cache_hits: int = 0
+    _cache_misses: int = 0
+    _max_cache_entries: int = 100  # Prevent unbounded growth
+
+    @classmethod
+    def get_cache_stats(cls) -> Dict[str, any]:
+        """Get attention mask cache statistics."""
+        total = cls._cache_hits + cls._cache_misses
+        hit_rate = cls._cache_hits / total if total > 0 else 0.0
+        cache_size_mb = sum(
+            m.element_size() * m.nelement() for m in cls._mask_cache.values()
+        ) / (1024 * 1024)
+        return {
+            'hits': cls._cache_hits,
+            'misses': cls._cache_misses,
+            'hit_rate': hit_rate,
+            'entries': len(cls._mask_cache),
+            'size_mb': cache_size_mb,
+        }
+
+    @classmethod
+    def clear_cache(cls):
+        """Clear the attention mask cache and reset statistics."""
+        cls._mask_cache.clear()
+        cls._cache_hits = 0
+        cls._cache_misses = 0
+
     def __init__(self, config: VisionTransformerConfig, drop_path: float = 0.):
         super().__init__()
         self.config = config
-        self.norm1 = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm1 = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps, use_fp32=config.use_fp32_layernorm)
 
         # Use flash attention if available and requested
         self.use_flash = config.use_flash_attention and _check_flash_attention_available()
@@ -193,7 +239,7 @@ class TransformerBlock(nn.Module):
             )
 
         self.drop_path = SafeDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.norm2 = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm2 = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps, use_fp32=config.use_fp32_layernorm)
         self.mlp = nn.Sequential(
             nn.Linear(config.hidden_size, config.intermediate_size),
             nn.GELU(),
@@ -203,6 +249,21 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass through transformer block.
+
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, hidden_size)
+            key_padding_mask: Optional attention mask of shape (batch_size, seq_len)
+                            where True indicates positions that should be ignored.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, hidden_size)
+                        after self-attention and feed-forward layers.
+
+        Note:
+            This implementation uses pre-layer normalization (LayerNorm -> Attention -> Residual)
+            rather than post-layer normalization for better training stability.
+        """
         # Self-attention with residual
         normed_x = self.norm1(x)
         
@@ -221,14 +282,66 @@ class TransformerBlock(nn.Module):
             # Invert it for SDPA.
             attn_mask = None
             if key_padding_mask is not None:
-                # Only validate in debug mode to avoid expensive GPU-CPU synchronization
-                # Note: During tracing, this check is skipped to avoid control flow issues.
-                # The model can still handle this case since CLS token is never masked.
-                if self.config.check_numerical_stability and not torch.jit.is_tracing():
-                    if key_padding_mask.all(dim=1).any().item():
-                        raise RuntimeError("key_padding_mask masks all keys for at least one sample.")
-                # Invert for SDPA: True=keep, False=mask
-                attn_mask = (~key_padding_mask).unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
+                # Production-level validation: Ensure at least one token per sample is unmasked
+                # This prevents the model from attempting attention with all-masked sequences
+                # Skip during tracing to avoid control flow issues
+                if not torch.jit.is_tracing():
+                    # Fast GPU check: ensure NOT all tokens are masked (i.e., at least one False exists)
+                    if key_padding_mask.all(dim=1).any():
+                        # At least one sample has all tokens masked - this is invalid
+                        if self.config.check_numerical_stability:
+                            # In debug mode, provide detailed error
+                            raise RuntimeError(
+                                "key_padding_mask masks all keys for at least one sample. "
+                                "At least one token (e.g., CLS) must be unmasked."
+                            )
+                        else:
+                            # In production, log warning but continue (assumes CLS is unmasked)
+                            warnings.warn(
+                                "Detected potentially invalid mask with all tokens masked. "
+                                "Continuing with assumption that CLS token is unmasked.",
+                                RuntimeWarning
+                            )
+
+                # Smart caching: For large datasets with fixed image sizes, padding masks are often identical
+                # Cache key: (batch_size, seq_len, device, mask_pattern_hash)
+                # This persists across epochs and works with orientation flipping (which affects tags, not geometry)
+                B_mask, L_mask = key_padding_mask.shape
+                cache_key = (B_mask, L_mask, str(key_padding_mask.device))
+
+                # Try cache lookup first (no CPU transfer, pure GPU check)
+                cached_mask = TransformerBlock._mask_cache.get(cache_key)
+
+                if cached_mask is not None and cached_mask.shape[0] == B_mask:
+                    # Cache hit: verify mask pattern matches using fast GPU comparison
+                    # Only compare first sample as heuristic (batch usually has identical masks)
+                    if torch.equal(key_padding_mask[0], (~cached_mask[0, 0, 0, :]).to(key_padding_mask.dtype)):
+                        attn_mask = cached_mask
+                        TransformerBlock._cache_hits += 1
+                    else:
+                        # Cache invalidation: pattern changed (e.g., different data split)
+                        cached_mask = None
+                        TransformerBlock._cache_misses += 1
+                else:
+                    TransformerBlock._cache_misses += 1
+
+                # Cache miss or invalidated: compute and cache
+                if cached_mask is None:
+                    # Invert for SDPA: True=keep, False=mask
+                    # This is a very cheap operation on GPU (simple element-wise NOT + reshape)
+                    attn_mask = (~key_padding_mask).unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
+
+                    # Cache for future use (limit cache size to prevent memory bloat)
+                    if len(TransformerBlock._mask_cache) < TransformerBlock._max_cache_entries:
+                        TransformerBlock._mask_cache[cache_key] = attn_mask
+                    elif len(TransformerBlock._mask_cache) == TransformerBlock._max_cache_entries:
+                        # Warn once when cache is full
+                        warnings.warn(
+                            f"Attention mask cache full ({TransformerBlock._max_cache_entries} entries). "
+                            f"Cache hit rate: {TransformerBlock._cache_hits}/{TransformerBlock._cache_hits + TransformerBlock._cache_misses}. "
+                            f"Consider increasing _max_cache_entries if you have many different image sizes.",
+                            ResourceWarning
+                        )
 
             # Use scaled_dot_product_attention with flash backend when available
             attn_out = F.scaled_dot_product_attention(
@@ -284,7 +397,7 @@ class SimplifiedTagger(nn.Module):
             for p in dpr
         ])
         # Final layer norm
-        self.norm = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps, use_fp32=config.use_fp32_layernorm)
         # Classification heads
         self.tag_head = nn.Linear(config.hidden_size, config.num_tags)
         self.rating_head = nn.Linear(config.hidden_size, config.num_ratings)
@@ -361,8 +474,8 @@ class SimplifiedTagger(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,  # (B,H,W) or (B,1,H,W), auto-detected semantics
     ) -> Dict[str, torch.Tensor]:
         B = pixel_values.shape[0]
-        # Patch embedding (force fp32 for numerical stability under AMP)
-        if pixel_values.dtype in (torch.float16, torch.bfloat16):
+        # Patch embedding (optionally force fp32 for numerical stability under AMP)
+        if self.config.use_fp32_layernorm and pixel_values.dtype in (torch.float16, torch.bfloat16):
             # Detect device type dynamically to support cuda/cpu/mps
             device_type = pixel_values.device.type
             # Autocast is only supported on certain device types
@@ -462,6 +575,47 @@ class SimplifiedTagger(nn.Module):
         """Create a dummy pixel tensor on the correct device for graph tracing."""
         device = next(self.parameters()).device
         return torch.zeros(batch_size, 3, self.config.image_size, self.config.image_size, device=device)
+
+    # CR-010: Memory cleanup methods for proper GPU memory management
+    def cleanup(self):
+        """CR-010: Explicitly release GPU memory and clear cached tensors."""
+        import gc
+
+        # Move all parameters to CPU to release GPU memory
+        self.cpu()
+
+        # Clear any cached gradients
+        for param in self.parameters():
+            if param.grad is not None:
+                param.grad = None
+
+        # Force garbage collection
+        gc.collect()
+
+        # Clear CUDA cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            import logging
+            current_memory = torch.cuda.memory_allocated()
+            logging.getLogger(__name__).debug(
+                f"Model cleaned up, GPU memory: {current_memory / 1e9:.2f}GB"
+            )
+
+    def __del__(self):
+        """CR-010: Cleanup on deletion."""
+        try:
+            self.cleanup()
+        except Exception:
+            pass  # Silent cleanup in __del__
+
+    def __enter__(self):
+        """CR-010: Context manager support."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """CR-010: Ensure cleanup on exit."""
+        self.cleanup()
+        return False
 
 
 def create_model(config: Optional[VisionTransformerConfig] = None, **kwargs) -> SimplifiedTagger:

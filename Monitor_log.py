@@ -583,18 +583,22 @@ class SystemMonitor:
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="SystemMetrics")        
         
         self._shutdown_event = threading.Event()
-        # Initialize GPU monitoring
+        # Initialize GPU monitoring using PyTorch native CUDA
         self.gpu_available = False
-        if config.track_gpu_metrics and GPUTIL_AVAILABLE:
+        self.num_gpus = 0
+        if config.track_gpu_metrics:
             try:
-        # Test GPUtil functionality, not just presence
-                test_gpus = GPUtil.getGPUs()
-                self.gpu_available = test_gpus is not None and len(test_gpus) > 0
-                if self.gpu_available:
-                    logger.info(f"GPU monitoring enabled for {len(test_gpus)} GPU(s)")
+                # Use PyTorch native CUDA detection (faster and more reliable)
+                if torch.cuda.is_available():
+                    self.num_gpus = torch.cuda.device_count()
+                    self.gpu_available = self.num_gpus > 0
+                    if self.gpu_available:
+                        logger.info(f"GPU monitoring enabled for {self.num_gpus} GPU(s) using PyTorch CUDA")
+                    else:
+                        logger.info("No GPUs detected for monitoring")
                 else:
-                    logger.info("No GPUs detected for monitoring")
-            except (Exception, ImportError) as e:
+                    logger.info("CUDA not available, GPU monitoring disabled")
+            except Exception as e:
                 logger.warning(f"GPU monitoring not available: {e}")
                 self.gpu_available = False
     
@@ -787,45 +791,44 @@ class SystemMonitor:
             return metrics
            
         try:
-            # GPU metrics (with fresh query)
-            if self.gpu_available and GPUTIL_AVAILABLE:
+            # GPU metrics using PyTorch native CUDA calls (much faster than GPUtil)
+            if self.gpu_available:
                 try:
                     if self._shutdown_event.is_set():
-                        return metrics                    
-                    # Double-check GPUtil is still available and working
-                    gpus = GPUtil.getGPUs()
-                    if gpus is not None:  # Additional safety check
-                        for gpu in gpus:
-                            if gpu is not None:  # Check each GPU object
-                                try:
-                                    # Safely get all values with proper null handling
-                                    mem_total = getattr(gpu, 'memoryTotal', None)
-                                    mem_used = getattr(gpu, 'memoryUsed', None)
-                                    mem_free = getattr(gpu, 'memoryFree', None)
-                                    gpu_load = getattr(gpu, 'load', None)
+                        return metrics
+                    # Use PyTorch CUDA API for fast, native GPU monitoring
+                    for gpu_id in range(self.num_gpus):
+                        try:
+                            # Get device properties
+                            props = torch.cuda.get_device_properties(gpu_id)
 
-                                    # Ensure numeric values with proper None handling
-                                    mem_total = float(mem_total) if mem_total is not None else 0
-                                    mem_used = float(mem_used) if mem_used is not None else 0
-                                    mem_free = float(mem_free) if mem_free is not None else 0
-                                    gpu_load = float(gpu_load) if gpu_load is not None else 0
+                            # Get memory info (in bytes)
+                            mem_allocated = torch.cuda.memory_allocated(gpu_id)
+                            mem_reserved = torch.cuda.memory_reserved(gpu_id)
+                            mem_total = props.total_memory
+                            mem_free = mem_total - mem_reserved
 
-                                    gpu_metrics = {
-                                        'id': getattr(gpu, 'id', -1),
-                                        'name': getattr(gpu, 'name', 'Unknown'),
-                                        'memory_total_gb': mem_total / 1024 if mem_total > 0 else 0,
-                                        'memory_used_gb': mem_used / 1024 if mem_used > 0 else 0,
-                                        'memory_free_gb': mem_free / 1024 if mem_free > 0 else 0,
-                                        'memory_percent': (mem_used / mem_total * 100) if mem_total > 0 else 0,
-                                        'utilization': gpu_load * 100,  # Convert to percentage
-                                        'temperature': getattr(gpu, 'temperature', 0) or 0
-                                    }
-                                    metrics['gpu'].append(gpu_metrics)
-                                    # Reset failure count on success
-                                    self.gpu_failure_count = 0
-                                except Exception as gpu_err:
-                                    logger.debug(f"Failed to process GPU {getattr(gpu, 'id', '?')}: {gpu_err}")
-                except (AttributeError, ImportError, RuntimeError, Exception) as e:
+                            # Convert bytes to GB
+                            mem_total_gb = mem_total / (1024**3)
+                            mem_used_gb = mem_reserved / (1024**3)
+                            mem_free_gb = mem_free / (1024**3)
+
+                            gpu_metrics = {
+                                'id': gpu_id,
+                                'name': props.name,
+                                'memory_total_gb': mem_total_gb,
+                                'memory_used_gb': mem_used_gb,
+                                'memory_free_gb': mem_free_gb,
+                                'memory_percent': (mem_used_gb / mem_total_gb * 100) if mem_total_gb > 0 else 0,
+                                'utilization': 0,  # PyTorch doesn't expose utilization directly
+                                'temperature': 0   # PyTorch doesn't expose temperature directly
+                            }
+                            metrics['gpu'].append(gpu_metrics)
+                            # Reset failure count on success
+                            self.gpu_failure_count = 0
+                        except Exception as gpu_err:
+                            logger.debug(f"Failed to process GPU {gpu_id}: {gpu_err}")
+                except (RuntimeError, Exception) as e:
                     # Increment failure count and possibly disable GPU monitoring
                     self.gpu_failure_count += 1
                     logger.warning(
@@ -1143,8 +1146,9 @@ class TrainingMonitor:
             **{f'train/{k}': v for k, v in metrics.items()}
         })
         
-        # System metrics
-        if self.config.track_system_metrics and step % 10 == 0:
+        # System metrics - use configurable interval to avoid overhead
+        system_log_interval = getattr(self.config, 'system_metrics_log_interval_steps', 3000)
+        if self.config.track_system_metrics and step % system_log_interval == 0:
             sys_metrics = self.system_monitor.get_latest_metrics()
             if sys_metrics:
                 self._log_system_metrics(sys_metrics, step)

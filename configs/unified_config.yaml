@@ -26,7 +26,7 @@ model:
     num_hidden_layers: 28
     num_attention_heads: 24
     intermediate_size: 6144
-    image_size: 640
+    image_size: 512
     patch_size: 16
     num_channels: 3
     use_cls_token: true
@@ -53,8 +53,10 @@ data:
   # Add the path to your raw training data (images and JSONs) here.
   # The script will look for .json files in this directory and then find the
   # corresponding images based on the "filename" field in each JSON.
+  # WARNING: Update this path! Currently set to Linux path but running on Windows.
+  # Example Windows path: "Z:/path/to/your/dataset/" or "C:/Users/YourName/datasets/"
   storage_locations:
-    - path: "/media/andrewk/qnap-public/workspace/Dab/"   # <- root that contains shard_* subfolders
+    - path: "Z:/workspace/Dab/"
       priority: 0
       type: "local"
       enabled: true
@@ -81,23 +83,28 @@ data:
   output_dir: "./outputs"
   
   # Image processing
-  image_size: 640
+  image_size: 512
   normalize_mean: [0.5, 0.5, 0.5]  # Anime-optimized (from inference_config.yaml)
   normalize_std: [0.5, 0.5, 0.5]   # Anime-optimized
   pad_color: [114, 114, 114]
 
   # Data loading (from dataloader.yaml)
-  batch_size: 20  # Increased further after enabling gradient checkpointing
-  num_workers: 8
+  batch_size: 56  # Optimized for RTX 5090 with 32GB VRAM
+  num_workers: 12  # Optimized for 32 logical CPU cores
   pin_memory: true
-  prefetch_factor: 2   # NOTE: effective only when num_workers > 0
+  prefetch_factor: 3   # Increased with more workers for better prefetching
   persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   drop_last: false
   
-  # Caching
-  cache_size_gb: 120.0
-  l1_per_worker_mb: 8192   # 8 GB per worker -> 64 GB total with 8 workers
-  preload_files: 2
+  # L1 Caching (RAM-based per-worker cache)
+  # ⚠️ DISABLED: Not worth it for large datasets (5M+ images)
+  # With 5M images, L1 cache (60 GB) provides only 0.8% hit rate, saving ~10 minutes over 40 epochs
+  # while consuming 47% of system RAM. The 60 GB is better used as OS disk cache for L2 reads.
+  # Recommendation: Keep L1 disabled, use L2 (disk) cache instead for 99% hit rate.
+  cache_size_gb: 0
+  l1_per_worker_mb: 0
+  l1_cache_enabled: false
+  preload_files: 0
   use_memory_cache: false
   cache_precision: "bfloat16"
   canonical_cache_dtype: "bfloat16"
@@ -105,7 +112,7 @@ data:
   # L2 Caching
   l2_cache_enabled: true
   l2_cache_path: "./l2_cache"
-  l2_max_size_gb: 14336.0
+  l2_max_size_gb: 8704.0  # Optimized for 5M images (7.86 TB needed + 8% headroom)
   l2_storage_dtype: "bfloat16"
   cpu_bf16_cache_pipeline: true
   # When the LMDB L2 writer queue is full, wait this long before dropping
@@ -113,23 +120,29 @@ data:
   l2_writer_full_wait_ms: 590
 
   # Augmentation (from augmentation.yaml)
+  # NOTE: Most augmentations are NOT IMPLEMENTED yet - only random_flip_prob is active.
+  # With 5-6 million images, augmentation is generally unnecessary.
   augmentation_enabled: true
-  random_flip_prob: 0.5
-  color_jitter: true
+  random_flip_prob: 0.0  # IMPLEMENTED: Horizontal flipping with orientation tag swapping (disabled by default)
+
+  # NOT IMPLEMENTED: Color augmentations below are configured but not applied in training
+  color_jitter: false
   color_jitter_brightness: 0.1
   color_jitter_contrast: 0.1
   color_jitter_saturation: 0.1
   color_jitter_hue: 0.05
   eye_color_weight_boost: 0.0
+
+  # NOT IMPLEMENTED: Geometric augmentations below are configured but not applied in training
   random_crop_scale: [0.8, 1.0]
   random_rotation_degrees: 0.0
-  
-  # Advanced Augmentation (set alpha/p to 0.0 to disable)
+
+  # NOT IMPLEMENTED: Advanced augmentations below are configured but not applied in training
   randaugment_num_ops: 2
   randaugment_magnitude: 9
-  mixup_alpha: 0.2
-  cutmix_alpha: 1.0
-  random_erasing_p: 0.5
+  mixup_alpha: 0.0
+  cutmix_alpha: 0.0
+  random_erasing_p: 0.0
 
   # Orientation mapping (from augmentation.yaml)
   orientation_map_path: "./configs/orientation_map.json"
@@ -145,9 +158,15 @@ training:
     num_epochs: 100
     learning_rate: 1.0e-4
     weight_decay: 0.01
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 2  # Reduced from 4 - RTX 5090 can handle larger batches directly
 
     # Optimizer
+    # NOTE: Consider using "adamw8bit" with auto_training_setup.py for dataset-adaptive optimization
+    # The auto-config system (optimizer_config.py + scheduler_config.py) will automatically:
+    #   - Scale learning rate based on effective batch size
+    #   - Adjust weight decay based on dataset size
+    #   - Select optimal scheduler (cosine/cosine_restarts)
+    #   - Save memory with 8-bit quantized optimizer states
     optimizer: "adan"
     adam_beta1: 0.9
     adam_beta2: 0.999
@@ -190,7 +209,7 @@ training:
     resume_from: "latest"
 
     eval_steps: 1000
-    logging_steps: 3000
+    logging_steps: 5000  # Reduced TensorBoard overhead (was 3000)
     # Resume-aware reseeding: avoid replaying the same early-epoch order after resume
     resume_reseed: true
 
@@ -330,14 +349,14 @@ export:
 # These are read by validation_loop.py at runtime.
 validation:
   dataloader:
-    batch_size: 8  # Lowered to reduce VRAM usage during validation
-    num_workers: 8
-    prefetch_factor: 2   # NOTE: effective only when num_workers > 0
+    batch_size: 32  # Increased for RTX 5090 - inference is more memory-efficient
+    num_workers: 12  # Match training workers for consistency
+    prefetch_factor: 3   # NOTE: effective only when num_workers > 0
     persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   preprocessing:
     # Uses data.normalize_mean/std by default; keep in sync with
     # training/inference unless intentionally different.
-    image_size: 640
+    image_size: 512
     patch_size: 16
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -350,7 +369,8 @@ monitor:
 
   # System resource tracking
   track_system_metrics: true
-  system_metrics_interval: 30.0
+  system_metrics_interval: 30.0  # Background collection interval (seconds)
+  system_metrics_log_interval_steps: 3000  # How often to log to TensorBoard (steps)
   track_gpu_metrics: true
   track_disk_io: true
   track_network_io: false
@@ -387,7 +407,7 @@ monitor:
   # --------------------------------------------------------------------
 
   tb_image_logging:
-    max_samples: 4          # how many examples to log per val step
+    max_samples: 2          # Reduced validation image overhead (was 4)
     topk: 15                # how many tags per sample in Text tab
     log_native_resolution: true  # keep images crisp in TB
     dpi_for_figures: 220          # only used if you later add composite figures

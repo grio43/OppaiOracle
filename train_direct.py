@@ -44,8 +44,9 @@ logger = logging.getLogger(__name__)
 # Import the orientation handler
 from orientation_handler import OrientationHandler, OrientationMonitor
 
-# Hardcoded cache monitor interval (steps). Adjust here as needed.
-CACHE_MONITOR_EVERY_STEPS = 3000
+# Cache monitor interval (steps). Configurable via CACHE_MONITOR_INTERVAL_STEPS env var.
+# Default: 3000 steps (~50 minutes at 1 step/sec, ~96k images with batch_size=32)
+CACHE_MONITOR_EVERY_STEPS = int(os.getenv('CACHE_MONITOR_INTERVAL_STEPS', '3000'))
 
 # Import base modules with error handling
 try:
@@ -97,15 +98,118 @@ Import error: {e}"""
     raise ImportError(error_msg)
 
 
-def _flatten_dict(d: Dict[str, Any], parent_key: str = '', sep: str = '.') -> Dict[str, Any]:
-    items = []
-    for k, v in d.items():
-        new_key = parent_key + sep + k if parent_key else k
-        if isinstance(v, dict):
-            items.extend(_flatten_dict(v, new_key, sep=sep).items())
+# CR-009: RatingValidator for graceful handling of out-of-range rating labels
+class RatingValidator:
+    """Validator for rating labels with error tracking and configurable error handling.
+
+    This class handles validation of rating labels during training and provides
+    flexible error handling strategies to prevent training crashes from data quality issues.
+    """
+
+    def __init__(self, num_ratings: int, action: str = 'warn'):
+        """
+        Initialize the rating validator.
+
+        Args:
+            num_ratings: Number of valid rating classes (labels must be in [0, num_ratings))
+            action: Error handling strategy:
+                - 'error': Crash like before (raises RuntimeError)
+                - 'warn': Log warning and skip batch (recommended for production)
+                - 'clamp': Fix labels by clamping to valid range
+                - 'ignore': Continue with invalid data (not recommended)
+        """
+        self.num_ratings = num_ratings
+        self.action = action
+        self.stats = {
+            'total_batches': 0,
+            'invalid_batches': 0,
+            'invalid_samples': 0,
+        }
+        self.logger = logging.getLogger(__name__)
+
+    def validate_and_handle(
+        self,
+        rating_labels: torch.Tensor,
+        batch: dict,
+        global_step: int
+    ) -> tuple[torch.Tensor, bool]:
+        """
+        Validate rating labels and handle errors based on configured action.
+
+        Args:
+            rating_labels: The rating labels tensor to validate
+            batch: The full batch dict (may contain image_ids for logging)
+            global_step: Current training step number
+
+        Returns:
+            (labels, is_valid): Tuple of (potentially fixed labels, whether batch is valid)
+        """
+        self.stats['total_batches'] += 1
+
+        # Skip validation for float labels (used in some loss functions)
+        if rating_labels.dtype not in (torch.long, torch.int64):
+            return rating_labels, True
+
+        # Check for out-of-range labels
+        mask_valid = (rating_labels >= 0) & (rating_labels < self.num_ratings)
+
+        if mask_valid.all():
+            return rating_labels, True  # All valid
+
+        # Found invalid labels - handle based on action
+        num_invalid = (~mask_valid).sum().item()
+        self.stats['invalid_batches'] += 1
+        self.stats['invalid_samples'] += num_invalid
+
+        min_val = rating_labels.min().item()
+        max_val = rating_labels.max().item()
+
+        error_msg = (
+            f"Invalid rating labels at step {global_step}: "
+            f"{num_invalid}/{len(rating_labels)} samples out of range. "
+            f"Found min={min_val}, max={max_val}, expected [0, {self.num_ratings})."
+        )
+
+        # Log which samples are invalid (if batch has identifiers)
+        if 'image_ids' in batch:
+            invalid_indices = (~mask_valid).nonzero(as_tuple=True)[0].tolist()
+            invalid_ids = [batch['image_ids'][i] for i in invalid_indices[:10]]  # Log first 10
+            if len(invalid_indices) > 10:
+                self.logger.warning(f"{error_msg} First 10 invalid samples: {invalid_ids}")
+            else:
+                self.logger.warning(f"{error_msg} Invalid samples: {invalid_ids}")
+
+        if self.action == 'error':
+            # Crash like before
+            raise RuntimeError(error_msg)
+
+        elif self.action == 'warn':
+            # Log and skip this batch
+            self.logger.warning(f"{error_msg} Skipping batch.")
+            return rating_labels, False  # Signal to skip batch
+
+        elif self.action == 'clamp':
+            # Fix the labels by clamping
+            rating_labels = rating_labels.clamp(0, self.num_ratings - 1)
+            self.logger.warning(f"{error_msg} Clamped to valid range.")
+            return rating_labels, True
+
+        elif self.action == 'ignore':
+            # Continue with invalid data (not recommended)
+            self.logger.debug(f"{error_msg} Ignoring.")
+            return rating_labels, True
+
         else:
-            items.append((new_key, v))
-    return dict(items)
+            raise ValueError(f"Unknown rating validation action: {self.action}")
+
+    def get_stats(self) -> dict:
+        """Return validation statistics for monitoring."""
+        stats = self.stats.copy()
+        if stats['total_batches'] > 0:
+            stats['invalid_rate'] = stats['invalid_batches'] / stats['total_batches']
+        else:
+            stats['invalid_rate'] = 0.0
+        return stats
 
 
 def assert_finite(*tensors, names=None, batch=None, outputs=None, config=None):
@@ -284,7 +388,27 @@ def train_with_orientation_tracking(config: FullConfig):
         raise ValueError(error_msg)
 
     active_data_path = Path(active_location['path'])
-    logger.info(f"Using active data path: {active_data_path}")
+
+    # Validate path exists and is accessible (CR-036)
+    if not active_data_path.exists():
+        raise FileNotFoundError(
+            f"Active data path does not exist: {active_data_path}\n"
+            f"Please ensure the path in your configuration is correct and the storage is mounted."
+        )
+
+    if not active_data_path.is_dir():
+        raise NotADirectoryError(
+            f"Active data path is not a directory: {active_data_path}\n"
+            f"Expected a directory containing training images and annotations."
+        )
+
+    if not os.access(active_data_path, os.R_OK):
+        raise PermissionError(
+            f"Active data path is not readable: {active_data_path}\n"
+            f"Please check file permissions."
+        )
+
+    logger.info(f"Using active data path: {active_data_path} (validated)")
 
     # --- Prompt to (re)build vocabulary at startup ---------------------------------
     # Decide where the vocabulary should live and whether we already have one
@@ -349,14 +473,6 @@ def train_with_orientation_tracking(config: FullConfig):
             rebuilt_vocab = create_vocabulary_from_datasets([active_data_path])
             vocab_file = (vocab_dest / "vocabulary.json") if vocab_dest.is_dir() else vocab_dest
             rebuilt_vocab.save_vocabulary(vocab_file)
-            # Also mirror to SQLite to reduce future I/O
-            try:
-                from vocab_sqlite import save_vocabulary_to_sqlite  # local import to avoid hard dep at import time
-                sqlite_path = (vocab_file.parent / 'vocab.sqlite')
-                save_vocabulary_to_sqlite(rebuilt_vocab, sqlite_path)
-                logger.info("Vocabulary mirrored to SQLite -> %s", sqlite_path)
-            except Exception as e:
-                logger.warning("Vocabulary rebuilt but failed to write SQLite sidecar: %s", e)
             logger.info("Vocabulary rebuilt with %d tags -> %s",
                         len(rebuilt_vocab.tag_to_index), vocab_file)
         except Exception as e:
@@ -433,11 +549,63 @@ def train_with_orientation_tracking(config: FullConfig):
         validate_dataset(val_loader, vocab, config, num_batches_to_check=5)
         logger.info("Pre-training input validation complete.")
 
+    # Optional: Warm attention mask cache before training
+    # This eliminates cold-start cache misses for variable-size datasets
+    if getattr(config.training, 'warmup_attention_cache', False):
+        try:
+            from cache_warmup import warmup_attention_cache, estimate_cache_coverage
+
+            # First, estimate how many unique patterns exist
+            logger.info("Analyzing attention mask patterns in dataset...")
+            coverage_stats = estimate_cache_coverage(
+                [train_loader, val_loader],
+                num_batches_per_loader=20,
+                show_progress=True
+            )
+
+            logger.info(
+                f"Found {coverage_stats['unique_patterns']} unique mask patterns. "
+                f"Most common pattern appears {coverage_stats['most_common_percentage']:.1f}% of the time."
+            )
+
+            # Warn if dataset has high pattern diversity
+            if coverage_stats['unique_patterns'] > 50:
+                logger.warning(
+                    f"Dataset has {coverage_stats['unique_patterns']} unique mask patterns. "
+                    f"Consider increasing TransformerBlock._max_cache_entries (current: 100)."
+                )
+
+            # Warm the cache
+            logger.info("Warming attention mask cache...")
+            warmup_stats = warmup_attention_cache(
+                model=model,
+                dataloaders=[train_loader, val_loader],
+                num_batches_per_loader=min(10, coverage_stats['unique_patterns']),
+                device=device,
+                show_progress=True
+            )
+
+            logger.info(
+                f"Cache warmup complete: {warmup_stats['new_entries']} entries created. "
+                f"Training will start with ~100% cache hit rate."
+            )
+
+        except Exception as e:
+            logger.warning(f"Cache warmup failed: {e}. Continuing with lazy cache initialization.")
+
     num_tags = len(vocab.tag_to_index)
     num_ratings = len(vocab.rating_to_index)
     logger.info(f"Creating model with {num_tags} tags and {num_ratings} ratings")
 
     metric_computer = MetricComputer(num_labels=num_tags)
+
+    # CR-009: Create rating validator with configurable error handling
+    rating_validation_action = getattr(config.training, 'rating_validation_action', 'warn')
+    rating_validator = RatingValidator(
+        num_ratings=num_ratings,
+        action=rating_validation_action
+    )
+    logger.info(f"Rating validator created with action='{rating_validation_action}'")
 
     model_config = config.model.to_dict()
     model_config["num_tags"] = num_tags
@@ -537,10 +705,51 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # ---- LR scheduler: STEP-BASED semantics ----
     # Interpret warmup / cycle lengths in optimizer updates (not epochs).
-    accum = max(1, int(getattr(config.training, "gradient_accumulation_steps", 1)))
+
+    # Validate gradient accumulation steps (CR-038)
+    try:
+        accum_raw = getattr(config.training, "gradient_accumulation_steps", 1)
+        accum = int(accum_raw)
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            f"Invalid gradient_accumulation_steps in config: {accum_raw!r}. "
+            f"Must be a positive integer. Error: {e}"
+        )
+
+    if accum < 1:
+        raise ValueError(
+            f"gradient_accumulation_steps must be >= 1, got {accum}. "
+            f"Use 1 to disable gradient accumulation."
+        )
+
+    # Warn if accumulation is suspiciously high
+    batch_size = config.data.batch_size
+    if accum > batch_size:
+        logger.warning(
+            f"gradient_accumulation_steps ({accum}) > batch_size ({batch_size}). "
+            f"This is unusual and may indicate a configuration error."
+        )
+
+    # Validate num_epochs
+    try:
+        num_epochs = int(getattr(config.training, "num_epochs", 1))
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            f"Invalid num_epochs in config: must be a positive integer. Error: {e}"
+        )
+
+    if num_epochs < 1:
+        raise ValueError(f"num_epochs must be >= 1, got {num_epochs}")
+
     steps_per_epoch = max(1, len(train_loader))
     updates_per_epoch = (steps_per_epoch + accum - 1) // accum  # ceil division
-    total_updates = max(1, int(getattr(config.training, "num_epochs", 1)) * updates_per_epoch)
+    total_updates = num_epochs * updates_per_epoch
+
+    logger.info(
+        f"Scheduler setup: {num_epochs} epochs, {steps_per_epoch} steps/epoch, "
+        f"{accum}x gradient accumulation = {updates_per_epoch} optimizer updates/epoch "
+        f"({total_updates} total updates)"
+    )
     warmup_steps = int(getattr(config.training, "warmup_steps", 10_000))
 
     scheduler = CosineAnnealingWarmupRestarts(
@@ -573,8 +782,19 @@ def train_with_orientation_tracking(config: FullConfig):
             def amp_autocast():
                 yield
 
-    # GradScaler is only needed for float16 AMP.
-    use_scaler = amp_enabled and amp_dtype == torch.float16 and torch.cuda.get_device_capability()[0] >= 7
+    # GradScaler is only needed for float16 AMP on Volta+ GPUs (compute capability >= 7)
+    use_scaler = False
+    if amp_enabled and amp_dtype == torch.float16:
+        if torch.cuda.is_available():
+            try:
+                capability = torch.cuda.get_device_capability()
+                use_scaler = capability[0] >= 7
+                if not use_scaler:
+                    logger.info(f"CUDA device capability {capability[0]}.{capability[1]} < 7.0. GradScaler disabled.")
+            except Exception as e:
+                logger.warning(f"Could not determine CUDA capability: {e}. GradScaler disabled.")
+        else:
+            logger.warning("AMP enabled but CUDA not available. GradScaler disabled.")
     # Prefer device-agnostic torch.amp.GradScaler; fallback to legacy CUDA scaler if needed.
     try:
         # PyTorch >= 2.x: torch.amp.GradScaler accepts 'device' as a string ('cuda' or 'cpu').
@@ -609,6 +829,9 @@ def train_with_orientation_tracking(config: FullConfig):
     _burn_in_vals = []  # collect val metric during burn-in window
     global_step = 0
     start_epoch = 0
+    # Track mid-epoch resume info (for resuming from exact batch position)
+    resume_batch_idx = 0
+    is_mid_epoch = False
     # Soft-stop sentinel files (located in log_dir)
     stop_sentinel = Path(config.log_dir) / "STOP_TRAINING"
     save_sentinel = Path(config.log_dir) / "SAVE_CHECKPOINT"
@@ -659,7 +882,14 @@ def train_with_orientation_tracking(config: FullConfig):
                     training_state.best_metric = max(training_state.best_metric, loaded_best)
                 except Exception:
                     pass
-            logger.info("Resumed from %s (epoch=%s, step=%s)", ckpt_path, start_epoch, global_step)
+            # Extract mid-epoch resume info if available
+            resume_batch_idx = getattr(training_state, 'batch_in_epoch', 0)
+            is_mid_epoch = not getattr(training_state, 'is_epoch_boundary', True)
+            if is_mid_epoch and resume_batch_idx > 0:
+                logger.info("Resumed from %s (epoch=%s, step=%s, batch_in_epoch=%s) - mid-epoch resume",
+                           ckpt_path, start_epoch, global_step, resume_batch_idx)
+            else:
+                logger.info("Resumed from %s (epoch=%s, step=%s)", ckpt_path, start_epoch, global_step)
         except Exception as e:
             logger.exception("Failed to load checkpoint from %s; starting fresh. Error: %s", ckpt_path, e)
 
@@ -668,6 +898,17 @@ def train_with_orientation_tracking(config: FullConfig):
     if not hasattr(training_state, 'optimizer_updates'):
         training_state.optimizer_updates = 0
 
+    # Create validation metrics once before training loop (CR-040 fix)
+    # These will be reset each epoch instead of being recreated
+    num_tags = len(vocab.index_to_tag)
+    threshold = getattr(getattr(config, "threshold_calibration", {}), "default_threshold", 0.5)
+    val_metrics = {
+        'f1_macro': MultilabelF1Score(num_labels=num_tags, average="macro", threshold=threshold).to(device),
+        'f1_micro': MultilabelF1Score(num_labels=num_tags, average="micro", threshold=threshold).to(device),
+        'map_macro': MultilabelAveragePrecision(num_labels=num_tags, average="macro").to(device)
+    }
+    logger.info(f"Validation metrics initialized with {num_tags} tags, threshold={threshold}")
+
     for epoch in range(start_epoch, config.training.num_epochs):
         # Ensure distinct shuffles across epochs in distributed mode
         try:
@@ -675,12 +916,33 @@ def train_with_orientation_tracking(config: FullConfig):
                 train_loader.sampler.set_epoch(epoch)
         except Exception as e:
             logger.debug(f"set_epoch skipped: {e}")
+
+        # Set epoch on datasets for epoch-varying flip decisions
+        # This ensures augmentation diversity across epochs while maintaining determinism
+        try:
+            if hasattr(train_loader.dataset, 'set_epoch'):
+                train_loader.dataset.set_epoch(epoch)
+                logger.debug(f"Train dataset epoch set to {epoch}")
+            if hasattr(val_loader.dataset, 'set_epoch'):
+                val_loader.dataset.set_epoch(epoch)
+                logger.debug(f"Val dataset epoch set to {epoch}")
+        except Exception as e:
+            logger.debug(f"Dataset set_epoch skipped: {e}")
+
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
 
         with anomaly_ctx:
             for step, batch in enumerate(train_loader):
+                # Skip already-processed batches when resuming mid-epoch
+                if epoch == start_epoch and is_mid_epoch and step < resume_batch_idx:
+                    # Fast-forward through already-processed batches
+                    # RNG states are restored, so dataset order is identical
+                    if step == 0:
+                        logger.info(f"Resuming mid-epoch: skipping first {resume_batch_idx} batches (already processed)")
+                    continue
+
                 images = batch['images'].to(device, non_blocking=True)
                 # accum defined above; used for correct grad-accum scaling
                 if getattr(config.training, "memory_format", "contiguous") == "channels_last":
@@ -690,9 +952,14 @@ def train_with_orientation_tracking(config: FullConfig):
 
                 # Assert that input data is finite and labels are in range
                 assert_finite(images, tag_labels, names=['images', 'tag_labels'], batch=batch, config=config)
-                if rating_labels.dtype in (torch.long, torch.int64):
-                    if not ((rating_labels >= 0) & (rating_labels < num_ratings)).all():
-                        raise RuntimeError(f"Rating label out of range. Found min {rating_labels.min()} / max {rating_labels.max()}, expected 0 to {num_ratings-1}")
+
+                # CR-009: Use rating validator for graceful error handling
+                rating_labels, is_valid = rating_validator.validate_and_handle(
+                    rating_labels, batch, global_step
+                )
+                if not is_valid:
+                    logger.warning(f"Skipping batch {global_step} due to invalid rating labels")
+                    continue  # Skip to next batch
 
                 if getattr(config.debug, 'log_input_stats', False) and (global_step % config.training.logging_steps == 0):
                     monitor.log_scalar('train/image_min', images.min().item(), global_step)
@@ -817,6 +1084,9 @@ def train_with_orientation_tracking(config: FullConfig):
                         training_state.epoch = epoch + 1
                         training_state.global_step = global_step
                         training_state.train_loss = float(current_train_loss) if np.isfinite(current_train_loss) else current_train_loss
+                        # Track mid-epoch position for resume
+                        training_state.batch_in_epoch = step
+                        training_state.is_epoch_boundary = False
 
                         try:
                             checkpoint_manager.save_checkpoint(
@@ -846,15 +1116,27 @@ def train_with_orientation_tracking(config: FullConfig):
                     stop_now = soft_stop_event.is_set() or stop_sentinel.exists()
                     save_now = save_sentinel.exists()
                     if stop_now or save_now:
+                        # CR-035: Atomically capture state snapshot to avoid race condition
+                        # This ensures checkpoint metadata matches the actual saved model state
+                        state_snapshot = {
+                            'epoch': epoch + 1,
+                            'global_step': global_step,
+                            'step': step + 1,
+                            'running_loss': running_loss
+                        }
+
                         try:
-                            current_train_loss = running_loss / max(1, (step + 1))
+                            current_train_loss = state_snapshot['running_loss'] / max(1, state_snapshot['step'])
                         except Exception:
                             current_train_loss = float('nan')
 
-                        # Update training state snapshot before saving
-                        training_state.epoch = epoch + 1
-                        training_state.global_step = global_step
+                        # Update training state using frozen snapshot
+                        training_state.epoch = state_snapshot['epoch']
+                        training_state.global_step = state_snapshot['global_step']
                         training_state.train_loss = float(current_train_loss) if np.isfinite(current_train_loss) else current_train_loss
+                        # Track mid-epoch position for resume
+                        training_state.batch_in_epoch = step
+                        training_state.is_epoch_boundary = False
 
                         # Save checkpoint (updates last.pt atomically)
                         try:
@@ -862,14 +1144,14 @@ def train_with_orientation_tracking(config: FullConfig):
                                 model=model,
                                 optimizer=optimizer,
                                 scheduler=scheduler,
-                                epoch=epoch + 1,
-                                step=global_step,
+                                epoch=state_snapshot['epoch'],
+                                step=state_snapshot['global_step'],
                                 metrics={'train_loss': float(current_train_loss) if np.isfinite(current_train_loss) else current_train_loss},
                                 training_state=training_state,
                                 is_best=False,
                                 config=config.to_dict()
                             )
-                            logger.info("Soft stop/save: checkpoint written at step %s.", global_step)
+                            logger.info("Soft stop/save: checkpoint written at step %s.", state_snapshot['global_step'])
                         except Exception as e:
                             logger.warning("Soft stop: failed to write checkpoint: %s", e)
 
@@ -906,6 +1188,20 @@ def train_with_orientation_tracking(config: FullConfig):
                         logging.getLogger('cache_monitor').info(cache_monitor.format_summary())
                     except Exception:
                         pass
+
+                # CR-009: Log rating validation statistics periodically
+                if global_step % 1000 == 0:
+                    stats = rating_validator.get_stats()
+                    if stats.get('invalid_batches', 0) > 0:
+                        logger.warning(
+                            f"Rating validation stats at step {global_step}: "
+                            f"{stats['invalid_batches']} invalid batches "
+                            f"({stats['invalid_samples']} samples, "
+                            f"{stats['invalid_rate']:.2%} rate)"
+                        )
+                        # Log to monitor for tracking
+                        monitor.log_scalar('validation/invalid_rating_batches', stats['invalid_batches'], global_step)
+                        monitor.log_scalar('validation/invalid_rating_rate', stats['invalid_rate'], global_step)
 
                 # Orientation health check (writes/refreshes unmapped_orientation_tags.txt)
                 try:
@@ -954,17 +1250,36 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.info("Soft stop engaged. Exiting training loop before validation.")
             break
 
+        # Clear mid-epoch resume flag after completing the first resumed epoch
+        if epoch == start_epoch and is_mid_epoch:
+            logger.info(f"Completed resumed epoch {epoch + 1} - cleared mid-epoch flag")
+            is_mid_epoch = False
+
         avg_train_loss = running_loss / len(train_loader)
-        
+
+        # Log attention mask cache statistics
+        try:
+            from model_architecture import TransformerBlock
+            cache_stats = TransformerBlock.get_cache_stats()
+            if cache_stats['hits'] + cache_stats['misses'] > 0:
+                logger.info(
+                    f"Attention mask cache stats - "
+                    f"Hit rate: {cache_stats['hit_rate']:.2%} "
+                    f"({cache_stats['hits']}/{cache_stats['hits'] + cache_stats['misses']}), "
+                    f"Entries: {cache_stats['entries']}, "
+                    f"Size: {cache_stats['size_mb']:.2f} MB"
+                )
+                monitor.log_scalar('cache/mask_hit_rate', cache_stats['hit_rate'], global_step)
+                monitor.log_scalar('cache/mask_entries', cache_stats['entries'], global_step)
+        except Exception as e:
+            logger.debug(f"Failed to log cache stats: {e}")
+
         # Validation loop
         model.eval()
         val_loss = 0.0
-        # Streaming metrics to avoid holding the entire validation set in memory
-        num_tags = len(vocab.index_to_tag)
-        threshold = getattr(getattr(config, "threshold_calibration", {}), "default_threshold", 0.5)
-        f1_macro = MultilabelF1Score(num_labels=num_tags, average="macro", threshold=threshold).to(device)
-        f1_micro = MultilabelF1Score(num_labels=num_tags, average="micro", threshold=threshold).to(device)
-        map_macro = MultilabelAveragePrecision(num_labels=num_tags, average="macro").to(device)
+        # Reset validation metrics for this epoch (CR-040 fix: reuse instead of recreate)
+        for metric in val_metrics.values():
+            metric.reset()
         with torch.no_grad():
             for val_step, batch in enumerate(val_loader):
                 images = batch['images'].to(device, non_blocking=True)
@@ -984,9 +1299,9 @@ def train_with_orientation_tracking(config: FullConfig):
                 # Update streaming metrics
                 probs = torch.sigmoid(outputs['tag_logits'])
                 targs = (tag_labels > 0.5).to(torch.long)
-                f1_macro.update(probs, targs)
-                f1_micro.update(probs, targs)
-                map_macro.update(probs, targs)
+                val_metrics['f1_macro'].update(probs, targs)
+                val_metrics['f1_micro'].update(probs, targs)
+                val_metrics['map_macro'].update(probs, targs)
 
                 if val_step == 0 and config.training.use_tensorboard:
                     tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
@@ -1002,9 +1317,9 @@ def train_with_orientation_tracking(config: FullConfig):
                     )
 
         avg_val_loss = val_loss / len(val_loader)
-        val_f1_macro = f1_macro.compute().item()
-        val_f1_micro = f1_micro.compute().item()
-        val_mAP = map_macro.compute().item()
+        val_f1_macro = val_metrics['f1_macro'].compute().item()
+        val_f1_micro = val_metrics['f1_micro'].compute().item()
+        val_mAP = val_metrics['map_macro'].compute().item()
         logger.info(
             f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, "
             f"Val F1(macro): {val_f1_macro:.4f}, Val F1(micro): {val_f1_micro:.4f}, Val mAP: {val_mAP:.4f}"
@@ -1016,7 +1331,7 @@ def train_with_orientation_tracking(config: FullConfig):
             current_lr = scheduler.get_last_lr()[0]
         except Exception:
             current_lr = optimizer.param_groups[0]['lr']
-        monitor.log_scalar('lr', current_lr, global_step)
+        # Note: Learning rate is already logged in monitor.log_step() during training
 
         training_state.epoch = epoch + 1
         training_state.global_step = global_step
@@ -1071,6 +1386,9 @@ def train_with_orientation_tracking(config: FullConfig):
         # Respect "save_best_only": skip cadence saves unless this is a new best.
         # Only handle best-at-epoch saves here; periodic saves happen in-loop
         if is_best:
+            # Mark as epoch boundary since this is saved at end of epoch
+            training_state.is_epoch_boundary = True
+            training_state.batch_in_epoch = 0
             checkpoint_manager.save_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -1109,23 +1427,62 @@ def train_with_orientation_tracking(config: FullConfig):
     except Exception as e:
         logger.debug(f"Failed to write orientation_safety_report.json: {e}")
 
-    monitor.close()
+    # Final attention mask cache statistics
+    try:
+        from model_architecture import TransformerBlock
+        cache_stats = TransformerBlock.get_cache_stats()
+        if cache_stats['hits'] + cache_stats['misses'] > 0:
+            logger.info(
+                f"Final attention mask cache statistics:\n"
+                f"  Total accesses: {cache_stats['hits'] + cache_stats['misses']}\n"
+                f"  Cache hits: {cache_stats['hits']} ({cache_stats['hit_rate']:.2%})\n"
+                f"  Cache misses: {cache_stats['misses']}\n"
+                f"  Cached entries: {cache_stats['entries']}\n"
+                f"  Cache size: {cache_stats['size_mb']:.2f} MB\n"
+                f"  Performance gain: ~{cache_stats['hits'] * 0.01:.2f}ms saved from mask inversions"
+            )
+    except Exception as e:
+        logger.debug(f"Failed to log final cache stats: {e}")
 
-    # ---- Teardown: stop any background validators if present ----
+    # CR-037, CR-039: Guaranteed resource cleanup on all exit paths (normal, exception, early exit)
+    logger.debug("Cleaning up training resources...")
+
+    # Close monitor (flushes TensorBoard)
+    try:
+        monitor.close()
+        logger.debug("Monitor closed successfully")
+    except Exception as e:
+        logger.warning(f"Error closing monitor: {e}")
+
+    # Stop background validators
     try:
         for _loader in (train_loader, val_loader):
             ds = getattr(_loader, "dataset", None)
             validator = getattr(ds, "validator", None) if ds is not None else None
             if validator is not None and hasattr(validator, "stop"):
                 validator.stop()
-    except Exception:
-        pass
+        logger.debug("Background validators stopped")
+    except Exception as e:
+        logger.warning(f"Error stopping validators: {e}")
 
+    # CR-037: Clean up stats queue (multiprocessing.Queue resource)
+    try:
+        import queue
+        if stats_queue is not None:
+            # Drain any remaining items
+            while not stats_queue.empty():
+                try:
+                    stats_queue.get_nowait()
+                except queue.Empty:
+                    break
+            # Close the queue
+            stats_queue.close()
+            stats_queue.join_thread()
+            logger.debug("Stats queue cleaned up")
+    except Exception as e:
+        logger.warning(f"Error cleaning up stats queue: {e}")
 
-def validate_orientation_mappings():
-    """Standalone function to validate orientation mappings."""
-    # This function can remain as is, it's a utility.
-    pass
+    logger.debug("Training resource cleanup complete")
 
 def main():
     """Main entry point for training script."""

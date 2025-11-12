@@ -33,6 +33,10 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import _LRScheduler
+try:
+    import bitsandbytes as bnb
+except ImportError:
+    bnb = None
 #
 # NOTE:
 # We dropped `pl_bolts` because it is incompatible with PyTorch Lightning >= 2.0.
@@ -1090,6 +1094,20 @@ class CheckpointManager:
         if scheduler is not None and 'scheduler_state_dict' in meta:
             scheduler.load_state_dict(meta['scheduler_state_dict'])
 
+        # Restore RNG states to ensure reproducible dataset shuffling
+        if 'rng_states' in meta:
+            try:
+                rng_dict = meta['rng_states']
+                # Unpack the numpy state if it was packed during save
+                np_state = _unpack_np_state(rng_dict['np'])
+                # Reconstruct tuple expected by _restore_rng_states
+                rng_tuple = (rng_dict['py'], np_state, rng_dict['torch_cpu'], rng_dict['cuda'])
+                success = _restore_rng_states(rng_tuple)
+                logger.info(f"RNG state restoration: {success}")
+            except Exception as e:
+                logger.warning(f"Failed to restore RNG states: {type(e).__name__}: {e}")
+                logger.warning("Dataset shuffling may differ from original training run")
+
         return {"state_dict": state_dict, **meta}
     
     def get_best_checkpoint(self) -> Optional[Path]:
@@ -1452,7 +1470,12 @@ class TrainingUtils:
             )
         
         elif optimizer_type.lower() == 'adamw':
-            return optim.AdamW(
+            if bnb is None:
+                raise ImportError(
+                    "bitsandbytes is required for AdamW8bit optimizer. "
+                    "Install it with: pip install bitsandbytes"
+                )
+            return bnb.optim.AdamW8bit(
                 params,
                 lr=learning_rate,
                 betas=kwargs.get('betas', (0.9, 0.999)),

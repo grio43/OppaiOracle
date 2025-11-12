@@ -327,7 +327,7 @@ class ValidationRunner:
             logger.info("Loading vocabulary from external file")
             vocab_path = Path(config.vocab_path)
             if vocab_path.exists():
-                # Use centralized loader which prefers SQLite sidecar for speed
+                # Use centralized loader with caching for speed
                 self.vocab = load_vocabulary_for_training(vocab_path)
             else:
                 for path in [DEFAULT_VOCAB_PATH, PROJECT_ROOT / "vocabulary/vocabulary.json"]:

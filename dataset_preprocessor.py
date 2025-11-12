@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
 Data Preparation Script for Direct Training Pipeline
-Prepares Danbooru dataset for simplified direct training approach
+
+Prepares Danbooru dataset for simplified direct training approach.
 FIXED VERSION - Handles single-string tag fields with duplicates
+
+Note: This file was previously named tag_vocabulary.py but has been renamed to
+dataset_preprocessor.py to better reflect its purpose. It contains the
+DanbooruDataPreprocessor class, not vocabulary management code (which is in
+vocabulary.py).
 """
 
 import json
@@ -602,11 +608,16 @@ class DanbooruDataPreprocessor:
         
         logger.info(f"Saved HDF5 data to {output_file}")
         
-        # Also save indices separately for flexibility
-        indices_file = self.output_dir / 'tag_indices.pkl'
-        with open(indices_file, 'wb') as f:
-            pickle.dump(results['tag_indices'], f, protocol=pickle.HIGHEST_PROTOCOL)
-        
+        # Also save indices separately for flexibility (CR-032: use JSON instead of pickle for security)
+        indices_file = self.output_dir / 'tag_indices.json'
+        with open(indices_file, 'w', encoding='utf-8') as f:
+            # Convert any non-JSON-serializable types to lists
+            serializable_indices = [
+                list(indices) if isinstance(indices, (set, tuple)) else indices
+                for indices in results['tag_indices']
+            ]
+            json.dump(serializable_indices, f, indent=2)
+
         logger.info(f"Saved tag indices to {indices_file}")
     
     def _save_metadata(self, results: Dict, aggregated_stats: Dict):

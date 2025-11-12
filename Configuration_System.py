@@ -337,12 +337,48 @@ class BaseConfig:
                             if is_dataclass(t) and isinstance(value, dict):
                                 kwargs[key] = t.from_dict(value)  # type: ignore[attr-defined]
                             else:
-                                # If this variant itself is another typing construct (e.g. list[int]),
-                                # fall back to assigning the raw value and let later validation handle it.
+                                # Handle nested typing constructs (e.g. List[int], Dict[str, str])
                                 origin_t = get_origin(t)
-                                if origin_t is not None:
+                                if origin_t is list and isinstance(value, list):
+                                    # Handle List[T] within Union
+                                    args_t = get_args(t)
+                                    if args_t and is_dataclass(args_t[0]):
+                                        kwargs[key] = [args_t[0].from_dict(v) if isinstance(v, dict) else v
+                                                      for v in value]
+                                    else:
+                                        kwargs[key] = value
+                                elif origin_t is tuple and isinstance(value, (list, tuple)):
+                                    # Handle Tuple within Union
+                                    kwargs[key] = tuple(value)
+                                elif origin_t is dict and isinstance(value, dict):
+                                    # Handle Dict within Union
+                                    kwargs[key] = value
+                                elif _is_union_origin(origin_t):
+                                    # Handle nested Union types recursively
+                                    temp_args = get_args(t)
+                                    temp_non_none = [tt for tt in temp_args if tt is not type(None)]
+                                    if value is None and type(None) in temp_args:
+                                        kwargs[key] = None
+                                    else:
+                                        # Recursively try nested union types
+                                        nested_assigned = False
+                                        for tt in temp_non_none:
+                                            try:
+                                                if is_dataclass(tt) and isinstance(value, dict):
+                                                    kwargs[key] = tt.from_dict(value)
+                                                else:
+                                                    kwargs[key] = tt(value)
+                                                nested_assigned = True
+                                                break
+                                            except (TypeError, ValueError, AttributeError):
+                                                continue
+                                        if not nested_assigned:
+                                            raise TypeError(f"Cannot coerce to nested union {t}")
+                                elif origin_t is not None:
+                                    # Other generic types - assign raw value
                                     kwargs[key] = value
                                 else:
+                                    # Primitive type - try direct coercion
                                     kwargs[key] = t(value)
                             assigned = True
                             break
@@ -647,7 +683,10 @@ class ModelConfig(BaseConfig):
     # Initialization
     initializer_range: float = 0.02
     layer_norm_eps: float = 1e-6
-    
+
+    # Precision and numerical stability
+    use_fp32_layernorm: bool = field(default=False, metadata={"help": "Use FP32 for LayerNorm (better stability, slight speed cost). Set to False for full bfloat16."})
+
     # Attention
     use_flash_attention: bool = True
     attention_bias: bool = True
@@ -767,18 +806,24 @@ class DataConfig(BaseConfig):
     use_memory_cache: bool = True
     
     # Augmentation
+    # NOTE: Most augmentations are NOT IMPLEMENTED - only random_flip_prob is active.
+    # With large datasets (5-6M images), augmentation is generally unnecessary.
     augmentation_enabled: bool = True
-    random_flip_prob: float = 0.35
-    color_jitter: bool = True
+    random_flip_prob: float = 0.0  # IMPLEMENTED: Horizontal flipping with orientation tag swapping (disabled by default)
+
+    # NOT IMPLEMENTED: Color augmentations below are configured but not applied
+    color_jitter: bool = False
     color_jitter_brightness: float = 0.10
     color_jitter_contrast:   float = 0.10
     color_jitter_hue:        float = 0.03  # cap hue to protect eye-color semantics
     color_jitter_saturation: float = 0.00
     eye_color_weight_boost: float = 1.5  # Boost for eye color tags in sampling
+
+    # NOT IMPLEMENTED: Geometric augmentations below are configured but not applied
     random_crop_scale: Tuple[float, float] = (0.8, 1.0)
     random_rotation_degrees: float = 0.0
 
-    # Advanced Augmentation (set alpha/p to 0.0 to disable)
+    # NOT IMPLEMENTED: Advanced augmentations below are configured but not applied
     randaugment_num_ops: int = 2
     randaugment_magnitude: int = 9
     mixup_alpha: float = 0.0
@@ -796,13 +841,18 @@ class DataConfig(BaseConfig):
     l2_cache_path: str = field(default="./l2_cache", metadata={"help": "Path to L2 cache directory"})
     l2_max_size_gb: float = field(default=48.0, metadata={"help": "Maximum size of L2 cache in GB"})
     l2_max_readers: int = field(default=2048, metadata={"help": "Max readers for LMDB"})
-    cache_precision: str = field(default='uint8', metadata={"help": "Precision for cached images ('uint8', 'float16', 'bfloat16', 'float32')"})
-    canonical_cache_dtype: str = field(default='uint8', metadata={"help": "Canonical dtype for cache storage"})
+    cache_precision: str = field(default='bfloat16', metadata={"help": "Precision for cached images ('uint8', 'float16', 'bfloat16', 'float32')"})
+    canonical_cache_dtype: str = field(default='bfloat16', metadata={"help": "Canonical dtype for L1 cache storage (images only; masks remain uint8)"})
     l2_storage_dtype: str = field(default='bfloat16', metadata={"help": "Storage dtype for L2 cache ('float16','bfloat16','float32','uint8')"})
     cpu_bf16_cache_pipeline: bool = field(default=True, metadata={"help": "Process normalization on CPU in bf16 when populating L2"})
     # When the async L2 writer queue is full, wait up to this many milliseconds
     # before dropping the write. 0 means drop immediately (non‑blocking behavior).
     l2_writer_full_wait_ms: int = field(default=0, metadata={"help": "Max ms to wait when L2 writer queue is full before dropping"})
+
+    # Dtype Configuration for various components
+    tag_vector_dtype: str = field(default='bfloat16', metadata={"help": "Dtype for tag/label vectors ('float16', 'bfloat16', 'float32')"})
+    cache_dequant_dtype: str = field(default='bfloat16', metadata={"help": "Target dtype for uint8 cache dequantization ('float16', 'bfloat16', 'float32')"})
+    metric_compute_dtype: str = field(default='float32', metadata={"help": "Dtype for metric computation ('float16', 'bfloat16', 'float32')"})
 
     # Dataset behavior (from dataset_loader.py usage)
     patch_size: int = field(default=16, metadata={"help": "Patch size for vision transformer"})
@@ -935,6 +985,15 @@ class DataConfig(BaseConfig):
             errors.append(f"Invalid cache_precision: {self.cache_precision}. Must be one of {valid_precisions}")
         if self.l2_storage_dtype not in valid_precisions:
             errors.append(f"Invalid l2_storage_dtype: {self.l2_storage_dtype}. Must be one of {valid_precisions}")
+
+        # Validate additional dtype configurations
+        valid_float_dtypes = ["float16", "bfloat16", "float32"]
+        if self.tag_vector_dtype not in valid_float_dtypes:
+            errors.append(f"Invalid tag_vector_dtype: {self.tag_vector_dtype}. Must be one of {valid_float_dtypes}")
+        if self.cache_dequant_dtype not in valid_float_dtypes:
+            errors.append(f"Invalid cache_dequant_dtype: {self.cache_dequant_dtype}. Must be one of {valid_float_dtypes}")
+        if self.metric_compute_dtype not in valid_float_dtypes:
+            errors.append(f"Invalid metric_compute_dtype: {self.metric_compute_dtype}. Must be one of {valid_float_dtypes}")
 
         # Bounds for L2 writer full wait time
         try:
@@ -1719,10 +1778,10 @@ class ConfigManager:
         try:
             # Determine file type and load
             if path.suffix in ['.yaml', '.yml']:
-                with open(path, 'r') as f:
+                with open(path, 'r', encoding='utf-8') as f:
                     data = yaml.safe_load(f)
             elif path.suffix == '.json':
-                with open(path, 'r') as f:
+                with open(path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
             else:
                 raise ConfigError(f"Unknown config file format: {path.suffix}")

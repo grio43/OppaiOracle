@@ -30,10 +30,16 @@ def ensure_pixel_padding_mask(
     if mask is None:
         return None
 
+    # Use tensor-based assertions that work during tracing
+    original_dims = mask.dim()
     if mask.dim() == 3:
         mask = mask.unsqueeze(1)  # (B,1,H,W)
-    if mask.dim() != 4:
-        raise ValueError(f"padding_mask must be (B,H,W) or (B,1,H,W); got {tuple(mask.shape)}")
+
+    # Trace-friendly validation: use torch assertions instead of Python conditionals
+    torch._assert(
+        mask.dim() == 4,
+        f"padding_mask must be (B,H,W) or (B,1,H,W) after expansion; got {original_dims}D -> {mask.dim()}D with shape {tuple(mask.shape)}"
+    )
 
     # Binarize + cast
     if mask.dtype is not torch.bool:
@@ -70,18 +76,30 @@ def pixel_to_token_ignore(mask_b1hw: torch.Tensor, patch: int, threshold: float 
     Pools pad-fraction per patch via avg_pool2d(kernel=stride=patch) and marks
     tokens IGNORE when pad_fraction >= threshold.
     """
-    # These checks are not tracer-friendly, so we disable them during tracing.
-    if not torch.jit.is_tracing():
-        if mask_b1hw.dim() != 4 or mask_b1hw.size(1) != 1:
-            raise ValueError(f"Expected (B,1,H,W) bool, got {tuple(mask_b1hw.shape)}")
-        if mask_b1hw.dtype is not torch.bool:
-            raise ValueError("mask_b1hw must be bool with True=PAD")
+    B, C, H, W = mask_b1hw.shape
 
-        B, _, H, W = mask_b1hw.shape
-        if H % patch != 0 or W % patch != 0:
-            raise AssertionError(
-                f"Image size (H={H},W={W}) must be divisible by patch={patch} before pooling."
-            )
+    # Use trace-friendly torch assertions instead of Python conditionals
+    torch._assert(
+        mask_b1hw.dim() == 4,
+        f"Expected 4D tensor (B,1,H,W), got {mask_b1hw.dim()}D with shape {tuple(mask_b1hw.shape)}"
+    )
+    torch._assert(
+        C == 1,
+        f"Expected channel dimension of 1, got {C} with shape {tuple(mask_b1hw.shape)}"
+    )
+    torch._assert(
+        mask_b1hw.dtype == torch.bool,
+        f"mask_b1hw must be bool (True=PAD), got dtype {mask_b1hw.dtype}"
+    )
+    torch._assert(
+        H % patch == 0,
+        f"Image height {H} must be divisible by patch size {patch}"
+    )
+    torch._assert(
+        W % patch == 0,
+        f"Image width {W} must be divisible by patch size {patch}"
+    )
+
     # pad_fraction per patch
     pad_frac = F.avg_pool2d(mask_b1hw.float(), kernel_size=patch, stride=patch)  # (B,1,GH,GW)
     ignore = (pad_frac.squeeze(1) >= threshold)                                   # (B,GH,GW)
