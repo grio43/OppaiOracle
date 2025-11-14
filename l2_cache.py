@@ -228,7 +228,7 @@ class _WriterProc(mp.Process):
         self.flush_s = flush_ms / 1000.0
         self._running = mp.Event()
         self._running.set()
-        self._flush_lock = threading.Lock()  # Thread-safe flush guard (CR-012)
+        self._flush_lock = None  # Thread-safe flush guard (CR-012) - initialized in run()
 
         # Cache statistics tracking (CR-006)
         self.stats = {
@@ -236,10 +236,13 @@ class _WriterProc(mp.Process):
             'dropped_batches': 0,
             'dropped_items': 0,
             'cache_full_events': 0,
+            'duplicate_skips': 0,  # Track duplicate write attempts
         }
         self.cache_full = False  # Backpressure signal
 
     def run(self) -> None:
+        # Initialize threading lock in child process (cannot be pickled on Windows spawn)
+        self._flush_lock = threading.Lock()
         env = lmdb.open(
             self.path,
             map_size=self.map_size_bytes,
@@ -269,8 +272,21 @@ class _WriterProc(mp.Process):
 
             try:
                 with env.begin(write=True) as txn:
+                    skipped = 0
+                    written = 0
                     for k, v in pending:
-                        txn.put(k, v, overwrite=True)
+                        # Check if key already exists to avoid duplicate preprocessing work
+                        if txn.get(k) is not None:
+                            skipped += 1
+                            continue
+                        txn.put(k, v, overwrite=False)
+                        written += 1
+
+                    # Update statistics
+                    if skipped > 0:
+                        self.stats['duplicate_skips'] += skipped
+                        logging.debug(f"Skipped {skipped} duplicate cache entries in batch")
+                    self.stats['writes'] += written
             except lmdb.MapFullError:
                 info = env.info()
                 current_size = info.get("map_size", self.map_size_bytes)
@@ -292,8 +308,17 @@ class _WriterProc(mp.Process):
                     try:
                         env.set_mapsize(new_size)
                         with env.begin(write=True) as txn:
+                            skipped = 0
+                            written = 0
                             for k, v in pending:
-                                txn.put(k, v, overwrite=True)
+                                if txn.get(k) is not None:
+                                    skipped += 1
+                                    continue
+                                txn.put(k, v, overwrite=False)
+                                written += 1
+                            if skipped > 0:
+                                self.stats['duplicate_skips'] += skipped
+                            self.stats['writes'] += written
                     except lmdb.MapFullError:
                         # Can't grow anymore, cache is truly full (CR-006)
                         self.cache_full = True
@@ -324,8 +349,17 @@ class _WriterProc(mp.Process):
 
                     env.set_mapsize(new_size)
                     with env.begin(write=True) as txn:
+                        skipped = 0
+                        written = 0
                         for k, v in pending:
-                            txn.put(k, v, overwrite=True)
+                            if txn.get(k) is not None:
+                                skipped += 1
+                                continue
+                            txn.put(k, v, overwrite=False)
+                            written += 1
+                        if skipped > 0:
+                            self.stats['duplicate_skips'] += skipped
+                        self.stats['writes'] += written
 
             finally:
                 pending.clear()
@@ -340,6 +374,10 @@ class _WriterProc(mp.Process):
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
 
+        # Queue monitoring for observability
+        last_queue_log = time.monotonic()
+        queue_log_interval = 30.0  # Log queue depth every 30 seconds
+
         while self._running.is_set():
             timeout = max(0.0, self.flush_s - (time.monotonic() - last_flush))
             try:
@@ -352,6 +390,38 @@ class _WriterProc(mp.Process):
                 pending_bytes += len(v)
             except queue.Empty:
                 pass
+
+            # Periodic queue depth monitoring
+            now = time.monotonic()
+            if now - last_queue_log >= queue_log_interval:
+                try:
+                    qsize = self.q.qsize()
+                    qmax = self.q._maxsize if hasattr(self.q, '_maxsize') else 'unknown'
+
+                    # Calculate utilization percentage if maxsize is known
+                    if isinstance(qmax, int) and qmax > 0:
+                        utilization = (qsize / qmax) * 100
+                        log_msg = (
+                            f"L2 writer queue: {qsize}/{qmax} items ({utilization:.1f}% full) | "
+                            f"Stats: {self.stats['writes']} writes, "
+                            f"{self.stats['duplicate_skips']} duplicates skipped"
+                        )
+                    else:
+                        log_msg = (
+                            f"L2 writer queue: {qsize} items | "
+                            f"Stats: {self.stats['writes']} writes, "
+                            f"{self.stats['duplicate_skips']} duplicates skipped"
+                        )
+
+                    # Log at appropriate level based on queue depth
+                    if isinstance(qmax, int) and qmax > 0 and qsize > qmax * 0.8:
+                        logging.warning(f"{log_msg} - Queue approaching capacity!")
+                    else:
+                        logging.info(log_msg)
+
+                    last_queue_log = now
+                except Exception as e:
+                    logging.debug(f"Failed to get queue size: {e}")
 
             if (
                 pending

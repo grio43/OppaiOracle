@@ -1470,6 +1470,16 @@ class TrainingUtils:
             )
         
         elif optimizer_type.lower() == 'adamw':
+            # Standard PyTorch AdamW (32-bit, no external dependencies)
+            return optim.AdamW(
+                params,
+                lr=learning_rate,
+                betas=kwargs.get('betas', (0.9, 0.999)),
+                eps=kwargs.get('eps', 1e-8)
+            )
+
+        elif optimizer_type.lower() == 'adamw8bit':
+            # Memory-efficient 8-bit AdamW from bitsandbytes
             if bnb is None:
                 raise ImportError(
                     "bitsandbytes is required for AdamW8bit optimizer. "

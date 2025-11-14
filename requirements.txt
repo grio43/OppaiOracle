@@ -25,6 +25,7 @@ scipy>=1.11
 safetensors>=0.4.2
 seaborn>=0.13.2
 tensorboard>=2.14,<2.21
+bitsandbytes>=0.41.0  # for 8-bit AdamW optimizer (memory efficient)
 # Upgrade PyTorch stack for modern APIs and CUDA 12.8+ / SM_120 support
 torch>=2.8.0
 torchvision>=0.23.0

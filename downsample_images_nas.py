@@ -12,6 +12,13 @@ Strategy:
 4. Batch operations to minimize NAS I/O overhead
 5. Preserve metadata JSON files (auto-add 'grey_background' tag when applied)
 
+NAS I/O Optimization:
+- All image processing done in-memory using BytesIO (no temp files)
+- Batched reads: Process BATCH_SIZE images in memory before writing
+- Batched writes: Write all processed images in a batch sequentially
+- File replacement logic: Delete original if format changes, overwrite if same format
+- Minimizes round-trips to NAS storage for maximum throughput
+
 Target Resolution Logic:
 - OppaiOracle trains at 512x512 with letterbox (downscale-only)
 - We downsample images to exactly match training resolution
@@ -38,8 +45,8 @@ Usage:
 
 import sys
 import warnings
-import shutil
 import json
+from io import BytesIO
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -73,6 +80,8 @@ DEFAULT_TARGET_SIZE = 512
 
 # File size threshold for PNG→JPEG conversion (in bytes)
 PNG_TO_JPEG_THRESHOLD = 1 * 1024 * 1024  # 1MB
+# NOTE: For 512px target, max uncompressed PNG size is ~786KB (512×512×3)
+# So this threshold will rarely trigger at 512px. Consider 500KB for 512px training.
 
 # JPEG quality for converted files (95 = high quality, minimal artifacts)
 JPEG_QUALITY = 95
@@ -278,17 +287,20 @@ def calculate_target_dimensions(original_size: Tuple[int, int], target_size: int
     return (max(1, new_width), max(1, new_height))
 
 
-def process_image(img_path: Path, target_size: int, dry_run: bool = True) -> ImageStats:
+def process_image(img_path: Path, target_size: int, dry_run: bool = True) -> Tuple[ImageStats, Optional[bytes], Optional[Path], bool]:
     """
     Process a single image: downsample and optionally convert format.
 
     Args:
         img_path: Path to image file
         target_size: Target size for longest side
-        dry_run: If True, don't actually modify files
+        dry_run: If True, don't actually process image data
 
     Returns:
-        ImageStats object with processing details
+        Tuple of (ImageStats, image_bytes, output_path, should_delete_original)
+        - image_bytes: Processed image data ready to write (None if skipped/error/dry_run)
+        - output_path: Path where image should be written (None if skipped/error)
+        - should_delete_original: True if original file should be deleted before writing
     """
     try:
         # Get original file info
@@ -304,7 +316,7 @@ def process_image(img_path: Path, target_size: int, dry_run: bool = True) -> Ima
                 should_process, reason = should_process_image(img_path, target_size)
 
                 if not should_process:
-                    return ImageStats(
+                    stats = ImageStats(
                         path=img_path,
                         original_size=original_size,
                         original_bytes=original_bytes,
@@ -312,6 +324,7 @@ def process_image(img_path: Path, target_size: int, dry_run: bool = True) -> Ima
                         action="skipped",
                         error=reason if "error" in reason else None
                     )
+                    return (stats, None, None, False)
 
                 # Calculate new dimensions
                 new_size = calculate_target_dimensions(original_size, target_size)
@@ -336,7 +349,7 @@ def process_image(img_path: Path, target_size: int, dry_run: bool = True) -> Ima
                 resized = img.resize(new_size, Image.Resampling.LANCZOS)
 
                 if dry_run:
-                    # Estimate size without actually saving
+                    # Estimate size without actually processing
                     # Use original format and compression to estimate
                     estimated_bytes = int(original_bytes * (new_size[0] * new_size[1]) / (original_size[0] * original_size[1]))
 
@@ -350,7 +363,7 @@ def process_image(img_path: Path, target_size: int, dry_run: bool = True) -> Ima
                         action = "would_convert_to_jpeg"
                         new_format = "JPEG"
 
-                    return ImageStats(
+                    stats = ImageStats(
                         path=img_path,
                         original_size=original_size,
                         original_bytes=original_bytes,
@@ -361,85 +374,87 @@ def process_image(img_path: Path, target_size: int, dry_run: bool = True) -> Ima
                         action=action,
                         gray_background_applied=gray_bg_applied
                     )
+                    return (stats, None, None, False)
 
                 else:
-                    # Actually save the processed image
-                    # Decide output format
+                    # Process the image in memory and determine output format
+                    # First, check PNG size to decide on conversion
                     should_convert_to_jpeg = False
+                    output_format = original_format
+
                     if original_format == 'PNG':
-                        # Save temporarily to check size
-                        temp_path = img_path.with_suffix('.tmp.png')
-                        resized.save(temp_path, format='PNG', optimize=True)
-                        temp_size = temp_path.stat().st_size
+                        # Use BytesIO to check PNG size without writing to disk
+                        buffer = BytesIO()
+                        resized.save(buffer, format='PNG', optimize=True)
+                        png_size = buffer.tell()
 
-                        if temp_size > PNG_TO_JPEG_THRESHOLD:
+                        if png_size > PNG_TO_JPEG_THRESHOLD:
                             should_convert_to_jpeg = True
-                            temp_path.unlink()  # Delete temp PNG
+                            output_format = 'JPEG'
                         else:
-                            # Keep PNG, replace original
-                            img_path.unlink()  # Delete original
-                            shutil.move(str(temp_path), str(img_path))
-                            new_bytes = temp_size
-                            new_format = 'PNG'
-                            action = 'downsampled'
+                            # Keep as PNG
+                            output_format = 'PNG'
+                            image_bytes = buffer.getvalue()
 
+                    # Generate final image bytes based on determined format
                     if should_convert_to_jpeg or (original_format in ('JPEG', 'JPG')):
-                        # Save as JPEG
-                        output_path = img_path.with_suffix('.jpg')
-
-                        # Delete original before saving
-                        if img_path.exists():
-                            img_path.unlink()
-
-                        # Save optimized JPEG
+                        # Convert to JPEG
+                        buffer = BytesIO()
                         resized.save(
-                            output_path,
+                            buffer,
                             format='JPEG',
                             quality=JPEG_QUALITY,
                             optimize=True,
                             subsampling=0  # 4:4:4 chroma subsampling for best quality
                         )
-
-                        new_bytes = output_path.stat().st_size
-                        new_format = 'JPEG'
+                        image_bytes = buffer.getvalue()
+                        output_format = 'JPEG'
                         action = 'converted' if should_convert_to_jpeg else 'downsampled'
+                        output_path = img_path.with_suffix('.jpg')
 
                     elif original_format == 'WebP':
-                        # Keep as WebP, replace original
-                        img_path.unlink()
-                        resized.save(img_path, format='WebP', quality=95, method=6)
-                        new_bytes = img_path.stat().st_size
-                        new_format = 'WebP'
+                        # Keep as WebP
+                        buffer = BytesIO()
+                        resized.save(buffer, format='WebP', quality=95, method=6)
+                        image_bytes = buffer.getvalue()
+                        output_format = 'WebP'
                         action = 'downsampled'
+                        output_path = img_path
+
+                    elif original_format == 'PNG' and not should_convert_to_jpeg:
+                        # Already generated PNG bytes above
+                        action = 'downsampled'
+                        output_path = img_path
 
                     else:
-                        # Other formats: save with original format, replace original
-                        img_path.unlink()
-                        resized.save(img_path, format=original_format, optimize=True)
-                        new_bytes = img_path.stat().st_size
-                        new_format = original_format
+                        # Other formats: keep original format
+                        buffer = BytesIO()
+                        resized.save(buffer, format=original_format, optimize=True)
+                        image_bytes = buffer.getvalue()
+                        output_format = original_format
                         action = 'downsampled'
+                        output_path = img_path
 
-                    # Update JSON metadata if gray background was applied
-                    if gray_bg_applied:
-                        json_path = img_path.with_suffix('.json')
-                        if json_path.exists():
-                            add_tag_to_json(json_path, 'grey_background')
+                    # Determine if we need to delete the original file
+                    # Delete if format changed (e.g., PNG -> JPEG means different extension)
+                    should_delete_original = (output_path != img_path)
 
-                    return ImageStats(
+                    stats = ImageStats(
                         path=img_path,
                         original_size=original_size,
                         original_bytes=original_bytes,
                         original_format=original_format,
                         new_size=new_size,
-                        new_bytes=new_bytes,
-                        new_format=new_format,
+                        new_bytes=len(image_bytes),
+                        new_format=output_format,
                         action=action,
                         gray_background_applied=gray_bg_applied
                     )
 
+                    return (stats, image_bytes, output_path, should_delete_original)
+
     except Exception as e:
-        return ImageStats(
+        stats = ImageStats(
             path=img_path,
             original_size=(0, 0),
             original_bytes=img_path.stat().st_size if img_path.exists() else 0,
@@ -447,6 +462,7 @@ def process_image(img_path: Path, target_size: int, dry_run: bool = True) -> Ima
             action="error",
             error=str(e)
         )
+        return (stats, None, None, False)
 
 
 # ============================================================================
@@ -455,7 +471,7 @@ def process_image(img_path: Path, target_size: int, dry_run: bool = True) -> Ima
 
 def process_shard_worker(args) -> Tuple[str, ShardStats, list]:
     """
-    Worker function to process a single shard.
+    Worker function to process a single shard with batched I/O.
     Returns: (shard_name, ShardStats, list[ImageStats])
     """
     shard_path, target_size, dry_run = args
@@ -484,8 +500,33 @@ def process_shard_worker(args) -> Tuple[str, ShardStats, list]:
             if i > 0 and VERBOSE:
                 print(f"  [{shard_name}] Progress: {i}/{len(image_files)} files...")
 
+            # Batch 1: Process all images in memory
+            batch_results = []
             for img_file in batch:
-                img_stat = process_image(img_file, target_size, dry_run)
+                result = process_image(img_file, target_size, dry_run)
+                batch_results.append(result)
+
+            # Batch 2: Write all processed images to disk (if not dry run)
+            if not dry_run:
+                for img_stat, image_bytes, output_path, should_delete_original in batch_results:
+                    # Update JSON metadata if gray background was applied
+                    if img_stat.gray_background_applied:
+                        json_path = img_stat.path.with_suffix('.json')
+                        if json_path.exists():
+                            add_tag_to_json(json_path, 'grey_background')
+
+                    # Write the image if we have bytes to write
+                    if image_bytes is not None and output_path is not None:
+                        # Delete original if format changed
+                        if should_delete_original and img_stat.path.exists():
+                            img_stat.path.unlink()
+
+                        # Write new image (overwrite if same path, create new if different)
+                        with open(output_path, 'wb') as f:
+                            f.write(image_bytes)
+
+            # Batch 3: Update statistics
+            for img_stat, _, _, _ in batch_results:
                 image_stats_list.append(img_stat)
 
                 # Update shard stats

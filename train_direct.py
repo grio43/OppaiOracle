@@ -549,50 +549,6 @@ def train_with_orientation_tracking(config: FullConfig):
         validate_dataset(val_loader, vocab, config, num_batches_to_check=5)
         logger.info("Pre-training input validation complete.")
 
-    # Optional: Warm attention mask cache before training
-    # This eliminates cold-start cache misses for variable-size datasets
-    if getattr(config.training, 'warmup_attention_cache', False):
-        try:
-            from cache_warmup import warmup_attention_cache, estimate_cache_coverage
-
-            # First, estimate how many unique patterns exist
-            logger.info("Analyzing attention mask patterns in dataset...")
-            coverage_stats = estimate_cache_coverage(
-                [train_loader, val_loader],
-                num_batches_per_loader=20,
-                show_progress=True
-            )
-
-            logger.info(
-                f"Found {coverage_stats['unique_patterns']} unique mask patterns. "
-                f"Most common pattern appears {coverage_stats['most_common_percentage']:.1f}% of the time."
-            )
-
-            # Warn if dataset has high pattern diversity
-            if coverage_stats['unique_patterns'] > 50:
-                logger.warning(
-                    f"Dataset has {coverage_stats['unique_patterns']} unique mask patterns. "
-                    f"Consider increasing TransformerBlock._max_cache_entries (current: 100)."
-                )
-
-            # Warm the cache
-            logger.info("Warming attention mask cache...")
-            warmup_stats = warmup_attention_cache(
-                model=model,
-                dataloaders=[train_loader, val_loader],
-                num_batches_per_loader=min(10, coverage_stats['unique_patterns']),
-                device=device,
-                show_progress=True
-            )
-
-            logger.info(
-                f"Cache warmup complete: {warmup_stats['new_entries']} entries created. "
-                f"Training will start with ~100% cache hit rate."
-            )
-
-        except Exception as e:
-            logger.warning(f"Cache warmup failed: {e}. Continuing with lazy cache initialization.")
-
     num_tags = len(vocab.tag_to_index)
     num_ratings = len(vocab.rating_to_index)
     logger.info(f"Creating model with {num_tags} tags and {num_ratings} ratings")
@@ -666,6 +622,91 @@ def train_with_orientation_tracking(config: FullConfig):
             monitor.log_model_graph(model, images, padding_mask)
         except Exception as e:
             logger.warning(f"Could not log model graph: {e}")
+
+    # Detect and log SDPA backend for Flash Attention verification
+    if config.model.use_flash_attention:
+        logger.info("=" * 70)
+        logger.info("Flash Attention Configuration:")
+        logger.info(f"  use_flash_attention: {config.model.use_flash_attention}")
+
+        # Detect available SDPA backends
+        try:
+            if hasattr(torch.nn.attention, 'SDPBackend'):
+                import torch.nn.attention as attention
+
+                logger.info("Checking available SDPA backends...")
+                with torch.no_grad():
+                    # Create test tensors
+                    test_q = torch.randn(1, 4, 8, 16, device=device, dtype=torch.bfloat16)
+                    test_k, test_v = test_q, test_q
+
+                    # Test each backend
+                    backends = [
+                        ('FLASH_ATTENTION (FlashAttention-2)', 'FLASH_ATTENTION'),
+                        ('EFFICIENT_ATTENTION (Memory-Efficient)', 'EFFICIENT_ATTENTION'),
+                        ('CUDNN_ATTENTION (cuDNN)', 'CUDNN_ATTENTION'),
+                        ('MATH (Fallback)', 'MATH'),
+                    ]
+
+                    active_backend = None
+                    for backend_name, backend_attr in backends:
+                        backend_enum = getattr(attention.SDPBackend, backend_attr, None)
+                        if backend_enum is not None:
+                            try:
+                                with attention.sdpa_kernel([backend_enum]):
+                                    _ = torch.nn.functional.scaled_dot_product_attention(test_q, test_k, test_v)
+                                    logger.info(f"  ✓ {backend_name} - AVAILABLE")
+                                    if active_backend is None:
+                                        active_backend = backend_name
+                            except Exception:
+                                logger.info(f"  ✗ {backend_name} - not available")
+
+                    if active_backend:
+                        logger.info(f"\n  Primary backend: {active_backend}")
+                        if 'FLASH_ATTENTION' in active_backend:
+                            logger.info("  Status: FlashAttention-2 is ACTIVE - optimal performance!")
+                        else:
+                            logger.warning(f"  Warning: Using {active_backend} instead of FlashAttention-2")
+                            logger.warning("  This may result in slower attention computation")
+            else:
+                logger.info("  Backend detection not available in this PyTorch version")
+                logger.info(f"  PyTorch version: {torch.__version__}")
+        except Exception as e:
+            logger.warning(f"Could not detect SDPA backend: {e}")
+
+        logger.info("=" * 70)
+
+    # torch.compile() optimization (PyTorch 2.0+)
+    # Provides 15-35% speedup through graph optimization and kernel fusion
+    if getattr(config.training, "use_compile", False):
+        logger.info("=" * 70)
+        logger.info("Compiling model with torch.compile()...")
+        logger.info("This will take 2-5 minutes on first forward pass but provides")
+        logger.info("15-35% speedup for transformer training workloads.")
+
+        compile_mode = getattr(config.training, "compile_mode", "default")
+        compile_fullgraph = getattr(config.training, "compile_fullgraph", False)
+        compile_dynamic = getattr(config.training, "compile_dynamic", True)
+
+        logger.info(f"  compile_mode: {compile_mode}")
+        logger.info(f"  fullgraph: {compile_fullgraph}")
+        logger.info(f"  dynamic: {compile_dynamic}")
+
+        try:
+            model = torch.compile(
+                model,
+                mode=compile_mode,
+                fullgraph=compile_fullgraph,
+                dynamic=compile_dynamic
+            )
+            logger.info("Model compiled successfully!")
+        except Exception as e:
+            logger.warning(f"torch.compile() failed: {e}")
+            logger.warning("Continuing with eager mode (uncompiled)...")
+
+        logger.info("=" * 70)
+    else:
+        logger.info("torch.compile() disabled (use_compile=false in config)")
 
     criterion = MultiTaskLoss(
         tag_loss_weight=0.9,
