@@ -1154,6 +1154,12 @@ class TrainingConfig(BaseConfig):
     world_size: int = 1
     ddp_backend: str = "nccl"
     
+
+    # torch.compile() Optimization (PyTorch 2.0+)
+    use_compile: bool = True
+    compile_mode: str = "max-autotune"  # Options: default, reduce-overhead, max-autotune
+    compile_fullgraph: bool = False  # Allow graph breaks for dynamic shapes
+    compile_dynamic: bool = True  # Support varying padding mask shapes
     # Tracking
     use_tensorboard: bool = True
     use_wandb: bool = False
@@ -1207,16 +1213,16 @@ class TrainingConfig(BaseConfig):
         if self.gradient_accumulation_steps <= 0:
             errors.append(f"gradient_accumulation_steps must be positive, got {self.gradient_accumulation_steps}")
         
-        valid_optimizers = ["adam", "adamw", "sgd", "rmsprop", "adagrad", "adan"]
+        valid_optimizers = ["adam", "adamw", "adamw8bit", "sgd", "rmsprop", "adagrad", "adan"]
         if self.optimizer not in valid_optimizers:
             errors.append(f"Unknown optimizer: {self.optimizer}. Must be one of {valid_optimizers}")
-        
+
         valid_schedulers = ["cosine", "cosine_restarts", "step", "multistep", "plateau", "exponential"]
         if self.scheduler not in valid_schedulers:
             errors.append(f"Unknown scheduler: {self.scheduler}. Must be one of {valid_schedulers}")
-        
+
         # Validate beta values for Adam optimizers
-        if self.optimizer in ["adam", "adamw"]:
+        if self.optimizer in ["adam", "adamw", "adamw8bit"]:
             if not 0 <= self.adam_beta1 < 1:
                 errors.append(f"adam_beta1 must be in [0, 1), got {self.adam_beta1}")
             if not 0 <= self.adam_beta2 < 1:
