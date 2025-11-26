@@ -11,6 +11,7 @@ logs/*
 l2_cache/
 tensorboard/
 experiments/
+test_downsample/
 
 # SQLite database files
 *.sqlite
