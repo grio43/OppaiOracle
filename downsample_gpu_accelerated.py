@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-RAM-Based CPU-Only Image Downsampling - Optimized for HDD-based NAS
+RAM-Based CPU-Only Image Downsampling
 
 Major optimizations:
 1. Load ENTIRE shard to RAM first (eliminates disk read during processing)
 2. Parallel CPU processing with multiprocessing (no GPU - handles variable sizes)
-3. HDD-friendly I/O pattern: Read All -> Process in RAM -> Write All
-4. Sequential writes to minimize disk seeks (critical for HDDs)
+3. Efficient I/O pattern: Read All -> Process in RAM -> Write All
+4. Sequential writes for optimal throughput
 5. Pure PIL processing on CPU
 6. Low-priority background operation (won't lag games or foreground apps)
 
 Expected performance: 50-100+ images/sec with 6 CPU workers (background-friendly)
 
-HDD Optimization Strategy:
+Optimization Strategy:
 - PHASE 1: Read entire shard into RAM as bytes (single sequential read pass)
 - PHASE 2: Process all images in parallel on CPU (disk idle, all data in RAM)
 - PHASE 3: Write all results back sequentially (single sequential write pass)
-- This completely eliminates read/write thrashing on HDD
+- This completely eliminates read/write thrashing
 
 Usage:
     python downsample_gpu_accelerated.py --yes
@@ -76,13 +76,13 @@ MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 # PNG to JPEG compression estimate (used in dry-run calculations)
 PNG_TO_JPEG_COMPRESSION_RATIO = 7  # Typical PNG files compress ~7x when converted to JPEG
 
-# Retry settings for NAS file operations
+# Retry settings for file operations
 MAX_WRITE_RETRIES = 3  # Number of retries for write operations
 WRITE_RETRY_DELAY = 0.1  # Initial retry delay in seconds
 
-# I/O optimization for NAS
-READ_BUFFER_SIZE = 16 * 1024 * 1024  # 16MB read buffer for better NAS read performance
-WRITE_BUFFER_SIZE = 8 * 1024 * 1024  # 8MB write buffer for better NAS performance
+# I/O optimization
+READ_BUFFER_SIZE = 16 * 1024 * 1024  # 16MB read buffer for better read performance
+WRITE_BUFFER_SIZE = 8 * 1024 * 1024  # 8MB write buffer for better write performance
 
 # Command line parsing
 DRY_RUN = '--yes' not in sys.argv
@@ -326,12 +326,12 @@ def load_shard_to_ram(shard_path: Path, shard_name: str, verbose: bool = False) 
     Load all images from a shard into RAM with optimized I/O.
 
     Returns list of ImageJob objects with image bytes loaded.
-    This is PHASE 1 of the pipeline - sequential read from NAS HDD.
+    This is PHASE 1 of the pipeline - sequential read pass.
 
     Optimizations:
     - Large 16MB read buffers to reduce I/O operations
     - Batch stat() operations upfront to avoid per-file syscalls
-    - Sequential reading with sorted paths (HDD-friendly)
+    - Sequential reading with sorted paths for optimal throughput
     """
     jobs = []
 
@@ -345,7 +345,7 @@ def load_shard_to_ram(shard_path: Path, shard_name: str, verbose: bool = False) 
     if not image_paths:
         return jobs
 
-    # Sort paths for sequential disk access (HDD optimization)
+    # Sort paths for sequential disk access
     image_paths = sorted(image_paths)
 
     # Batch stat operations upfront and filter by size
@@ -387,7 +387,7 @@ def load_shard_to_ram(shard_path: Path, shard_name: str, verbose: bool = False) 
 
     for img_path in pbar:
         try:
-            # Read with large buffer for better NAS performance
+            # Read with large buffer for better I/O performance
             with open(img_path, 'rb', buffering=READ_BUFFER_SIZE) as f:
                 image_bytes = f.read()
                 jobs.append(ImageJob(
@@ -423,18 +423,17 @@ def write_results_sequential(results: List[ProcessedImage], dry_run: bool, verbo
     """
     Write all processed images sequentially to disk with batched I/O.
 
-    This is PHASE 3 of the pipeline - sequential write to NAS HDD.
-    Sorts results by output path to minimize disk seeks on mechanical drives.
+    This is PHASE 3 of the pipeline - sequential write pass.
+    Sorts results by output path for optimal throughput.
 
-    Optimizations for NAS performance:
+    Optimizations:
     - Uses large write buffers (8MB) to reduce I/O operations
     - Defers all delete operations to end (batch metadata updates)
     - Minimizes file system metadata churn during writes
 
-    NOTE: Atomic operations on Windows NAS (SMB):
+    NOTE: Atomic operations on network drives:
     - Path.replace() may not be truly atomic on network drives
-    - Power loss or network interruption during rename can corrupt files
-    - This is a limitation of Windows SMB protocol over NAS
+    - Power loss or interruption during rename can corrupt files
     - Use --direct-write for faster (but less safe) direct writes
 
     Returns: Number of files written
@@ -442,11 +441,11 @@ def write_results_sequential(results: List[ProcessedImage], dry_run: bool, verbo
     if dry_run:
         return 0
 
-    # Sort by output path for sequential writes (HDD optimization)
+    # Sort by output path for sequential writes
     results_to_write = [r for r in results if r.image_data and r.output_path]
     results_to_write = sorted(results_to_write, key=lambda r: str(r.output_path))
 
-    print(f"  [PHASE 3] Writing {len(results_to_write)} images back to NAS...")
+    print(f"  [PHASE 3] Writing {len(results_to_write)} images...")
 
     written = 0
     files_to_delete = []  # Defer deletes to end for better I/O performance
@@ -457,7 +456,7 @@ def write_results_sequential(results: List[ProcessedImage], dry_run: bool, verbo
         pbar = results_to_write
 
     for result in pbar:
-        # Retry logic for NAS file locks
+        # Retry logic for file locks
         for attempt in range(MAX_WRITE_RETRIES):
             try:
                 if DIRECT_WRITE:
@@ -477,7 +476,7 @@ def write_results_sequential(results: List[ProcessedImage], dry_run: bool, verbo
                     with open(temp_path, 'wb', buffering=WRITE_BUFFER_SIZE) as f:
                         f.write(result.image_data)
 
-                    # Atomic rename (NOTE: May not be truly atomic on Windows SMB/NAS)
+                    # Atomic rename (NOTE: May not be truly atomic on network drives)
                     temp_path.replace(result.output_path)
 
                     # Defer delete - collect files to delete
@@ -505,7 +504,7 @@ def write_results_sequential(results: List[ProcessedImage], dry_run: bool, verbo
     if HAS_TQDM and hasattr(pbar, 'close'):
         pbar.close()
 
-    print(f"  [PHASE 3] Wrote {written} images to NAS")
+    print(f"  [PHASE 3] Wrote {written} images")
 
     # PHASE 3B: Batch delete all original files (deferred metadata operations)
     if files_to_delete:
@@ -540,14 +539,13 @@ def write_results_sequential(results: List[ProcessedImage], dry_run: bool, verbo
 
 def process_shard_pipeline(shard_path: Path, shard_name: str, target_size: int, num_workers: int, dry_run: bool, verbose: bool = False) -> List[ProcessedImage]:
     """
-    Process an entire shard with 3-phase pipeline optimized for HDD NAS.
+    Process an entire shard with 3-phase pipeline.
 
     PHASE 1: Load entire shard to RAM (sequential read, no disk thrashing)
     PHASE 2: Process all images in parallel on CPU (disk completely idle)
     PHASE 3: Write all results sequentially (sequential write, no disk thrashing)
 
-    This approach completely eliminates read/write interleaving that causes
-    severe performance degradation on mechanical HDDs.
+    This approach completely eliminates read/write interleaving for optimal performance.
     """
     phase_times = {}
 
@@ -587,7 +585,7 @@ def process_shard_pipeline(shard_path: Path, shard_name: str, target_size: int, 
     phase_times['process'] = time.time() - process_start
     print(f"  [PHASE 2] Processing complete ({phase_times['process']:.1f}s)")
 
-    # PHASE 3: WRITE sequentially to NAS
+    # PHASE 3: WRITE sequentially
     write_start = time.time()
     written = write_results_sequential(results, dry_run, verbose)
     phase_times['write'] = time.time() - write_start
@@ -671,7 +669,7 @@ def main() -> None:
         set_low_priority()
 
     # Allow custom database path via --database= parameter
-    database_path = Path(r'Z:\workspace\Dab')
+    database_path = Path(r'L:\Dab\Dab')
     for arg in sys.argv:
         if arg.startswith('--database='):
             db_path_str = arg[11:]  # Remove '--database=' prefix
@@ -738,12 +736,12 @@ def main() -> None:
     print(f"  Write mode: {'DIRECT (faster, less safe)' if DIRECT_WRITE else 'SAFE (atomic renames)'}")
     print(f"  Processing: Pure CPU with PIL (no GPU)")
 
-    print(f"\nOptimization Strategy (HDD-optimized):")
+    print(f"\nOptimization Strategy:")
     print(f"  1. Load ENTIRE shard to RAM (sequential read)")
     print(f"  2. Process all images in parallel on {CPU_WORKERS} CPU cores (disk idle)")
     print(f"  3. Write all results sequentially (sequential write)")
     print(f"  4. Repeat for next shard")
-    print(f"\n  This eliminates read/write thrashing on HDD!")
+    print(f"\n  This eliminates read/write thrashing!")
 
     mode = "DRY RUN" if DRY_RUN else "EXECUTE"
     print(f"\nMode: {mode}")

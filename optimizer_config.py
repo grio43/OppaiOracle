@@ -4,6 +4,15 @@ Adaptive AdamW8bit optimizer configuration that scales based on dataset size.
 Provides best-practice hyperparameters tuned for anime image tagging with automatic scaling.
 """
 
+import warnings
+
+warnings.warn(
+    "The 'optimizer_config.py' file is deprecated and will be removed in a future version. "
+    "Please use the unified configuration system in 'Configuration_System.py'.",
+    DeprecationWarning,
+    stacklevel=2
+)
+
 import logging
 import math
 from dataclasses import dataclass
@@ -229,7 +238,7 @@ def get_adamw8bit_config(
     num_gpus: int = 1,
     num_nodes: int = 1,
     base_config: Optional[AdamW8bitConfig] = None
-) -> Tuple[float, dict]:
+) -> Tuple[float, dict, int]:
     """Get complete AdamW8bit configuration scaled for dataset size.
 
     This is the main function you should use. It computes all optimizer
@@ -245,10 +254,10 @@ def get_adamw8bit_config(
         base_config: Base configuration to override defaults
 
     Returns:
-        Tuple of (learning_rate, optimizer_kwargs_dict)
+        Tuple of (learning_rate, optimizer_kwargs_dict, warmup_steps)
 
     Example:
-        >>> lr, optim_kwargs = get_adamw8bit_config(
+        >>> lr, optim_kwargs, warmup_steps = get_adamw8bit_config(
         ...     dataset_size=50000,
         ...     batch_size=32,
         ...     num_epochs=50,
@@ -256,6 +265,17 @@ def get_adamw8bit_config(
         ... )
         >>> optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=lr, **optim_kwargs)
     """
+    # Validate inputs
+    if dataset_size <= 0:
+        raise ValueError(
+            f"dataset_size must be positive, got {dataset_size}. "
+            "Check that your dataset was loaded correctly."
+        )
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if num_epochs <= 0:
+        raise ValueError(f"num_epochs must be positive, got {num_epochs}")
+
     if base_config is None:
         base_config = AdamW8bitConfig()
 

@@ -138,8 +138,12 @@ class ValidationRunner:
         self.config = config
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
         self.amp_enabled = self.config.use_amp and self.device.type == "cuda"
-        self.amp_dtype = torch.bfloat16 if (self.amp_enabled and torch.cuda.is_bf16_supported()) else torch.float16
+        self.amp_dtype = torch.bfloat16
+        if self.config.use_amp and self.device.type != "cuda":
+            raise RuntimeError("bfloat16 validation requires CUDA; set device to 'cuda'.")
         if self.amp_enabled:
+            if not torch.cuda.is_bf16_supported():
+                raise RuntimeError("bfloat16 validation requested but CUDA device does not support bf16.")
             logger.info(f"Validation AMP dtype set to {self.amp_dtype}.")
         # Logging queue used by workers
         self._log_queue: Optional[mp.Queue] = mp.Queue()
@@ -211,17 +215,21 @@ class ValidationRunner:
         preprocessing_cfg = validation_section.get("preprocessing", {})
 
         # Get normalization parameters (preprocessing overrides data)
-        mean = preprocessing_cfg.get("normalize_mean") or data_section.get("normalize_mean")
-        std = preprocessing_cfg.get("normalize_std") or data_section.get("normalize_std")
+        mean = preprocessing_cfg.get("normalize_mean")
+        if mean is None:
+            mean = data_section.get("normalize_mean")
+        std = preprocessing_cfg.get("normalize_std")
+        if std is None:
+            std = data_section.get("normalize_std")
 
-        if not mean:
+        if mean is None:
             raise ValueError(
                 f"Missing 'normalize_mean' in {UNIFIED_CONFIG_PATH}.\n"
                 f"Add to either 'data.normalize_mean' or 'validation.preprocessing.normalize_mean'.\n"
                 f"Example: normalize_mean: [0.485, 0.456, 0.406]"
             )
 
-        if not std:
+        if std is None:
             raise ValueError(
                 f"Missing 'normalize_std' in {UNIFIED_CONFIG_PATH}.\n"
                 f"Add to either 'data.normalize_std' or 'validation.preprocessing.normalize_std'.\n"
@@ -269,6 +277,24 @@ class ValidationRunner:
             data_section.get("patch_size") or
             self._val_patch_size
         )
+
+        # Validate image_size and patch_size
+        if self._val_image_size <= 0:
+            raise ValueError(
+                f"Invalid 'image_size': {self._val_image_size}. Must be a positive integer.\n"
+                f"Check 'data.image_size' or 'validation.preprocessing.image_size' in {UNIFIED_CONFIG_PATH}"
+            )
+        if self._val_patch_size <= 0:
+            raise ValueError(
+                f"Invalid 'patch_size': {self._val_patch_size}. Must be a positive integer.\n"
+                f"Check 'data.patch_size' or 'validation.preprocessing.patch_size' in {UNIFIED_CONFIG_PATH}"
+            )
+        if self._val_image_size % self._val_patch_size != 0:
+            raise ValueError(
+                f"image_size ({self._val_image_size}) must be divisible by patch_size ({self._val_patch_size}).\n"
+                f"Current remainder: {self._val_image_size % self._val_patch_size}\n"
+                f"Consider adjusting image_size to {(self._val_image_size // self._val_patch_size) * self._val_patch_size}"
+            )
 
         logger.info(
             f"Loaded validation config: image_size={self._val_image_size}, "
@@ -318,7 +344,9 @@ class ValidationRunner:
                     )
                     # Compute vocabulary hash
                     self.vocab_sha256 = compute_vocab_sha256(vocab_data=vocab_data)
-                except Exception as e:
+                except (KeyError, ValueError, TypeError, AttributeError) as e:
+                    # Catch specific exceptions for vocabulary loading issues
+                    # Don't catch broad Exception to avoid masking serious errors
                     logger.error(f"Failed to use embedded vocabulary: {e}")
                     vocab_loaded = False
 
@@ -342,6 +370,23 @@ class ValidationRunner:
             # Compute vocabulary hash for external file
             self.vocab_sha256 = compute_vocab_sha256(vocab_path=vocab_path)
 
+            # Validate vocabulary hash against checkpoint if available
+            if checkpoint:
+                checkpoint_vocab_hash = checkpoint.get('vocab_sha256')
+                if checkpoint_vocab_hash and checkpoint_vocab_hash != self.vocab_sha256:
+                    logger.warning(
+                        f"Vocabulary mismatch detected! "
+                        f"Checkpoint was trained with vocab hash {checkpoint_vocab_hash[:16]}... "
+                        f"but external vocab has hash {self.vocab_sha256[:16]}... "
+                        f"Predictions may be mapped to incorrect tags."
+                    )
+                    # Optionally raise an error for strict validation
+                    if getattr(config, 'strict_vocab_validation', False):
+                        raise ValueError(
+                            f"Vocabulary hash mismatch: checkpoint={checkpoint_vocab_hash}, "
+                            f"external={self.vocab_sha256}"
+                        )
+
         logger.info(f"Loaded vocabulary with {len(self.vocab.tag_to_index)} tags")
 
         self.num_tags = len(self.vocab.tag_to_index)
@@ -355,7 +400,21 @@ class ValidationRunner:
         # Default frequency bins if not provided
         if config.frequency_bins is None:
             self.config.frequency_bins = [0, 10, 100, 1000, 10000, float('inf')]
-    
+
+    # ---------- Pickling support for multiprocessing ----------
+    def __getstate__(self):
+        """Prepare for pickling - exclude unpicklable objects."""
+        state = self.__dict__.copy()
+        # Remove unpicklable objects before sending to worker
+        state['_log_queue'] = None    # multiprocessing.Queue (cannot be pickled on Windows spawn)
+        state['_listener'] = None     # QueueListener (contains threads)
+        return state
+
+    def __setstate__(self, state):
+        """Restore from pickle in worker process."""
+        self.__dict__.update(state)
+        # _log_queue and _listener stay None in workers (logging from main process only)
+
     def _infer_num_tags(self, checkpoint: Optional[Dict]) -> int:
         """
         Decide the correct number of tags before model creation.
@@ -723,19 +782,39 @@ class ValidationRunner:
                     allocated = torch.cuda.memory_allocated() / 1024**3
                     logger.info(f"GPU memory allocated: {allocated:.2f} GB")
         
-        # Concatenate all results
+        # Concatenate all results - check for empty dataloader first
+        if not all_predictions or not all_targets:
+            logger.error("Validation dataloader is empty - no batches to process")
+            return {
+                'error': 'Empty validation dataloader - no data to validate',
+                'f1_macro': 0.0,
+                'f1_micro': 0.0,
+                'precision_macro': 0.0,
+                'recall_macro': 0.0,
+            }
+
         all_predictions = torch.cat(all_predictions, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
-        
+
         logger.info(f"Collected predictions for {len(all_predictions)} samples")
-        
-        # Compute metrics
+
+        # Compute metrics with error handling
         logger.info("Computing metrics...")
 
-        metrics = self.metric_computer.compute_all_metrics(
-            all_predictions,
-            all_targets
-        )
+        try:
+            metrics = self.metric_computer.compute_all_metrics(
+                all_predictions,
+                all_targets
+            )
+        except Exception as e:
+            logger.error(f"Metrics computation failed: {e}")
+            return {
+                'error': f'Metrics computation failed: {str(e)}',
+                'f1_macro': 0.0,
+                'f1_micro': 0.0,
+                'precision_macro': 0.0,
+                'recall_macro': 0.0,
+            }
 
         # Get tag names and frequencies for optional analysis
         tag_names = []
@@ -825,8 +904,9 @@ class ValidationRunner:
         if not tag_indices:
             raise ValueError("No valid tags found in vocabulary")
         
-        tag_indices = torch.tensor(tag_indices)
-        
+        # Create tensor on the correct device to avoid CPU-GPU sync during indexing
+        tag_indices = torch.tensor(tag_indices, device=self.device, dtype=torch.long)
+
         # Collect predictions for specific tags
         all_predictions = []
         all_targets = []
@@ -970,11 +1050,13 @@ class ValidationRunner:
                 if flat_labels.size(1) == G * T:
                     labels_h = flat_labels.view(B, G, T)
                 else:
-                    logger.warning(
-                        "Cannot reshape flat labels of shape %s into (B=%d, G=%d, T=%d); "
-                        "filling targets with zeros for metrics.", tuple(flat_labels.shape), B, G, T
+                    # CRITICAL: Don't silently fill with zeros - this corrupts validation metrics
+                    # Raise an error so the user knows there's a shape mismatch
+                    raise ValueError(
+                        f"Cannot reshape flat labels of shape {tuple(flat_labels.shape)} into "
+                        f"(B={B}, G={G}, T={T}). Expected {G * T} label columns but got {flat_labels.size(1)}. "
+                        f"This indicates a mismatch between model output and target labels."
                     )
-                    labels_h = torch.zeros((B, G, T), dtype=flat_labels.dtype)
                 for g in range(num_groups):
                     group_predictions[g].append(predictions[:, g, :].cpu())
                     group_targets[g].append(labels_h[:, g, :].cpu())

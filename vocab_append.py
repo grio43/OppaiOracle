@@ -16,7 +16,7 @@ Behavior:
 Notes:
 - Special tokens are preserved: <PAD>=0, <UNK>=1.
 - Tags listed in Tags_ignore.txt are excluded (no label signal, no frequency).
-- L2 cache does not need clearing: it stores images only, not labels.
+- Sidecar cache does not need clearing: it stores images only, not labels.
 - New tags are appended in descending frequency (ties broken lexicographically) for determinism.
 """
 
@@ -177,7 +177,12 @@ def _scan_tags(root: Path) -> Counter:
         logger.warning(f"Dataset root does not exist: {root}")
         return counts
 
-    json_files: List[Path] = sorted(root.rglob("*.json"))
+    # Scan subdirectories only (skip root-level files like train.json, val.json)
+    json_files: List[Path] = []
+    for subdir in root.iterdir():
+        if subdir.is_dir():
+            json_files.extend(subdir.rglob("*.json"))
+    json_files.sort()
 
     if not json_files:
         logger.warning(f"No JSON files found in {root}")
@@ -358,8 +363,25 @@ def main() -> None:
         existing[vocab.unk_token] = 1
         vocab.index_to_tag[1] = vocab.unk_token
 
-    # Determine next index
-    next_idx = max(existing.values(), default=1) + 1
+    # Validate existing indices and determine next index
+    # All indices must be non-negative integers, with 0=PAD and 1=UNK reserved
+    existing_indices = set(existing.values())
+    if not all(isinstance(i, int) and i >= 0 for i in existing_indices):
+        invalid = [i for i in existing_indices if not isinstance(i, int) or i < 0]
+        raise ValueError(f"Vocabulary contains invalid indices: {invalid[:5]}... (must be non-negative integers)")
+    if 0 not in existing_indices or existing.get(vocab.pad_token) != 0:
+        raise ValueError(f"PAD token '{vocab.pad_token}' must have index 0")
+    if 1 not in existing_indices or existing.get(vocab.unk_token) != 1:
+        raise ValueError(f"UNK token '{vocab.unk_token}' must have index 1")
+
+    # Check for duplicate indices (would cause data corruption)
+    if len(existing_indices) != len(existing):
+        from collections import Counter
+        idx_counts = Counter(existing.values())
+        duplicates = {idx: count for idx, count in idx_counts.items() if count > 1}
+        raise ValueError(f"Vocabulary contains duplicate indices: {duplicates}")
+
+    next_idx = max(existing_indices) + 1
 
     # Identify new tags (not in existing mapping)
     new_tags = [t for t in counts.keys() if t not in existing]
@@ -404,7 +426,7 @@ def main() -> None:
         preview: List[Tuple[str, int]] = [(t, counts.get(t, 0)) for t in new_tags[:25]]
         print("Top new tags (count):", ", ".join(f"{t}({c})" for t, c in preview))
     print(f"Vocab SHA256 (ordered list): {sha}")
-    print("Note: L2 cache need not be cleared; it stores images only.")
+    print("Note: Sidecar cache need not be cleared; it stores images only.")
 
 
 if __name__ == "__main__":

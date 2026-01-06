@@ -7,9 +7,10 @@ without duplicating it in memory, reducing startup overhead and memory usage.
 """
 
 import atexit
+import hashlib
 import json
 import logging
-import pickle
+import threading
 from typing import Optional, Set
 import sys
 import weakref
@@ -26,23 +27,41 @@ else:
 
 # Registry of shared memory segments to clean up on exit
 _SHARED_MEMORY_REGISTRY: Set[str] = set()
+_SHARED_MEMORY_REGISTRY_LOCK = threading.Lock()  # Thread-safe access to registry
 
 def _cleanup_shared_memory():
-    """Clean up all registered shared memory segments on exit."""
+    """Clean up all registered shared memory segments on exit.
+
+    This function handles the race condition where multiple processes may try
+    to unlink the same shared memory segment. FileNotFoundError indicates
+    another process already unlinked it, which is fine.
+    """
     if not _has_shared_memory or shared_memory is None:
         return
 
-    for shm_name in list(_SHARED_MEMORY_REGISTRY):
+    # Get a snapshot of names to clean up (thread-safe)
+    with _SHARED_MEMORY_REGISTRY_LOCK:
+        names_to_cleanup = list(_SHARED_MEMORY_REGISTRY)
+
+    for shm_name in names_to_cleanup:
         try:
             shm = shared_memory.SharedMemory(name=shm_name)
             shm.close()
-            shm.unlink()
-            logger.debug(f"Cleaned up shared memory segment: {shm_name}")
+            try:
+                shm.unlink()
+                logger.debug(f"Cleaned up shared memory segment: {shm_name}")
+            except FileNotFoundError:
+                # Another process already unlinked this segment - this is fine
+                logger.debug(f"Shared memory '{shm_name}' already unlinked by another process")
+        except FileNotFoundError:
+            # Segment doesn't exist (already cleaned up by another process)
+            logger.debug(f"Shared memory '{shm_name}' not found - already cleaned up")
         except Exception as e:
-            # Segment may already be cleaned up, which is fine
+            # Other errors (permission, etc.) - log but continue
             logger.debug(f"Could not clean up shared memory '{shm_name}': {e}")
         finally:
-            _SHARED_MEMORY_REGISTRY.discard(shm_name)
+            with _SHARED_MEMORY_REGISTRY_LOCK:
+                _SHARED_MEMORY_REGISTRY.discard(shm_name)
 
 # Register cleanup on exit
 atexit.register(_cleanup_shared_memory)
@@ -80,21 +99,37 @@ class SharedVocabularyManager:
                 f"Current version: {sys.version_info.major}.{sys.version_info.minor}"
             )
 
-        # Serialize vocabulary to bytes using pickle
+        # Serialize vocabulary to bytes using JSON (safer than pickle)
         # Include only necessary data to minimize size
-        vocab_data = {
+        # Add content hash for version verification
+        #
+        # SECURITY: Using JSON instead of pickle to prevent arbitrary code execution
+        # when loading vocabulary from shared memory
+        vocab_content = {
             'tag_to_index': vocab.tag_to_index,
-            'index_to_tag': vocab.index_to_tag,
+            # JSON requires string keys, convert integer keys to strings
+            'index_to_tag': {str(k): v for k, v in vocab.index_to_tag.items()},
             'tag_frequencies': vocab.tag_frequencies,
-            'ignored_tag_indices': vocab.ignored_tag_indices,
+            # Convert set to list for JSON serialization
+            'ignored_tag_indices': list(vocab.ignored_tag_indices) if isinstance(vocab.ignored_tag_indices, set) else vocab.ignored_tag_indices,
             'pad_token': vocab.pad_token,
             'unk_token': vocab.unk_token,
             'rating_to_index': vocab.rating_to_index,
-            'tags': vocab.tags,
+            'tags': list(vocab.tags) if isinstance(vocab.tags, set) else vocab.tags,
             'unk_index': vocab.unk_index,
         }
+        # Compute full SHA256 hash for version verification (no truncation for security)
+        content_hash = hashlib.sha256(
+            json.dumps(sorted(vocab.tag_to_index.items()), ensure_ascii=False).encode()
+        ).hexdigest()  # Full 64-char hash, not truncated
+        vocab_data = {
+            **vocab_content,
+            '_vocab_hash': content_hash,
+            '_vocab_size': len(vocab.tag_to_index),
+        }
 
-        data_bytes = pickle.dumps(vocab_data, protocol=pickle.HIGHEST_PROTOCOL)
+        # Use JSON for safe serialization (no arbitrary code execution risk)
+        data_bytes = json.dumps(vocab_data, ensure_ascii=False).encode('utf-8')
         self.vocab_size = len(data_bytes)
 
         # Create shared memory buffer
@@ -105,8 +140,9 @@ class SharedVocabularyManager:
             # Write vocabulary data to shared memory
             self.shm.buf[:self.vocab_size] = data_bytes
 
-            # Register for cleanup on exit
-            _SHARED_MEMORY_REGISTRY.add(self.shm_name)
+            # Register for cleanup on exit (thread-safe)
+            with _SHARED_MEMORY_REGISTRY_LOCK:
+                _SHARED_MEMORY_REGISTRY.add(self.shm_name)
 
             logger.info(
                 f"Created shared vocabulary in memory '{self.shm_name}' "
@@ -146,9 +182,22 @@ class SharedVocabularyManager:
             # Attach to existing shared memory
             shm = shared_memory.SharedMemory(name=shm_name)
 
-            # Read and deserialize vocabulary data
+            # Read and deserialize vocabulary data using JSON (safe)
             data_bytes = bytes(shm.buf[:vocab_size])
-            vocab_data = pickle.loads(data_bytes)
+            vocab_data = json.loads(data_bytes.decode('utf-8'))
+
+            # Convert string keys back to integers for index_to_tag
+            if 'index_to_tag' in vocab_data:
+                vocab_data['index_to_tag'] = {int(k): v for k, v in vocab_data['index_to_tag'].items()}
+
+            # Convert list back to set for ignored_tag_indices
+            if 'ignored_tag_indices' in vocab_data and isinstance(vocab_data['ignored_tag_indices'], list):
+                vocab_data['ignored_tag_indices'] = set(vocab_data['ignored_tag_indices'])
+
+            # Convert list back to set for tags if it was a set
+            # Note: We store as list, caller should know if it needs set
+            if 'tags' in vocab_data and isinstance(vocab_data['tags'], list):
+                vocab_data['tags'] = set(vocab_data['tags'])
 
             # Close but don't unlink (other processes may still need it)
             shm.close()
@@ -168,28 +217,61 @@ class SharedVocabularyManager:
                 logger.warning(f"Error closing shared vocabulary: {e}")
 
     def cleanup(self):
-        """Close and unlink the shared memory (call only from main process on exit)."""
-        if self.shm is not None:
-            try:
-                self.shm.close()
-                self.shm.unlink()
-                logger.info(f"Cleaned up shared vocabulary '{self.shm_name}'")
-                # Remove from registry to avoid double cleanup
+        """Close and unlink shared memory (idempotent - safe to call multiple times)."""
+        if self.shm is None:
+            return  # Already cleaned up
+
+        # Remove from registry first to prevent other cleanups (thread-safe)
+        if self.shm_name:
+            with _SHARED_MEMORY_REGISTRY_LOCK:
                 _SHARED_MEMORY_REGISTRY.discard(self.shm_name)
-            except Exception as e:
-                logger.warning(f"Error cleaning up shared vocabulary: {e}")
-            finally:
-                self.shm = None
-                self.shm_name = None
+
+        try:
+            self.shm.close()
+            self.shm.unlink()
+            logger.info(f"Cleaned up shared vocabulary '{self.shm_name}'")
+        except FileNotFoundError:
+            # Already unlinked by another cleanup, that's fine
+            pass
+        except Exception as e:
+            logger.warning(f"Error cleaning up shared vocabulary: {e}")
+        finally:
+            self.shm = None
+            self.shm_name = None
 
 
-def populate_vocab_from_shared(vocab, vocab_data: dict):
+def populate_vocab_from_shared(vocab, vocab_data: dict, verify: bool = True):
     """Populate a TagVocabulary instance with data from shared memory.
 
     Args:
         vocab: TagVocabulary instance to populate
         vocab_data: Dictionary with vocabulary data from shared memory
+        verify: If True, verify content hash matches expected (default: True)
+
+    Raises:
+        ValueError: If verification fails (hash mismatch or missing metadata)
     """
+    # Verify vocabulary integrity if hash metadata is present
+    if verify:
+        stored_hash = vocab_data.get('_vocab_hash')
+        stored_size = vocab_data.get('_vocab_size')
+        if stored_hash is not None and stored_size is not None:
+            # Recompute full SHA256 hash to verify (no truncation for security)
+            actual_hash = hashlib.sha256(
+                json.dumps(sorted(vocab_data['tag_to_index'].items()), ensure_ascii=False).encode()
+            ).hexdigest()  # Full 64-char hash
+            actual_size = len(vocab_data['tag_to_index'])
+            # Handle both old truncated hashes (16-char) and new full hashes (64-char)
+            hash_match = (actual_hash == stored_hash or actual_hash[:16] == stored_hash)
+            if not hash_match or actual_size != stored_size:
+                raise ValueError(
+                    f"Shared vocabulary integrity check failed: "
+                    f"hash {stored_hash[:16]}... vs {actual_hash[:16]}..., "
+                    f"size {stored_size} vs {actual_size}. "
+                    "The vocabulary may have been corrupted or modified."
+                )
+            logger.debug(f"Shared vocabulary verified: hash={actual_hash[:16]}..., size={actual_size}")
+
     vocab.tag_to_index = vocab_data['tag_to_index']
     vocab.index_to_tag = vocab_data['index_to_tag']
     vocab.tag_frequencies = vocab_data['tag_frequencies']

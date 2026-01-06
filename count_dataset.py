@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Optimized dataset counter for NAS - shard-based processing to minimize thrashing"""
+"""Optimized dataset counter - shard-based processing for efficient I/O"""
 import sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,7 +9,7 @@ from threading import Lock
 # Force immediate output flushing
 sys.stdout.reconfigure(line_buffering=True)
 
-dataset_path = Path("Z:/workspace/Dab")
+dataset_path = Path("L:/Dab/Dab")
 
 # Thread-safe counter for progress updates
 progress_lock = Lock()
@@ -26,7 +26,7 @@ def count_json_in_shard(shard_path):
 
     try:
         # Use rglob to recursively find all JSON files in this shard
-        # This keeps the worker focused on one area of the NAS
+        # This keeps the worker focused on one directory tree
         for json_file in shard_path.rglob("*.json"):
             local_count += 1
 
@@ -43,7 +43,7 @@ def count_json_in_shard(shard_path):
 
 def count_json_sharded(root_path, max_workers=4, shard_depth=1):
     """
-    Shard-based parallel counting optimized for NAS.
+    Shard-based parallel counting for efficient I/O.
     Each worker processes one complete folder shard at a time.
 
     Args:
@@ -160,7 +160,7 @@ if __name__ == "__main__":
 
     # Parse command line arguments
     mode = "simple"
-    workers = 4  # Default: 4 workers for typical NAS with a few main folders
+    workers = 4  # Default: 4 workers
     shard_depth = 1  # Default: use immediate subdirectories as shards
 
     if len(sys.argv) > 1:

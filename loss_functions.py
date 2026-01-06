@@ -40,6 +40,17 @@ class AsymmetricFocalLoss(nn.Module):
         ignore_index: Optional[int] = 0,
     ):
         super().__init__()
+
+        # Validate gamma values (must be non-negative, reasonable range)
+        if gamma_pos < 0:
+            raise ValueError(f"gamma_pos must be non-negative, got {gamma_pos}")
+        if gamma_neg < 0:
+            raise ValueError(f"gamma_neg must be non-negative, got {gamma_neg}")
+        if gamma_pos > 10:
+            logger.warning(f"gamma_pos={gamma_pos} is unusually high (typical range 0-4)")
+        if gamma_neg > 10:
+            logger.warning(f"gamma_neg={gamma_neg} is unusually high (typical range 0-4)")
+
         self.gamma_pos = gamma_pos
         self.gamma_neg = gamma_neg
         self.alpha = alpha
@@ -80,8 +91,10 @@ class AsymmetricFocalLoss(nn.Module):
 
         batch_size, num_classes = logits.shape
 
-        # Detach targets to prevent gradient flow
-        targets = targets.detach()
+        # Note: targets are ground truth labels and should not have requires_grad=True.
+        # We don't detach here because:
+        # 1. Labels shouldn't have gradients in the first place
+        # 2. The operations below (one-hot, dtype cast) create new tensors anyway
 
         # Ensure targets have shape (B, C). If provided as class indices (B,),
         # convert to one-hot suitable for BCE-with-logits.
@@ -143,8 +156,10 @@ class AsymmetricFocalLoss(nn.Module):
                 targets = targets[:, keep]
 
         # Apply label smoothing if specified
+        # Compute in float32 for numerical stability, especially for bfloat16 training
         if self.label_smoothing > 0:
-            targets = targets * (1 - self.label_smoothing) + self.label_smoothing / 2
+            targets = targets.float() * (1 - self.label_smoothing) + self.label_smoothing / 2
+            targets = targets.to(dtype=logits.dtype)
 
         # Use BCEWithLogitsLoss for numerical stability.
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
@@ -157,8 +172,12 @@ class AsymmetricFocalLoss(nn.Module):
 
         # Calculate focal weights using exp(gamma * log_prob) = prob^gamma
         # This avoids pow(0, gamma) numerically while maintaining gradients everywhere
-        pos_weights = targets * torch.exp(self.gamma_pos * log_one_minus_probs)
-        neg_weights = (1 - targets) * torch.exp(self.gamma_neg * log_probs)
+        # Clamp the exponent to prevent overflow: exp(88) ≈ 2e38 (near float32 max)
+        MAX_EXP = 88.0
+        pos_exp = torch.clamp(self.gamma_pos * log_one_minus_probs, min=-MAX_EXP, max=MAX_EXP)
+        neg_exp = torch.clamp(self.gamma_neg * log_probs, min=-MAX_EXP, max=MAX_EXP)
+        pos_weights = targets * torch.exp(pos_exp)
+        neg_weights = (1 - targets) * torch.exp(neg_exp)
 
         # Apply focal weights with separate positive/negative weighting
         pos_loss = pos_weights * bce_loss

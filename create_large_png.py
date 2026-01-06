@@ -6,7 +6,7 @@ from PIL import Image
 import numpy as np
 from pathlib import Path
 
-test_dir = Path(r'Z:\OppaiOracle\test_downsample\shard_test')
+test_dir = Path(r'L:\Dab\OppaiOracle\test_downsample\shard_test')
 
 print("Creating ultra-detailed PNG that will be >1MB at 512px...")
 

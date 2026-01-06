@@ -16,8 +16,8 @@ It loads images and metadata on-the-fly from JSON files using two modes:
    - Auto-splits 95/5 train/val with caching
 
 CACHING LAYERS:
-- L1 Cache: In-memory LRU cache (per worker, configurable MB limit)
-- L2 Cache: LMDB persistent cache with background writer (shared across workers)
+- Sidecar Cache: Preprocessed tensors stored as .safetensor files alongside original images
+  (no LMDB, no virtual memory issues, pooled SSD-friendly, unlimited parallel reads)
 
 VOCABULARY:
 - Built automatically by vocabulary.py:create_vocabulary_from_datasets()
@@ -38,7 +38,7 @@ WHY JSON-BASED IS BETTER:
 - On-the-fly loading allows dynamic augmentation (flips, crops, etc.)
 - Orientation-aware tag swapping during training
 - No preprocessing step required
-- L2 cache provides similar performance to HDF5
+- Sidecar cache provides similar performance to HDF5
 - More flexible for iterative dataset refinement
 
 DO NOT USE dataset_preprocessor.py - it is dead code maintained only for
@@ -56,17 +56,35 @@ USAGE:
 """
 
 # Standard library imports
-import atexit  # CR-005: For cleanup on program exit
+import atexit
 import hashlib
 import json
 import logging
+import shutil
+
+# Try to use orjson for faster JSON parsing (3-5x faster than stdlib json)
+try:
+    import orjson
+    HAS_ORJSON = True
+    JSON_DECODE_ERRORS = (json.JSONDecodeError, orjson.JSONDecodeError)
+except ImportError:
+    HAS_ORJSON = False
+    JSON_DECODE_ERRORS = (json.JSONDecodeError,)
+
+# Optional file locking for sidecar cache writes
+try:
+    import filelock
+    HAS_FILELOCK = True
+except ImportError:
+    HAS_FILELOCK = False
 import logging.handlers
 import multiprocessing as mp
 import os
 import queue
+import random
 import threading
 import time
-import weakref  # CR-005: For validator registry
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Thread
@@ -93,11 +111,11 @@ except (ImportError, ModuleNotFoundError, AttributeError):  # keep backward comp
     tv_tensors = None
 
 # Local imports
-from l1_cache import build_l1_cache, encode_l1_image_01, decode_l1_image_01
-from l2_cache import LMDBReader, start_l2_writer, _tensor_to_bytes, _tensor_from_bytes
-from utils.cache_keys import compute_l2_cfg_hash
+from cache_codec import get_sidecar_path, save_sidecar, load_sidecar
+from utils.cache_keys import compute_cache_config_hash
 from utils.cache_monitor import monitor
 from utils.metadata_ingestion import parse_tags_field
+from utils.metadata_cache import try_load_metadata_cache
 from utils.path_utils import sanitize_identifier, validate_image_path, resolve_and_confine
 from vocabulary import load_vocabulary_for_training, TagVocabulary
 from shared_vocabulary import (
@@ -112,43 +130,6 @@ try:
 except (ImportError, ModuleNotFoundError):  # pragma: no cover
     OrientationHandler = None  # type: ignore
 
-def _probe_lmdb_map_size(path: str, config_map_size: int) -> int:
-    """Probe actual LMDB map size and return max of (config, actual).
-
-    This ensures readers can access entries written when cache grew beyond
-    initial config size. If probing fails, returns config_map_size.
-
-    Args:
-        path: Path to LMDB database directory
-        config_map_size: Map size from configuration
-
-    Returns:
-        Maximum of config_map_size and actual stored map_size
-    """
-    try:
-        import lmdb
-        import os
-        # Check if database exists
-        data_file = os.path.join(path, "data.mdb")
-        if not os.path.exists(data_file):
-            return config_map_size
-
-        # Probe actual map size
-        with lmdb.open(path, subdir=True, readonly=True, lock=False) as env:
-            actual_size = env.info()['map_size']
-            if actual_size > config_map_size:
-                logging.info(
-                    f"L2 cache grew beyond config: "
-                    f"config={config_map_size / (1024**3):.2f}GB, "
-                    f"actual={actual_size / (1024**3):.2f}GB. "
-                    f"Using actual size for reader."
-                )
-                return actual_size
-            return config_map_size
-    except Exception as e:
-        logging.debug(f"Failed to probe LMDB map size: {e}. Using config value.")
-        return config_map_size
-
 # Pillow resampling compatibility and truncated image handling
 try:  # Pillow ≥10
     RESAMPLE_BILINEAR = Image.Resampling.BILINEAR  # type: ignore[attr-defined]
@@ -160,11 +141,6 @@ ALLOW_TRUNCATED = bool(int(os.environ.get("OO_ALLOW_TRUNCATED", "0")))
 if ALLOW_TRUNCATED:
     ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-
-# Single place to control floating tolerance when reconstructing padding masks
-# When L2 stores images as bfloat16, quantization near |x|≈1 is ~7.8e‑3.
-# Use a slightly larger atol to keep legacy heuristic reconstruction viable.
-PAD_MASK_ATOL = 1e-2
 
 # Minimal dtype mapping for cache plumbing
 _DTYPE_MAP = {
@@ -201,7 +177,32 @@ def _is_cpu_bf16_supported() -> bool:
             logging.getLogger(__name__).info("CPU does not support bfloat16 operations")
     return _CPU_BF16_SUPPORTED
 
-## moved to utils/cache_keys.py: compute_l2_cfg_hash
+
+def _normalize_preserve_dtype(img: torch.Tensor, mean: tuple, std: tuple) -> torch.Tensor:
+    """Apply normalization while preserving the input tensor's dtype.
+
+    torchvision.transforms.Normalize may convert bfloat16 tensors to float32 in some
+    PyTorch versions. This helper ensures the original dtype is preserved.
+
+    Args:
+        img: Input tensor of shape (C, H, W)
+        mean: Normalization mean per channel
+        std: Normalization std per channel
+
+    Returns:
+        Normalized tensor with same dtype as input
+    """
+    original_dtype = img.dtype
+    if transforms is None:
+        raise ImportError("torchvision is required for normalization")
+    normalized = transforms.Normalize(mean=mean, std=std)(img)
+    # Ensure dtype is preserved (may be converted to float32 by Normalize)
+    if normalized.dtype != original_dtype:
+        normalized = normalized.to(original_dtype)
+    return normalized
+
+
+## moved to utils/cache_keys.py: compute_cache_config_hash
 
 # Guarded DataLoader wrapper:
 # - If num_workers == 0, drop prefetch_factor and force persistent_workers=False.
@@ -218,6 +219,13 @@ class DataLoader(_TorchDataLoader):  # keep public name the same
 
 # --- JSON sidecar split caching to reduce startup I/O -----------------------
 _PROJ_ROOT = Path(__file__).resolve().parent
+_SPLIT_CACHE_VERSION = "2.0"
+_EXCLUSION_PATTERNS = ["train.json", "val.json"]  # Manifest files excluded from sidecar mode
+
+def _compute_exclusion_hash() -> str:
+    """Compute hash of file exclusion logic to detect changes."""
+    exclusion_str = ",".join(sorted(_EXCLUSION_PATTERNS))
+    return hashlib.sha256(exclusion_str.encode("utf-8")).hexdigest()[:16]
 
 def _split_cache_paths(root: Path) -> tuple[Path, Path]:
     """Return cache file paths for train/val splits for a given dataset root.
@@ -233,41 +241,130 @@ def _split_cache_paths(root: Path) -> tuple[Path, Path]:
         splits_dir / f"{key}.val.txt",
     )
 
-def _try_load_cached_split(root: Path) -> Optional[tuple[list[Path], list[Path]]]:
-    """Load cached split files with optimized I/O.
+def _try_load_cached_split(root: Path, seed: int = 42) -> Optional[tuple[list[Path], list[Path]]]:
+    """Load cached split files with v2.0 validation.
+
+    Args:
+        root: Dataset root directory
+        seed: Random seed to validate against cached seed
 
     Optimizations:
       - Lazy validation: only check first 10 paths instead of 100 (10x faster)
       - Parallel existence checks using ThreadPoolExecutor
       - Early return on cache hit without full validation
+
+    v2.0 Validation:
+      - Version check
+      - Exclusion hash check (detects changes to manifest file filtering)
+      - File count tolerance check (0.1%)
+      - Seed check (detects when seed changes between runs)
     """
+    logger = logging.getLogger(__name__)
     train_file, val_file = _split_cache_paths(root)
     if train_file.exists() and val_file.exists():
         try:
             # Read both files concurrently for faster I/O
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                train_future = executor.submit(
-                    lambda: [Path(line.strip()) for line in train_file.read_text(encoding="utf-8").splitlines() if line.strip()]
-                )
-                val_future = executor.submit(
-                    lambda: [Path(line.strip()) for line in val_file.read_text(encoding="utf-8").splitlines() if line.strip()]
-                )
-                train_list = train_future.result()
-                val_list = val_future.result()
+            def parse_cache_file(file_path: Path) -> tuple[dict, list]:
+                """Parse cache file, extracting header and paths."""
+                lines = file_path.read_text(encoding="utf-8").splitlines()
+                header = {}
+                paths = []
 
-            # Optimized sanity check: only validate first 10 paths (reduces I/O by 90%)
-            # This is sufficient to catch corrupt caches while minimizing startup delay
-            # Add timeout to avoid hanging on slow NAS/network storage
-            sample_size = min(10, len(train_list), len(val_list))
-            if sample_size > 0:
-                # Parallel existence checks using ThreadPoolExecutor with timeout
-                sample_paths = train_list[:sample_size] + val_list[:sample_size]
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("#"):
+                        # Parse header
+                        if "=" in line:
+                            key, value = line[1:].split("=", 1)
+                            header[key.strip()] = value.strip()
+                    else:
+                        # Regular path line
+                        paths.append(Path(line))
+
+                return header, paths
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                train_future = executor.submit(parse_cache_file, train_file)
+                val_future = executor.submit(parse_cache_file, val_file)
+                train_header, train_list = train_future.result()
+                val_header, val_list = val_future.result()
+
+            # Validate v2.0 header (use train file header as canonical)
+            cache_version = train_header.get("SPLIT_CACHE_VERSION", "1.0")
+            if cache_version != _SPLIT_CACHE_VERSION:
+                logger.info(
+                    f"Split cache version mismatch: {cache_version} != {_SPLIT_CACHE_VERSION}. "
+                    "Rebuilding with current version..."
+                )
+                return None
+
+            # Validate exclusion hash
+            cached_hash = train_header.get("EXCLUSION_HASH", "")
+            current_hash = _compute_exclusion_hash()
+            if cached_hash != current_hash:
+                logger.info(
+                    f"Exclusion logic changed (hash: {cached_hash} != {current_hash}). "
+                    "Rebuilding split cache..."
+                )
+                return None
+
+            # Validate file count with 0.1% tolerance
+            if "FILE_COUNT" in train_header:
+                cached_count = int(train_header["FILE_COUNT"])
+                actual_count = len(train_list) + len(val_list)
+                tolerance = max(100, int(cached_count * 0.001))
+
+                if abs(cached_count - actual_count) > tolerance:
+                    logger.warning(
+                        f"Split cache count drift: cached={cached_count}, actual={actual_count}, "
+                        f"diff={abs(cached_count - actual_count)}, tolerance={tolerance} (0.1%). "
+                        "Rebuilding split cache..."
+                    )
+                    return None
+
+            # Validate seed to ensure split is deterministic with current seed
+            cached_seed = train_header.get("SEED", "")
+            if cached_seed and str(seed) != cached_seed:
+                logger.info(
+                    f"Split cache seed mismatch: cached={cached_seed}, current={seed}. "
+                    "Rebuilding split cache with new seed..."
+                )
+                return None
+
+            # Stratified sampling: check files from beginning, end, and random middle
+            # This catches orphan files anywhere in the list, not just at the start
+            sample_paths = []
+
+            def stratified_sample(file_list: list, count: int) -> list:
+                """Sample from beginning, end, and random middle of a list."""
+                if len(file_list) <= count:
+                    return list(file_list)
+                samples = []
+                edge_count = min(5, count // 3)
+                # First N files
+                samples.extend(file_list[:edge_count])
+                # Last N files
+                samples.extend(file_list[-edge_count:])
+                # Random middle samples
+                middle_count = count - (2 * edge_count)
+                if middle_count > 0 and len(file_list) > 2 * edge_count:
+                    middle = file_list[edge_count:-edge_count]
+                    samples.extend(random.sample(middle, min(middle_count, len(middle))))
+                return samples
+
+            # Sample 25 from train, 25 from val (50 total)
+            sample_paths.extend(stratified_sample(train_list, 25))
+            sample_paths.extend(stratified_sample(val_list, 25))
+
+            if sample_paths:
                 logging.getLogger(__name__).debug(
-                    f"Validating cached split (checking {len(sample_paths)} sample paths with 30s timeout)..."
+                    f"Validating cached split (checking {len(sample_paths)} stratified sample paths with 30s timeout)..."
                 )
                 try:
                     from concurrent.futures import as_completed
-                    with ThreadPoolExecutor(max_workers=4) as executor:
+                    with ThreadPoolExecutor(max_workers=8) as executor:
                         # Use default argument to avoid lambda closure issues
                         futures = [executor.submit(lambda p=p: p.exists()) for p in sample_paths]
                         existence_checks = []
@@ -285,7 +382,7 @@ def _try_load_cached_split(root: Path) -> Optional[tuple[list[Path], list[Path]]
                         return None
                 except TimeoutError:
                     logging.getLogger(__name__).warning(
-                        "Cached split validation timed out after 30s (slow NAS?). Skipping validation and using cache anyway."
+                        "Cached split validation timed out after 30s. Skipping validation and using cache anyway."
                     )
                     # On timeout, trust the cache anyway rather than re-scanning
                     pass
@@ -298,16 +395,37 @@ def _try_load_cached_split(root: Path) -> Optional[tuple[list[Path], list[Path]]
             pass
     return None
 
-def _write_cached_split(root: Path, train_list: list[Path], val_list: list[Path]) -> None:
-    """Write cached split files. Logs warning on failure but does not raise."""
+def _write_cached_split(root: Path, train_list: list[Path], val_list: list[Path], seed: int = 42) -> None:
+    """Write cached split files with v2.0 header. Logs warning on failure but does not raise.
+
+    Args:
+        root: Dataset root directory
+        train_list: List of training file paths
+        val_list: List of validation file paths
+        seed: Random seed used for splitting (stored in header for validation)
+    """
     train_file, val_file = _split_cache_paths(root)
     try:
         # Atomic write pattern: write to temp then rename
         train_tmp = train_file.with_suffix(".tmp")
         val_tmp = val_file.with_suffix(".tmp")
 
-        train_tmp.write_text("\n".join(str(p) for p in train_list), encoding="utf-8")
-        val_tmp.write_text("\n".join(str(p) for p in val_list), encoding="utf-8")
+        # Build header (v2.0 format with seed)
+        exclusion_hash = _compute_exclusion_hash()
+        total_count = len(train_list) + len(val_list)
+        header = (
+            f"# SPLIT_CACHE_VERSION={_SPLIT_CACHE_VERSION}\n"
+            f"# EXCLUSION_HASH={exclusion_hash}\n"
+            f"# FILE_COUNT={total_count}\n"
+            f"# SEED={seed}\n"
+        )
+
+        # Write with header
+        train_content = header + "\n".join(str(p) for p in train_list)
+        val_content = header + "\n".join(str(p) for p in val_list)
+
+        train_tmp.write_text(train_content, encoding="utf-8")
+        val_tmp.write_text(val_content, encoding="utf-8")
 
         train_tmp.rename(train_file)
         val_tmp.rename(val_file)
@@ -382,13 +500,18 @@ def _save_manifest_cache(path: Path, annotations: list) -> None:
     """Save parsed manifest to binary cache for faster future loads."""
     import pickle
     cache_path = _get_manifest_cache_path(path)
+    temp_path = cache_path.with_suffix(".tmp")
 
     try:
-        # Atomic write: write to temp then rename
-        temp_path = cache_path.with_suffix(".tmp")
+        # Atomic write: write to temp then move (cross-platform safe)
         with open(temp_path, "wb") as f:
             pickle.dump(annotations, f, protocol=pickle.HIGHEST_PROTOCOL)
-        temp_path.rename(cache_path)
+
+        # Windows-safe atomic rename: remove existing file first if needed
+        if cache_path.exists():
+            cache_path.unlink()
+        shutil.move(str(temp_path), str(cache_path))
+
         logging.getLogger(__name__).debug(
             f"Cached manifest to {cache_path} ({len(annotations)} entries)"
         )
@@ -432,7 +555,11 @@ class ImagePreFetcher:
         self._last_idx = -1
 
     def _load_image(self, img_path: Path, pad_color: tuple) -> Optional[Image.Image]:
-        """Load and decode image in background thread."""
+        """Load and decode image in background thread.
+
+        Returns a fully-loaded copy of the image to avoid file handle leaks.
+        PIL's convert() can return lazy objects that reference the original file.
+        """
         try:
             with Image.open(img_path) as pil_img:
                 pil_img.load()
@@ -448,7 +575,9 @@ class ImagePreFetcher:
                 else:
                     img = pil_img.convert("RGB")
 
-                return img
+                # Return a fully loaded copy to ensure file handle is released
+                # PIL's convert() can return lazy objects that hold file references
+                return img.copy()
         except Exception:
             # Silent failure - will be retried in main thread
             return None
@@ -538,21 +667,42 @@ class ImagePreFetcher:
 
     def shutdown(self) -> None:
         """Shutdown background threads and cleanup resources."""
-        self.executor.shutdown(wait=False)
+        self.executor.shutdown(wait=True)
+        # Close any cached PIL Images to release file handles
+        for img in self.cache.values():
+            if hasattr(img, 'close'):
+                try:
+                    img.close()
+                except Exception:
+                    pass
         self.cache.clear()
         self.futures.clear()
 
 
-def _make_worker_init(log_queue, shared_vocab_info=None):
-    """Create a worker_init_fn that attaches a QueueHandler for logging and loads shared vocab.
+class WorkerInitializer:
+    """Picklable worker initialization callable for DataLoader.
 
-    Args:
-        log_queue: Queue for logging (optional)
-        shared_vocab_info: Tuple of (shm_name, vocab_size) for shared vocabulary (optional)
+    Handles logging queue setup and shared vocabulary loading in worker processes.
+    Unlike closures, class instances are picklable by default.
     """
-    def _init(worker_id: int):
+
+    def __init__(self, log_queue=None, shared_vocab_info=None):
+        """
+        Args:
+            log_queue: Queue for logging (optional)
+            shared_vocab_info: Tuple of (shm_name, vocab_size) for shared vocabulary (optional)
+        """
+        self.log_queue = log_queue
+        self.shared_vocab_info = shared_vocab_info
+
+    def __call__(self, worker_id: int):
+        """Worker initialization function called by DataLoader.
+
+        Args:
+            worker_id: Worker process ID
+        """
         # Setup logging queue handler
-        if log_queue is not None:
+        if self.log_queue is not None:
             logger = logging.getLogger()
             # Ensure a single QueueHandler per worker
             for h in list(logger.handlers):
@@ -566,17 +716,17 @@ def _make_worker_init(log_queue, shared_vocab_info=None):
                         logger.removeHandler(h)
             try:
                 from logging.handlers import QueueHandler
-                logger.addHandler(QueueHandler(log_queue))
+                logger.addHandler(QueueHandler(self.log_queue))
             except Exception:
                 pass
 
         # Load shared vocabulary if available
-        if shared_vocab_info is not None:
+        if self.shared_vocab_info is not None:
             from torch.utils.data import get_worker_info
             worker_info = get_worker_info()
             if worker_info is not None:
                 dataset = worker_info.dataset
-                shm_name, vocab_size = shared_vocab_info
+                shm_name, vocab_size = self.shared_vocab_info
 
                 # Check if dataset has vocab attribute and needs loading
                 if hasattr(dataset, 'vocab') and hasattr(dataset, '_shared_vocab_loaded'):
@@ -595,8 +745,6 @@ def _make_worker_init(log_queue, shared_vocab_info=None):
                                 f"Worker {worker_id}: Failed to load shared vocabulary: {e}"
                             )
 
-    return _init
-
 
 class DatasetLoader(Dataset):
     def __init__(
@@ -613,18 +761,6 @@ class DatasetLoader(Dataset):
         pad_color: Tuple[int, int, int] = (114, 114, 114),
         normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
-        # L2 cache plumbing
-        l2_enabled: bool = False,
-        l2_cache_path: Optional[str] = None,
-        l2_map_size_bytes: int = 0,
-        l2_max_readers: int = 512,
-        l2_writer_queue: Optional[mp.Queue] = None,
-        l2_storage_dtype: str = "bfloat16",
-        cpu_bf16_cache_pipeline: Optional[bool] = None,
-        # --- L1 (in-memory) cache ---
-        use_memory_cache: bool = True,
-        l1_per_worker_mb: int = 256,
-        canonical_cache_dtype: str = "bfloat16",
         preload_files: int = 0,
         # Background validator control
         enable_background_validator: Optional[bool] = None,
@@ -640,11 +776,17 @@ class DatasetLoader(Dataset):
         self.transform = transform
         self.joint_transforms = joint_transforms
         self.max_retries = max_retries
+        # Validate num_classes to prevent dimension mismatches in tag vectors
+        if num_classes is None:
+            logging.warning(
+                "DatasetLoader: num_classes not provided. Tag vectors may have incorrect dimensions. "
+                "Pass num_classes=len(vocab.tag_to_index) for consistency."
+            )
         self.num_classes = num_classes
         self.retry_counts = {}
         self.failed_samples = set()
         self.logger = logging.getLogger(__name__)
-        # CR-011: Track error distribution per tag to detect bias
+        # Track error distribution per tag to detect bias
         from collections import defaultdict
         self.error_stats = defaultdict(lambda: defaultdict(int))
         self._error_warn_counts = defaultdict(int)  # Rate limit warnings per tag
@@ -658,32 +800,9 @@ class DatasetLoader(Dataset):
         ) if isinstance(pad_color, (list, tuple)) else (114, 114, 114)
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
-        # L2 storage dtype + CPU bf16 preference
-        self._l2_dtype_str = str(l2_storage_dtype).lower()
-        self._l2_dtype = _canon_dtype(self._l2_dtype_str)
 
         # Tag vector dtype
         self._tag_vector_dtype = _canon_dtype(str(tag_vector_dtype).lower())
-
-        # Check CPU BF16 support before enabling
-        requested_cpu_bf16 = bool(cpu_bf16_cache_pipeline) if cpu_bf16_cache_pipeline is not None else (self._l2_dtype is torch.bfloat16)
-
-        if requested_cpu_bf16:
-            if _is_cpu_bf16_supported():
-                self._cpu_bf16_cache = True
-                self.logger.debug("CPU BF16 cache pipeline enabled")
-            else:
-                self._cpu_bf16_cache = False
-                self.logger.warning(
-                    "CPU does not support bfloat16 operations. "
-                    "Falling back to float32 for cache operations. "
-                    "This may impact performance. "
-                    "To suppress this warning, set cpu_bf16_cache_pipeline=False in config."
-                )
-        else:
-            self._cpu_bf16_cache = False
-
-        # Hash computed after L1 dtype is known (see below)
 
         # Properly initialise background validator (opt-out via env or param)
         if enable_background_validator is None:
@@ -703,33 +822,10 @@ class DatasetLoader(Dataset):
                 "Disabled BackgroundValidator in DataLoader worker process"
             )
 
-        # --- L2 cache (read-only in workers) ---
-        self._l2_enabled = bool(l2_enabled and l2_cache_path)
-        self._l2_path = l2_cache_path
-        self._l2_map_size = int(l2_map_size_bytes or 0)
-        self._l2_max_readers = int(l2_max_readers or 4096)
-        self._l2_reader: Optional[LMDBReader] = None
-        self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
-        self._last_qfull_warn: float = 0.0
-
-        # Compute L2 cfg hash once (depends only on L2-relevant preprocessing config)
-        self._l2_cfg_hash = compute_l2_cfg_hash(
-            image_size=self.image_size,
-            pad_color=self.pad_color,
-            normalize_mean=self.normalize_mean,
-            normalize_std=self.normalize_std,
-            l2_dtype_str=self._l2_dtype_str,
-        )
-
         # Epoch tracking for future flip support and consistency with SidecarJsonDataset
         # Default to 0 for first epoch; updated by set_epoch() in training loop
         self._current_epoch = 0
 
-        # --- L1 cache (per-worker; created lazily in worker) ---
-        self._use_l1 = bool(use_memory_cache)
-        self._l1_mb = int(l1_per_worker_mb or 0)
-        self._l1_dtype_str = str(canonical_cache_dtype or "uint8").lower()
-        self._l1 = None  # created lazily per worker
         self._preload_n = int(preload_files or 0)
 
         # --- Image pre-fetching (per-worker; created lazily) ---
@@ -738,29 +834,6 @@ class DatasetLoader(Dataset):
 
         # --- Shared vocabulary flag (for worker_init_fn) ---
         self._shared_vocab_loaded = False
-
-    def _ensure_l2_reader(self):
-        """Create the L2 LMDB reader if (and only if) the path is set and size is positive."""
-        if not getattr(self, "_l2_enabled", False):
-            return
-        # If the path is unset OR empty, treat L2 as disabled.
-        if not getattr(self, "_l2_path", None) or not str(self._l2_path):
-            return
-        # If size missing or non-positive, warn once and treat as disabled.
-        if not getattr(self, "_l2_map_size", None) or int(self._l2_map_size) <= 0:
-            logging.warning("L2 cache enabled but l2_map_size_bytes<=0 or missing; disabling L2 reads.")
-            return
-        # Open env lazily **inside** the worker process to avoid fork-related handle reuse
-        if self._l2_reader is None:
-            # Probe actual LMDB size to handle cache growth across sessions
-            actual_map_size = _probe_lmdb_map_size(self._l2_path, self._l2_map_size)
-            self._l2_reader = LMDBReader(self._l2_path, actual_map_size, max_readers=self._l2_max_readers)
-
-    # ---------- L1 ----------
-    def _ensure_l1(self):
-        if not self._use_l1 or self._l1 is not None or self._l1_mb <= 0:
-            return
-        self._l1 = build_l1_cache(self._l1_mb, self._l1_dtype_str)
 
     # ---------- Pre-fetcher ----------
     def _ensure_prefetcher(self):
@@ -775,6 +848,22 @@ class DatasetLoader(Dataset):
         cache_size = int(os.getenv("DATASET_PREFETCH_SIZE", "32"))
         max_workers = int(os.getenv("DATASET_PREFETCH_WORKERS", "4"))
         self._prefetcher = ImagePreFetcher(max_workers=max_workers, cache_size=cache_size)
+
+    # ---------- Pickling support for multiprocessing ----------
+    def __getstate__(self):
+        """Prepare for pickling - exclude unpicklable objects."""
+        state = self.__dict__.copy()
+        # Remove unpicklable objects before sending to worker
+        state['validator'] = None           # BackgroundValidator thread
+        state['_prefetcher'] = None        # ImagePreFetcher thread pool
+        return state
+
+    def __setstate__(self, state):
+        """Restore from pickle in worker process."""
+        self.__dict__.update(state)
+        # These will be lazily recreated when needed:
+        # - _prefetcher via _ensure_prefetcher()
+        # - validator stays None in workers
 
     def _get_image_path_for_idx(self, idx: int) -> Path:
         """Get image path for a given index (for prefetching).
@@ -792,33 +881,6 @@ class DatasetLoader(Dataset):
             raw_image_id,
             allowed_external_roots=([Path(self.dataset_root)] if self.dataset_root else None),
         )
-
-    # Helpers for L2 keys: incorporate preprocessing config and flip status
-    def _l2_key(self, image_id: str, *, flipped: bool) -> bytes:
-        """
-        Build a unique key for the L2 cache that includes the image_id, a hash of
-        the preprocessing configuration, and a flip bit.  The flip bit is always
-        false for DatasetLoader since this dataset does not support flipping.
-        """
-        flip = "1" if flipped else "0"
-        return f"{image_id}|cfg{self._l2_cfg_hash}|flip{flip}".encode("utf-8")
-
-    def _l2_mask_key(self, image_id: str, *, flipped: bool) -> bytes:
-        """
-        Build a unique key for the L2 cache for the padding mask.
-
-        The mask key appends '|m' to the standard L2 key. Storing an explicit
-        mask alongside the image avoids heuristic reconstruction based on pad
-        colour and normalization.
-        """
-        flip = "1" if flipped else "0"
-        return f"{image_id}|cfg{self._l2_cfg_hash}|flip{flip}|m".encode("utf-8")
-
-    def _l1_keys(self, image_key: bytes, *, flipped: bool) -> tuple[bytes, bytes]:
-        sz = str(int(self.image_size)).encode("utf-8")
-        flip = b"1" if flipped else b"0"
-        base = image_key + b"|sz" + sz + b"|flip" + flip
-        return base + b"|raw", base + b"|m"
 
     def _encode_labels(self, annotation: Dict[str, Any]) -> torch.Tensor:
         """Encode tag labels from annotation to multi-hot vector.
@@ -942,14 +1004,17 @@ class DatasetLoader(Dataset):
             # Skip validation for cached data (already validated when cached)
             return annotations
 
-        # Cache miss: load from JSON
+        # Cache miss: load from JSON (use orjson if available for 3-5x speedup)
         try:
-            with open(path_obj, "r", encoding="utf-8") as f:
-                annotations = json.load(f)
-        except json.JSONDecodeError as e:
+            if HAS_ORJSON:
+                annotations = orjson.loads(path_obj.read_bytes())
+            else:
+                with open(path_obj, "r", encoding="utf-8") as f:
+                    annotations = json.load(f)
+        except JSON_DECODE_ERRORS as e:
             raise ValueError(
                 f"Failed to parse annotation JSON file: {path}\n"
-                f"JSON syntax error at line {e.lineno}, column {e.colno}: {e.msg}\n"
+                f"JSON syntax error: {e}\n"
                 f"Please validate the JSON file using a JSON linter."
             ) from e
         except UnicodeDecodeError as e:
@@ -1032,117 +1097,8 @@ class DatasetLoader(Dataset):
             annotation = self.annotations[idx]
             # Enforce allowlist and strip any sneaky path components
             raw_image_id = sanitize_identifier(str(annotation['image_id']))
-            # L1 keys are based on the raw image id; L2 keys include config + flip bit
-            image_key_base = raw_image_id.encode("utf-8")
 
-            flipped = False  # this Dataset has no flip logic
-            l2_key = self._l2_key(raw_image_id, flipped=flipped)
-
-            # --- L1 READ PATH (precedes L2) ---
-            if self._use_l1 and self._l1_mb > 0:
-                self._ensure_l1()
-                if self._l1 is not None:
-                    raw_key, mask_key = self._l1_keys(image_key_base, flipped=flipped)
-                    raw_stored = self._l1.get(raw_key)
-                    if raw_stored is not None:
-                        if transforms is None:
-                            raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                        img_01 = decode_l1_image_01(raw_stored)
-                        if self._cpu_bf16_cache:
-                            img_01 = img_01.to(torch.bfloat16)
-                        t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
-                        m = self._l1.get(mask_key)
-                        if m is not None:
-                            pmask = m.to(torch.bool)
-                        else:
-                            # Legacy entries may lack a stored mask. Reconstruct by comparing
-                            # the pre-normalised 0–1 image to the pad colour. Without this
-                            # fallback the model would incorrectly treat all tokens as valid.
-                            pad_vec = torch.tensor(
-                                [c / 255.0 for c in self.pad_color],
-                                dtype=img_01.dtype,
-                                device=img_01.device,
-                            ).view(3, 1, 1)
-                            with torch.no_grad():
-                                pmask = torch.isclose(
-                                    img_01,
-                                    pad_vec,
-                                    atol=PAD_MASK_ATOL,
-                                    rtol=0.0,
-                                ).all(dim=0)
-
-                        # Build sample using helper to avoid duplication
-                        return self._build_sample_dict(
-                            t, pmask, annotation, raw_image_id, cached=True
-                        )
-
-            # --- L2 READ PATH ---
-            if self._l2_enabled:
-                self._ensure_l2_reader()
-                payload = self._l2_reader.get(l2_key) if self._l2_reader else None
-                # Prefer a mask that matches the flip state; fall back to legacy flip0 masks
-                mask_payload = None
-                if self._l2_reader:
-                    try:
-                        mask_payload = self._l2_reader.get(self._l2_mask_key(raw_image_id, flipped=flipped))
-                        if mask_payload is None:
-                            mask_payload = self._l2_reader.get(self._l2_mask_key(raw_image_id, flipped=False))
-                    except Exception:
-                        mask_payload = None
-                if payload is not None:
-                    try:
-                        t = _tensor_from_bytes(payload)
-                        # Require channel‑first tensors with 3 channels; reject HWC or wrong channel counts
-                        if (
-                            t.dim() != 3
-                            or t.shape[0] != 3
-                            or t.shape[1] != int(self.image_size)
-                            or t.shape[2] != int(self.image_size)
-                        ):
-                            raise ValueError(
-                                f"L2 cached tensor shape {t.shape} does not match expected (3, {self.image_size}, {self.image_size})"
-                            )
-
-                        # Try explicit mask first; fall back to heuristic reconstruction for legacy caches
-                        pmask: torch.Tensor
-                        if mask_payload is not None:
-                            try:
-                                m = _tensor_from_bytes(mask_payload)
-                                # Validate mask geometry matches current config
-                                if m.dim() != 2 or m.shape[0] != int(self.image_size) or m.shape[1] != int(self.image_size):
-                                    mask_payload = None  # fall back to reconstruction
-                                else:
-                                    pmask = m.to(torch.bool)
-                            except Exception:
-                                mask_payload = None
-                        if mask_payload is None:
-                            pad_vec = torch.tensor(
-                                [c / 255.0 for c in self.pad_color],
-                                dtype=t.dtype,
-                                device=t.device,
-                            )
-                            mean = torch.tensor(self.normalize_mean, dtype=t.dtype, device=t.device)
-                            std = torch.tensor(self.normalize_std, dtype=t.dtype, device=t.device)
-                            pad_norm = ((pad_vec - mean) / std).view(3, 1, 1)
-                            with torch.no_grad():
-                                pmask = torch.isclose(
-                                    t,
-                                    pad_norm,
-                                    atol=PAD_MASK_ATOL,
-                                    rtol=0.0,
-                                ).all(dim=0)
-
-                        # Build sample using helper to avoid duplication
-                        return self._build_sample_dict(
-                            t, pmask, annotation, raw_image_id, cached=True
-                        )
-                    except Exception as e:
-                        # Treat as cache miss; skip bad/tampered records safely
-                        self.logger.warning(
-                            f"L2 cache decode failed for {raw_image_id}: {e} (treating as miss)"
-                        )
-
-            # --- Cache miss: load + transform (confined path) ---
+            # --- Load + transform (confined path) ---
             # Use the sanitized image identifier we derived above.
             # Allow symlink targets to live under the dataset root (manifest symlinks → shard files)
             img_path = validate_image_path(
@@ -1206,9 +1162,7 @@ class DatasetLoader(Dataset):
                 img_01 = T.ToTensor()(img_tv)  # 0..1 float
                 if self._cpu_bf16_cache:
                     img_01 = img_01.to(torch.bfloat16)
-                if transforms is None:
-                    raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
+                t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
                 pmask = mask_tv.to(torch.bool)
             else:
                 # Fallback: color-only transforms ok; any geometry here would desync pmask
@@ -1222,67 +1176,35 @@ class DatasetLoader(Dataset):
                         # Keep dtype as-is; bf16 preferred when configured
                         if self._cpu_bf16_cache:
                             img_01 = img_01.to(torch.bfloat16)
-                        t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
+                        t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
                     except Exception:
                         if transforms is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img_01 = transforms.ToTensor()(canvas)
                         if self._cpu_bf16_cache:
                             img_01 = img_01.to(torch.bfloat16)
-                        t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
+                        t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
                 else:
                     if transforms is None:
                         raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                     img_01 = transforms.ToTensor()(canvas)
                     if self._cpu_bf16_cache:
                         img_01 = img_01.to(torch.bfloat16)
-                    t = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img_01)
+                    t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
 
             # Reset retry count on success
             self.retry_counts[idx] = 0
 
             # Build sample using helper to avoid duplication
-            sample = self._build_sample_dict(
+            return self._build_sample_dict(
                 t, pmask, annotation, raw_image_id, cached=False
             )
-
-            # Enqueue write with backpressure to avoid dropping cache writes
-            if self._l2_enabled and self._l2_writer_q is not None:
-                try:
-                    # Write normalized image in configured L2 dtype and explicit padding mask
-                    _img_bytes = _tensor_to_bytes(sample["images"].to(self._l2_dtype))
-                    # Use put() with short timeout (50ms) to apply backpressure without blocking __getitem__
-                    # This improves cache effectiveness while avoiding training pipeline stalls
-                    self._l2_writer_q.put((l2_key, _img_bytes), timeout=0.05)
-                    monitor.l2_put_enqueued(len(_img_bytes))
-                    _mask_bytes = _tensor_to_bytes(sample["padding_mask"].to(torch.uint8))
-                    self._l2_writer_q.put((self._l2_mask_key(raw_image_id, flipped=False), _mask_bytes), timeout=0.05)
-                    monitor.l2_put_enqueued(len(_mask_bytes))
-                except queue.Full:
-                    # Only happens if timeout exceeded (writer under heavy load or stalled)
-                    now = time.time()
-                    if (now - self._last_qfull_warn) > 5.0:
-                        self._last_qfull_warn = now
-                        self.logger.warning(
-                            "L2 writer queue timeout after 50ms; dropping cache write (rate-limited)"
-                        )
-            # L1: write pre-norm image (and mask) in canonical dtype; never block
-            if self._use_l1 and self._l1_mb > 0:
-                self._ensure_l1()
-                if self._l1 is not None:
-                    try:
-                        raw_key, mask_key = self._l1_keys(image_key_base, flipped=False)
-                        self._l1.put(raw_key, encode_l1_image_01(img_01, dtype_str=self._l1_dtype_str))
-                        self._l1.put(mask_key, pmask.to(torch.uint8))
-                    except Exception:
-                        pass
-            return sample
 
         except Exception as e:
             self.retry_counts[idx] += 1
             self.logger.warning(f"Failed to load sample {idx}: {e}")
 
-            # CR-011: Track error distribution to detect bias
+            # Track error distribution to detect bias
             error_type = 'load_failed' if 'load' in str(e).lower() else 'decode_failed'
             self._track_error_distribution(idx, error_type)
 
@@ -1296,9 +1218,6 @@ class DatasetLoader(Dataset):
 
     def _track_error_distribution(self, idx: int, error_type: str):
         """Track error rates per tag to detect distribution bias.
-
-        CR-011: Monitor if errors are clustered in certain tags/classes,
-        which would bias the training distribution.
 
         Args:
             idx: Sample index that failed
@@ -1349,10 +1268,7 @@ class DatasetLoader(Dataset):
         }
 
     def get_failure_statistics(self):
-        """Return statistics about failed samples for logging.
-
-        CR-011: Enhanced to include per-tag error distribution.
-        """
+        """Return statistics about failed samples for logging."""
         # Calculate per-tag error rates
         tag_error_summary = {}
         for tag_idx, stats in self.error_stats.items():
@@ -1369,23 +1285,12 @@ class DatasetLoader(Dataset):
             "total_failed": len(self.failed_samples),
             "failed_indices": list(self.failed_samples),
             "retry_counts": self.retry_counts,
-            "tag_error_distribution": tag_error_summary,  # CR-011: Per-tag error tracking
+            "tag_error_distribution": tag_error_summary,
         }
 
     def close(self):
-        """Close LMDB reader and release resources."""
-        if hasattr(self, "_l2_reader") and self._l2_reader is not None:
-            try:
-                self._l2_reader.close()
-            except Exception as e:
-                logging.getLogger(__name__).debug(
-                    f"Error closing L2 reader: {e}"
-                )
-            finally:
-                self._l2_reader = None
-
-        # Also cleanup validator
-        # CR-005: Use close() instead of stop() for proper cleanup
+        """Release resources."""
+        # Cleanup validator
         if hasattr(self, "validator") and self.validator is not None:
             try:
                 self.validator.close()
@@ -1416,22 +1321,19 @@ class DatasetLoader(Dataset):
         return False
 
 
-# CR-005: Class-level registry to track active validators for cleanup
 _active_validators = weakref.WeakSet()
 
 
 class BackgroundValidator(Thread):
-    # HL003 Fix: Implement actual validation logic
-    # CR-005 Fix: Add explicit cleanup, context manager, and registry tracking
+    """Background validation thread with explicit cleanup and registry tracking."""
+
     def __init__(self, dataset_loader):
-        super().__init__(daemon=False)  # CR-005: Non-daemon for proper cleanup
+        super().__init__(daemon=False)
         self.dataset_loader = dataset_loader
-        self.validation_queue = queue.Queue(maxsize=1000)  # Bounded queue to prevent memory growth
+        self.validation_queue = queue.Queue(maxsize=1000)
         self.running = True
         self._stop_event = threading.Event()
         self.logger = logging.getLogger(__name__)
-
-        # CR-005: Track this validator in global registry
         _active_validators.add(self)
 
     def run(self):
@@ -1529,7 +1431,7 @@ class BackgroundValidator(Thread):
             pass
 
     def close(self):
-        """CR-005: Explicit cleanup method for resource management."""
+        """Explicit cleanup method for resource management."""
         if not self.running:
             return  # Already closed
 
@@ -1540,19 +1442,18 @@ class BackgroundValidator(Thread):
         _active_validators.discard(self)
 
     def __enter__(self):
-        """CR-005: Context manager entry."""
+        """Context manager entry."""
         self.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """CR-005: Context manager exit - guaranteed cleanup."""
+        """Context manager exit - guaranteed cleanup."""
         self.close()
         return False
 
     def __del__(self):
         """Cleanup on garbage collection."""
         try:
-            # CR-005: Use close() instead of stop() for proper cleanup
             if self.running:
                 self.stop(timeout=1.0)
                 _active_validators.discard(self)
@@ -1560,7 +1461,6 @@ class BackgroundValidator(Thread):
             pass
 
 
-# CR-005: Cleanup all validators on program exit
 @atexit.register
 def _cleanup_all_validators():
     """Emergency cleanup of any remaining validators."""
@@ -1588,6 +1488,9 @@ class SidecarJsonDataset(Dataset):
       - filename: image file name (e.g., "12345.jpg")
       - tags: space-delimited string or list of tags
       - rating: optional rating string or int (safe/general/questionable/explicit/unknown)
+
+    Supports sidecar tensor cache: preprocessed images are stored as .safetensor files
+    alongside original images for fast loading on subsequent runs.
     """
 
     def __init__(
@@ -1603,13 +1506,10 @@ class SidecarJsonDataset(Dataset):
         pad_color: Tuple[int, int, int] = (114, 114, 114),
         normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
-        # L2 cache plumbing
-        l2_enabled: bool = False,
-        l2_cache_path: Optional[str] = None,
-        l2_map_size_bytes: int = 0,
-        l2_max_readers: int = 512,
-        l2_writer_queue: Optional[mp.Queue] = None,
-        l2_storage_dtype: str = "bfloat16",
+        # Sidecar cache configuration (replaces L2 LMDB cache)
+        sidecar_cache_enabled: bool = True,
+        sidecar_extension: str = ".safetensor",
+        sidecar_storage_dtype: str = "bfloat16",
         cpu_bf16_cache_pipeline: Optional[bool] = None,
         # --- Orientation / flipping ---
         random_flip_prob: float = 0.0,
@@ -1619,6 +1519,11 @@ class SidecarJsonDataset(Dataset):
         stats_queue: Optional[mp.Queue] = None,
         # Dtype configuration
         tag_vector_dtype: str = "bfloat16",
+        # Metadata cache configuration
+        metadata_cache_enabled: bool = True,
+        metadata_cache_workers: int = 16,
+        force_rebuild_metadata_cache: bool = False,
+        metadata_cache_staleness_check_samples: int = 100,
     ):
         self.root = Path(root_dir)
         self.json_files = list(json_files)
@@ -1630,6 +1535,24 @@ class SidecarJsonDataset(Dataset):
         self.failed_samples = set()
         self.logger = logging.getLogger(__name__)
 
+        # Load exclusion list for bad/corrupted images (written by l2_cache_warmup.py)
+        # Stores image_ids (stems) for format-agnostic matching
+        self.excluded_image_ids: Set[str] = set()
+        exclusion_path = self.root / 'cache_exclusions.txt'
+        if exclusion_path.exists():
+            try:
+                with open(exclusion_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            # Handle both old format (full path) and new format (just id)
+                            # Path().stem extracts just the filename without extension
+                            self.excluded_image_ids.add(Path(line).stem)
+                if self.excluded_image_ids:
+                    self.logger.info(f"Loaded {len(self.excluded_image_ids)} excluded image IDs from {exclusion_path}")
+            except Exception as e:
+                self.logger.warning(f"Failed to load exclusion list from {exclusion_path}: {e}")
+
         # Image pipeline settings
         self.image_size = int(image_size)
         self.pad_color: Tuple[int, int, int] = (
@@ -1637,15 +1560,18 @@ class SidecarJsonDataset(Dataset):
         ) if isinstance(pad_color, (list, tuple)) else (114, 114, 114)
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
-        # L2 dtype + CPU bf16 preference
-        self._l2_dtype_str = str(l2_storage_dtype).lower()
-        self._l2_dtype = _canon_dtype(self._l2_dtype_str)
+
+        # Sidecar cache configuration
+        self._sidecar_enabled = bool(sidecar_cache_enabled)
+        self._sidecar_extension = str(sidecar_extension) if sidecar_extension.startswith(".") else f".{sidecar_extension}"
+        self._sidecar_dtype_str = str(sidecar_storage_dtype).lower()
+        self._sidecar_dtype = _canon_dtype(self._sidecar_dtype_str)
 
         # Tag vector dtype
         self._tag_vector_dtype = _canon_dtype(str(tag_vector_dtype).lower())
 
         # Check CPU BF16 support before enabling
-        requested_cpu_bf16 = bool(cpu_bf16_cache_pipeline) if cpu_bf16_cache_pipeline is not None else (self._l2_dtype is torch.bfloat16)
+        requested_cpu_bf16 = bool(cpu_bf16_cache_pipeline) if cpu_bf16_cache_pipeline is not None else (self._sidecar_dtype is torch.bfloat16)
 
         if requested_cpu_bf16:
             if _is_cpu_bf16_supported():
@@ -1653,31 +1579,33 @@ class SidecarJsonDataset(Dataset):
                 self.logger.debug("CPU BF16 cache pipeline enabled")
             else:
                 self._cpu_bf16_cache = False
+                # Also fall back storage dtype to float32 to ensure cache consistency
+                # This prevents issues where bf16 tensors are stored but operations fail
+                if self._sidecar_dtype is torch.bfloat16:
+                    self._sidecar_dtype = torch.float32
+                    self._sidecar_dtype_str = "float32"
                 self.logger.warning(
                     "CPU does not support bfloat16 operations. "
-                    "Falling back to float32 for cache operations. "
-                    "This may impact performance. "
-                    "To suppress this warning, set cpu_bf16_cache_pipeline=False in config."
+                    "Falling back to float32 for both cache pipeline and storage. "
+                    "IMPACT: Existing bfloat16 cache files will be automatically re-processed during training "
+                    "because the storage_dtype change affects the config hash (from 'bfloat16' to 'float32'). "
+                    "No manual cache deletion is needed - stale entries are detected and replaced. "
+                    "To suppress this warning, set sidecar_storage_dtype='float32' in config."
                 )
         else:
             self._cpu_bf16_cache = False
 
-        # L2 cache
-        self._l2_enabled = bool(l2_enabled and l2_cache_path)
-        self._l2_path = l2_cache_path
-        self._l2_map_size = int(l2_map_size_bytes or 0)
-        self._l2_max_readers = int(l2_max_readers or 4096)
-        self._l2_reader: Optional[LMDBReader] = None
-        self._l2_writer_q: Optional[mp.Queue] = l2_writer_queue
-        self._last_qfull_warn: float = 0.0
-
-        # Compute L2 cfg hash once for sidecar dataset (L2-relevant preprocessing only)
-        self._l2_cfg_hash = compute_l2_cfg_hash(
+        # Compute config hash for sidecar cache invalidation
+        # Include vocab_size to invalidate cache if vocabulary changes
+        # Include has_joint_transforms to invalidate cache if transforms change
+        self._config_hash = compute_cache_config_hash(
             image_size=self.image_size,
             pad_color=self.pad_color,
             normalize_mean=self.normalize_mean,
             normalize_std=self.normalize_std,
-            l2_dtype_str=self._l2_dtype_str,
+            storage_dtype=self._sidecar_dtype_str,
+            vocab_size=len(self.vocab.tag_to_index),
+            has_joint_transforms=(self.joint_transforms is not None),
         )
 
         # --- Orientation / flipping state ---
@@ -1690,7 +1618,7 @@ class SidecarJsonDataset(Dataset):
             try:
                 path = Path(flip_overrides_path)
                 if path.exists():
-                    data = json.loads(path.read_text(encoding="utf-8"))
+                    data = orjson.loads(path.read_bytes()) if HAS_ORJSON else json.loads(path.read_text(encoding="utf-8"))
                     if isinstance(data, dict):
                         force = data.get("force_flip") or data.get("flip") or []
                         never = data.get("never_flip") or data.get("no_flip") or []
@@ -1715,39 +1643,86 @@ class SidecarJsonDataset(Dataset):
 
         # Pre-parse minimal fields for speed
         self.items: List[Dict[str, Any]] = []
-        for jp in self.json_files:
-            try:
-                data = json.loads(Path(jp).read_text(encoding="utf-8"))
-                fname = str(data.get("filename") or jp.with_suffix(".png").name)
-                image_id = sanitize_identifier(Path(fname).stem)
-                tags_raw = data.get("tags")
-                tags_list = parse_tags_field(tags_raw)
-                rating = data.get("rating", "unknown")
-                # Remember the shard folder this pair lives in for image resolution
-                self.items.append({
-                    "image_id": image_id,
-                    "tags": tags_list,
-                    "rating": rating,
-                    "dir": Path(jp).parent,
-                })
-            except Exception as e:
-                self.logger.warning(f"Failed to parse {jp}: {e}")
 
-    def _ensure_l2_reader(self):
-        """Create the L2 LMDB reader if (and only if) the path is set and size is positive."""
-        if not getattr(self, "_l2_enabled", False):
-            return
-        # If the path is unset OR empty, treat L2 as disabled.
-        if not getattr(self, "_l2_path", None) or not str(self._l2_path):
-            return
-        # If size missing or non-positive, warn once and treat as disabled.
-        if not getattr(self, "_l2_map_size", None) or int(self._l2_map_size) <= 0:
-            logging.warning("L2 cache enabled but l2_map_size_bytes<=0 or missing; disabling L2 reads.")
-            return
-        if self._l2_reader is None:
-            # Probe actual LMDB size to handle cache growth across sessions
-            actual_map_size = _probe_lmdb_map_size(self._l2_path, self._l2_map_size)
-            self._l2_reader = LMDBReader(self._l2_path, actual_map_size, max_readers=self._l2_max_readers)
+        # Try loading from metadata cache if enabled
+        if metadata_cache_enabled:
+            cache_result = try_load_metadata_cache(
+                root_dir=self.root,
+                json_files=self.json_files,
+                force_rebuild=force_rebuild_metadata_cache,
+                num_workers=metadata_cache_workers,
+                staleness_check_samples=metadata_cache_staleness_check_samples,
+                logger=self.logger
+            )
+
+            if cache_result is not None:
+                # Filter out excluded images by image_id (format-agnostic)
+                if self.excluded_image_ids:
+                    original_count = len(cache_result)
+                    self.items = [
+                        item for item in cache_result
+                        if item['image_id'] not in self.excluded_image_ids
+                    ]
+                    excluded_count = original_count - len(self.items)
+                    if excluded_count > 0:
+                        self.logger.info(f"Filtered out {excluded_count} excluded images from metadata cache")
+                else:
+                    self.items = cache_result
+                self.logger.info(f"Loaded {len(self.items):,} items from metadata cache")
+            else:
+                # Cache unavailable, fall back to sequential parsing
+                self.logger.warning("Metadata cache unavailable, parsing sequentially...")
+                metadata_cache_enabled = False  # Skip cache for fallback
+
+        # Fallback: sequential parsing (if cache disabled or failed)
+        if not metadata_cache_enabled or len(self.items) == 0:
+            excluded_count = 0
+            for jp in self.json_files:
+                try:
+                    data = orjson.loads(Path(jp).read_bytes()) if HAS_ORJSON else json.loads(Path(jp).read_text(encoding="utf-8"))
+                    # Skip if data is not a dict (e.g., manifest files are lists)
+                    if not isinstance(data, dict):
+                        self.logger.warning(f"Skipping {jp}: expected dict, got {type(data).__name__}")
+                        continue
+                    fname = str(data.get("filename") or jp.with_suffix(".png").name)
+                    image_id = sanitize_identifier(Path(fname).stem)
+
+                    # Skip excluded images by image_id (format-agnostic)
+                    if self.excluded_image_ids and image_id in self.excluded_image_ids:
+                        excluded_count += 1
+                        continue
+
+                    tags_raw = data.get("tags")
+                    tags_list = parse_tags_field(tags_raw)
+                    rating = data.get("rating", "unknown")
+                    # Remember the shard folder this pair lives in for image resolution
+                    self.items.append({
+                        "image_id": image_id,
+                        "tags": tags_list,
+                        "rating": rating,
+                        "dir": Path(jp).parent,
+                    })
+                except Exception as e:
+                    self.logger.warning(f"Failed to parse {jp}: {e}")
+            if excluded_count > 0:
+                self.logger.info(f"Filtered out {excluded_count} excluded images during parsing")
+
+    # ---------- Pickling support for multiprocessing ----------
+    def __getstate__(self):
+        """Prepare for pickling - exclude unpicklable objects."""
+        state = self.__dict__.copy()
+        # Remove unpicklable objects before sending to worker
+        state['_prefetcher'] = None          # ImagePreFetcher thread pool (if any)
+        state['_orientation_handler'] = None # May contain unpicklable state
+        state['_stats_queue'] = None         # multiprocessing.Queue (cannot be pickled on Windows spawn)
+        return state
+
+    def __setstate__(self, state):
+        """Restore from pickle in worker process."""
+        self.__dict__.update(state)
+        # These will be lazily recreated when needed:
+        # - _prefetcher and _orientation_handler if needed
+        # - _stats_queue stays None in workers (telemetry only from main process)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -1769,50 +1744,6 @@ class SidecarJsonDataset(Dataset):
         """
         self._current_epoch = int(epoch)
         self.logger.debug(f"Dataset epoch set to {self._current_epoch}")
-
-    # Helpers for L2 keys: incorporate preprocessing config and flip status
-    def _l2_key(self, image_id: str, *, flipped: bool) -> bytes:
-        """
-        Build a unique key for the L2 cache that includes the image_id and a hash of the
-        preprocessing configuration.
-
-        IMPORTANT: L2 cache only stores UNFLIPPED versions to save disk space and allow
-        epoch-varying flips. Flipped images are computed on-the-fly from the unflipped cache.
-        This ensures that:
-        - Cache doesn't grow linearly with epochs
-        - Flip decisions can vary across epochs
-        - Unflipped images are reused efficiently
-
-        Args:
-            image_id: Unique image identifier
-            flipped: Whether this is a flipped request (only False is cached)
-
-        Returns:
-            Cache key (empty bytes for flipped=True to skip L2 cache)
-        """
-        if flipped:
-            # Don't cache flipped versions - compute on-the-fly
-            return b""
-        return f"{image_id}|cfg{self._l2_cfg_hash}".encode("utf-8")
-
-    def _l2_mask_key(self, image_id: str, *, flipped: bool) -> bytes:
-        """
-        Build a unique key for the L2 cache for the padding mask.
-
-        IMPORTANT: Like _l2_key, only unflipped masks are cached in L2.
-        Flipped masks are computed by flipping the unflipped mask on-the-fly.
-
-        Args:
-            image_id: Unique image identifier
-            flipped: Whether this is a flipped request (only False is cached)
-
-        Returns:
-            Cache key with '|m' suffix (empty bytes for flipped=True to skip L2 cache)
-        """
-        if flipped:
-            # Don't cache flipped masks - compute on-the-fly
-            return b""
-        return f"{image_id}|cfg{self._l2_cfg_hash}|m".encode("utf-8")
 
     def _deterministic_coin(self, image_id: str) -> bool:
         """Stable per-image, per-epoch coin flip based on SHA256(image_id + epoch).
@@ -1915,62 +1846,55 @@ class SidecarJsonDataset(Dataset):
                     # Avoid double safety checks here; decision already made by _decide_flip_mode
                     tags_now, flipped = self.orientation_handler.swap_tags(original_tags, skip_safety_check=True)
                     flip_bit = bool(flipped)
-            # Build the L2 key and mask key using the config hash and flip bit
-            l2_key = self._l2_key(image_id, flipped=flip_bit)
-            mask_key = self._l2_mask_key(image_id, flipped=flip_bit)
 
-            # Try L2 cache first
-            if self._l2_enabled:
-                self._ensure_l2_reader()
-                img_payload = self._l2_reader.get(l2_key) if self._l2_reader else None
-                mask_payload = self._l2_reader.get(mask_key) if self._l2_reader else None
-                if img_payload is not None:
-                    try:
-                        img_t = _tensor_from_bytes(img_payload)
-                        # Verify cached shape matches expected resolution
-                        if img_t.dim() != 3 or img_t.shape[-2] != int(self.image_size) or img_t.shape[-1] != int(self.image_size):
-                            raise ValueError(
-                                f"L2 cached tensor shape {img_t.shape} does not match expected {(3, self.image_size, self.image_size)}"
-                            )
-                    except Exception as e:
-                        self.logger.warning(f"L2 cache decode failed for {image_id}: {e}")
-                        img_t = None
-                    if img_t is not None:
-                        # Try to load an explicit mask; fall back to heuristic reconstruction
-                        if mask_payload is not None:
-                            try:
-                                m = _tensor_from_bytes(mask_payload)
-                                if m.dim() != 2 or m.shape[0] != int(self.image_size) or m.shape[1] != int(self.image_size):
-                                    mask_payload = None
-                                else:
-                                    pmask = m.to(torch.bool)
-                            except Exception:
-                                mask_payload = None
-                        if mask_payload is None:
-                            pad_vec = torch.tensor(
-                                [c / 255.0 for c in self.pad_color],
-                                dtype=img_t.dtype,
-                                device=img_t.device,
-                            )
-                            mean = torch.tensor(self.normalize_mean, dtype=img_t.dtype, device=img_t.device)
-                            std = torch.tensor(self.normalize_std, dtype=img_t.dtype, device=img_t.device)
-                            pad_norm = ((pad_vec - mean) / std).view(3, 1, 1)
-                            with torch.no_grad():
-                                pmask = torch.isclose(
-                                    img_t,
-                                    pad_norm,
-                                    atol=PAD_MASK_ATOL,
-                                    rtol=0.0,
-                                ).all(dim=0)
+            # Resolve image path first (needed for both cache lookup and loading)
+            img_root = ann.get("dir", self.root)
+            img_path = validate_image_path(Path(img_root), image_id)
+
+            # Get source file mtime for cache invalidation when source is modified
+            try:
+                source_mtime = os.path.getmtime(img_path)
+            except OSError:
+                source_mtime = None  # File might not exist yet, will fail later
+
+            # Try sidecar cache first
+            if self._sidecar_enabled:
+                sidecar_path = get_sidecar_path(str(img_path), self._sidecar_extension)
+                cache_result = load_sidecar(
+                    sidecar_path,
+                    expected_config_hash=self._config_hash,
+                    expected_source_mtime=source_mtime,
+                )
+                if cache_result is not None:
+                    img_t, pmask = cache_result
+                    # Verify cached shape and dtype match expected values
+                    shape_ok = (img_t.dim() == 3 and
+                                img_t.shape[0] == 3 and
+                                img_t.shape[1] == int(self.image_size) and
+                                img_t.shape[2] == int(self.image_size))
+                    dtype_ok = (img_t.dtype == self._sidecar_dtype)
+                    if shape_ok and dtype_ok:
+                        # Apply flip transformation to cached data if needed
+                        if flip_bit:
+                            img_t = torch.flip(img_t, dims=[2])  # Flip width dimension (CHW format)
+                            pmask = torch.flip(pmask, dims=[1])  # Flip width dimension (HW format)
                         # Use tags that already reflect the flip decision
                         tag_vec = self.vocab.encode_tags(tags_now)
+                        monitor.l2_hit()  # Sidecar cache hit
                         return self._build_sample_dict(
                             img_t, pmask, tag_vec, ann.get("rating", "unknown"), image_id, cached=True
                         )
+                    else:
+                        # Cache file loaded but validation failed - this is a stale entry, not a miss
+                        if not shape_ok:
+                            self.logger.debug(f"Sidecar shape mismatch for {image_id}, reloading")
+                        elif not dtype_ok:
+                            self.logger.debug(f"Sidecar dtype mismatch for {image_id}: {img_t.dtype} != {self._sidecar_dtype}")
+                        monitor.l2_stale()  # Stale cache entry (loaded but invalid)
+                else:
+                    monitor.l2_miss()  # True cache miss (file not found or couldn't load)
 
-            # Cache miss: load from disk (resolve under the JSON's shard folder)
-            img_root = ann.get("dir", self.root)
-            img_path = validate_image_path(Path(img_root), image_id)
+            # Cache miss: load from disk
             # Fully decode and correct EXIF while file is open
             with Image.open(img_path) as pil_img:
                 pil_img.load()
@@ -2009,9 +1933,7 @@ class SidecarJsonDataset(Dataset):
                 img = T.ToTensor()(img_tv)
                 if self._cpu_bf16_cache:
                     img = img.to(torch.bfloat16)
-                if transforms is None:
-                    raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
+                img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
                 pmask = mask_tv.to(torch.bool)
             else:
                 # Fallback: color-only transforms permitted
@@ -2023,42 +1945,66 @@ class SidecarJsonDataset(Dataset):
                         img = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
                         if self._cpu_bf16_cache:
                             img = img.to(torch.bfloat16)
-                        img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
+                        img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
                     except Exception:
                         if transforms is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img = transforms.ToTensor()(canvas)
                         if self._cpu_bf16_cache:
                             img = img.to(torch.bfloat16)
-                        img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
+                        img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
                 else:
                     if transforms is None:
                         raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                     img = transforms.ToTensor()(canvas)
                     if self._cpu_bf16_cache:
                         img = img.to(torch.bfloat16)
-                    img = transforms.Normalize(mean=self.normalize_mean, std=self.normalize_std)(img)
+                    img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
 
             # Encode labels (tags already account for flipping)
             tag_vec = self.vocab.encode_tags(tags_now)  # (V,)
 
-            # Enqueue write (non-blocking)
-            if self._l2_enabled and self._l2_writer_q is not None:
-                try:
-                    # Store the normalized image in L2 dtype and explicit padding mask
-                    _img_bytes = _tensor_to_bytes(img.to(self._l2_dtype))
-                    self._l2_writer_q.put_nowait((l2_key, _img_bytes))
-                    monitor.l2_put_enqueued(len(_img_bytes))
-                    _mask_bytes = _tensor_to_bytes(pmask.to(torch.uint8))
-                    self._l2_writer_q.put_nowait((mask_key, _mask_bytes))
-                    monitor.l2_put_enqueued(len(_mask_bytes))
-                except queue.Full:
-                    now = time.time()
-                    if (now - self._last_qfull_warn) > 5.0:
-                        self._last_qfull_warn = now
-                        self.logger.warning(
-                            "L2 writer queue full; dropping cache write (rate-limited)"
-                        )
+            # Save sidecar cache file (stores unflipped version for reuse across epochs)
+            if self._sidecar_enabled:
+                # Store the UNFLIPPED version (flip is applied on load)
+                # If flip_bit was True, we need to unflip before saving
+                img_to_cache = img
+                mask_to_cache = pmask
+                if flip_bit:
+                    # Undo the flip for caching (cache stores canonical unflipped version)
+                    img_to_cache = torch.flip(img, dims=[2])
+                    mask_to_cache = torch.flip(pmask, dims=[1])
+
+                # Use file locking to coordinate concurrent writes to same sidecar
+                # This prevents multiple workers from competing on the same file
+                # Skip locking for very long paths to avoid filesystem limits (Windows: 260 chars)
+                use_locking = HAS_FILELOCK and len(sidecar_path) <= 240  # Leave room for .lock extension
+                if use_locking:
+                    lock_path = sidecar_path + ".lock"
+                    try:
+                        with filelock.FileLock(lock_path, timeout=5):  # Short timeout for cache writes
+                            # Check again inside lock in case another worker wrote it
+                            if not os.path.exists(sidecar_path):
+                                save_sidecar(
+                                    sidecar_path,
+                                    img_to_cache.to(self._sidecar_dtype),
+                                    mask_to_cache,
+                                    self._config_hash,
+                                    image_size=self.image_size,
+                                    source_mtime=source_mtime,
+                                )
+                    except filelock.Timeout:
+                        pass  # Another worker is writing, skip this cache write
+                else:
+                    # Without locking, still safe due to UUID-based temp files in save_sidecar
+                    save_sidecar(
+                        sidecar_path,
+                        img_to_cache.to(self._sidecar_dtype),
+                        mask_to_cache,
+                        self._config_hash,
+                        image_size=self.image_size,
+                        source_mtime=source_mtime,
+                    )
 
             self.retry_counts[idx] = 0
             return self._build_sample_dict(
@@ -2092,12 +2038,12 @@ class SidecarJsonDataset(Dataset):
                 pass
 
     def _error_sample(self, idx: int, reason: str) -> Dict[str, Any]:
-        sz = getattr(self.transform.transforms[0], "size", 224) if hasattr(self, "transform") and self.transform else getattr(self, "image_size", 224)
-        if isinstance(sz, (tuple, list)):
-            sz = sz[0]
+        # Always use self.image_size for consistency with actual samples
+        # This ensures error samples have the same shape as valid samples for batching
+        sz = int(self.image_size)
         return {
-            "images": torch.zeros((3, int(sz), int(sz))),
-            "padding_mask": torch.ones((int(sz), int(sz)), dtype=torch.bool),
+            "images": torch.zeros((3, sz, sz)),
+            "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
             "tag_labels": torch.zeros(len(self.vocab.tag_to_index), dtype=self._tag_vector_dtype),
             "rating_labels": torch.tensor(4, dtype=torch.long),
             "image_id": f"error_{idx}",
@@ -2105,34 +2051,6 @@ class SidecarJsonDataset(Dataset):
             "error": True,
             "error_reason": reason,
         }
-
-    def close(self):
-        """Close LMDB reader and release resources."""
-        if hasattr(self, "_l2_reader") and self._l2_reader is not None:
-            try:
-                self._l2_reader.close()
-            except Exception as e:
-                logging.getLogger(__name__).debug(
-                    f"Error closing L2 reader: {e}"
-                )
-            finally:
-                self._l2_reader = None
-
-    def __del__(self):
-        """Fallback cleanup when object is garbage collected."""
-        try:
-            self.close()
-        except Exception:
-            pass  # Silently ignore errors in __del__
-
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - cleanup resources."""
-        self.close()
-        return False
 
 
 def _map_rating(rating: Any) -> int:
@@ -2187,18 +2105,12 @@ def create_dataloaders(
 ):
     logger = logging.getLogger(__name__)
 
-    # CR-016: Extract config once to avoid redundant processing
-    # This eliminates 2-5s overhead from duplicate config extraction
+    # Extract config once to avoid redundant processing
     config_cache = {
-        # L2 cache configuration
-        'l2_cache_enabled': bool(getattr(data_config, "l2_cache_enabled", False)),
-        'l2_cache_path': getattr(data_config, "l2_cache_path", None),
-        'l2_max_readers': getattr(data_config, "l2_max_readers", 4096),
-        'l2_storage_dtype': getattr(data_config, "l2_storage_dtype", "bfloat16"),
-        # L1 cache configuration
-        'use_memory_cache': bool(getattr(data_config, "use_memory_cache", True)),
-        'l1_per_worker_mb': int(getattr(data_config, "l1_per_worker_mb", 256)),
-        'canonical_cache_dtype': str(getattr(data_config, "canonical_cache_dtype", "bfloat16")),
+        # Sidecar cache configuration (replaces L2 LMDB cache)
+        'sidecar_cache_enabled': bool(getattr(data_config, "sidecar_cache_enabled", True)),
+        'sidecar_extension': str(getattr(data_config, "sidecar_extension", ".safetensor")),
+        'sidecar_storage_dtype': str(getattr(data_config, "sidecar_storage_dtype", "bfloat16")),
         'preload_files': int(getattr(data_config, "preload_files", 0)),
         'cpu_bf16_cache_pipeline': getattr(data_config, "cpu_bf16_cache_pipeline", None),
         # Image processing configuration
@@ -2216,38 +2128,21 @@ def create_dataloaders(
         'stats_queue': getattr(data_config, "stats_queue", None),
         # DataLoader configuration
         'drop_last': bool(getattr(data_config, "drop_last", False)),
+        # Metadata cache configuration
+        'metadata_cache_enabled': bool(getattr(data_config, "metadata_cache_enabled", True)),
+        'metadata_cache_workers': int(getattr(data_config, "metadata_cache_workers", 16)),
+        'force_rebuild_metadata_cache': bool(getattr(data_config, "force_rebuild_metadata_cache", False)),
+        'metadata_cache_staleness_check_samples': int(getattr(data_config, "metadata_cache_staleness_check_samples", 100)),
     }
 
-    # ---- L2 fail-fast guard --------------------------------------------
-    if config_cache['l2_cache_enabled']:
-        max_gb = getattr(data_config, "l2_max_size_gb", None)
-        max_bytes = getattr(data_config, "l2_map_size_bytes", None)
-        ok = False
-        try:
-            ok = (max_gb is not None and float(max_gb) > 0.0) or (max_bytes is not None and int(max_bytes) > 0)
-        except Exception:
-            ok = False
-        if not ok:
-            raise ValueError("data.l2_cache_enabled=true requires a positive l2_max_size_gb or l2_map_size_bytes.")
-
-    # Map size for LMDB (bytes) — accept either GB or direct bytes
-    _size_bytes_cfg = getattr(data_config, "l2_map_size_bytes", None)
-    if _size_bytes_cfg is not None and int(_size_bytes_cfg) > 0:
-        map_size_bytes = int(_size_bytes_cfg)
-    else:
-        map_size_bytes = int(getattr(data_config, "l2_max_size_gb", 0) * (1024 ** 3))
-
-    # Optional writer process (CR-016: use cached config)
-    if config_cache['l2_cache_enabled']:
-        q, _proc = start_l2_writer(config_cache['l2_cache_path'], map_size_bytes)
+    if config_cache['sidecar_cache_enabled']:
         logger.info(
-            "L2 cache enabled at %s (map_size_bytes=%d)",
-            config_cache['l2_cache_path'],
-            map_size_bytes,
+            "Sidecar cache enabled (extension=%s, dtype=%s)",
+            config_cache['sidecar_extension'],
+            config_cache['sidecar_storage_dtype'],
         )
     else:
-        q, _proc = None, None
-        logger.info("L2 cache disabled; proceeding without LMDB writer")
+        logger.info("Sidecar cache disabled")
 
     # Load vocabulary once (needed for sidecar mode and to determine num classes)
     vocab = load_vocabulary_for_training(Path(vocab_path))
@@ -2272,7 +2167,6 @@ def create_dataloaders(
     else:
         logger.debug("Shared memory not available (requires Python 3.8+), using vocabulary pickling")
 
-    # CR-016: Use cached config values
     image_size = config_cache['image_size']
     mean = config_cache['normalize_mean']
     std = config_cache['normalize_std']
@@ -2285,7 +2179,7 @@ def create_dataloaders(
     manifest_val = root / "val.json"
     images_dir = root / "images"
 
-    # --- Orientation handler / flip list wiring (CR-016: use cached config) ---
+    # Orientation handler / flip list wiring
     random_flip_prob = config_cache['random_flip_prob']
     orientation_map_path = config_cache['orientation_map_path']
     if isinstance(orientation_map_path, str) and orientation_map_path:
@@ -2315,7 +2209,12 @@ def create_dataloaders(
                 setattr(data_config, "random_flip_prob", 0.0)
             except Exception:
                 pass
-        # CR-016: Use cached config to eliminate redundant getattr calls
+        # Note: Manifest mode uses legacy DatasetLoader which doesn't support sidecar cache.
+        # Caching is disabled for manifest mode. Migrate to sidecar JSON mode for caching support.
+        logger.warning(
+            "Manifest mode detected. Sidecar caching not supported for manifest datasets. "
+            "Consider migrating to per-image JSON sidecar files for caching support."
+        )
         train_ds = DatasetLoader(
             annotations_path=str(manifest_train),
             image_dir=str(images_dir),
@@ -2326,18 +2225,7 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
-            # L1 (in-memory) cache controls
-            use_memory_cache=config_cache['use_memory_cache'],
-            l1_per_worker_mb=config_cache['l1_per_worker_mb'],
-            canonical_cache_dtype=config_cache['canonical_cache_dtype'],
             preload_files=config_cache['preload_files'],
-            l2_enabled=config_cache['l2_cache_enabled'],
-            l2_cache_path=config_cache['l2_cache_path'],
-            l2_map_size_bytes=map_size_bytes,
-            l2_max_readers=config_cache['l2_max_readers'],
-            l2_writer_queue=q,
-            l2_storage_dtype=config_cache['l2_storage_dtype'],
-            cpu_bf16_cache_pipeline=config_cache['cpu_bf16_cache_pipeline'],
         )
 
         val_ds = DatasetLoader(
@@ -2350,32 +2238,35 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
-            # L1 (in-memory) cache controls
-            use_memory_cache=config_cache['use_memory_cache'],
-            l1_per_worker_mb=config_cache['l1_per_worker_mb'],
-            canonical_cache_dtype=config_cache['canonical_cache_dtype'],
             preload_files=config_cache['preload_files'],
-            l2_enabled=config_cache['l2_cache_enabled'],
-            l2_cache_path=config_cache['l2_cache_path'],
-            l2_map_size_bytes=map_size_bytes,
-            l2_max_readers=config_cache['l2_max_readers'],
-            l2_writer_queue=q,
-            l2_storage_dtype=config_cache['l2_storage_dtype'],
-            cpu_bf16_cache_pipeline=config_cache['cpu_bf16_cache_pipeline'],
         )
     else:
         # Sidecar JSON mode: scan per-image *.json recursively (shard-aware)
         logger.info("Manifest not found; entering sidecar JSON mode (scanning .json next to images)")
 
-        cached = _try_load_cached_split(root)
+        cached = _try_load_cached_split(root, seed=int(seed))
         if cached is not None:
             train_list, val_list = cached
         else:
             all_jsons = sorted(root.rglob("*.json")) if root.exists() else []
+            all_jsons_before_filter = len(all_jsons)
+
+            # Exclude manifest files from sidecar parsing (uses _EXCLUSION_PATTERNS constant)
+            all_jsons = [jp for jp in all_jsons if jp.name not in _EXCLUSION_PATTERNS]
+
             if not all_jsons:
-                raise FileNotFoundError(
-                    f"No annotation JSON files found under {root}. Expected per-image JSON sidecars."
-                )
+                if all_jsons_before_filter > 0:
+                    # Found JSONs but they were all manifests
+                    raise FileNotFoundError(
+                        f"Found {all_jsons_before_filter} JSON file(s) under {root}, but they were all "
+                        f"manifest files ({', '.join(_EXCLUSION_PATTERNS)}). Expected per-image JSON sidecars. "
+                        f"If you have a manifest-based dataset, place {_EXCLUSION_PATTERNS[0]} and {_EXCLUSION_PATTERNS[1]} "
+                        f"directly in {root} (not subdirectories) along with an images/ directory to use manifest mode."
+                    )
+                else:
+                    raise FileNotFoundError(
+                        f"No annotation JSON files found under {root}. Expected per-image JSON sidecars."
+                    )
 
             # Deterministic split
             import random as _random
@@ -2385,9 +2276,8 @@ def create_dataloaders(
             n_train = max(1, int(len(all_jsons) * split_ratio))
             train_list = all_jsons[:n_train]
             val_list = all_jsons[n_train:] if n_train < len(all_jsons) else all_jsons[-max(1, len(all_jsons)//20):]
-            _write_cached_split(root, train_list, val_list)
+            _write_cached_split(root, train_list, val_list, seed=int(seed))
 
-        # CR-016: Use cached config to eliminate redundant getattr calls
         train_ds = SidecarJsonDataset(
             root_dir=root,
             json_files=train_list,
@@ -2397,17 +2287,18 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
-            l2_enabled=config_cache['l2_cache_enabled'],
-            l2_cache_path=config_cache['l2_cache_path'],
-            l2_map_size_bytes=map_size_bytes,
-            l2_max_readers=config_cache['l2_max_readers'],
-            l2_writer_queue=q,
-            l2_storage_dtype=config_cache['l2_storage_dtype'],
+            sidecar_cache_enabled=config_cache['sidecar_cache_enabled'],
+            sidecar_extension=config_cache['sidecar_extension'],
+            sidecar_storage_dtype=config_cache['sidecar_storage_dtype'],
             cpu_bf16_cache_pipeline=config_cache['cpu_bf16_cache_pipeline'],
             random_flip_prob=random_flip_prob,
             orientation_handler=_handler,
             flip_overrides_path=flip_overrides_path,
             stats_queue=config_cache['stats_queue'],
+            metadata_cache_enabled=config_cache['metadata_cache_enabled'],
+            metadata_cache_workers=config_cache['metadata_cache_workers'],
+            force_rebuild_metadata_cache=config_cache['force_rebuild_metadata_cache'],
+            metadata_cache_staleness_check_samples=config_cache['metadata_cache_staleness_check_samples'],
         )
 
         val_ds = SidecarJsonDataset(
@@ -2419,20 +2310,23 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
-            l2_enabled=config_cache['l2_cache_enabled'],
-            l2_cache_path=config_cache['l2_cache_path'],
-            l2_map_size_bytes=map_size_bytes,
-            l2_max_readers=config_cache['l2_max_readers'],
-            l2_writer_queue=q,
-            l2_storage_dtype=config_cache['l2_storage_dtype'],
+            sidecar_cache_enabled=config_cache['sidecar_cache_enabled'],
+            sidecar_extension=config_cache['sidecar_extension'],
+            sidecar_storage_dtype=config_cache['sidecar_storage_dtype'],
             cpu_bf16_cache_pipeline=config_cache['cpu_bf16_cache_pipeline'],
             random_flip_prob=0.0,          # keep val deterministic
             orientation_handler=_handler,  # still needed to encode swapped tags if you ever TTA
             flip_overrides_path=None,
             stats_queue=config_cache['stats_queue'],
+            # Disable metadata cache for validation - it's small enough that parsing
+            # is fast, and sharing cache with train causes file count mismatch errors
+            metadata_cache_enabled=False,
+            metadata_cache_workers=config_cache['metadata_cache_workers'],
+            force_rebuild_metadata_cache=False,
+            metadata_cache_staleness_check_samples=config_cache['metadata_cache_staleness_check_samples'],
         )
 
-    # ---- Samplers for distributed (CR-016: use cached config) ----------
+    # Samplers for distributed training
     train_sampler = None
     val_sampler = None
     if distributed:
@@ -2473,13 +2367,13 @@ def create_dataloaders(
     _train_kw = _dl_kwargs(
         data_config,
         shuffle=(train_sampler is None),
-        drop_last=config_cache['drop_last'],  # CR-016: use cached config
+        drop_last=config_cache['drop_last'],
     )
     if train_sampler is not None:
         _train_kw["sampler"] = train_sampler
     # Attach logging QueueHandler in workers if a queue is provided
     log_queue = kwargs.get("log_queue")
-    _train_kw["worker_init_fn"] = _make_worker_init(log_queue, shared_vocab_info)
+    _train_kw["worker_init_fn"] = WorkerInitializer(log_queue, shared_vocab_info)
     train_loader = DataLoader(train_ds, **_train_kw)
 
     val_batch = (
@@ -2492,7 +2386,20 @@ def create_dataloaders(
     _val_kw["batch_size"] = val_batch
     if val_sampler is not None:
         _val_kw["sampler"] = val_sampler
-    _val_kw["worker_init_fn"] = _make_worker_init(log_queue, shared_vocab_info)
+    _val_kw["worker_init_fn"] = WorkerInitializer(log_queue, shared_vocab_info)
     val_loader = DataLoader(val_ds, **_val_kw)
+
+    # Validate datasets have samples (first-time startup safety check)
+    if len(train_ds) == 0:
+        raise ValueError(
+            "Training dataset has 0 samples. Check that:\n"
+            "  1. Annotation files (train.json or *.json sidecars) contain entries\n"
+            "  2. Image files exist in the expected locations\n"
+            f"  3. Data path is correct: {root}"
+        )
+    if len(val_ds) == 0:
+        logger.warning(
+            "Validation dataset has 0 samples. Validation metrics will be unavailable."
+        )
 
     return train_loader, val_loader, vocab

@@ -1,5 +1,5 @@
 """
-GPU-accelerated batch processor for L2 cache warmup.
+GPU-accelerated batch processor for sidecar cache warmup.
 
 This module provides GPU-accelerated image preprocessing with dynamic batch sizing
 that automatically scales to utilize target VRAM usage (default: 90% of available).
@@ -88,14 +88,14 @@ class VRAMMonitor:
 class DynamicBatchSizer:
     """Dynamically adjust batch size based on VRAM usage."""
 
-    def __init__(self, initial_batch_size: int = 32, min_batch_size: int = 8, max_batch_size: int = 512):
+    def __init__(self, initial_batch_size: int = 32, min_batch_size: int = 8, max_batch_size: int = 2048):
         """
         Initialize dynamic batch sizer.
 
         Args:
             initial_batch_size: Starting batch size
             min_batch_size: Minimum allowed batch size
-            max_batch_size: Maximum allowed batch size
+            max_batch_size: Maximum allowed batch size (default: 2048 for RTX 5090)
         """
         self.current_batch_size = initial_batch_size
         self.min_batch_size = min_batch_size
@@ -133,12 +133,15 @@ class DynamicBatchSizer:
             self.stable_count += 1
 
             if self.stable_count >= self.increase_threshold:
-                self.current_batch_size = min(
+                new_size = min(
                     int(self.current_batch_size * 1.25),
                     self.max_batch_size
                 )
+                # Only log and update if we actually increased
+                if new_size > self.current_batch_size:
+                    self.current_batch_size = new_size
+                    logger.info(f"VRAM has room - increasing batch size: {old_size} -> {self.current_batch_size}")
                 self.stable_count = 0
-                logger.info(f"VRAM has room - increasing batch size: {old_size} -> {self.current_batch_size}")
         else:
             # In target range - keep stable
             self.stable_count += 1
@@ -174,9 +177,13 @@ class GPUBatchPreprocessor:
             cpu_bf16_cache_pipeline: Convert to bfloat16
         """
         self.image_size = image_size
+        self.pad_color_int = tuple(pad_color)  # Keep original int values for PIL compositing
         self.pad_color = torch.tensor(pad_color, dtype=torch.float32) / 255.0
         self.device = torch.device(f'cuda:{device_id}')
         self.cpu_bf16 = cpu_bf16_cache_pipeline
+        if self.cpu_bf16 and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("bfloat16 GPU preprocessing requested but CUDA device does not support bf16.")
+        self.gpu_dtype = torch.bfloat16 if self.cpu_bf16 else torch.float32
 
         # Create normalization transform on GPU
         self.normalize = transforms.Normalize(
@@ -184,10 +191,9 @@ class GPUBatchPreprocessor:
             std=normalize_std
         )
 
-        # Pre-compute normalized pad color for mask generation
-        self.pad_color_normalized = self.normalize(
-            self.pad_color.view(3, 1, 1)
-        ).view(3)
+        # Note: pad_color is applied BEFORE normalization, so the entire tensor
+        # (including pad regions) gets normalized uniformly at line 338.
+        # This matches the CPU path in dataset_loader.py.
 
         logger.info(f"GPU Batch Preprocessor initialized:")
         logger.info(f"  Image size: {image_size}x{image_size}")
@@ -198,7 +204,7 @@ class GPUBatchPreprocessor:
     def load_and_prepare_images(
         self,
         image_paths: List[str]
-    ) -> Tuple[torch.Tensor, List[Tuple[int, int]]]:
+    ) -> Tuple[List[torch.Tensor], List[Tuple[int, int]], List[int]]:
         """
         Load images from disk and prepare for GPU processing.
 
@@ -206,12 +212,14 @@ class GPUBatchPreprocessor:
             image_paths: List of image file paths
 
         Returns:
-            Tuple of (batched tensor on CPU, list of original sizes)
+            Tuple of (list of image tensors, list of original sizes, list of failed indices)
+            Failed indices indicate which images in the batch failed to load and have dummy data.
         """
         images = []
         original_sizes = []
+        failed_indices = []
 
-        for path in image_paths:
+        for idx, path in enumerate(image_paths):
             try:
                 # Load image with EXIF correction
                 img = Image.open(path)
@@ -219,8 +227,8 @@ class GPUBatchPreprocessor:
 
                 # Handle transparency
                 if img.mode == 'RGBA' or img.mode == 'LA':
-                    pad_r, pad_g, pad_b = int(self.pad_color[0] * 255), int(self.pad_color[1] * 255), int(self.pad_color[2] * 255)
-                    background = Image.new('RGB', img.size, (pad_r, pad_g, pad_b))
+                    # Use original int pad_color to avoid float→int precision loss
+                    background = Image.new('RGB', img.size, self.pad_color_int)
                     if img.mode == 'LA':
                         img = img.convert('RGBA')
                     background.paste(img, mask=img.split()[-1])
@@ -238,11 +246,12 @@ class GPUBatchPreprocessor:
 
             except Exception as e:
                 logger.error(f"Failed to load image {path}: {e}")
-                # Create dummy image
-                images.append(torch.zeros(3, 256, 256))
-                original_sizes.append((256, 256))
+                # Create dummy image with correct target size
+                images.append(torch.zeros(3, self.image_size, self.image_size))
+                original_sizes.append((self.image_size, self.image_size))
+                failed_indices.append(idx)
 
-        return images, original_sizes
+        return images, original_sizes, failed_indices
 
     def letterbox_resize_gpu(
         self,
@@ -265,7 +274,7 @@ class GPUBatchPreprocessor:
         # Create output tensors on GPU
         output_images = torch.zeros(
             batch_size, 3, target_size, target_size,
-            dtype=torch.float32,
+            dtype=self.gpu_dtype,
             device=self.device
         )
 
@@ -273,8 +282,9 @@ class GPUBatchPreprocessor:
         for c in range(3):
             output_images[:, c, :, :] = self.pad_color[c]
 
-        # Create padding masks (True = real content, False = padding)
-        padding_masks = torch.zeros(
+        # Create padding masks (True = PAD, False = real content)
+        # Must match dataset_loader.py convention for model compatibility
+        padding_masks = torch.ones(
             batch_size, target_size, target_size,
             dtype=torch.bool,
             device=self.device
@@ -287,7 +297,7 @@ class GPUBatchPreprocessor:
             new_h = int(orig_h * scale)
 
             # Resize image
-            img_gpu = img.unsqueeze(0).to(self.device)  # Add batch dim and move to GPU
+            img_gpu = img.unsqueeze(0).to(device=self.device, dtype=self.gpu_dtype)  # Add batch dim and move to GPU
 
             if (new_h, new_w) != (orig_h, orig_w):
                 img_resized = F.interpolate(
@@ -306,15 +316,15 @@ class GPUBatchPreprocessor:
             # Place resized image in center
             output_images[i, :, pad_top:pad_top+new_h, pad_left:pad_left+new_w] = img_resized.squeeze(0)
 
-            # Mark non-padded region in mask
-            padding_masks[i, pad_top:pad_top+new_h, pad_left:pad_left+new_w] = True
+            # Mark non-padded region in mask (False = real content)
+            padding_masks[i, pad_top:pad_top+new_h, pad_left:pad_left+new_w] = False
 
         return output_images, padding_masks
 
     def process_batch(
         self,
         image_paths: List[str]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
         """
         Process a batch of images on GPU.
 
@@ -322,26 +332,23 @@ class GPUBatchPreprocessor:
             image_paths: List of image file paths
 
         Returns:
-            Tuple of (processed images [B, C, H, W], padding masks [B, H, W]) on CPU
+            Tuple of (processed images [B, C, H, W], padding masks [B, H, W], failed_indices) on CPU
+            failed_indices contains batch indices where image loading failed (dummy data inserted)
         """
         # Load images on CPU
-        images, original_sizes = self.load_and_prepare_images(image_paths)
+        images, original_sizes, failed_indices = self.load_and_prepare_images(image_paths)
 
         # Apply letterbox resize on GPU
         images_gpu, masks_gpu = self.letterbox_resize_gpu(images, original_sizes)
 
-        # Apply normalization on GPU
+        # Apply normalization on GPU (tensor is already in self.gpu_dtype from letterbox_resize_gpu)
         images_normalized = self.normalize(images_gpu)
-
-        # Convert to bfloat16 if requested
-        if self.cpu_bf16:
-            images_normalized = images_normalized.to(torch.bfloat16)
 
         # Move back to CPU for cache writing
         images_cpu = images_normalized.cpu()
         masks_cpu = masks_gpu.cpu()
 
-        return images_cpu, masks_cpu
+        return images_cpu, masks_cpu, failed_indices
 
 
 class GPUBatchProcessor:
@@ -357,6 +364,7 @@ class GPUBatchProcessor:
         target_vram_gb: float = 31.5,
         target_vram_util: float = 0.9,
         initial_batch_size: int = 32,
+        max_batch_size: int = 2048,
         cpu_bf16_cache_pipeline: bool = True
     ):
         """
@@ -371,10 +379,11 @@ class GPUBatchProcessor:
             target_vram_gb: Target VRAM capacity
             target_vram_util: Target utilization
             initial_batch_size: Starting batch size
+            max_batch_size: Maximum batch size (default: 2048 for RTX 5090)
             cpu_bf16_cache_pipeline: Convert to bfloat16
         """
         self.vram_monitor = VRAMMonitor(device_id, target_vram_gb, target_vram_util)
-        self.batch_sizer = DynamicBatchSizer(initial_batch_size)
+        self.batch_sizer = DynamicBatchSizer(initial_batch_size, max_batch_size=max_batch_size)
         self.preprocessor = GPUBatchPreprocessor(
             image_size, pad_color, normalize_mean, normalize_std,
             device_id, cpu_bf16_cache_pipeline
@@ -397,7 +406,7 @@ class GPUBatchProcessor:
     def process_batch(
         self,
         image_paths: List[str]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
         """
         Process a batch of images.
 
@@ -405,7 +414,8 @@ class GPUBatchProcessor:
             image_paths: List of image paths
 
         Returns:
-            Tuple of (images, masks) on CPU
+            Tuple of (images, masks, failed_indices) on CPU
+            failed_indices contains batch indices where image loading failed (dummy data inserted)
         """
         return self.preprocessor.process_batch(image_paths)
 

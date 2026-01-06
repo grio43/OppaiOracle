@@ -7,6 +7,7 @@ Vision Transformer adjusted for orientation-aware tagger
 import functools
 import math
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass, fields
 from typing import Dict, Optional, Tuple
 
@@ -177,9 +178,10 @@ class VisionTransformerConfig:
 
 class TransformerBlock(nn.Module):
     """Single transformer block"""
-    # Class-level cache shared across all blocks and epochs
+    # Class-level LRU cache shared across all blocks and epochs
     # Key: (batch_size, seq_len, device) -> Value: inverted mask tensor
-    _mask_cache: Dict[tuple, torch.Tensor] = {}
+    # OrderedDict maintains insertion order; move_to_end() for LRU behavior
+    _mask_cache: OrderedDict = OrderedDict()
     _cache_hits: int = 0
     _cache_misses: int = 0
     _max_cache_entries: int = 100  # Prevent unbounded growth
@@ -318,6 +320,8 @@ class TransformerBlock(nn.Module):
                     if torch.equal(key_padding_mask[0], (~cached_mask[0, 0, 0, :]).to(key_padding_mask.dtype)):
                         attn_mask = cached_mask
                         TransformerBlock._cache_hits += 1
+                        # LRU: move accessed entry to end (most recently used)
+                        TransformerBlock._mask_cache.move_to_end(cache_key)
                     else:
                         # Cache invalidation: pattern changed (e.g., different data split)
                         cached_mask = None
@@ -331,17 +335,12 @@ class TransformerBlock(nn.Module):
                     # This is a very cheap operation on GPU (simple element-wise NOT + reshape)
                     attn_mask = (~key_padding_mask).unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
 
-                    # Cache for future use (limit cache size to prevent memory bloat)
-                    if len(TransformerBlock._mask_cache) < TransformerBlock._max_cache_entries:
-                        TransformerBlock._mask_cache[cache_key] = attn_mask
-                    elif len(TransformerBlock._mask_cache) == TransformerBlock._max_cache_entries:
-                        # Warn once when cache is full
-                        warnings.warn(
-                            f"Attention mask cache full ({TransformerBlock._max_cache_entries} entries). "
-                            f"Cache hit rate: {TransformerBlock._cache_hits}/{TransformerBlock._cache_hits + TransformerBlock._cache_misses}. "
-                            f"Consider increasing _max_cache_entries if you have many different image sizes.",
-                            ResourceWarning
-                        )
+                    # Cache for future use with LRU eviction
+                    if len(TransformerBlock._mask_cache) >= TransformerBlock._max_cache_entries:
+                        # LRU eviction: remove oldest entry (first item in OrderedDict)
+                        oldest_key = next(iter(TransformerBlock._mask_cache))
+                        del TransformerBlock._mask_cache[oldest_key]
+                    TransformerBlock._mask_cache[cache_key] = attn_mask
 
             # Use scaled_dot_product_attention with flash backend when available
             attn_out = F.scaled_dot_product_attention(
@@ -508,7 +507,7 @@ class SimplifiedTagger(nn.Module):
         # Semantics: True=PAD at pixel-level -> pooled to True=IGNORE at token-level.
         attn_kpm: Optional[torch.Tensor] = None
         if padding_mask is not None:
-            pm = ensure_pixel_padding_mask(padding_mask)          # -> (B,1,H,W) bool, True=PAD
+            pm = ensure_pixel_padding_mask(padding_mask, mask_semantics='pad')  # -> (B,1,H,W) bool, True=PAD
             thr = getattr(self.config, "token_ignore_threshold", 0.9)
             token_ignore = pixel_to_token_ignore(pm, patch=self.config.patch_size, threshold=thr)  # (B,Lp)
             # Prepend CLS token (never ignored)
@@ -525,17 +524,21 @@ class SimplifiedTagger(nn.Module):
         # Transformer blocks with optional gradient checkpointing
         for block in self.blocks:
             if self.config.gradient_checkpointing and self.training:
-                # use_reentrant=True is more robust with AMP, though it uses more memory.
-                # This is to fix the CheckpointError where recomputed values have different metadata.
-                if attn_kpm is not None:
-                    # checkpoint requires tensor args; pass mask explicitly
-                    # Use functools.partial to avoid creating new lambda on each iteration
-                    wrapper = functools.partial(block, key_padding_mask=attn_kpm)
-                    x = torch.utils.checkpoint.checkpoint(
-                        wrapper, x, use_reentrant=True
-                    )
-                else:
-                    x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=True)
+                # use_reentrant=False is recommended for PyTorch 2.x and works better with
+                # complex inputs like attention masks. It's also more memory efficient.
+                # See: https://pytorch.org/docs/stable/checkpoint.html
+
+                def create_block_forward(b, kpm):
+                    """Create a closure that captures block and mask for checkpointing."""
+                    def block_forward(hidden_states):
+                        return b(hidden_states, key_padding_mask=kpm)
+                    return block_forward
+
+                x = torch.utils.checkpoint.checkpoint(
+                    create_block_forward(block, attn_kpm),
+                    x,
+                    use_reentrant=False
+                )
             else:
                 x = block(x, key_padding_mask=attn_kpm)
         # Final norm
@@ -576,9 +579,8 @@ class SimplifiedTagger(nn.Module):
         device = next(self.parameters()).device
         return torch.zeros(batch_size, 3, self.config.image_size, self.config.image_size, device=device)
 
-    # CR-010: Memory cleanup methods for proper GPU memory management
     def cleanup(self):
-        """CR-010: Explicitly release GPU memory and clear cached tensors."""
+        """Explicitly release GPU memory and clear cached tensors."""
         import gc
 
         # Move all parameters to CPU to release GPU memory
@@ -594,26 +596,23 @@ class SimplifiedTagger(nn.Module):
 
         # Clear CUDA cache if available
         if torch.cuda.is_available():
+            # Synchronize before clearing cache to ensure all GPU operations complete
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
-            import logging
-            current_memory = torch.cuda.memory_allocated()
-            logging.getLogger(__name__).debug(
-                f"Model cleaned up, GPU memory: {current_memory / 1e9:.2f}GB"
-            )
 
     def __del__(self):
-        """CR-010: Cleanup on deletion."""
+        """Cleanup on deletion."""
         try:
             self.cleanup()
         except Exception:
-            pass  # Silent cleanup in __del__
+            pass
 
     def __enter__(self):
-        """CR-010: Context manager support."""
+        """Context manager support."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """CR-010: Ensure cleanup on exit."""
+        """Ensure cleanup on exit."""
         self.cleanup()
         return False
 

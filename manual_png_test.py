@@ -6,7 +6,7 @@ import downsample_images_nas as ds
 # Temporarily lower threshold
 ds.PNG_TO_JPEG_THRESHOLD = 500 * 1024  # 500KB
 
-test_dir = Path(r'Z:\OppaiOracle\test_downsample\shard_test')
+test_dir = Path(r'L:\Dab\OppaiOracle\test_downsample\shard_test')
 test_png = test_dir / 'test_large_png_1.png'
 
 print("Testing PNG to JPEG conversion with file deletion")

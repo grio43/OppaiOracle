@@ -18,6 +18,7 @@ from pathlib import Path
 import yaml
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
+from contextlib import nullcontext
 import hashlib
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
@@ -37,13 +38,18 @@ try:
     import bitsandbytes as bnb
 except ImportError:
     bnb = None
+
+try:
+    import filelock
+    HAS_FILELOCK = True
+except ImportError:
+    HAS_FILELOCK = False
 #
 # NOTE:
 # We dropped `pl_bolts` because it is incompatible with PyTorch Lightning >= 2.0.
 # Use our vendored scheduler instead (behavior matches the one from pl_bolts).
 from schedulers import LinearWarmupCosineLR as LinearWarmupCosineAnnealingLR
 from torch.amp import GradScaler, autocast
-from safe_checkpoint import safe_load_checkpoint, InvalidCheckpointError
 import torch.backends.cudnn as cudnn
 
 # Import ModelMetadata at module level for fail-fast behavior
@@ -60,6 +66,10 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 LAST_CKPT_NAME = "last.pt"  # always maintained for crash-resume
+
+class InvalidCheckpointError(RuntimeError):
+    """Raised when a checkpoint file contains unexpected objects."""
+    pass
 
 # -----------------------------------------------------------------------------
 def setup_seed(user_seed: Optional[int], deterministic: bool) -> tuple[int, bool]:
@@ -288,6 +298,131 @@ def _unpack_np_state(packed_state: tuple) -> tuple:
     return packed_state
 
 
+def _get_nested_value(obj, key_path: str, default=None):
+    """Get a value from a nested dict/object using dot notation.
+
+    Args:
+        obj: Dict or object to search
+        key_path: Dot-separated path like 'model.num_labels' or 'data.image_size'
+        default: Value to return if key not found
+
+    Returns:
+        The value at the path, or default if not found
+    """
+    parts = key_path.split('.')
+    current = obj
+
+    for part in parts:
+        if current is None:
+            return default
+
+        if isinstance(current, dict):
+            current = current.get(part)
+        elif hasattr(current, part):
+            current = getattr(current, part, None)
+        else:
+            return default
+
+    return current if current is not None else default
+
+
+def validate_config_compatibility(
+    checkpoint_config: dict,
+    current_config,
+    strict: bool = False
+) -> tuple[bool, list[str]]:
+    """Validate that critical config parameters match between checkpoint and current config.
+
+    Args:
+        checkpoint_config: Config dict from checkpoint
+        current_config: Current config (dict or object with attributes)
+        strict: If True, raise exception on critical mismatches. If False, just warn.
+
+    Returns:
+        Tuple of (is_compatible, list of warning messages)
+
+    Raises:
+        ValueError: If strict=True and critical parameters don't match
+    """
+    if not checkpoint_config:
+        return True, ["No config in checkpoint - skipping validation"]
+
+    warnings = []
+    errors = []
+
+    # Critical parameters that MUST match (will cause training issues if different)
+    critical_params = [
+        ('model.num_labels', 'Vocabulary size', 'Model head size mismatch will cause crashes'),
+        ('data.image_size', 'Image size', 'Images will be wrong size for model'),
+        ('data.patch_size', 'Patch size', 'Patch embedding size mismatch'),
+    ]
+
+    # Important parameters that SHOULD match (may cause subtle issues)
+    important_params = [
+        ('data.normalize_mean', 'Normalization mean', 'Input normalization differs'),
+        ('data.normalize_std', 'Normalization std', 'Input normalization differs'),
+        ('training.gradient_accumulation_steps', 'Gradient accumulation', 'Effective batch size changed'),
+    ]
+
+    # Check critical parameters
+    for key_path, name, impact in critical_params:
+        ckpt_val = _get_nested_value(checkpoint_config, key_path)
+        curr_val = _get_nested_value(current_config, key_path)
+
+        # Skip if either value is None (not set)
+        if ckpt_val is None or curr_val is None:
+            continue
+
+        # Handle list/tuple comparison
+        if isinstance(ckpt_val, (list, tuple)):
+            ckpt_val = tuple(ckpt_val)
+        if isinstance(curr_val, (list, tuple)):
+            curr_val = tuple(curr_val)
+
+        if ckpt_val != curr_val:
+            msg = f"CRITICAL: {name} mismatch - checkpoint: {ckpt_val}, current: {curr_val}. {impact}"
+            errors.append(msg)
+
+    # Check important parameters
+    for key_path, name, impact in important_params:
+        ckpt_val = _get_nested_value(checkpoint_config, key_path)
+        curr_val = _get_nested_value(current_config, key_path)
+
+        if ckpt_val is None or curr_val is None:
+            continue
+
+        # Handle list/tuple comparison
+        if isinstance(ckpt_val, (list, tuple)):
+            ckpt_val = tuple(ckpt_val)
+        if isinstance(curr_val, (list, tuple)):
+            curr_val = tuple(curr_val)
+
+        if ckpt_val != curr_val:
+            msg = f"WARNING: {name} changed - checkpoint: {ckpt_val}, current: {curr_val}. {impact}"
+            warnings.append(msg)
+
+    # Log all warnings
+    for msg in warnings:
+        logger.warning(msg)
+
+    # Handle errors based on strict mode
+    if errors:
+        for msg in errors:
+            logger.error(msg)
+
+        if strict:
+            raise ValueError(
+                "Config incompatibility detected on resume. Errors:\n" +
+                "\n".join(f"  - {e}" for e in errors) +
+                "\n\nTo start fresh, set training.resume_from='none' in config."
+            )
+
+    is_compatible = len(errors) == 0
+    all_messages = errors + warnings
+
+    return is_compatible, all_messages
+
+
 def log_index_order_hash(dataloader, epoch: int, N: int = 128):
     """Log sha1 over first N indices from the DataLoader's sampler.
 
@@ -380,11 +515,7 @@ class TrainingState:
     best_metric: float = float('-inf')
     best_epoch: int = 0
 
-    # CR-046: Epoch tracking for proper resume semantics
-    # epoch: Current epoch index (0-based) being trained or just completed
-    # completed_epochs: Number of fully completed epochs (for unambiguous resume)
-    # is_epoch_boundary: True if checkpoint saved at end of epoch, False if mid-epoch
-    # batch_in_epoch: Position within current epoch (for mid-epoch resume)
+    # Epoch tracking for proper resume semantics
     completed_epochs: int = 0
     is_epoch_boundary: bool = True
     batch_in_epoch: int = 0
@@ -659,13 +790,14 @@ class EarlyStopping:
     def save_checkpoint(self, val_score: float, model: nn.Module = None):
         """Saves model when validation score improves"""
         if self.verbose:
-            delta = val_score - self.val_score_min if self.mode == 'min' else self.val_score_min - val_score
-            logger.info(f'Validation score improved ({self.val_score_min:.6f} --> {val_score:.6f})')
-        
-        if self.mode == 'min':
-            self.val_score_min = val_score
-        else:
-            self.val_score_min = val_score
+            if self.mode == 'min':
+                delta = self.val_score_min - val_score
+            else:
+                delta = val_score - self.val_score_min
+            logger.info(f'Validation score improved ({self.val_score_min:.6f} --> {val_score:.6f}, delta={delta:.6f})')
+
+        # Update the tracked best score (val_score_min is misleading name for 'max' mode)
+        self.val_score_min = val_score
     
     def reset(self):
         """Reset early stopping state"""
@@ -771,8 +903,13 @@ class CheckpointManager:
                 return cfg[key]
             for section in ('data', 'model', 'inference', 'export', 'training'):
                 sub = cfg.get(section)
+                if sub is None:
+                    continue
+                # Support both dict and dataclass/object access
                 if isinstance(sub, dict) and key in sub:
                     return sub[key]
+                elif hasattr(sub, key):
+                    return getattr(sub, key)
             return None
 
         missing_params = [p for p in required_params if get_param(config, p) is None]
@@ -910,37 +1047,45 @@ class CheckpointManager:
         # Save numbered checkpoint atomically unless enforcing best-only retention
         checkpoint_path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{step}.pt"
         wrote_numbered = False
+
+        # Use file locking to prevent race conditions in distributed training
+        lock_path = self.checkpoint_dir / ".checkpoint_write.lock"
+        lock_context = filelock.FileLock(lock_path, timeout=60) if HAS_FILELOCK else nullcontext()
+
         if not (self.keep_best and not is_best):
-            fd, temp_path = tempfile.mkstemp(suffix='.tmp', prefix='checkpoint_', dir=self.checkpoint_dir)
-
-            # Close fd immediately - we only needed mkstemp for unique name
+            temp_path = None
             try:
-                os.close(fd)
-            except Exception:
-                pass  # If close fails, continue anyway
+                with lock_context:
+                    fd, temp_path = tempfile.mkstemp(suffix='.tmp', prefix='checkpoint_', dir=self.checkpoint_dir)
 
-            try:
-                # Now torch.save() is the only process with file open
-                torch.save(checkpoint, temp_path)
-                # Atomic rename - should work on all platforms
-                os.replace(temp_path, checkpoint_path)
-                wrote_numbered = True
-            except Exception as e:
-                logger.error(f"Failed to save checkpoint to {checkpoint_path}: {e}")
-                # Clean up temp file
-                try:
-                    if Path(temp_path).exists():
-                        Path(temp_path).unlink()
-                except Exception:
-                    pass
-                raise
+                    # Close fd immediately - we only needed mkstemp for unique name
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass  # If close fails, continue anyway
+
+                    # Now torch.save() is the only process with file open
+                    torch.save(checkpoint, temp_path)
+                    # Atomic rename - should work on all platforms
+                    os.replace(temp_path, checkpoint_path)
+                    temp_path = None  # Mark as consumed (file was moved)
+                    wrote_numbered = True
+
+            except filelock.Timeout if HAS_FILELOCK else Exception as e:
+                if HAS_FILELOCK and isinstance(e, filelock.Timeout):
+                    logger.warning(f"Timeout acquiring checkpoint lock, skipping save for step {step}")
+                else:
+                    logger.error(f"Failed to save checkpoint to {checkpoint_path}: {e}")
+                return None
             finally:
-                # Ensure temp file is cleaned up if replace failed
-                try:
-                    if Path(temp_path).exists():
-                        Path(temp_path).unlink()
-                except Exception:
-                    pass
+                # Clean up temp file if it wasn't consumed (on success, file was moved)
+                if temp_path is not None:
+                    try:
+                        if Path(temp_path).exists():
+                            Path(temp_path).unlink()
+                            logger.debug(f"Cleaned up orphaned temp file: {temp_path}")
+                    except Exception:
+                        pass
 
             if wrote_numbered:
                 self.checkpoints.append(checkpoint_path)
@@ -948,42 +1093,62 @@ class CheckpointManager:
         else:
             logger.debug("save_best_only=True: skipping numbered checkpoint at step %s", step)
 
-        # Always update last.pt atomically for crash-resume
+        # Always update last.pt atomically for crash-resume (with file locking for DDP safety)
         if self.save_last:
             last_path = self.checkpoint_dir / LAST_CKPT_NAME
-            fd_last, temp_last = tempfile.mkstemp(suffix='.tmp', prefix='last_', dir=self.checkpoint_dir)
-
-            # Close fd immediately
+            temp_last = None
             try:
-                os.close(fd_last)
-            except Exception:
-                pass
+                with lock_context:  # Use same lock as numbered checkpoints for DDP safety
+                    fd_last, temp_last = tempfile.mkstemp(suffix='.tmp', prefix='last_', dir=self.checkpoint_dir)
 
-            try:
-                torch.save(checkpoint, temp_last)
-                os.replace(temp_last, last_path)
+                    # Close fd immediately
+                    try:
+                        os.close(fd_last)
+                    except Exception:
+                        pass
+
+                    torch.save(checkpoint, temp_last)
+                    os.replace(temp_last, last_path)
+                    temp_last = None  # Mark as consumed
             except Exception as e:
                 logger.warning("Failed to update %s: %s", last_path, e)
-                # Clean up temp file
-                try:
-                    if Path(temp_last).exists():
-                        Path(temp_last).unlink()
-                except Exception:
-                    pass
             finally:
-                # Ensure temp file is cleaned up
-                try:
-                    if Path(temp_last).exists():
-                        Path(temp_last).unlink()
-                except Exception:
-                    pass
+                # Clean up temp file if it wasn't consumed
+                if temp_last is not None:
+                    try:
+                        if Path(temp_last).exists():
+                            Path(temp_last).unlink()
+                    except Exception:
+                        pass
         
-        # Save best model if applicable
+        # Save best model if applicable (use atomic copy via temp file with locking)
         if is_best and self.keep_best and wrote_numbered:
             best_path = self.checkpoint_dir / "best_model.pt"
-            shutil.copy(checkpoint_path, best_path)
-            self.best_checkpoint = best_path
-            logger.info(f"Saved best model to {best_path}")
+            temp_best = None
+            try:
+                with lock_context:  # Use same lock for DDP safety
+                    fd_best, temp_best = tempfile.mkstemp(suffix='.tmp', prefix='best_', dir=self.checkpoint_dir)
+                    try:
+                        os.close(fd_best)
+                    except Exception:
+                        pass
+
+                    # Copy to temp, then atomic rename
+                    shutil.copy2(checkpoint_path, temp_best)
+                    os.replace(temp_best, best_path)
+                    temp_best = None  # Mark as consumed
+                    self.best_checkpoint = best_path
+                    logger.info(f"Saved best model to {best_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save best model to {best_path}: {e}")
+            finally:
+                # Clean up temp file if it wasn't consumed
+                if temp_best is not None:
+                    try:
+                        if Path(temp_best).exists():
+                            Path(temp_best).unlink()
+                    except Exception:
+                        pass
         
         # Manage checkpoint limit
         if wrote_numbered:
@@ -1014,14 +1179,16 @@ class CheckpointManager:
             oldest = self.checkpoints.pop(0)
             if oldest == self.best_checkpoint:
                 continue
-            if oldest.exists():
-                try:
-                    oldest.unlink()
-                    logger.info(f"Removed old checkpoint: {oldest}")
-                except FileNotFoundError:
-                    pass
-                except Exception as e:
-                    logger.warning(f"Warning: Could not delete {oldest}: {e}")
+            # Don't check exists() before unlink to avoid TOCTOU race
+            # FileNotFoundError is caught if another process deleted it
+            try:
+                oldest.unlink()
+                logger.info(f"Removed old checkpoint: {oldest}")
+            except FileNotFoundError:
+                # File was already deleted (by another process or manually)
+                pass
+            except Exception as e:
+                logger.warning(f"Warning: Could not delete {oldest}: {e}")
 
     def _refresh_checkpoint_list(self):
         """Refresh the checkpoint list to sync with disk state."""
@@ -1040,6 +1207,94 @@ class CheckpointManager:
         for disk_path in disk_checkpoints:
             if disk_path not in known_paths:
                 self.checkpoints.append(Path(disk_path))
+
+    def _safe_load_checkpoint(
+        self,
+        path: Union[str, Path],
+        validate_values: bool = True,
+        allow_nan: bool = False
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+        """Load a checkpoint without executing arbitrary code.
+
+        This uses ``torch.load`` with ``weights_only=True`` when available. It
+        ensures the result is a dictionary of tensors and splits out metadata
+        entries.
+
+        Args:
+            path: Path to the checkpoint file.
+            validate_values: If True, check for NaN/Inf in tensors.
+            allow_nan: If True, allow NaN values (some models use them intentionally).
+
+        Returns:
+            A tuple of ``(state_dict, metadata)``.
+
+        Raises:
+            FileNotFoundError: If checkpoint file doesn't exist.
+            InvalidCheckpointError: If checkpoint is invalid or corrupted.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+        try:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            # PyTorch < 1.13 doesn't support weights_only
+            warnings.warn(
+                f"PyTorch version {torch.__version__} does not support weights_only=True. "
+                f"Loading checkpoint with reduced security. "
+                f"Upgrade to PyTorch >= 1.13 for safe checkpoint loading. "
+                f"DO NOT load checkpoints from untrusted sources.",
+                UserWarning,
+                stacklevel=2
+            )
+            checkpoint = torch.load(path, map_location="cpu")
+
+        if not isinstance(checkpoint, dict):
+            raise InvalidCheckpointError("Checkpoint does not contain a state_dict dictionary")
+
+        if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+            state_dict = checkpoint["state_dict"]
+            meta = {k: v for k, v in checkpoint.items() if k != "state_dict"}
+        elif "model_state_dict" in checkpoint and isinstance(checkpoint["model_state_dict"], dict):
+            # Backward-compat: accept older key
+            state_dict = checkpoint["model_state_dict"]
+            meta = {k: v for k, v in checkpoint.items() if k != "model_state_dict"}
+        else:
+            # Fallback: assume entire mapping is a state_dict
+            state_dict = checkpoint
+            meta = {}
+
+        # Validate state_dict is not empty
+        if len(state_dict) == 0:
+            raise InvalidCheckpointError(
+                "state_dict is empty - checkpoint may be corrupted"
+            )
+
+        # Validate all values are tensors
+        if not all(torch.is_tensor(v) for v in state_dict.values()):
+            raise InvalidCheckpointError("state_dict contains non-tensor values")
+
+        # Optional: Check for corruption (NaN/Inf)
+        if validate_values and not allow_nan:
+            corrupt_keys = []
+            for k, v in state_dict.items():
+                if v.dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+                    if torch.isnan(v).any():
+                        corrupt_keys.append((k, "contains NaN"))
+                    elif torch.isinf(v).any():
+                        corrupt_keys.append((k, "contains Inf"))
+
+            if corrupt_keys:
+                keys_str = ', '.join(f"{k} ({reason})" for k, reason in corrupt_keys[:5])
+                if len(corrupt_keys) > 5:
+                    keys_str += f", ... and {len(corrupt_keys) - 5} more"
+                raise InvalidCheckpointError(
+                    f"Checkpoint contains NaN/Inf in {len(corrupt_keys)} tensor(s): "
+                    f"{keys_str}. File may be corrupted."
+                )
+
+        return state_dict, meta
     
     def load_checkpoint(
         self,
@@ -1064,10 +1319,24 @@ class CheckpointManager:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         
         logger.info(f"Loading checkpoint from {checkpoint_path}")
-        state_dict, meta = safe_load_checkpoint(checkpoint_path)
+        state_dict, meta = self._safe_load_checkpoint(checkpoint_path)
 
-        # Load model state
+        # Load model state (handles DDP key prefix mismatches)
         if model is not None:
+            # Determine if model is wrapped (DDP/DataParallel)
+            is_wrapped = hasattr(model, 'module')
+            # Check if state dict keys have 'module.' prefix
+            has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
+
+            if is_wrapped and not has_module_prefix:
+                # Loading unwrapped checkpoint into wrapped model: add 'module.' prefix
+                state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+                logger.debug("Added 'module.' prefix to state dict keys for DDP model")
+            elif not is_wrapped and has_module_prefix:
+                # Loading wrapped checkpoint into unwrapped model: remove 'module.' prefix
+                state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+                logger.debug("Removed 'module.' prefix from state dict keys for non-DDP model")
+
             model.load_state_dict(state_dict)
 
         # Load optimizer state
@@ -1076,13 +1345,43 @@ class CheckpointManager:
                 # Load state dict (optimizer creates state entries as needed)
                 optimizer.load_state_dict(meta['optimizer_state_dict'])
 
-                # Move optimizer state to device if it exists
+                # Move optimizer state to device (handles tensor-like objects)
                 if hasattr(optimizer, 'state') and optimizer.state:
+                    tensors_moved = 0
+                    tensors_failed = 0
                     for state in optimizer.state.values():
                         for k, v in state.items():
+                            # Check for torch.Tensor and any tensor-like object with .to() method
                             if isinstance(v, torch.Tensor):
                                 state[k] = v.to(device)
-                    logger.debug(f"Moved optimizer state to {device}")
+                                tensors_moved += 1
+                            elif hasattr(v, 'to') and callable(getattr(v, 'to', None)):
+                                # Handle tensor-like objects (e.g., bitsandbytes quantized tensors)
+                                try:
+                                    state[k] = v.to(device)
+                                    tensors_moved += 1
+                                except (TypeError, AttributeError) as e:
+                                    tensors_failed += 1
+                                    logger.debug(f"Could not move optimizer state '{k}' to {device}: {e}")
+                    logger.debug(f"Moved {tensors_moved} optimizer state tensors to {device}")
+                    if tensors_failed > 0:
+                        logger.warning(
+                            f"Failed to move {tensors_failed} optimizer state tensors to {device}. "
+                            "Training may continue but optimizer momentum/variance could be on wrong device."
+                        )
+
+                    # Verify all tensors migrated successfully - fail fast if not
+                    wrong_device_count = 0
+                    for state in optimizer.state.values():
+                        for v in state.values():
+                            if isinstance(v, torch.Tensor) and v.device != device:
+                                wrong_device_count += 1
+                    if wrong_device_count > 0:
+                        raise RuntimeError(
+                            f"{wrong_device_count} optimizer state tensors failed to migrate to {device}. "
+                            f"Cannot continue - optimizer.step() would fail with device mismatch. "
+                            f"To start fresh, set training.resume_from='none' in config."
+                        )
                 else:
                     logger.debug("Optimizer state loaded but empty (no tensors to migrate)")
 
@@ -1090,9 +1389,14 @@ class CheckpointManager:
                 logger.warning(f"Failed to load optimizer state: {type(e).__name__}: {e}")
                 # Continue training with fresh optimizer state
 
-        # Load scheduler state
+        # Load scheduler state (with exception handling like optimizer)
         if scheduler is not None and 'scheduler_state_dict' in meta:
-            scheduler.load_state_dict(meta['scheduler_state_dict'])
+            try:
+                scheduler.load_state_dict(meta['scheduler_state_dict'])
+                logger.info("Scheduler state loaded successfully")
+            except Exception as e:
+                logger.warning(f"Failed to load scheduler state: {type(e).__name__}: {e}")
+                logger.warning("Continuing with fresh scheduler state - LR schedule may restart from beginning")
 
         # Restore RNG states to ensure reproducible dataset shuffling
         if 'rng_states' in meta:
@@ -1103,10 +1407,25 @@ class CheckpointManager:
                 # Reconstruct tuple expected by _restore_rng_states
                 rng_tuple = (rng_dict['py'], np_state, rng_dict['torch_cpu'], rng_dict['cuda'])
                 success = _restore_rng_states(rng_tuple)
-                logger.info(f"RNG state restoration: {success}")
+
+                # Check for critical failures and warn prominently
+                critical_components = ['python', 'numpy', 'torch_cpu']
+                critical_failed = [k for k in critical_components if success.get(k) is False]
+
+                if critical_failed:
+                    logger.error("=" * 60)
+                    logger.error("CRITICAL: RNG state restoration failed for: %s", critical_failed)
+                    logger.error("Mid-epoch resume will produce DIFFERENT data order!")
+                    logger.error("Training may repeat or skip batches, affecting results.")
+                    logger.error("Consider restarting from epoch boundary if reproducibility matters.")
+                    logger.error("=" * 60)
+                elif success.get('cuda') is False:
+                    logger.warning("CUDA RNG restoration failed - GPU random operations may differ")
+
+                logger.info(f"RNG state restoration results: {success}")
             except Exception as e:
-                logger.warning(f"Failed to restore RNG states: {type(e).__name__}: {e}")
-                logger.warning("Dataset shuffling may differ from original training run")
+                logger.error(f"Failed to restore RNG states: {type(e).__name__}: {e}")
+                logger.error("Dataset shuffling WILL differ from original training run!")
 
         return {"state_dict": state_dict, **meta}
     
@@ -1144,7 +1463,7 @@ class CheckpointManager:
 
         for path in candidates:
             try:
-                state_dict, meta = safe_load_checkpoint(path)
+                state_dict, meta = self._safe_load_checkpoint(path)
                 return {"state_dict": state_dict, **meta}
             except (FileNotFoundError, ValueError, InvalidCheckpointError) as e:
                 logger.warning("Failed to load latest checkpoint %s: %s", path, e)
@@ -1156,7 +1475,7 @@ class CheckpointManager:
         best_path = self.checkpoint_dir / "best_model.pt"
         if best_path.exists():
             try:
-                state_dict, meta = safe_load_checkpoint(best_path)
+                state_dict, meta = self._safe_load_checkpoint(best_path)
                 return {"state_dict": state_dict, **meta}
             except (FileNotFoundError, ValueError, InvalidCheckpointError) as e:
                 logger.warning("Failed to load best checkpoint %s: %s", best_path, e)
@@ -1201,11 +1520,30 @@ class LearningRateSchedulerFactory:
             )
 
         elif scheduler_type == 'cosine_restarts':
+            # Compute first_cycle_steps with fallback for when steps_per_epoch is 0
+            first_cycle_steps = kwargs.get('first_cycle_steps', None)
+            if first_cycle_steps is None or first_cycle_steps <= 0:
+                if steps_per_epoch > 0 and num_epochs > 0:
+                    first_cycle_steps = steps_per_epoch * num_epochs
+                else:
+                    raise ValueError(
+                        f"cosine_restarts scheduler requires first_cycle_steps > 0, "
+                        f"but got steps_per_epoch={steps_per_epoch}, num_epochs={num_epochs}"
+                    )
+            # Get max_lr from kwargs or optimizer defaults (with fallback)
+            max_lr = kwargs.get('max_lr', None)
+            if max_lr is None:
+                try:
+                    max_lr = optimizer.defaults.get('lr', optimizer.param_groups[0]['lr'])
+                except (KeyError, IndexError):
+                    raise ValueError(
+                        "cosine_restarts scheduler requires max_lr or optimizer with lr set"
+                    )
             return CosineAnnealingWarmupRestarts(
                 optimizer,
-                first_cycle_steps=kwargs.get('first_cycle_steps', steps_per_epoch * num_epochs),
+                first_cycle_steps=first_cycle_steps,
                 cycle_mult=kwargs.get('cycle_mult', 1.0),
-                max_lr=kwargs.get('max_lr', optimizer.defaults['lr']),
+                max_lr=max_lr,
                 min_lr=min_lr,
                 warmup_steps=warmup_steps,
                 gamma=kwargs.get('gamma', 1.0)
@@ -1251,36 +1589,28 @@ class MixedPrecisionTrainer:
     def __init__(
         self,
         use_amp: bool = True,
-        amp_dtype: str = 'float16',
+        amp_dtype: str = 'bfloat16',
         gradient_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0
     ):
+        if use_amp and not torch.cuda.is_available():
+            raise RuntimeError("bfloat16 AMP requested but CUDA is not available.")
         self.use_amp = use_amp and torch.cuda.is_available()
-        
-        # Determine AMP dtype
-        if amp_dtype == 'bfloat16' and torch.cuda.is_bf16_supported():
-            self.amp_dtype = torch.bfloat16
-        else:
-            self.amp_dtype = torch.float16
+
+        # Enforce bfloat16 to avoid fp32/fp16 VRAM usage.
+        self.amp_dtype = torch.bfloat16
+        if self.use_amp:
+            amp_dtype_norm = str(amp_dtype).lower()
+            if amp_dtype_norm not in {"bfloat16", "bf16"}:
+                raise ValueError(f"MixedPrecisionTrainer requires bfloat16, got '{amp_dtype}'.")
+            if not torch.cuda.is_bf16_supported():
+                raise RuntimeError("bfloat16 AMP requested but CUDA device does not support bf16.")
         
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
 
-        # Create gradient scaler for FP16 with new API; prefer CUDA device when available
-        if self.use_amp and self.amp_dtype == torch.float16:
-            try:
-                # torch.amp.GradScaler (PyTorch >= 2.0) supports 'device'
-                self.scaler = GradScaler(device='cuda')
-            except TypeError:
-                # Fallback to legacy CUDA GradScaler
-                try:
-                    from torch.cuda.amp import GradScaler as CudaGradScaler  # type: ignore
-                    self.scaler = CudaGradScaler()
-                except Exception:
-                    # Final fallback without device specification
-                    self.scaler = GradScaler()
-        else:
-            self.scaler = None
+        # GradScaler is only needed for float16 AMP, which we do not allow here.
+        self.scaler = None
     
     def train_step(
         self,
@@ -1525,9 +1855,11 @@ class TrainingUtils:
     @staticmethod
     def get_cosine_scheduler(optimizer: optim.Optimizer, training_cfg) -> _LRScheduler:
         """Create CosineAnnealingWarmupRestarts scheduler from training config."""
+        steps_per_epoch = getattr(training_cfg, "steps_per_epoch", 1)
+        total_steps = steps_per_epoch * training_cfg.num_epochs
         return CosineAnnealingWarmupRestarts(
             optimizer,
-            first_cycle_steps=training_cfg.num_epochs,
+            first_cycle_steps=total_steps,
             cycle_mult=1.0,
             max_lr=training_cfg.learning_rate,
             min_lr=getattr(training_cfg, "lr_end", 1e-6),
@@ -1653,6 +1985,23 @@ class TrainingUtils:
             json.dump(config, f, indent=2, default=str)
         
         logger.info(f"Saved training config to {config_path}")
+
+    @staticmethod
+    def worker_init_fn(worker_id: int):
+        """
+        Initializes the random number generators for each worker in a DataLoader.
+        This ensures reproducibility across different workers.
+        """
+        # Use a unique seed for each worker based on the main process's seed
+        # and the worker ID.
+        worker_seed = torch.initial_seed() % (2**32 - 1) + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(worker_seed)
+            torch.cuda.manual_seed_all(worker_seed)
+        logger.debug(f"Worker {worker_id} initialized with seed {worker_seed}")
 
 
 if __name__ == "__main__":

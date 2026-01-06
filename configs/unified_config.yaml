@@ -42,10 +42,10 @@ model:
     use_flash_attention: true
     attention_bias: true
     token_ignore_threshold: 0.9
-    num_labels: 200000
+    num_labels: 0  # Auto-detect from vocabulary
     num_groups: 20
     tags_per_group: 10000
-    gradient_checkpointing: false  # Disabled for ~30% speed boost with AdamW8bit memory savings
+    gradient_checkpointing: true  # Enabled for VRAM reduction (~30% slower but saves 30-40GB)
 
 # Data Configuration (consolidates dataloader.yaml, train_config.yaml, augmentation.yaml)
 data:
@@ -56,7 +56,7 @@ data:
   # WARNING: Update this path! Currently set to Linux path but running on Windows.
   # Example Windows path: "Z:/path/to/your/dataset/" or "C:/Users/YourName/datasets/"
   storage_locations:
-    - path: "Z:/workspace/Dab/"
+    - path: "L:/Dab/Dab"
       priority: 0
       type: "local"
       enabled: true
@@ -68,17 +68,9 @@ data:
       priority: 2
       type: "das"
       enabled: false  # Disabled by default
-    - path: "/mnt/nas/anime_dataset/primary"
-      priority: 3
-      type: "nas"
-      enabled: false  # Disabled by default
-    - path: "/mnt/nas/anime_dataset/video_frames"
-      priority: 4
-      type: "nas"
-      enabled: false  # Disabled by default
   
   # Paths (from paths.yaml)
-  hdf5_dir: "/home/user/datasets/teacher_features"
+  hdf5_dir: "./teacher_features"
   vocab_dir: "./vocabulary"
   output_dir: "./outputs"
   
@@ -89,35 +81,41 @@ data:
   pad_color: [114, 114, 114]
 
   # Data loading (from dataloader.yaml)
-  batch_size: 32  # Reduced to fit RTX 5090 32GB VRAM (effective batch: 32×3=96 with gradient accumulation)
-  num_workers: 12  # Optimized for 32 logical CPU cores
-  pin_memory: true
-  prefetch_factor: 3   # Increased with more workers for better prefetching
+  batch_size: 24  # Optimized for RTX 5090 32GB VRAM (effective batch: 24×4=96 with gradient accumulation)
+  num_workers: 4  # Reduced from 6 to save ~1GB RAM
+  pin_memory: false  # Disabled - not needed with PCIe 4.0/5.0, saves ~2GB
+  prefetch_factor: 1   # Reduced from 2 to save ~1GB prefetch buffers
   persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   drop_last: false
   
-  # L1 Caching (RAM-based per-worker cache)
-  # ⚠️ DISABLED: Not worth it for large datasets (5M+ images)
-  # With 5M images, L1 cache (60 GB) provides only 0.8% hit rate, saving ~10 minutes over 40 epochs
-  # while consuming 47% of system RAM. The 60 GB is better used as OS disk cache for L2 reads.
-  # Recommendation: Keep L1 disabled, use L2 (disk) cache instead for 99% hit rate.
-  cache_size_gb: 0
-  l1_per_worker_mb: 0
-  l1_cache_enabled: false
   preload_files: 0
-  use_memory_cache: false
-  cache_precision: "bfloat16"
-  canonical_cache_dtype: "bfloat16"
-  
-  # L2 Caching
-  l2_cache_enabled: true
-  l2_cache_path: "./l2_cache"
-  l2_max_size_gb: 8704.0  # Optimized for 5M images (7.86 TB needed + 8% headroom)
-  l2_storage_dtype: "bfloat16"
-  cpu_bf16_cache_pipeline: true
-  # When the LMDB L2 writer queue is full, wait this long before dropping
-  # the write (0 = drop immediately, non-blocking).
-  l2_writer_full_wait_ms: 590
+
+  # Sidecar Tensor Cache (replaces L2 LMDB cache)
+  # Preprocessed images are stored as .safetensor files alongside original images.
+  # No virtual memory issues, pooled SSD-friendly, unlimited parallel reads.
+  sidecar_cache_enabled: true
+  sidecar_extension: ".safetensor"  # File extension for cached tensors
+  sidecar_storage_dtype: "bfloat16"  # Storage dtype for cached tensors
+  cpu_bf16_cache_pipeline: true  # Use bfloat16 in preprocessing pipeline if CPU supports it
+
+  # Metadata Cache (JSON parsing cache)
+  # Caches parsed JSON metadata to avoid re-parsing millions of files on every run.
+  # First run: ~3-5 minutes to build cache with parallel processing
+  # Subsequent runs: ~2-5 seconds to load from cache (940× speedup)
+  # Cache size: ~1.8 GB for 5.6M images
+  metadata_cache_enabled: true
+  metadata_cache_workers: 16  # Number of parallel workers for cache creation
+  force_rebuild_metadata_cache: false  # Set true to force cache rebuild
+  metadata_cache_staleness_check_samples: 100  # Base sample size (scaled dynamically by dataset size)
+
+  # Cache Validation Settings (v2.0)
+  # New in v2.0: Improved cache validation and staleness detection
+  split_cache_version: "2.0"  # Don't change unless format changes
+  metadata_cache_version: "2.0"  # Don't change unless format changes
+  metadata_cache_use_dynamic_sampling: true  # Scale sample size with dataset (100→10K for 5.6M files)
+  metadata_cache_use_stratified_sampling: true  # Sample across directories for better coverage
+  cache_count_tolerance_percent: 0.1  # 0.1% tolerance (down from 1%, stricter validation)
+  cache_count_tolerance_min: 100  # Minimum absolute tolerance
 
   # Augmentation (from augmentation.yaml)
   # NOTE: Most augmentations are NOT IMPLEMENTED yet - only random_flip_prob is active.
@@ -155,10 +153,10 @@ data:
 # Training Configuration (from training_config.yaml)
 training:
     memory_format: "channels_last"
-    num_epochs: 60
+    num_epochs: 40
     learning_rate: 1.0e-4
     weight_decay: 0.01
-    gradient_accumulation_steps: 3  # Optimized for effective batch size of 120 (40 × 3)
+    gradient_accumulation_steps: 4  # Maintains effective batch size of 96 (24 × 4)
 
     # Optimizer
     # NOTE: Using "adamw8bit" for memory-efficient 8-bit quantized optimizer states
@@ -184,7 +182,6 @@ training:
     # Enabled by default to reduce VRAM usage and improve performance.
     # bfloat16 is preferred for its numerical stability and range, similar to float32.
     use_amp: true
-    amp_opt_level: "O1"
     amp_dtype: bfloat16           # one of: bfloat16, float16
     enable_anomaly_detection: false  # set true for debugging only
 
@@ -245,7 +242,7 @@ training:
     # Provides 15-35% speedup through graph optimization and kernel fusion
     # Especially effective for transformer models with attention mechanisms
     use_compile: true
-    compile_mode: "max-autotune"  # Options: "default", "reduce-overhead", "max-autotune"
+    compile_mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
     compile_fullgraph: false  # Allow graph breaks for dynamic shapes (padding masks)
     compile_dynamic: true  # Support varying padding mask shapes across batches
     # First compilation takes 2-5 minutes but is negligible over 60 epochs

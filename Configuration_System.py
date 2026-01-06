@@ -379,6 +379,15 @@ class BaseConfig:
                                     kwargs[key] = value
                                 else:
                                     # Primitive type - try direct coercion
+                                    if t is int and isinstance(value, float):
+                                        if value != int(value):
+                                            import warnings
+                                            warnings.warn(
+                                                f"Lossy coercion: {key}={value} (float) will be truncated to int {int(value)}. "
+                                                f"Consider using an integer value in config.",
+                                                UserWarning,
+                                                stacklevel=2
+                                            )
                                     kwargs[key] = t(value)
                             assigned = True
                             break
@@ -695,7 +704,7 @@ class ModelConfig(BaseConfig):
     token_ignore_threshold: float = 0.9  # Fraction of padding pixels to ignore token
     
     # Tag prediction
-    num_labels: int = 200000
+    num_labels: int = 0
     num_groups: int = 20
     tags_per_group: int = 10000
     
@@ -712,10 +721,14 @@ class ModelConfig(BaseConfig):
                 f"num_attention_heads ({self.num_attention_heads})"
             )
         
-        if self.num_labels != self.num_groups * self.tags_per_group:
+        # Note: num_labels validation is deferred until after vocabulary is loaded
+        # because the actual vocabulary size is only known at runtime.
+        # A value of 0 indicates "use vocabulary size" (computed dynamically).
+        if self.num_labels != 0 and self.num_labels != self.num_groups * self.tags_per_group:
             errors.append(
                 f"num_labels ({self.num_labels}) must equal "
-                f"num_groups ({self.num_groups}) * tags_per_group ({self.tags_per_group})"
+                f"num_groups ({self.num_groups}) * tags_per_group ({self.tags_per_group}) "
+                f"or be 0 (auto-detect from vocabulary)"
             )
         
         if self.patch_size > self.image_size:
@@ -754,18 +767,18 @@ class StorageLocation:
     """Storage location configuration"""
     path: str
     priority: int
-    type: str = "local"  # local, das, nas, s3, gcs
+    type: str = "local"  # local, das, s3, gcs
     enabled: bool = True
-    
+
     def validate(self):
         """Validate storage location"""
         if not self.path:
             raise ConfigValidationError("Storage location must have a path")
-        
+
         if self.priority < 0:
             raise ConfigValidationError(f"Priority must be non-negative, got {self.priority}")
-        
-        valid_types = ["local", "das", "nas", "s3", "gcs"]
+
+        valid_types = ["local", "das", "s3", "gcs"]
         if self.type not in valid_types:
             raise ConfigValidationError(f"Storage type must be one of {valid_types}, got {self.type}")
 
@@ -800,11 +813,20 @@ class DataConfig(BaseConfig):
     drop_last: bool = False
     
     # Caching
-    cache_size_gb: float = 105.0
-    l1_per_worker_mb: int = 256
     preload_files: int = 2
-    use_memory_cache: bool = True
-    
+
+    # Metadata cache configuration
+    metadata_cache_enabled: bool = True
+    metadata_cache_workers: int = 16
+    force_rebuild_metadata_cache: bool = False
+    metadata_cache_staleness_check_samples: int = 100
+    split_cache_version: str = "2.0"
+    metadata_cache_version: str = "2.0"
+    metadata_cache_use_dynamic_sampling: bool = True
+    metadata_cache_use_stratified_sampling: bool = True
+    cache_count_tolerance_percent: float = 0.1
+    cache_count_tolerance_min: int = 100
+
     # Augmentation
     # NOTE: Most augmentations are NOT IMPLEMENTED - only random_flip_prob is active.
     # With large datasets (5-6M images), augmentation is generally unnecessary.
@@ -836,18 +858,11 @@ class DataConfig(BaseConfig):
     skip_unmapped: bool = True
     orientation_safety_mode: str = "conservative"
 
-    # L2 Caching (from dataset_loader.py usage)
-    l2_cache_enabled: bool = field(default=False, metadata={"help": "Enable L2 (LMDB) caching"})
-    l2_cache_path: str = field(default="./l2_cache", metadata={"help": "Path to L2 cache directory"})
-    l2_max_size_gb: float = field(default=48.0, metadata={"help": "Maximum size of L2 cache in GB"})
-    l2_max_readers: int = field(default=2048, metadata={"help": "Max readers for LMDB"})
-    cache_precision: str = field(default='bfloat16', metadata={"help": "Precision for cached images ('uint8', 'float16', 'bfloat16', 'float32')"})
-    canonical_cache_dtype: str = field(default='bfloat16', metadata={"help": "Canonical dtype for L1 cache storage (images only; masks remain uint8)"})
-    l2_storage_dtype: str = field(default='bfloat16', metadata={"help": "Storage dtype for L2 cache ('float16','bfloat16','float32','uint8')"})
-    cpu_bf16_cache_pipeline: bool = field(default=True, metadata={"help": "Process normalization on CPU in bf16 when populating L2"})
-    # When the async L2 writer queue is full, wait up to this many milliseconds
-    # before dropping the write. 0 means drop immediately (non‑blocking behavior).
-    l2_writer_full_wait_ms: int = field(default=0, metadata={"help": "Max ms to wait when L2 writer queue is full before dropping"})
+    # Sidecar Cache Configuration
+    sidecar_cache_enabled: bool = field(default=True, metadata={"help": "Enable sidecar tensor caching"})
+    sidecar_extension: str = field(default='.safetensor', metadata={"help": "File extension for cached tensors"})
+    sidecar_storage_dtype: str = field(default='bfloat16', metadata={"help": "Storage dtype for sidecar cache ('float16','bfloat16','float32')"})
+    cpu_bf16_cache_pipeline: bool = field(default=True, metadata={"help": "Process normalization on CPU in bf16 when populating cache"})
 
     # Dtype Configuration for various components
     tag_vector_dtype: str = field(default='bfloat16', metadata={"help": "Dtype for tag/label vectors ('float16', 'bfloat16', 'float32')"})
@@ -898,6 +913,16 @@ class DataConfig(BaseConfig):
                 # Only check priority uniqueness for enabled locations
                 if storage_loc.enabled:
                     priorities.append(storage_loc.priority)
+                    # Validate enabled storage paths exist (early detection of config errors)
+                    storage_path = Path(storage_loc.path)
+                    if not storage_path.exists():
+                        errors.append(
+                            f"Storage location {i}: path does not exist: {storage_loc.path}"
+                        )
+                    elif not storage_path.is_dir():
+                        errors.append(
+                            f"Storage location {i}: path is not a directory: {storage_loc.path}"
+                        )
             except (TypeError, ValueError, ConfigValidationError) as e:
                 # Expected validation errors
                 errors.append(f"Storage location {i}: {str(e)}")
@@ -906,14 +931,15 @@ class DataConfig(BaseConfig):
             dupes = [p for p in set(priorities) if priorities.count(p) > 1]
             errors.append(f"Duplicate storage location priorities detected: {sorted(dupes)}")
 
+        # Ensure at least one storage location is enabled
+        if not priorities:
+            errors.append("No enabled storage locations found. At least one must be enabled.")
+
         if self.batch_size <= 0:
             errors.append(f"batch_size must be positive, got {self.batch_size}")
 
         if self.num_workers < 0:
             errors.append(f"num_workers must be non-negative, got {self.num_workers}")
-
-        if self.cache_size_gb < 0:
-            errors.append(f"cache_size_gb must be non-negative, got {self.cache_size_gb}")
 
         # New bounds checks
         if self.prefetch_factor < 1:
@@ -980,11 +1006,9 @@ class DataConfig(BaseConfig):
         if not 0 <= self.random_erasing_p <= 1:
             errors.append(f"random_erasing_p must be in [0, 1], got {self.random_erasing_p}")
 
-        valid_precisions = ["uint8", "float16", "bfloat16", "float32"]
-        if self.cache_precision not in valid_precisions:
-            errors.append(f"Invalid cache_precision: {self.cache_precision}. Must be one of {valid_precisions}")
-        if self.l2_storage_dtype not in valid_precisions:
-            errors.append(f"Invalid l2_storage_dtype: {self.l2_storage_dtype}. Must be one of {valid_precisions}")
+        valid_precisions = ["float16", "bfloat16", "float32"]
+        if self.sidecar_storage_dtype not in valid_precisions:
+            errors.append(f"Invalid sidecar_storage_dtype: {self.sidecar_storage_dtype}. Must be one of {valid_precisions}")
 
         # Validate additional dtype configurations
         valid_float_dtypes = ["float16", "bfloat16", "float32"]
@@ -994,13 +1018,6 @@ class DataConfig(BaseConfig):
             errors.append(f"Invalid cache_dequant_dtype: {self.cache_dequant_dtype}. Must be one of {valid_float_dtypes}")
         if self.metric_compute_dtype not in valid_float_dtypes:
             errors.append(f"Invalid metric_compute_dtype: {self.metric_compute_dtype}. Must be one of {valid_float_dtypes}")
-
-        # Bounds for L2 writer full wait time
-        try:
-            if int(self.l2_writer_full_wait_ms) < 0:
-                errors.append(f"l2_writer_full_wait_ms must be >= 0, got {self.l2_writer_full_wait_ms}")
-        except (TypeError, ValueError):
-            errors.append(f"l2_writer_full_wait_ms must be an integer, got {self.l2_writer_full_wait_ms!r}")
 
         if errors:
             raise ConfigValidationError("Data config validation failed:\n" + "\n".join(errors))
@@ -1108,7 +1125,6 @@ class TrainingConfig(BaseConfig):
     
     # Mixed precision
     use_amp: bool = True
-    amp_opt_level: str = "O1"
     amp_dtype: str = "bfloat16"  # float16 or bfloat16
     enable_anomaly_detection: bool = False
 
@@ -1199,10 +1215,6 @@ class TrainingConfig(BaseConfig):
                 "Set benchmark=False for deterministic training, or "
                 "set deterministic=False to use benchmark mode for speed."
             )
-        
-        # AMP backend note
-        if self.use_amp and self.amp_opt_level:
-            logger.warning("amp_opt_level appears to target NVIDIA Apex; if using torch.amp, prefer configuring amp_dtype and ignore amp_opt_level")
         
         if self.learning_rate <= 0:
             errors.append(f"learning_rate must be positive, got {self.learning_rate}")
@@ -1335,7 +1347,12 @@ class InferenceConfig(BaseConfig):
                 logger.warning("API CORS origins allow '*'; require explicit origins for production")
 
         if self.model_path and not Path(self.model_path).exists():
-            logger.warning(f"Model path does not exist: {self.model_path}")
+            # Only warn when API is enabled (actual inference mode), otherwise just debug
+            # During training, the checkpoint won't exist yet and this is expected
+            if self.enable_api:
+                logger.warning(f"Model path does not exist: {self.model_path}")
+            else:
+                logger.debug(f"Model path does not exist: {self.model_path} (expected during training)")
 
         if not 0 <= self.prediction_threshold <= 1:
             errors.append(f"prediction_threshold must be in [0, 1], got {self.prediction_threshold}")
@@ -1531,6 +1548,7 @@ class MonitorConfig(BaseConfig):
     # Metrics tracking
     track_system_metrics: bool = True
     system_metrics_interval: float = 30.0  # seconds
+    system_metrics_log_interval_steps: int = 3000  # Log system metrics to TensorBoard every N steps
     track_gpu_metrics: bool = True
     track_disk_io: bool = True
     track_network_io: bool = False
@@ -1655,6 +1673,84 @@ class DebugConfig(BaseConfig):
 
 
 @dataclass
+class AdamW8bitConfig(BaseConfig):
+    """Configuration for AdamW8bit optimizer with dataset-aware scaling.
+
+    This configuration automatically adjusts hyperparameters based on:
+    - Dataset size (number of training samples)
+    - Effective batch size (batch_size * grad_accum * num_gpus)
+    - Number of training epochs
+
+    Key principles:
+    1. Learning rate scales with sqrt(effective_batch_size) following linear scaling rule
+    2. Warmup steps scale with dataset size to ensure stable initialization
+    3. Weight decay adjusted based on model size and dataset size
+    4. Beta2 adjusted for longer training runs
+    """
+
+    # Base hyperparameters (for reference batch size of 256)
+    base_lr: float = 1e-4
+    base_batch_size: int = 256
+
+    # AdamW-specific parameters
+    beta1: float = 0.9
+    beta2: float = 0.999
+    eps: float = 1e-8
+    weight_decay: float = 0.01
+
+    # Learning rate scaling
+    lr_scaling_mode: str = "sqrt"  # "linear", "sqrt", or "none"
+
+    # Warmup configuration
+    warmup_ratio: float = 0.05  # 5% of total steps for warmup
+    min_warmup_steps: int = 500
+    max_warmup_steps: int = 10000
+
+    # Weight decay scaling
+    wd_scaling_mode: str = "inverse_sqrt"  # "fixed", "linear", "inverse_sqrt"
+    min_weight_decay: float = 0.001
+    max_weight_decay: float = 0.1
+
+
+class SchedulerType(Enum):
+    """Available learning rate scheduler types"""
+    COSINE = "cosine"                          # Simple cosine decay
+    COSINE_RESTARTS = "cosine_restarts"       # Cosine with warm restarts (SGDR)
+    LINEAR = "linear"                          # Linear decay
+    POLYNOMIAL = "polynomial"                  # Polynomial decay
+    CONSTANT_WARMUP = "constant_warmup"       # Constant LR after warmup
+    ONE_CYCLE = "one_cycle"                   # One-cycle policy
+
+
+@dataclass
+class SchedulerConfig(BaseConfig):
+    """Configuration for learning rate schedulers.
+
+    This config helps you choose and configure the best scheduler for your training scenario.
+    """
+
+    # Scheduler type
+    scheduler_type: SchedulerType = SchedulerType.COSINE
+
+    # Warmup configuration
+    warmup_steps: int = 1000
+    warmup_strategy: str = "linear"  # "linear" or "constant"
+
+    # Cosine-specific
+    min_lr_ratio: float = 0.01  # min_lr = max_lr * min_lr_ratio
+
+    # Cosine with restarts specific
+    num_cycles: int = 3          # Number of cosine cycles
+    cycle_mult: float = 2.0      # Multiplier for cycle length (1.0 = same length)
+    restart_decay: float = 1.0   # Decay factor for max_lr after each restart
+
+    # One-cycle specific
+    pct_start: float = 0.3       # Percentage of training in warmup phase
+    div_factor: float = 25.0     # Initial LR = max_lr / div_factor
+    final_div_factor: float = 1e4  # Final LR = max_lr / final_div_factor
+
+
+@dataclass
 class FullConfig(BaseConfig):
     """Complete configuration combining all components"""
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -1665,6 +1761,8 @@ class FullConfig(BaseConfig):
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    optimizer: AdamW8bitConfig = field(default_factory=AdamW8bitConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     
     # Global settings
     project_name: str = "anime-image-tagger"
@@ -1692,7 +1790,7 @@ class FullConfig(BaseConfig):
         errors = []
         
         # Validate each sub-config
-        for config_name in ['model', 'data', 'training', 'inference', 'export', 'monitor', 'debug']:
+        for config_name in ['model', 'data', 'training', 'inference', 'export', 'monitor', 'debug', 'optimizer', 'scheduler']:
             try:
                 config_obj = getattr(self, config_name)
                 if hasattr(config_obj, 'validate') and callable(getattr(config_obj, 'validate')):
@@ -1734,6 +1832,109 @@ class FullConfig(BaseConfig):
         
         if errors:
             raise ConfigValidationError("Config validation failed:\n" + "\n".join(errors))
+
+    def compute_effective_batch_size(self) -> int:
+        """Compute the effective batch size for optimization."""
+        return self.data.batch_size * self.training.gradient_accumulation_steps * self.training.world_size
+
+    def scale_learning_rate(self) -> float:
+        """Scale learning rate based on effective batch size."""
+        effective_batch_size = self.compute_effective_batch_size()
+        if self.optimizer.lr_scaling_mode == "none":
+            return self.training.learning_rate
+        elif self.optimizer.lr_scaling_mode == "linear":
+            return self.training.learning_rate * (effective_batch_size / self.optimizer.base_batch_size)
+        elif self.optimizer.lr_scaling_mode == "sqrt":
+            return self.training.learning_rate * (effective_batch_size / self.optimizer.base_batch_size)**0.5
+        else:
+            raise ValueError(f"Unknown scaling mode: {self.optimizer.lr_scaling_mode}")
+
+    def compute_total_steps(self, dataset_size: int) -> int:
+        """Compute total training steps."""
+        effective_batch_size = self.compute_effective_batch_size()
+        steps_per_epoch = (dataset_size + effective_batch_size - 1) // effective_batch_size
+        return steps_per_epoch * self.training.num_epochs
+
+    def compute_warmup_steps(self, dataset_size: int) -> int:
+        """Compute number of warmup steps."""
+        total_steps = self.compute_total_steps(dataset_size)
+        warmup_steps = int(total_steps * self.optimizer.warmup_ratio)
+        return max(self.optimizer.min_warmup_steps, min(warmup_steps, self.optimizer.max_warmup_steps))
+
+    def scale_weight_decay(self, dataset_size: int) -> float:
+        """Scale weight decay based on dataset size."""
+        if self.optimizer.wd_scaling_mode == "fixed":
+            return self.training.weight_decay
+
+        ref_size = 100_000
+        if self.optimizer.wd_scaling_mode == "inverse_sqrt":
+            scale_factor = (ref_size / max(dataset_size, 1000))**0.5
+            scaled_wd = self.training.weight_decay * scale_factor
+        elif self.optimizer.wd_scaling_mode == "linear":
+            scale_factor = ref_size / max(dataset_size, 1000)
+            scaled_wd = self.training.weight_decay * scale_factor
+        else:
+            raise ValueError(f"Unknown weight decay scaling mode: {self.optimizer.wd_scaling_mode}")
+
+        return max(self.optimizer.min_weight_decay, min(scaled_wd, self.optimizer.max_weight_decay))
+
+    def adjust_beta2_for_long_training(self, dataset_size: int) -> float:
+        """Adjust beta2 for long training runs."""
+        total_steps = self.compute_total_steps(dataset_size)
+        if total_steps > 100_000:
+            adjustment = min(0.0009, 0.0009 * (total_steps - 100_000) / 400_000)
+            return min(self.training.adam_beta2 + adjustment, 0.9999)
+        return self.training.adam_beta2
+
+    def get_optimizer_kwargs(self, dataset_size: int) -> dict:
+        """Get keyword arguments for the optimizer."""
+        return {
+            'lr': self.scale_learning_rate(),
+            'betas': (self.training.adam_beta1, self.adjust_beta2_for_long_training(dataset_size)),
+            'eps': self.training.adam_epsilon,
+            'weight_decay': self.scale_weight_decay(dataset_size),
+        }
+
+    def get_scheduler_kwargs(self, dataset_size: int) -> dict:
+        """Get keyword arguments for the scheduler."""
+        total_steps = self.compute_total_steps(dataset_size)
+        warmup_steps = self.compute_warmup_steps(dataset_size)
+        
+        kwargs = {
+            'warmup_steps': warmup_steps,
+            'total_steps': total_steps,
+        }
+
+        if self.scheduler.scheduler_type == SchedulerType.COSINE:
+            kwargs['min_lr_ratio'] = self.scheduler.min_lr_ratio
+        elif self.scheduler.scheduler_type == SchedulerType.COSINE_RESTARTS:
+            if total_steps < 20000:
+                num_cycles = 2
+            elif total_steps < 100000:
+                num_cycles = 3
+            else:
+                num_cycles = 4
+            
+            if self.scheduler.cycle_mult == 1.0:
+                first_cycle_steps = total_steps // num_cycles
+            else:
+                sum_mult = (self.scheduler.cycle_mult ** num_cycles - 1) / (self.scheduler.cycle_mult - 1)
+                first_cycle_steps = int(total_steps / sum_mult)
+
+            kwargs.update({
+                'first_cycle_steps': first_cycle_steps,
+                'cycle_mult': self.scheduler.cycle_mult,
+                'num_cycles': num_cycles,
+                'min_lr_ratio': self.scheduler.min_lr_ratio,
+            })
+        elif self.scheduler.scheduler_type == SchedulerType.ONE_CYCLE:
+            kwargs.update({
+                'pct_start': self.scheduler.pct_start,
+                'div_factor': self.scheduler.div_factor,
+                'final_div_factor': self.scheduler.final_div_factor,
+            })
+        
+        return kwargs
 
 
 class ConfigManager:
@@ -1795,10 +1996,8 @@ class ConfigManager:
             # Create config from data
             config_class = type(self.config)
             self.config = config_class.from_dict(data)
-            
-            # Validate
-            self.config.validate()
-            
+
+            # Note: Validation is deferred to load_config() after env/args are merged
             logger.info(f"Successfully loaded config from {path}")
             return self.config
             
@@ -1828,11 +2027,19 @@ class ConfigManager:
             path = path.with_suffix('.yaml')
 
         # Create backup if requested and file exists
-        if backup and path.exists():
-            timestamp = f"{datetime.now():%Y%m%d_%H%M%S}_{int(time.time() * 1000000) % 1000000:06d}"
-            backup_path = path.with_suffix(f'.backup_{timestamp}{path.suffix}')
-            path.rename(backup_path)
-            logger.info(f"Created backup at {backup_path}")
+        # Use try-catch to handle race condition where file could be deleted between check and rename
+        if backup:
+            try:
+                timestamp = f"{datetime.now():%Y%m%d_%H%M%S}_{int(time.time() * 1000000) % 1000000:06d}"
+                backup_path = path.with_suffix(f'.backup_{timestamp}{path.suffix}')
+                path.rename(backup_path)
+                logger.info(f"Created backup at {backup_path}")
+            except FileNotFoundError:
+                # File doesn't exist, no backup needed
+                pass
+            except OSError as e:
+                # Other OS errors (permissions, etc.) - log warning but continue
+                logger.warning(f"Could not create backup of {path}: {e}")
 
         # Create directory if needed
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1920,8 +2127,14 @@ class ConfigManager:
         if value.strip().startswith(('[', '{')):
             try:
                 return json.loads(value)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                # Log warning when JSON-like value fails to parse
+                # This helps catch typos in environment variable configurations
+                logger.warning(
+                    f"Environment variable value looks like JSON but failed to parse: "
+                    f"'{value[:50]}{'...' if len(value) > 50 else ''}' - Error: {e}. "
+                    f"Treating as string."
+                )
 
         # Try JSON for null values
         if value.lower() == 'null':
@@ -2202,7 +2415,7 @@ def generate_example_configs(output_dir: Path = Path("./config_examples")):
     
     # High performance inference config
     hp_inference = InferenceConfig(
-        precision="fp16",
+        precision="bf16",
         use_tensorrt=True,
         optimize_for_speed=True,
         compile_model=True,

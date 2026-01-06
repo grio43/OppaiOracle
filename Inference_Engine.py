@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safe_checkpoint import safe_load_checkpoint
+from training_utils import CheckpointManager
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image, ImageOps, ImageFile
@@ -73,52 +73,9 @@ logger = logging.getLogger(__name__)
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
-def _load_vocab_path() -> Path:
-    """Resolve vocabulary path via unified_config.yaml, with sensible fallbacks."""
-    try:
-        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
-    except FileNotFoundError:
-        logger.warning("unified_config.yaml not found, using default vocabulary path")
-        cfg = {}
-    except yaml.YAMLError as e:
-        logger.error(f"Failed to parse unified_config.yaml: {e}")
-        cfg = {}
-    except PermissionError as e:
-        logger.error(f"Permission denied reading unified_config.yaml: {e}")
-        cfg = {}
-    except Exception as e:
-        logger.error(f"Unexpected error loading unified_config.yaml: {e}")
-        cfg = {}
+DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
+ORIENTATION_MAP_PATH = PROJECT_ROOT / "configs" / "orientation_map.json"
 
-    data = (cfg.get("data") or {})
-    p = cfg.get("vocab_path") or data.get("vocab_path")
-    if p:
-        return Path(p)
-    vd = data.get("vocab_dir")
-    return (PROJECT_ROOT / vd / "vocabulary.json") if vd else (PROJECT_ROOT / "vocabulary.json")
-DEFAULT_VOCAB_PATH = _load_vocab_path()
-
-# Load orientation map path from unified_config.yaml (best-effort)
-def _load_orientation_map_path() -> Optional[Path]:
-    try:
-        cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "unified_config.yaml").read_text(encoding="utf-8")) or {}
-    except FileNotFoundError:
-        logger.warning("unified_config.yaml not found, using default orientation map path")
-        cfg = {}
-    except yaml.YAMLError as e:
-        logger.error(f"Failed to parse unified_config.yaml: {e}")
-        cfg = {}
-    except PermissionError as e:
-        logger.error(f"Permission denied reading unified_config.yaml: {e}")
-        cfg = {}
-    except Exception as e:
-        logger.error(f"Unexpected error loading unified_config.yaml: {e}")
-        cfg = {}
-    data = (cfg.get("data") or {})
-    p = data.get("orientation_map_path")
-    if p:
-        return Path(p)
-    return None
 
 
 @dataclass
@@ -410,11 +367,21 @@ class ModelWrapper:
         self.vocab_sha256 = "unknown"  # Will be computed when vocabulary is loaded
         self.patch_size = 16  # Default, will be updated from model config
 
-    def load_model(self):
+    def load_model(self, config: "FullConfig"):
         """Load the trained model"""
+        self.config = config.inference
         try:
             # Load checkpoint first
-            state_dict, meta = safe_load_checkpoint(self.config.model_path)
+            model_path = Path(self.config.model_path)
+            checkpoint_dir = model_path.parent
+            manager = CheckpointManager(checkpoint_dir=str(checkpoint_dir))
+            checkpoint = manager.load_checkpoint(checkpoint_path=str(model_path))
+            
+            if not checkpoint:
+                raise FileNotFoundError(f"Could not load checkpoint from {model_path}")
+
+            state_dict = checkpoint.pop('state_dict')
+            meta = checkpoint # The rest is meta
 
             # Priority 1: Check for embedded vocabulary in checkpoint
             if 'vocab_b64_gzip' in meta:
@@ -449,7 +416,7 @@ class ModelWrapper:
             self._tta_index_map = None
             if getattr(self.config, "tta_flip", False) and self.tag_names:
                 try:
-                    map_path = _load_orientation_map_path()
+                    map_path = Path(config.data.orientation_map_path) if config.data.orientation_map_path else None
                     if map_path and map_path.exists():
                         oh = OrientationHandler(mapping_file=map_path)
                         mapping = oh.precompute_all_mappings(set(self.tag_names))
@@ -482,42 +449,15 @@ class ModelWrapper:
                 logger.warning("Preprocessing params not found in checkpoint. Using config defaults.")
 
             # Load model config
-            if os.path.exists(self.config.config_path):
-                with open(self.config.config_path, 'r') as f:
-                    model_config = json.load(f)
-            else:
-                logger.warning(f"Config file not found at {self.config.config_path}")
-                model_config = {}
-            
-            # Extract model configuration from checkpoint or use defaults
-            vit_config_dict = meta.get('model_config', {})
-            
-            # Merge with config file if available
-            if 'vit_config' in model_config:
-                vit_config_dict.update(model_config['vit_config'])
-            
-            # Set number of tags based on checkpoint or tag_names
-            if 'num_tags' not in vit_config_dict:
-                if self.tag_names:
-                    vit_config_dict['num_tags'] = len(self.tag_names)
-                    logger.info(f"Setting num_tags={len(self.tag_names)} from tag_names")
-                elif 'num_classes' in meta:
-                    vit_config_dict['num_tags'] = meta['num_classes']
-                    logger.info(f"Setting num_tags={meta['num_classes']} from checkpoint")
-                else:
-                    # Try to infer from tag_head dimensions in state_dict
-                    for key, value in state_dict.items():
-                        if 'tag_head.weight' in key:
-                            vit_config_dict['num_tags'] = value.shape[0]
-                            logger.info(f"Inferred num_tags={value.shape[0]} from tag_head.weight")
-                            break
-                        elif 'tag_head.bias' in key:
-                            vit_config_dict['num_tags'] = value.shape[0]
-                            logger.info(f"Inferred num_tags={value.shape[0]} from tag_head.bias")
-                            break
-                    else:
-                        raise ValueError("Cannot determine num_tags from checkpoint or config")
-            
+            vit_config_dict = config.model.to_dict()
+
+            # Set number of tags based on the loaded vocabulary
+            if self.tag_names:
+                vit_config_dict['num_tags'] = len(self.tag_names)
+                logger.info(f"Setting num_tags={len(self.tag_names)} from tag_names")
+            elif 'num_tags' not in vit_config_dict:
+                raise ValueError("Cannot determine num_tags from vocabulary or config")
+
             # Ensure critical parameters are present with sensible defaults
             vit_config_defaults = {
                 'image_size': self.config.image_size if self.config.image_size != 448 else 640,
@@ -548,13 +488,10 @@ class ModelWrapper:
             self.model = SimplifiedTagger(vit_config)
 
             # Load weights with explicit strict checking
+            # Note: load_state_dict(strict=True) returns None on success, raises RuntimeError on mismatch
             try:
-                missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=True)
-
-                if missing_keys:
-                    logger.warning(f"Missing keys in checkpoint: {missing_keys}")
-                if unexpected_keys:
-                    logger.warning(f"Unexpected keys in checkpoint: {unexpected_keys}")
+                self.model.load_state_dict(state_dict, strict=True)
+                logger.info("Model state dict loaded successfully (strict=True)")
 
             except RuntimeError as e:
                 logger.error(f"Failed to load model state dict: {e}")
@@ -576,18 +513,14 @@ class ModelWrapper:
                 self.model = torch.compile(self.model)
             
             # Setup mixed precision
+            precision = str(getattr(self.config, "precision", "bf16")).lower()
+            if precision not in {"bf16", "bfloat16"}:
+                raise ValueError(f"Only bf16 precision is supported, got '{precision}'.")
             if self.config.device == 'cuda':
-                if self.config.precision == "fp16":
-                    logger.info("Using fp16 for inference.")
-                    self.model = self.model.half()
-                elif self.config.precision == "bf16":
-                    if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
-                        logger.info("Using bf16 for inference.")
-                        self.model = self.model.to(torch.bfloat16)
-                    else:
-                        logger.warning("bf16 not supported on this device, falling back to float32.")
-                else:
-                    logger.info("Using float32 for inference.")
+                if not (hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported()):
+                    raise RuntimeError("bf16 requested for inference but CUDA device does not support bf16.")
+            logger.info("Using bf16 for inference.")
+            self.model = self.model.to(torch.bfloat16)
             
             logger.info(f"SimplifiedTagger model loaded successfully:")
             logger.info(f"  - Image size: {vit_config.image_size}")
@@ -602,10 +535,7 @@ class ModelWrapper:
 
     def _load_external_vocabulary(self):
         """Load vocabulary from external file (fallback)"""
-        if self.config.vocab_path:
-            vocab_path = Path(self.config.vocab_path)
-        else:
-            vocab_path = DEFAULT_VOCAB_PATH
+        vocab_path = Path(self.config.vocab_path)
 
         if not vocab_path.exists():
             search_paths = []

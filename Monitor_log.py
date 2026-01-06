@@ -1022,10 +1022,13 @@ class TrainingMonitor:
         def signal_handler(signum, frame):
             """Signal handler function"""
             logger.info(f"Received signal {signum}, shutting down...")
+            if getattr(self, '_closed', False):
+                sys.exit(0)  # Already cleaned up
             if getattr(self, 'system_monitor', None):
                 self.system_monitor.stop()
             if hasattr(self, 'writer') and self.writer:
                 try:
+                    self.writer.flush()
                     self.writer.close()
                 except:
                     pass
@@ -1042,10 +1045,13 @@ class TrainingMonitor:
 
         def cleanup():
             """Cleanup function for atexit"""
+            if getattr(self, '_closed', False):
+                return  # Already cleaned up
             if getattr(self, 'system_monitor', None):
                 self.system_monitor.stop()
             if hasattr(self, 'writer') and self.writer:
                 try:
+                    self.writer.flush()
                     self.writer.close()
                 except:
                     pass
