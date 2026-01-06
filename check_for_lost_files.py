@@ -10,7 +10,7 @@ This script looks for:
 from pathlib import Path
 import json
 
-database_path = Path(r'Z:\workspace\Dab')
+database_path = Path(r'L:\Dab\Dab')
 
 print("Checking for data loss...")
 print("=" * 70)
@@ -90,7 +90,7 @@ if total_images == 0:
     print("  ⚠️  WARNING: No images found at all! This could indicate:")
     print("     - Wrong database path")
     print("     - All files were deleted")
-    print("     - NAS is not mounted")
+    print("     - Storage is not mounted")
 
 print("=" * 70)
 

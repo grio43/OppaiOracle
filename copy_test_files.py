@@ -5,8 +5,8 @@ import shutil
 from pathlib import Path
 
 # Source and destination
-source_shard = Path(r'Z:\workspace\Dab\shard_00000')
-dest_shard = Path(r'Z:\OppaiOracle\test_downsample\shard_00000')
+source_shard = Path(r'L:\Dab\Dab\shard_00000')
+dest_shard = Path(r'L:\Dab\OppaiOracle\test_downsample\shard_00000')
 
 # Ensure destination exists
 dest_shard.mkdir(parents=True, exist_ok=True)

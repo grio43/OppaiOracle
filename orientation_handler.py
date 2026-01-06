@@ -95,7 +95,22 @@ class OrientationHandler:
         else:
             # Flips disabled, no mapping needed
             logger.info("Horizontal flips disabled (random_flip_prob=0)")
-    
+
+    # ---------- Pickling support for multiprocessing ----------
+    def __getstate__(self):
+        """Prepare for pickling - exclude unpicklable objects."""
+        state = self.__dict__.copy()
+        # Remove unpicklable threading.Lock before sending to worker
+        state['_stats_lock'] = None
+        return state
+
+    def __setstate__(self, state):
+        """Restore from pickle in worker process."""
+        self.__dict__.update(state)
+        # Recreate the lock in the worker process
+        import threading
+        self._stats_lock = threading.Lock()
+
     def _load_mappings(self, mapping_file: Path) -> None:
         """Load orientation mappings from JSON file.
 
@@ -450,11 +465,9 @@ class OrientationHandler:
         """
         Swap all orientation-sensitive tags in a list atomically.
 
-        CR-017: This method guarantees atomic tag swapping by building a complete
-        new list of swapped tags before returning. The caller receives either:
-        - The complete swapped list (all tags processed), OR
-        - The original list unchanged (if flip was skipped)
-        Never a partial swap, even in multithreaded scenarios.
+        Guarantees atomic tag swapping by building a complete new list before
+        returning. The caller receives either the complete swapped list or the
+        original list unchanged (if flip was skipped). Never a partial swap.
 
         Args:
             tags: Original list of tags (not modified in-place)
@@ -483,9 +496,8 @@ class OrientationHandler:
                                                   'copyright', 'single_'])
             )
 
-        # CR-017: Build complete swapped list before returning (atomic from caller perspective)
-        # Swap tags and collect stats in single pass (avoids second iteration)
-        swapped_tags: list[str] = []  # New list - original 'tags' never modified
+        # Build complete swapped list before returning (atomic from caller perspective)
+        swapped_tags: list[str] = []
         mapped_tags = []
         unmapped_tags = []
 
@@ -500,7 +512,6 @@ class OrientationHandler:
                 # Tag is unmapped orientation
                 unmapped_tags.append(tag)
 
-        # CR-017: Validate atomicity - ensure we processed all tags
         assert len(swapped_tags) == len(tags), \
             f"Tag swap incomplete: {len(swapped_tags)} swapped vs {len(tags)} original"
 

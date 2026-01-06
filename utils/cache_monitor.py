@@ -28,15 +28,10 @@ class CacheMonitor:
         self.enabled = bool(enabled)
         self._lock = threading.Lock()
         self._counters: Dict[str, int] = {
-            # L1
-            "l1_hit": 0,
-            "l1_miss": 0,
-            "l1_put": 0,
-            "l1_expired": 0,
-            "l1_bytes": 0,
-            # L2
+            # Sidecar cache metrics (l2_ prefix kept for backward compatibility)
             "l2_hit": 0,
             "l2_miss": 0,
+            "l2_stale": 0,  # Cache entries that loaded but failed validation (shape/dtype/hash mismatch)
             "l2_put_enq": 0,
             "l2_bytes_enq": 0,
         }
@@ -56,22 +51,21 @@ class CacheMonitor:
     def _add_bytes(self, key: str, nbytes: int) -> None:
         if not self.enabled:
             return
-        if nbytes <= 0:
+        if nbytes < 0:
+            # Log warning for negative bytes - indicates bug in caller
+            logging.getLogger("cache_monitor").warning(
+                f"Negative byte count {nbytes} for {key} - this indicates a bug in the caller"
+            )
+            return
+        if nbytes == 0:
             return
         with self._lock:
             self._counters[key] = int(self._counters.get(key, 0) + int(nbytes))
 
-    # ---- L1 API ----
-    def l1_hit(self) -> None: self._incr("l1_hit", 1)
-    def l1_miss(self) -> None: self._incr("l1_miss", 1)
-    def l1_put(self, nbytes: int) -> None:
-        self._incr("l1_put", 1)
-        self._add_bytes("l1_bytes", int(nbytes))
-    def l1_expired(self) -> None: self._incr("l1_expired", 1)
-
-    # ---- L2 API ----
+    # ---- Sidecar Cache API (l2_ method names kept for backward compatibility) ----
     def l2_hit(self) -> None: self._incr("l2_hit", 1)
     def l2_miss(self) -> None: self._incr("l2_miss", 1)
+    def l2_stale(self) -> None: self._incr("l2_stale", 1)  # Cache loaded but failed validation
     def l2_put_enqueued(self, nbytes: int) -> None:
         self._incr("l2_put_enq", 1)
         self._add_bytes("l2_bytes_enq", int(nbytes))
@@ -91,18 +85,15 @@ class CacheMonitor:
 
     def format_summary(self) -> str:
         c = self.snapshot()
-        l1h, l1m = c.get("l1_hit", 0), c.get("l1_miss", 0)
-        l1r = (100.0 * l1h / max(1, (l1h + l1m)))
-        l2h, l2m = c.get("l2_hit", 0), c.get("l2_miss", 0)
-        l2r = (100.0 * l2h / max(1, (l2h + l2m)))
-        l1_bytes = c.get("l1_bytes", 0)
-        l2_bytes = c.get("l2_bytes_enq", 0)
+        hits, misses, stale = c.get("l2_hit", 0), c.get("l2_miss", 0), c.get("l2_stale", 0)
+        # Hit rate excludes stale (which were loaded but invalid)
+        total_requests = hits + misses + stale
+        hit_rate = (100.0 * hits / max(1, total_requests))
+        bytes_enq = c.get("l2_bytes_enq", 0)
         return (
             "CacheMonitor: "
-            f"L1(hit={l1h}, miss={l1m}, hit_rate={l1r:.1f}%, puts={c.get('l1_put',0)}, "
-            f"expired={c.get('l1_expired',0)}, bytes={self._fmt(l1_bytes)}); "
-            f"L2(hit={l2h}, miss={l2m}, hit_rate={l2r:.1f}%, put_enq={c.get('l2_put_enq',0)}, "
-            f"bytes_enq={self._fmt(l2_bytes)})"
+            f"Sidecar(hit={hits}, miss={misses}, stale={stale}, hit_rate={hit_rate:.1f}%, "
+            f"put_enq={c.get('l2_put_enq',0)}, bytes_enq={self._fmt(bytes_enq)})"
         )
 
     def log_summary(self) -> None:

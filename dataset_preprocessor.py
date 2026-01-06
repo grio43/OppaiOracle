@@ -3,12 +3,7 @@
 Data Preparation Script for Direct Training Pipeline
 
 Prepares Danbooru dataset for simplified direct training approach.
-FIXED VERSION - Handles single-string tag fields with duplicates
-
-Note: This file was previously named tag_vocabulary.py but has been renamed to
-dataset_preprocessor.py to better reflect its purpose. It contains the
-DanbooruDataPreprocessor class, not vocabulary management code (which is in
-vocabulary.py).
+Handles single-string tag fields with duplicates.
 """
 
 import json
@@ -66,27 +61,8 @@ class DanbooruDataPreprocessor:
 
         self.num_workers = int(num_workers or cpu_count())
 
-        # ------------------------------------------------------------------
-        # Tag ignoring support
-        #
-        # Some training setups require excluding certain tags from the label
-        # vocabulary.  For example, you might want the model to learn from the
-        # images but *not* treat particular tags as targets or use them for
-        # evaluation.  Two mechanisms are supported:
-        #
-        #  1. `ignore_tags_file`: a path to a text file containing one tag per
-        #     line.  Any tag found in this file will be excluded from
-        #     training/labeling.  Blank lines and comments (lines starting with
-        #     '#') are ignored.
-        #
-        #  2. `ignored_tags`: a Python list of tag strings to ignore.  This is
-        #     convenient if you want to hard‑code the ignore list in your
-        #     configuration or script.
-        #
-        # If both are provided, the union of the two sets is used.  If
-        # neither is provided, no tags are ignored.
+        # Tag ignoring: load from file and/or list, union of both is used
         self.ignore_tags: set[str] = set()
-        # The ignore_tags_file is now passed in from main(), which gets it from the unified config.
         if ignore_tags_file:
             try:
                 with open(ignore_tags_file, 'r', encoding='utf-8') as f:
@@ -330,11 +306,9 @@ class DanbooruDataPreprocessor:
         
         for json_file in json_files:
             try:
-                # ISSUE-009 FIX: Force UTF-8 encoding
                 with open(json_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                
-                # ISSUE-002 FIX: Handle single-object JSON files (your format)
+
                 entries = [data] if isinstance(data, dict) else data
                 
                 for entry in entries:
@@ -349,8 +323,7 @@ class DanbooruDataPreprocessor:
                     if not filename:
                         logger.debug(f"Entry in {json_file} missing filename")
                         continue
-                    
-                    # ISSUE-001 FIX: Parse space-delimited string correctly
+
                     tags_list = parse_tags_field(tags_field)
                     
                     if not tags_list:
@@ -359,18 +332,9 @@ class DanbooruDataPreprocessor:
                     
                     original_count = len(tags_list)
                     
-                    # ISSUE-003 FIX: Remove duplicates while preserving order
                     tags_list = dedupe_preserve_order(tags_list)
 
-                    # ------------------------------------------------------------------
-                    # Remove ignored tags
-                    #
-                    # If an ignore list is provided (either via a file or an in‑memory
-                    # list), filter those tags out before any further processing.
-                    # This ensures they are not counted towards the label vectors
-                    # and do not influence quality scores.  Images will still be
-                    # retained as long as at least one remaining tag maps to the
-                    # vocabulary.
+                    # Remove ignored tags before further processing
                     if self.ignore_tags:
                         tags_list = [t for t in tags_list if t not in self.ignore_tags]
                         if not tags_list:
@@ -393,7 +357,6 @@ class DanbooruDataPreprocessor:
                         if idx is not None:
                             tag_indices.append(idx)
                         else:
-                            # ISSUE-010 FIX: Track OOV tags
                             oov_count += 1
                             batch_stats['total_oov_tags'] += 1
                     
@@ -401,8 +364,7 @@ class DanbooruDataPreprocessor:
                     if oov_count > 0:
                         oov_tags = [t for t in tags_list if t not in self.tag_to_index]
                         logger.debug(f"{filename}: {oov_count} OOV tags: {oov_tags[:5]}...")
-                    
-                    # ISSUE-007 FIX: Skip if no tags are in vocabulary
+
                     if not tag_indices:
                         batch_stats['files_with_all_oov'] += 1
                         logger.warning(f"Skipping {filename}: all {len(tags_list)} tags are OOV")
@@ -424,13 +386,11 @@ class DanbooruDataPreprocessor:
                     results['ratings'].append(self.rating_to_index.get(rating, 0))
                     results['tag_counts'].append(len(tag_indices))
                     results['quality_scores'].append(quality_score)
-                    
+
             except json.JSONDecodeError as e:
-                # ISSUE-008 FIX: Better error logging
                 logger.error(f"JSON decode error in {json_file}: {e}")
                 continue
             except Exception as e:
-                # ISSUE-008 FIX: Log with file path
                 logger.error(f"Error processing {json_file}: {e}")
                 continue
 
@@ -493,10 +453,21 @@ class DanbooruDataPreprocessor:
                     if key in batch_stats:
                         aggregated_stats[key] += batch_stats[key]
 
-                # Convert to binary vectors
+                # Convert to binary vectors with bounds checking
                 for indices in batch_results['tag_indices']:
                     binary_vector = np.zeros(self.vocab_size, dtype=np.float32)
-                    binary_vector[indices] = 1.0
+                    if indices:
+                        # Validate indices are within vocabulary bounds
+                        max_idx = max(indices)
+                        min_idx = min(indices)
+                        if max_idx >= self.vocab_size or min_idx < 0:
+                            logger.error(
+                                f"Tag index out of bounds: min={min_idx}, max={max_idx}, "
+                                f"vocab_size={self.vocab_size}. Filtering invalid indices."
+                            )
+                            indices = [i for i in indices if 0 <= i < self.vocab_size]
+                        if indices:  # Recheck after filtering
+                            binary_vector[indices] = 1.0
                     all_results['tag_vectors'].append(binary_vector)
                 
                 all_results['filenames'].extend(batch_results['filenames'])
@@ -569,13 +540,28 @@ class DanbooruDataPreprocessor:
         return sorted(indices)
     
     def _subset_results(self, results: Dict, indices: List[int]) -> Dict:
-        """Subset results by indices"""
+        """Subset results by indices.
+
+        Handles both lists and numpy arrays correctly. Lists are subset by
+        iterating through indices, numpy arrays use numpy's advanced indexing.
+        """
+        import numpy as np
         subset = {}
         for key, values in results.items():
             if isinstance(values, list):
                 subset[key] = [values[i] for i in indices]
+            elif isinstance(values, np.ndarray):
+                # Use numpy array indexing for numpy arrays
+                subset[key] = values[np.array(indices)]
             else:
-                subset[key] = values[indices]
+                # Fallback: try direct indexing (may fail for some types)
+                try:
+                    subset[key] = values[indices]
+                except (TypeError, IndexError) as e:
+                    raise TypeError(
+                        f"Cannot subset key '{key}' of type {type(values).__name__}. "
+                        f"Expected list or numpy array. Error: {e}"
+                    )
         return subset
     
     def _save_to_hdf5(self, results: Dict):
@@ -608,7 +594,7 @@ class DanbooruDataPreprocessor:
         
         logger.info(f"Saved HDF5 data to {output_file}")
         
-        # Also save indices separately for flexibility (CR-032: use JSON instead of pickle for security)
+        # Also save indices separately for flexibility (use JSON instead of pickle for security)
         indices_file = self.output_dir / 'tag_indices.json'
         with open(indices_file, 'w', encoding='utf-8') as f:
             # Convert any non-JSON-serializable types to lists

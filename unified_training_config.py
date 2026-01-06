@@ -4,6 +4,15 @@ Unified training configuration that combines optimizer and scheduler setup.
 This is the ONE function you need for complete AdamW8bit + scheduler configuration.
 """
 
+import warnings
+
+warnings.warn(
+    "The 'unified_training_config.py' file is deprecated and will be removed in a future version. "
+    "Please use the unified configuration system in 'Configuration_System.py'.",
+    DeprecationWarning,
+    stacklevel=2
+)
+
 import logging
 from typing import Optional, Tuple, Any
 from dataclasses import dataclass

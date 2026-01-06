@@ -1,46 +1,15 @@
 #!/usr/bin/env python3
 """
-Optimized Image Downsampling for OppaiOracle - NAS-Friendly
+Optimized Image Downsampling for OppaiOracle
 
-Intelligently downsizes high-resolution images before training while being
-mindful of network I/O on NAS storage.
-
-Strategy:
-1. Only process images larger than necessary for 512x512 training
-2. Downsample to target resolution while preserving aspect ratio
-3. Convert large PNGs to high-quality JPEG to save space
-4. Batch operations to minimize NAS I/O overhead
-5. Preserve metadata JSON files (auto-add 'grey_background' tag when applied)
-
-NAS I/O Optimization:
-- All image processing done in-memory using BytesIO (no temp files)
-- Batched reads: Process BATCH_SIZE images in memory before writing
-- Batched writes: Write all processed images in a batch sequentially
-- File replacement logic: Delete original if format changes, overwrite if same format
-- Minimizes round-trips to NAS storage for maximum throughput
-
-Target Resolution Logic:
-- OppaiOracle trains at 512x512 with letterbox (downscale-only)
-- We downsample images to exactly match training resolution
-- Target: 512px on longest side (eliminates training-time resize overhead)
-- Images <512px on longest side are left untouched
-
-File Format Optimization:
-- PNG files > 1MB after downsampling → Convert to JPEG (quality=95)
-- Small PNGs and JPEGs remain as-is
-- WebP handled gracefully
-- Transparent images (RGBA, LA, P) → Gray background (114,114,114) applied
-- JSON metadata automatically tagged with 'grey_background' when applied
-
-Progress Tracking:
-- Resumable with progress file
-- Per-shard processing with multiprocessing
-- Detailed statistics on space savings
+Downsizes high-resolution images to training resolution (default 512px longest side).
+Converts large PNGs to JPEG, handles transparency, and auto-tags grey background.
+Resumable with progress tracking and multiprocessing support.
 
 Usage:
-    python downsample_images_nas.py           # Dry run (preview)
-    python downsample_images_nas.py --yes     # Execute downsampling
-    python downsample_images_nas.py --target=640 --yes  # Custom target size (e.g., 640px)
+    python downsample_images_nas.py           # Dry run
+    python downsample_images_nas.py --yes     # Execute
+    python downsample_images_nas.py --target=640 --yes  # Custom size
 """
 
 import sys
@@ -86,10 +55,10 @@ PNG_TO_JPEG_THRESHOLD = 1 * 1024 * 1024  # 1MB
 # JPEG quality for converted files (95 = high quality, minimal artifacts)
 JPEG_QUALITY = 95
 
-# Batch size for NAS-friendly I/O
+# Batch size for efficient I/O
 BATCH_SIZE = 100
 
-# Number of parallel workers (be conservative with NAS)
+# Number of parallel workers
 NUM_WORKERS = 3
 
 # Common image extensions
@@ -493,7 +462,7 @@ def process_shard_worker(args) -> Tuple[str, ShardStats, list]:
 
         print(f"[START] {shard_name}: Processing {len(image_files)} images...")
 
-        # Process in batches for better NAS I/O
+        # Process in batches for efficient I/O
         for i in range(0, len(image_files), BATCH_SIZE):
             batch = image_files[i:i + BATCH_SIZE]
 
@@ -561,7 +530,7 @@ def process_shard_worker(args) -> Tuple[str, ShardStats, list]:
 def main():
     """Main execution function."""
 
-    database_path = Path(r'Z:\workspace\Dab')
+    database_path = Path(r'L:\Dab\Dab')
     progress_file = Path(__file__).parent / 'downsample_progress.txt'
 
     if not database_path.exists():

@@ -6,7 +6,7 @@ This should guarantee a large file size.
 from PIL import Image
 from pathlib import Path
 
-test_dir = Path(r'Z:\OppaiOracle\test_downsample\shard_test')
+test_dir = Path(r'L:\Dab\OppaiOracle\test_downsample\shard_test')
 
 # Find a large existing image
 large_images = []

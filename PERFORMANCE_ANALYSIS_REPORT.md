@@ -1,6 +1,6 @@
 # Performance Analysis Report: Downsampling GPU Accelerated (Live Test)
 **Test Date:** 2025-11-14
-**Test Shard:** Z:\OppaiOracle\test_downsample\shard_00000
+**Test Shard:** L:\Dab\OppaiOracle\test_downsample\shard_00000
 **Target Size:** 512px
 **Workers:** 8 CPU cores
 
@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-**Critical Finding:** Write operations to NAS are the primary bottleneck, consuming 64% of total processing time (331.3s out of 514.3s total). This is far worse than HDD read performance.
+**Critical Finding:** Write operations are the primary bottleneck, consuming 64% of total processing time (331.3s out of 514.3s total).
 
 ---
 
@@ -43,15 +43,14 @@ Total images: 7,340 images scanned
 ### 1. Loading Phase (PHASE 1)
 - **Time:** 164.8s
 - **Data loaded:** 4,429.6 MB
-- **Speed:** 26.9 MB/s (typical for HDD over network)
+- **Speed:** 26.9 MB/s
 - **Images loaded:** 7,340
 - **Load speed:** 44.5 images/sec
-- **Status:** ✅ Acceptable for NAS HDD
+- **Status:** ✅ Acceptable
 
 **Analysis:**
-Loading performance is reasonable for network HDD access. The variance in load speed (35-64 img/s) indicates NAS disk performance variability, likely due to:
-- Network congestion
-- HDD seek times
+Loading performance is reasonable. The variance in load speed (35-64 img/s) indicates disk performance variability, likely due to:
+- Disk seek times
 - Competing I/O from other processes
 
 ### 2. Processing Phase (PHASE 2)
@@ -83,11 +82,10 @@ Loading performance is reasonable for network HDD access. The variance in load s
 Write performance is **13x slower than read performance** (2.0 MB/s vs 26.9 MB/s). This is the primary bottleneck.
 
 **Possible causes:**
-1. **NAS write cache disabled** - Most NAS systems have slower write than read
-2. **SMB protocol overhead** - Multiple small writes with acknowledgments
-3. **File deletion overhead** - PNG files being deleted after JPG written (2,338 deletions)
-4. **Directory metadata updates** - 2,338 files being modified requires directory table updates
-5. **No write buffering** - Direct write mode may be causing sync-on-write behavior
+1. **Multiple small writes** - Writing many small files with overhead
+2. **File deletion overhead** - PNG files being deleted after JPG written (2,338 deletions)
+3. **Directory metadata updates** - 2,338 files being modified requires directory table updates
+4. **No write buffering** - Direct write mode may be causing sync-on-write behavior
 
 ---
 
@@ -118,8 +116,7 @@ Write performance is **13x slower than read performance** (2.0 MB/s vs 26.9 MB/s
 1. **Batch writes** - Write multiple images in larger sequential blocks
 2. **Delayed deletes** - Don't delete PNGs immediately; batch delete at end
 3. **Async writes** - Use buffered/async I/O instead of direct writes
-4. **NAS optimization** - Enable write cache if available
-5. **Consider local temp storage** - Write to fast local drive, then rsync to NAS
+4. **Larger write buffers** - Enable write buffering for better throughput
 
 ### 2. ⚠️ Processing Time Discrepancy
 **Issue:** Processing takes 18.0s in live mode vs 4.6s in dry run
@@ -135,7 +132,7 @@ This is expected behavior, not a bug:
 **Issue:** Load speed varies wildly (35-64 img/s)
 
 **Analysis:**
-HDD seek time variability over network. Could be improved with:
+Disk seek time variability. Could be improved with:
 - Better file sorting (by disk location, not name)
 - Larger read buffer sizes
 - Prefetching next shard during processing
@@ -171,7 +168,7 @@ else:
     with open(temp_path, 'wb') as f:
         f.write(result.image_data)
 
-    # Atomic rename (NOTE: May not be truly atomic on Windows SMB/NAS)
+    # Atomic rename (NOTE: May not be truly atomic on Windows SMB)
     temp_path.replace(result.output_path)
 
     # Delete original AFTER successful write
@@ -184,7 +181,7 @@ else:
 1. **Sequential writes** - Writing one file at a time with file open/close overhead
 2. **Immediate deletes** - Delete happens immediately after each write (expensive metadata operation)
 3. **No buffering** - Each `write()` call may flush to disk
-4. **Windows SMB** - Comment admits atomic rename may not be atomic on network drives
+4. **Network drives** - Atomic rename may not be atomic on network drives
 
 **Recommendation:**
 Refactor to batch writes and deletes:
@@ -265,11 +262,10 @@ for path in to_delete:
 
 ## Conclusion
 
-The downsampling script works correctly and achieves excellent compression (84.7%). However, **write performance to NAS is the critical bottleneck**, consuming 64% of total processing time.
+The downsampling script works correctly and achieves excellent compression (84.7%). However, **write performance is the critical bottleneck**, consuming 64% of total processing time.
 
 **Action items:**
 1. ✅ **Immediate:** Use the identified optimizations above (buffering, batch deletes)
 2. ⚠️ **Short-term:** Test async writes and parallel I/O
-3. 📊 **Long-term:** Consider hybrid approach (write to local SSD, then sync to NAS)
 
 **Expected outcome with fixes:** Total time could drop from 514s to ~150-200s (2.5-3.3 min), a 2.5-3x improvement.

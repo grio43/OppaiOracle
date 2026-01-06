@@ -4,11 +4,20 @@ Learning rate scheduler configuration for AdamW8bit optimizer.
 Provides guidance on when to use different schedulers and integrates with optimizer_config.
 """
 
+import warnings
+
+warnings.warn(
+    "The 'scheduler_config.py' file is deprecated and will be removed in a future version. "
+    "Please use the unified configuration system in 'Configuration_System.py'.",
+    DeprecationWarning,
+    stacklevel=2
+)
+
 import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +146,7 @@ def compute_cycle_steps(
     total_steps: int,
     num_cycles: int,
     cycle_mult: float = 1.0
-) -> list[int]:
+) -> List[int]:
     """Compute the length of each cycle for cosine annealing with restarts.
 
     Args:

@@ -26,7 +26,6 @@ These files are core components of the machine learning pipeline, responsible fo
 -   `onnx_infer.py`: Performs inference with an ONNX model.
 -   `evaluation_metrics.py`: Defines metrics for model evaluation.
 -   `safe_checkpoint.py`: Handles saving and loading of model checkpoints.
--   `l1_cache.py`: L1 cache implementation.
 -   `l2_cache.py`: L2 cache implementation.
 -   `l2_cache_warmup.py`: A script to warm up the L2 cache.
 -   `cache_codec.py`: Codec for caching.

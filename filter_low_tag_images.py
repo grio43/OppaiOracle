@@ -17,7 +17,7 @@ from collections import defaultdict
 
 # Configuration
 MIN_TAG_COUNT = 26  # Keep images with 26+ tags, delete images with <26 tags
-DATASET_BASE = r"Z:\workspace\Dab"
+DATASET_BASE = r"L:\Dab\Dab"
 IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
 
 def parse_tags(tags_str):
@@ -182,7 +182,7 @@ def process_all_shards(dry_run=True, shard_range=None):
     print(f"Shards processed: {total_stats['shards_processed']}")
     print(f"Total JSON files: {total_stats['total_json']:,}")
     print(f"Files with <{MIN_TAG_COUNT} tags: {total_stats['to_delete']:,} "
-          f"({total_stats['to_delete']/total_stats['total_json']*100:.2f}%)")
+          f"({(total_stats['to_delete']/total_stats['total_json']*100) if total_stats['total_json'] > 0 else 0:.2f}%)")
 
     if dry_run:
         print(f"\nWould delete:")
@@ -199,7 +199,7 @@ def process_all_shards(dry_run=True, shard_range=None):
 
     # Calculate retention
     retained = total_stats['total_json'] - total_stats['to_delete']
-    print(f"\nRetained: {retained:,} images ({retained/total_stats['total_json']*100:.2f}%)")
+    print(f"\nRetained: {retained:,} images ({(retained/total_stats['total_json']*100) if total_stats['total_json'] > 0 else 0:.2f}%)")
 
     # Show tag distribution summary
     print(f"\n{'='*70}")
@@ -209,7 +209,7 @@ def process_all_shards(dry_run=True, shard_range=None):
     for tag_count in sorted(total_stats['tag_distribution'].keys()):
         if tag_count < MIN_TAG_COUNT:
             count = total_stats['tag_distribution'][tag_count]
-            pct = count / total_stats['total_json'] * 100
+            pct = (count / total_stats['total_json'] * 100) if total_stats['total_json'] > 0 else 0
             print(f"  {tag_count:3d} tags: {count:6,} images ({pct:5.2f}%)")
 
     print(f"{'='*70}")

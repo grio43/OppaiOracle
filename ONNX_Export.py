@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safe_checkpoint import safe_load_checkpoint
+from training_utils import CheckpointManager
 
 try:
     from model_metadata import ModelMetadata
@@ -79,236 +79,78 @@ def _check_versions_and_env(opset: int) -> None:
     if opset < 18:
         _fail(f"opset >= 18 required (requested {opset}). Set export.opset_version to 18 or 19.")
 
-@dataclass
-class ONNXExportConfig:
-    """Configuration for ONNX export"""
-    # Model paths
-    checkpoint_path: str
-    # Accept a file or directory. Kept backward-compatible: 'vocab_dir' still works via __post_init__.
-    vocab_path: str = "./vocabulary.json"
-    # deprecated alias (kept for YAMLs/CLIs that still use it)
-    vocab_dir: str = "./vocabulary.json"
-    output_path: str = "model.onnx"
-    
-    # Export settings
-    # Use the latest stable opset for transformer models with LayerNormalization support
-    # Opset timeline:
-    # - 16 (2021): Basic support, no LayerNormalization
-    # - 17 (2022): Added LayerNormalization, GroupNormalization improvements
-    # - 18 (2023): Additional optimizations for transformers
-    # - 19 (2024): Latest improvements and better CUDA kernels
-    opset_version: int = 19
-    input_names: List[str] = field(default_factory=lambda: ["input_image"])
-    # Only export scores, not binary predictions (to avoid threshold-related validation issues)
-    output_names: List[str] = field(default_factory=lambda: ["scores"])
-    dynamic_axes: Optional[Dict[str, Dict[int, str]]] = None
-    use_dynamic_axes: bool = True
-    filenames: Dict[str, str] = field(default_factory=lambda: {"model": "model.onnx"})
-    metadata_paths: Dict[str, str] = field(default_factory=dict)
-    
-    # Model configuration
-    batch_size: int = 1
-    image_size: int = 640
-    patch_size: int = 16
-    # Default to ImageNet normalization (matching DataConfig defaults)
-    # These should be overridden from checkpoint/training config when available
-    normalize_mean: List[float] = field(default_factory=lambda: [0.485, 0.456, 0.406])
-    normalize_std: List[float] = field(default_factory=lambda: [0.229, 0.224, 0.225])
-    export_params: bool = True
-    do_constant_folding: bool = True
-    
-    # Optimization settings
-    optimize: bool = True
-    optimize_for_mobile: bool = False
-    quantize: bool = False
-    quantization_type: str = "dynamic"  # dynamic, static, qat
-    
-    # Validation
-    validate_export: bool = True
-    tolerance_rtol: float = 1e-3
-    tolerance_atol: float = 1e-5
-    
-    # Export variants
-    export_variants: List[str] = field(default_factory=lambda: ["full"])
-    
-    # Metadata
-    add_metadata: bool = True
-    model_description: str = "Anime Image Tagger Model"
-    model_author: str = "AnimeTaggers"
-    model_version: str = "1.0"
-    # Require explicit opt-in to rebuild head on mismatch
-    force_rebuild_head: bool = False
-    # Fail if vocabulary can't be embedded (recommended for production exports)
-    require_embedded_vocabulary: bool = True
-    
-    def __post_init__(self):
-        # Back-compat: if old configs specify vocab_dir, honor it.
-        if self.vocab_path and self.vocab_dir and self.vocab_dir != "./vocabulary.json":
-            if self.vocab_path == "./vocabulary.json":
-                self.vocab_path = self.vocab_dir
-        if self.use_dynamic_axes:
-            if self.dynamic_axes is None:
-                # The new wrapper takes a raw image with dynamic H and W
-                self.dynamic_axes = {
-                    "input_image": {0: "batch_size", 1: "height", 2: "width"},
-                    "scores": {0: "batch_size"}
-                }
-        else:
-            self.dynamic_axes = None
-
-
 class InferenceWrapper(nn.Module):
-    """
-    Wraps the model to include full preprocessing, creating a self-contained
-    ONNX model that takes a raw image and outputs final scores.
-    """
-    def __init__(self, model: nn.Module, image_size: int,
-                 normalize_mean: List[float], normalize_std: List[float]):
+    def __init__(self, model, image_size, normalize_mean, normalize_std):
         super().__init__()
         self.model = model
-        self.target_size = image_size
+        self.image_size = image_size
+        self.register_buffer('mean', torch.tensor(normalize_mean).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor(normalize_std).view(1, 3, 1, 1))
 
-        # Register normalization constants as buffers
-        self.register_buffer('mean', torch.tensor(normalize_mean, dtype=torch.float32).view(1, 3, 1, 1))
-        self.register_buffer('std', torch.tensor(normalize_std, dtype=torch.float32).view(1, 3, 1, 1))
-        # Pad color is a neutral grey (114, 114, 114)
-        self.register_buffer('pad_color', torch.tensor([114.0, 114.0, 114.0], dtype=torch.float32).view(1, 3, 1, 1) / 255.0)
-
-    def forward(self, image_uint8: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass from raw uint8 image to scores.
-
-        Args:
-            image_uint8: Input raw image tensor (batch_size, H, W, 3), dtype=uint8
-
-        Returns:
-            scores: Confidence scores (batch_size, num_tags)
-        """
-        # 1. Type Conversion and Permutation
-        image_f32 = image_uint8.permute(0, 3, 1, 2).float() / 255.0  # (B, 3, H, W)
-
-        # 2. Get dynamic shape using ONNX-safe operations
-        # Extract dimensions - ONNX export converts these to Shape + Gather ops
-        batch_dim = image_f32.size(0)
-        channel_dim = image_f32.size(1)
-        height_dim = image_f32.size(2)
-        width_dim = image_f32.size(3)
-
-        # Convert to int64 tensors for subsequent operations
-        # In tracing mode, .size() returns tensors; in eager mode, returns ints
-        h = height_dim if torch.jit.is_tracing() or isinstance(height_dim, torch.Tensor) else torch.tensor(height_dim, dtype=torch.int64, device=image_f32.device)
-        w = width_dim if torch.jit.is_tracing() or isinstance(width_dim, torch.Tensor) else torch.tensor(width_dim, dtype=torch.int64, device=image_f32.device)
-
-        # 3. Downscale-only letterbox to target size without stretching
-        # Compute uniform scale factor: min(target/h, target/w), clamped to <= 1.0
-        h_f = h.to(torch.float32) if isinstance(h, torch.Tensor) else torch.tensor(float(h), dtype=torch.float32, device=image_f32.device)
-        w_f = w.to(torch.float32) if isinstance(w, torch.Tensor) else torch.tensor(float(w), dtype=torch.float32, device=image_f32.device)
-        tgt = torch.tensor(float(self.target_size), dtype=torch.float32, device=image_f32.device)
-        eps = torch.tensor(1.0, dtype=torch.float32, device=image_f32.device)  # for clamp denominator
-        ratio_h = tgt / torch.maximum(h_f, eps)
-        ratio_w = tgt / torch.maximum(w_f, eps)
-        scale = torch.minimum(ratio_h, ratio_w)
-        scale = torch.minimum(scale, torch.tensor(1.0, dtype=torch.float32, device=image_f32.device))
-
-        # Resize with dynamic scale factor (uniform for H and W)
-        resized = F.interpolate(
-            image_f32,
-            scale_factor=scale,
-            mode='bilinear',
-            align_corners=False,
-            recompute_scale_factor=True,
-        )
-
-        # 4. Pad to fixed target canvas with pad_color
-        # Get resized dimensions using ONNX-safe operations
-        resized_height = resized.size(2)
-        resized_width = resized.size(3)
-
-        # Convert to int64 tensors (works in both eager and tracing modes)
-        rh = resized_height if torch.jit.is_tracing() or isinstance(resized_height, torch.Tensor) else torch.tensor(resized_height, dtype=torch.int64, device=image_f32.device)
-        rw = resized_width if torch.jit.is_tracing() or isinstance(resized_width, torch.Tensor) else torch.tensor(resized_width, dtype=torch.int64, device=image_f32.device)
-
-        target_i64 = torch.tensor(self.target_size, dtype=torch.int64, device=image_f32.device)
-        pad_h = target_i64 - rh
-        pad_w = target_i64 - rw
-        pad_top = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left = pad_w // 2
-        pad_right = pad_w - pad_left
-
-        padded = F.pad(resized, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
-
-        # Build a single-channel padding mask (B,1,H,W) with True=PAD
-        pad_mask = F.pad(
-            torch.ones_like(resized[:, :1]),
-            (pad_left, pad_right, pad_top, pad_bottom),
-            mode='constant', value=0
-        ) == 0
-        pad_mask3 = pad_mask.expand_as(padded)
-        padded = padded.masked_scatter(pad_mask3, self.pad_color.expand_as(padded)[pad_mask3])
-
-        # 5. Normalization
-        normalized = (padded - self.mean) / self.std
-
-        # 6. Inference (propagate padding mask)
-        outputs = self.model(normalized, padding_mask=pad_mask)
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Assuming input is (B, H, W, C) uint8
+        x = x.permute(0, 3, 1, 2).contiguous()  # to (B, C, H, W)
+        x = x.to(torch.float32) / 255.0
+        
+        # Resize
+        x = F.interpolate(x, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
+        
+        # Normalize
+        x = (x - self.mean) / self.std
+        
+        # Run model
+        outputs = self.model(x)
+        
+        # Return only tag_logits for ONNX export
         if isinstance(outputs, dict):
-            logits = outputs.get('logits', outputs.get('output', outputs))
-            if isinstance(logits, dict):
-                logits = logits.get('logits', next(iter(logits.values())))
-        else:
-            logits = outputs
-
-        if logits.dim() == 3:
-            batch_size = logits.shape[0]
-            logits = logits.view(batch_size, -1)
-
-        scores = torch.sigmoid(logits)
-
-        return scores
-
+            return outputs['tag_logits']
+        return outputs
 
 class ONNXExporter:
     """Main ONNX export class"""
 
-    def __init__(self, config: ONNXExportConfig):
+    def __init__(self, config: FullConfig):
         self.config = config
-        if self.config.opset_version < 18:
-            logger.warning(f"Raising opset_version from {self.config.opset_version} to 18 (minimum).")
-            self.config.opset_version = 18
-        _check_versions_and_env(self.config.opset_version)
+        self.export_config = config.export
+        if self.export_config.opset_version < 18:
+            logger.warning(f"Raising opset_version from {self.export_config.opset_version} to 18 (minimum).")
+            self.export_config.opset_version = 18
+        _check_versions_and_env(self.export_config.opset_version)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Using device: {self.device}")
         
         # Create output directory
-        self.output_dir = Path(config.output_path).parent
+        self.output_dir = Path(self.export_config.output_path).parent
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Load vocabulary
         try:
             # Check for embedded vocabulary in checkpoint first
-            checkpoint_path = Path(self.config.checkpoint_path)
+            checkpoint_path = Path(self.config.training.resume_from)
             if checkpoint_path.exists():
-                _, meta = safe_load_checkpoint(checkpoint_path)
-                if 'vocab_b64_gzip' in meta:
-                    logger.info("Found embedded vocabulary in checkpoint, extracting...")
-                    vocab_data = ModelMetadata.extract_vocabulary(meta)
-                    if vocab_data:
-                        self.vocab = TagVocabulary()
-                        self.vocab.tag_to_index = vocab_data['tag_to_index']
-                        self.vocab.index_to_tag = {int(k): v for k, v in vocab_data['index_to_tag'].items()}
-                        self.vocab.tag_frequencies = vocab_data.get('tag_frequencies', {})
-                        self.num_tags = len(self.vocab.tag_to_index)
-                        logger.info(
-                            f"Successfully extracted embedded vocabulary with {self.num_tags} tags"
-                        )
-                    else:
-                        logger.error("Failed to extract embedded vocabulary, falling back to external file")
+                checkpoint_dir = checkpoint_path.parent
+                manager = CheckpointManager(checkpoint_dir=str(checkpoint_dir))
+                checkpoint = manager.load_checkpoint(checkpoint_path=str(checkpoint_path))
+                if checkpoint:
+                    meta = checkpoint
+                    if 'vocab_b64_gzip' in meta:
+                        logger.info("Found embedded vocabulary in checkpoint, extracting...")
+                        vocab_data = ModelMetadata.extract_vocabulary(meta)
+                        if vocab_data:
+                            self.vocab = TagVocabulary()
+                            self.vocab.tag_to_index = vocab_data['tag_to_index']
+                            self.vocab.index_to_tag = {int(k): v for k, v in vocab_data['index_to_tag'].items()}
+                            self.vocab.tag_frequencies = vocab_data.get('tag_frequencies', {})
+                            self.num_tags = len(self.vocab.tag_to_index)
+                            logger.info(
+                                f"Successfully extracted embedded vocabulary with {self.num_tags} tags"
+                            )
+                        else:
+                            logger.error("Failed to extract embedded vocabulary, falling back to external file")
 
             # If vocabulary not loaded from checkpoint, load from file
             if not hasattr(self, 'vocab'):
-                vocab_path = Path(config.vocab_path)
+                vocab_path = Path(self.config.vocab_path)
                 
                 if vocab_path.is_dir():
                     vocab_path = vocab_path / "vocabulary.json"
@@ -378,34 +220,12 @@ class ONNXExporter:
         self._update_preprocessing_params()
 
     def _update_preprocessing_params(self):
-        """Update preprocessing parameters from checkpoint if available"""
-        try:
-            _, meta = safe_load_checkpoint(self.config.checkpoint_path)
-
-            # Check for preprocessing params in checkpoint
-            if 'preprocessing_params' in meta:
-                params = meta['preprocessing_params']
-                self.config.normalize_mean = params.get('normalize_mean', self.config.normalize_mean)
-                self.config.normalize_std = params.get('normalize_std', self.config.normalize_std)
-                self.config.image_size = params.get('image_size', self.config.image_size)
-                self.config.patch_size = params.get('patch_size', self.config.patch_size)
-                logger.info(f"Loaded preprocessing params from checkpoint: mean={self.config.normalize_mean}, std={self.config.normalize_std}")
-            elif 'config' in meta and isinstance(meta['config'], dict):
-                # Try to extract from training config
-                if 'data' in meta['config']:
-                    data_config = meta['config']['data']
-                    self.config.normalize_mean = list(data_config.get('normalize_mean', self.config.normalize_mean))
-                    self.config.normalize_std = list(data_config.get('normalize_std', self.config.normalize_std))
-                    self.config.image_size = data_config.get('image_size', self.config.image_size)
-                    logger.info(f"Loaded preprocessing params from training config: mean={self.config.normalize_mean}, std={self.config.normalize_std}")
-            else:
-                logger.warning(
-                    f"No preprocessing params found in checkpoint, using defaults: "
-                    f"mean={self.config.normalize_mean}, std={self.config.normalize_std}. "
-                    f"These may not match training values!"
-                )
-        except Exception as e:
-            logger.warning(f"Failed to extract preprocessing params from checkpoint: {e}")
+        """Update preprocessing parameters from the unified config"""
+        self.config.data.normalize_mean = self.config.data.normalize_mean
+        self.config.data.normalize_std = self.config.data.normalize_std
+        self.config.data.image_size = self.config.model.image_size
+        self.config.model.patch_size = self.config.model.patch_size
+        logger.info(f"Loaded preprocessing params from config: mean={self.config.data.normalize_mean}, std={self.config.data.normalize_std}")
 
     def _extract_model_config(self) -> Dict[str, Any]:
         """Extract configuration from the model"""
@@ -453,57 +273,28 @@ class ONNXExporter:
         
     def _load_model(self) -> nn.Module:
         """Load model from checkpoint"""
-        logger.info(f"Loading model from {self.config.checkpoint_path}")
+        checkpoint_path = self.config.training.resume_from
+        logger.info(f"Loading model from {checkpoint_path}")
         
-        if not Path(self.config.checkpoint_path).exists():
-            raise FileNotFoundError(f"Checkpoint not found: {self.config.checkpoint_path}")
+        if not Path(checkpoint_path).exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-        state_dict, meta = safe_load_checkpoint(self.config.checkpoint_path)
-        # Detect number of tags from checkpoint
-        num_tags = None
+        checkpoint_dir = Path(checkpoint_path).parent
+        manager = CheckpointManager(checkpoint_dir=str(checkpoint_dir))
+        checkpoint = manager.load_checkpoint(checkpoint_path=str(checkpoint_path))
+        if not checkpoint:
+            raise FileNotFoundError(f"Could not load checkpoint from {checkpoint_path}")
 
-        # Look for tag_head.weight or tag_head.bias to determine num_tags
-        for key in state_dict.keys():
-            if 'tag_head.weight' in key:
-                num_tags = state_dict[key].shape[0]
-                logger.info(f"Detected {num_tags} tags from checkpoint")
-                break
-            elif 'tag_head.bias' in key:
-                num_tags = state_dict[key].shape[0]
-                logger.info(f"Detected {num_tags} tags from checkpoint")
-                break
+        state_dict = checkpoint.pop('state_dict')
+        meta = checkpoint
         
-        if num_tags is None:
-            # Use vocabulary size as fallback
-            num_tags = self.num_tags
-            logger.warning(f"Could not detect number of tags from checkpoint, using vocabulary size: {num_tags}")
+        num_tags = self.num_tags
         
-        # Extract model config
-        model_config = None
-        if 'config' in meta:
-            model_config = meta['config']
-            if isinstance(model_config, dict) and 'model_config' in model_config:
-                model_config = model_config['model_config']
+        model_config = self.config.model.to_dict()
+        model_config['num_labels'] = num_tags
         
-        if model_config is None:
-            logger.warning("No config found in checkpoint, using default VisionTransformerConfig")
-            model_config = VisionTransformerConfig()
-        
-        # Create model
-        try:
-            if isinstance(model_config, dict):
-                model_params = model_config.copy()
-                model_params['num_tags'] = num_tags
-                logger.info(f"Creating model with {num_tags} tags")
-                model = create_model(**model_params)
-            else:
-                model_params = asdict(model_config)
-                model_params['num_tags'] = num_tags
-                logger.info(f"Creating model with {num_tags} tags")
-                model = create_model(**model_params)
-        except Exception as e:
-            logger.error(f"Failed to create model: {e}")
-            raise
+        logger.info(f"Creating model with {num_tags} tags")
+        model = create_model(**model_config)
 
         # Additional check: Verify the model's tag_head matches vocabulary
         if hasattr(model, 'tag_head'):
@@ -536,9 +327,9 @@ class ONNXExporter:
         # Wrap model for inference
         wrapped_model = InferenceWrapper(
             model,
-            image_size=self.config.image_size,
-            normalize_mean=self.config.normalize_mean,
-            normalize_std=self.config.normalize_std
+            image_size=self.config.data.image_size,
+            normalize_mean=self.config.data.normalize_mean,
+            normalize_std=self.config.data.normalize_std
         )
         wrapped_model.to(self.device)
         
@@ -591,13 +382,13 @@ class ONNXExporter:
     
     def _export_full_model(self) -> Optional[Path]:
         """Export full precision model"""
-        output_path = Path(self.config.output_path)
+        output_path = Path(self.export_config.output_path)
         
         try:
             # Create dummy input for the new InferenceWrapper
             # Input is a raw image: (B, H, W, C) with dtype=uint8
             # Use small size for faster export - exact size doesn't matter with dynamic axes
-            dummy_batch_size = max(1, self.config.batch_size)
+            dummy_batch_size = max(1, self.config.data.batch_size)
             dummy_height = 256  # Small representative size for faster export
             dummy_width = 256
             dummy_input = torch.randint(
@@ -622,29 +413,32 @@ class ONNXExporter:
                     self.model,
                     dummy_input,
                     str(output_path),
-                    export_params=self.config.export_params,
-                    opset_version=self.config.opset_version,
-                    do_constant_folding=self.config.do_constant_folding,
-                    input_names=self.config.input_names,
-                    output_names=self.config.output_names,
-                    dynamic_axes=self.config.dynamic_axes,
+                    export_params=self.export_config.export_params,
+                    opset_version=self.export_config.opset_version,
+                    do_constant_folding=self.export_config.do_constant_folding,
+                    input_names=["input_image"],
+                    output_names=["scores"],
+                    dynamic_axes={
+                        "input_image": {0: "batch_size", 1: "height", 2: "width"},
+                        "scores": {0: "batch_size"}
+                    } if self.export_config.dynamic_batch_size else None,
                     verbose=False
                 )
             
             # Add metadata
-            if self.config.add_metadata:
+            if self.export_config.add_metadata:
                 self._add_metadata(output_path)
 
             # Validate BEFORE optimization (critical fix)
-            if self.config.validate_export:
+            if self.export_config.validate_export:
                 self._validate_model(output_path)
 
             # Optimize
-            if self.config.optimize:
+            if self.export_config.optimize:
                 self._optimize_model(output_path)
 
             # Validate ORT inference after optimization
-            if self.config.validate_export:
+            if self.export_config.validate_export:
                 self._validate_ort_inference(output_path)
             
             logger.info(f"✓ Full model exported to {output_path}")
@@ -661,7 +455,7 @@ class ONNXExporter:
     
     def _export_quantized_model(self) -> Optional[Path]:
         """Export quantized model"""
-        base_path = Path(self.config.output_path)
+        base_path = Path(self.export_config.output_path)
         
         try:
             # Ensure full model exists
@@ -670,16 +464,16 @@ class ONNXExporter:
                 if not self._export_full_model():
                     raise RuntimeError("Failed to export full model")
             
-            if self.config.quantization_type == "dynamic":
+            if self.export_config.quantization_type == "dynamic":
                 quantized_path = base_path.parent / f"{base_path.stem}_quantized_dynamic.onnx"
                 self._quantize_dynamic(base_path, quantized_path)
                 
-            elif self.config.quantization_type == "static":
+            elif self.export_config.quantization_type == "static":
                 quantized_path = base_path.parent / f"{base_path.stem}_quantized_static.onnx"
                 self._quantize_static(base_path, quantized_path)
                 
             else:
-                logger.warning(f"Unknown quantization type: {self.config.quantization_type}")
+                logger.warning(f"Unknown quantization type: {self.export_config.quantization_type}")
                 return None
             
             logger.info(f"✓ Quantized model exported to {quantized_path}")
@@ -858,7 +652,6 @@ class ONNXExporter:
             del model.metadata_props[:]
 
             # Prepare vocabulary for embedding
-            vocab_embedded_successfully = False
             vocab_b64 = ''
             vocab_sha = ''
 
@@ -884,7 +677,7 @@ class ONNXExporter:
 
                 except Exception as e:
                     logger.error(f"Failed to embed loaded vocabulary: {e}")
-                    if self.config.require_embedded_vocabulary:
+                    if self.export_config.require_embedded_vocabulary:
                         raise RuntimeError(
                             f"Failed to embed vocabulary in ONNX model: {e}\n"
                             f"Cannot export model without embedded vocabulary.\n"
@@ -919,7 +712,7 @@ class ONNXExporter:
 
             # Check if embedding succeeded
             if not vocab_embedded_successfully:
-                if self.config.require_embedded_vocabulary:
+                if self.export_config.require_embedded_vocabulary:
                     raise RuntimeError(
                         "No vocabulary available for embedding.\n"
                         "ONNX export requires embedded vocabulary for reproducible inference.\n"
@@ -934,19 +727,19 @@ class ONNXExporter:
 
             # Add metadata
             metadata = {
-                'model_description': self.config.model_description,
-                'model_author': self.config.model_author,
-                'model_version': self.config.model_version,
+                'model_description': self.export_config.model_description,
+                'model_author': self.export_config.model_author,
+                'model_version': self.export_config.model_version,
                 'export_date': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'num_tags': str(len(self.vocab.tag_to_index)),
-                'image_size': str(self.config.image_size),
-                'patch_size': str(self.config.patch_size),
-                'normalize_mean': json.dumps(self.config.normalize_mean),
-                'normalize_std': json.dumps(self.config.normalize_std),
+                'image_size': str(self.config.data.image_size),
+                'patch_size': str(self.config.model.patch_size),
+                'normalize_mean': json.dumps(self.config.data.normalize_mean),
+                'normalize_std': json.dumps(self.config.data.normalize_std),
                 'framework': 'PyTorch',
                 'framework_version': torch.__version__,
                 'onnx_version': onnx.__version__,
-                'opset_version': str(self.config.opset_version),
+                'opset_version': str(self.export_config.opset_version),
                 'device': str(self.device),
             }
 
@@ -1226,28 +1019,22 @@ def main():
         try:
             manager = ConfigManager(config_type=ConfigType.FULL)
             unified_config = manager.load_from_file("configs/unified_config.yaml")
-            export_cfg = unified_config.export
-            data_cfg = unified_config.data
-            model_cfg = unified_config.model
         except Exception as e:
             logger.error(f"Could not load unified_config.yaml: {e}. Cannot proceed without configuration.")
             sys.exit(1)
 
         parser = argparse.ArgumentParser(description='Export Anime Tagger model to ONNX')
-        parser.add_argument('checkpoint', type=str, help='Path to model checkpoint')
-        # New preferred flag; can point to file or directory
+        parser.add_argument('checkpoint', nargs='?', default=None, help='Path to model checkpoint')
         parser.add_argument('--vocab_path', type=str, default=None, help='Path to vocabulary file or directory')
-        # Backward-compat positional (optional). If provided, used when --vocab_path is not.
-        parser.add_argument('vocab_dir', type=str, nargs='?', default=None, help='[deprecated] Path to vocabulary directory or file')
-        parser.add_argument('-o', '--output', type=str, default=None, help=f'Output ONNX model path (default: {export_cfg.output_path})')
-        parser.add_argument('-b', '--batch-size', type=int, default=1, help='Batch size for export (for dummy input)')
-        parser.add_argument('-s', '--image-size', type=int, default=None, help=f'Input image size (default: {data_cfg.image_size})')
-        parser.add_argument('--opset', type=int, default=None, help=f'ONNX opset version (default: {export_cfg.opset_version})')
-        parser.add_argument('--variants', nargs='+', default=['full'], choices=['full', 'quantized'], help='Export variants to generate')
+        parser.add_argument('-o', '--output', type=str, default=None, help=f'Output ONNX model path')
+        parser.add_argument('-b', '--batch-size', type=int, default=None, help='Batch size for export')
+        parser.add_argument('-s', '--image-size', type=int, default=None, help=f'Input image size')
+        parser.add_argument('--opset', type=int, default=None, help=f'ONNX opset version')
+        parser.add_argument('--variants', nargs='+', default=None, choices=['full', 'quantized'], help='Export variants to generate')
         parser.add_argument('--optimize', action='store_true', default=None, help='Optimize exported model')
         parser.add_argument('--no-optimize', action='store_true', default=None, help='Do not optimize exported model')
         parser.add_argument('--quantize', action='store_true', default=None, help='Enable quantization')
-        parser.add_argument('--quantization-type', type=str, default=None, choices=['dynamic', 'static'], help=f'Quantization type (default: {export_cfg.quantization_type})')
+        parser.add_argument('--quantization-type', type=str, default=None, choices=['dynamic', 'static'], help=f'Quantization type')
         parser.add_argument('--no-validate', action='store_true', default=None, help='Skip validation')
         parser.add_argument('--benchmark', action='store_true', help='Run benchmark after export')
         parser.add_argument('--force-rebuild-head', action='store_true', help='Recreate tag head if its out_features does not match the vocabulary size')
@@ -1255,59 +1042,32 @@ def main():
 
         args = parser.parse_args()
 
-        # Verify checkpoint exists
-        if not Path(args.checkpoint).exists():
-            logger.error(f"Checkpoint not found: {args.checkpoint}")
-            sys.exit(1)
-
-        # Determine final optimize flag
-        if args.optimize is True and args.no_optimize is True:
-            raise ValueError("Cannot use both --optimize and --no-optimize")
-        if args.optimize is None and args.no_optimize is None:
-            optimize = export_cfg.optimize
-        else:
-            optimize = args.optimize is True
-
-        # Determine final quantize flag
-        quantize = args.quantize if args.quantize is not None else export_cfg.quantize
-
-        # Determine final validate flag
-        validate_export = not args.no_validate if args.no_validate is not None else export_cfg.validate_export
-
-        # Create config
-        config = ONNXExportConfig(
-            checkpoint_path=args.checkpoint,
-            vocab_path=(args.vocab_path if args.vocab_path is not None else (args.vocab_dir or getattr(unified_config, 'vocab_path', None) or getattr(data_cfg, 'vocab_dir', None) or "./vocabulary.json")),
-            output_path=args.output or export_cfg.output_path,
-            batch_size=args.batch_size,
-            image_size=args.image_size or data_cfg.image_size,
-            patch_size=model_cfg.patch_size,
-            opset_version=args.opset or export_cfg.opset_version,
-            export_variants=args.variants,
-            optimize=optimize,
-            quantize=quantize,
-            quantization_type=args.quantization_type or export_cfg.quantization_type,
-            validate_export=validate_export,
-            use_dynamic_axes=export_cfg.dynamic_batch_size,
-            export_params=export_cfg.export_params,
-            do_constant_folding=export_cfg.do_constant_folding,
-            add_metadata=export_cfg.add_metadata,
-            model_description=export_cfg.model_description,
-            model_author=export_cfg.model_author,
-            model_version=export_cfg.model_version,
-            normalize_mean=list(data_cfg.normalize_mean),
-            normalize_std=list(data_cfg.normalize_std),
-            tolerance_atol=export_cfg.tolerance_atol,
-            tolerance_rtol=export_cfg.tolerance_rtol,
-            force_rebuild_head=args.force_rebuild_head,
-        )
-
-        # Log vocabulary path being used
-        logger.info(f"Using vocabulary: {config.vocab_path}")
-        logger.info(f"Checkpoint: {config.checkpoint_path}")
-
+        # Override config with CLI args
+        if args.checkpoint:
+            unified_config.training.resume_from = args.checkpoint
+        if args.vocab_path:
+            unified_config.vocab_path = args.vocab_path
+        if args.output:
+            unified_config.export.output_path = args.output
+        if args.batch_size:
+            unified_config.data.batch_size = args.batch_size
+        if args.image_size:
+            unified_config.model.image_size = args.image_size
+        if args.opset:
+            unified_config.export.opset_version = args.opset
+        if args.variants:
+            unified_config.export.export_variants = args.variants
+        if args.optimize is not None:
+            unified_config.export.optimize = not args.no_optimize
+        if args.quantize is not None:
+            unified_config.export.quantize = args.quantize
+        if args.quantization_type:
+            unified_config.export.quantization_type = args.quantization_type
+        if args.no_validate is not None:
+            unified_config.export.validate_export = not args.no_validate
+        
         # Create exporter
-        exporter = ONNXExporter(config)
+        exporter = ONNXExporter(unified_config)
         
         # Export
         results = exporter.export()

@@ -13,8 +13,8 @@ original_main = ds.main
 
 def test_main():
     """Modified main for testing"""
-    database_path = Path(r'Z:\OppaiOracle\test_downsample')
-    progress_file = Path(r'Z:\OppaiOracle\test_downsample\test_progress.txt')
+    database_path = Path(r'L:\Dab\OppaiOracle\test_downsample')
+    progress_file = Path(r'L:\Dab\OppaiOracle\test_downsample\test_progress.txt')
 
     if not database_path.exists():
         print(f"ERROR: Test database path not found: {database_path}")

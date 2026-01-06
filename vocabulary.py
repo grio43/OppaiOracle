@@ -9,6 +9,17 @@ management for both training and inference, eliminating code duplication.
 import atexit
 import json
 import logging
+import itertools
+import threading
+
+# Try to use orjson for faster JSON parsing (3-5x faster than stdlib json)
+try:
+    import orjson
+    HAS_ORJSON = True
+except ImportError:
+    HAS_ORJSON = False
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
 import torch
@@ -22,43 +33,23 @@ VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
 
 # Global vocabulary cache to avoid reloading same vocabulary
 _VOCAB_CACHE: Dict[str, 'TagVocabulary'] = {}
+_VOCAB_CACHE_LOCK = threading.Lock()  # Thread-safe access to vocabulary cache
 
 def _clear_vocab_cache():
     """Clear the vocabulary cache (called on exit)."""
     global _VOCAB_CACHE
-    _VOCAB_CACHE.clear()
+    with _VOCAB_CACHE_LOCK:
+        _VOCAB_CACHE.clear()
 
 # Register cleanup on exit
 atexit.register(_clear_vocab_cache)
 
-# ---------------------------------------------------------------------------
-# Ignore tag handling
-#
-# Tags listed in a plain text file called ``Tags_ignore.txt`` located in the
-# repository root will be automatically excluded from both the vocabulary and
-# the training labels. This allows callers to specify words that should be
-# entirely ignored by the system – no learning signal is generated for them
-# and they are omitted from scoring
-#
-# Each line in ``Tags_ignore.txt`` should contain a single tag. Blank lines
-# and lines beginning with ``#`` are ignored.
-
-# IMPORTANT: Due to PyTorch DataLoader multiprocessing, ignored indices must be
-# passed explicitly to dataset constructors. Global module state does not
-# propagate to worker processes.
-
 def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:
-    """Load ignore tags from a plain text file with validation (CR-013).
+    """Load ignore tags from a plain text file.
 
-    If ``ignore_file`` is not provided, this attempts to locate a
-    ``Tags_ignore.txt`` file in the same directory as this module.  Each
-    non‑empty, non‑comment line of the file is treated as a tag to ignore.
-
-    Returns:
-        A set of tag strings that should be ignored.
+    Each non-empty, non-comment line is treated as a tag to ignore.
+    Falls back to Tags_ignore.txt in this module's directory if no path given.
     """
-    # The logic for finding the ignore_file from vocabulary.yaml has been removed.
-    # The path should be passed in explicitly or it will fall back to the default.
     if ignore_file is None:
         module_path = Path(__file__).resolve()
         ignore_file = module_path.parent / 'Tags_ignore.txt'
@@ -106,16 +97,60 @@ def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:
     return ignored
 
 
+def _iter_chunks(items: List[str], chunk_size: int) -> Iterable[List[str]]:
+    chunk: List[str] = []
+    for item in items:
+        chunk.append(item)
+        if len(chunk) >= chunk_size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+def _count_tags_in_files(file_paths: List[str], ignored_tags: Set[str]) -> Dict[str, int]:
+    tag_counts: Counter = Counter()
+    for json_file in file_paths:
+        try:
+            # Use orjson if available (3-5x faster for large-scale vocabulary building)
+            if HAS_ORJSON:
+                data = orjson.loads(Path(json_file).read_bytes())
+            else:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+            entries = data if isinstance(data, list) else [data]
+
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+
+                tags_field = entry.get('tags')
+                if not tags_field:
+                    continue
+
+                if isinstance(tags_field, str):
+                    tags_list = [tag.strip() for tag in tags_field.split(',') if tag.strip()]
+                elif isinstance(tags_field, list):
+                    tags_list = [str(tag).strip() for tag in tags_field if str(tag).strip()]
+                else:
+                    continue
+
+                for tag in tags_list:
+                    if tag in ignored_tags:
+                        continue
+                    tag_counts[tag] += 1
+
+        except (KeyError, json.JSONDecodeError) as e:
+            logger.warning(f"Failed to parse {json_file}: {e}")
+        except Exception as e:
+            logger.warning(f"Unexpected error parsing {json_file}: {e}")
+
+    return tag_counts
+
+
 class TagVocabulary:
-    """Unified tag vocabulary manager with support for both training and inference.
-    
-    This class combines functionality from both dataset_loader.py and Inference_Engine.py
-    to provide a single, comprehensive vocabulary implementation.
-    
-    Note: When using with PyTorch DataLoader in multiprocessing mode, ignored_tag_indices
-    must be explicitly passed to dataset constructors as global state does not propagate
-    to worker processes.
-    """
+    """Unified tag vocabulary manager for training and inference."""
     
     def __init__(self,
                  vocab_path: Optional[Path] = None,
@@ -138,19 +173,8 @@ class TagVocabulary:
         self.index_to_tag: Dict[int, str] = {}
         self.tag_frequencies: Dict[str, int] = {}
         self.min_frequency = min_frequency
-
-        # Load the ignore list once.  ``ignored_tags`` holds the set of tag
-        # strings that should be ignored entirely.  ``ignored_tag_indices`` is
-        # derived later once the vocabulary is built or loaded. These
-        # attributes are instance specific so that unit tests or multiple
-        # vocabularies can operate independently.
         self.ignored_tags: Set[str] = _load_ignore_tags(ignore_file)
         self.ignored_tag_indices: List[int] = []
-        
-        # Special tokens
-        # Use distinct strings for padding and unknown tokens.
-        # The pad token (index 0) is reserved for masking and is not a valid output.
-        # The unk token (index 1) represents unknown or rare tags.
         self.pad_token = pad_token
         self.unk_token = unk_token
 
@@ -179,8 +203,11 @@ class TagVocabulary:
         if vocab_path is not None and vocab_path.exists():
             try:
                 self.load_vocabulary(vocab_path)
-            except Exception:
-                logger.info(f"Could not load vocabulary from {vocab_path}, will build a new one")
+            except Exception as e:
+                # Critical: vocabulary load failure should not be silent
+                # An empty vocabulary will cause training to produce meaningless results
+                logger.error(f"Failed to load vocabulary from {vocab_path}: {e}")
+                raise ValueError(f"Vocabulary load failed for {vocab_path}: {e}") from e
     
     def __len__(self) -> int:
         """Return the size of the vocabulary."""
@@ -194,22 +221,8 @@ class TagVocabulary:
         return self.ignored_tag_indices.copy()
     
     def encode_tags(self, tags: Iterable[str]) -> torch.Tensor:
-        """Encode a list of tag strings into a multi-hot tensor.
-        
-        Unknown tags are mapped to the <UNK> index; the resulting tensor
-        has shape (vocab_size,) and dtype float32.
-        
-        Args:
-            tags: Iterable of tag strings
-            
-        Returns:
-            Multi-hot tensor of shape (vocab_size,)
-        """
+        """Encode tag strings into a multi-hot tensor of shape (vocab_size,)."""
         vector = torch.zeros(len(self.tag_to_index), dtype=self._tag_vector_dtype)
-        # Skip any tags that are marked as ignored.  Ignored tags are not
-        # encoded at all; they do not contribute to the label vector and
-        # therefore produce no training signal.  Unknown tags are still
-        # mapped to the <UNK> index as before.
         for tag in tags:
             if tag in self.ignored_tags:
                 continue
@@ -229,17 +242,7 @@ class TagVocabulary:
         return self.tag_to_index.get(tag, self.unk_index)
     
     def get_tag_from_index(self, index: int) -> str:
-        """Get tag from index (for inference compatibility).
-        
-        Args:
-            index: Tag index
-
-        Returns:
-            Tag string, or <UNK> if index not found
-            
-        Raises:
-            ValueError: If the tag at the index is a placeholder (corrupted vocabulary)
-        """
+        """Get tag from index. Returns <UNK> if not found."""
         tag = self.index_to_tag.get(index, self.unk_token)
         # Fail fast if we encounter a placeholder tag
         if tag != self.unk_token and tag.startswith("tag_") and len(tag) > 4 and tag[4:].isdigit():
@@ -261,8 +264,12 @@ class TagVocabulary:
         
         for json_file in json_files:
             try:
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                # Use orjson if available (3-5x faster for large-scale vocabulary building)
+                if HAS_ORJSON:
+                    data = orjson.loads(Path(json_file).read_bytes())
+                else:
+                    with open(json_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
 
                 # Handle both single entry (dict) and multiple entries (list)
                 entries = data if isinstance(data, list) else [data]
@@ -297,48 +304,44 @@ class TagVocabulary:
                 logger.warning(f"Failed to parse {json_file}: {e}")
             except Exception as e:
                 logger.warning(f"Unexpected error parsing {json_file}: {e}")
-        
-        # Sort tags by frequency and cut to top_k
+
+        self.build_from_tag_counts(tag_counts, top_k)
+
+    def build_from_tag_counts(self, tag_counts: Dict[str, int], top_k: Optional[int]) -> None:
+        """Build a vocabulary from precomputed tag counts.
+
+        Args:
+            tag_counts: Mapping of tag string to frequency
+            top_k: Maximum number of tags to keep (sorted by frequency)
+        """
         sorted_tags = sorted(
             [t for t, c in tag_counts.items() if c >= self.min_frequency],
             key=lambda x: (-tag_counts[x], x)
         )
-        
+
         if top_k is not None and top_k > 0:
             sorted_tags = sorted_tags[:top_k]
-        
-        # Assign indices. Reserve 0 for <PAD> and 1 for <UNK>
+
         self.tag_to_index = {self.pad_token: 0, self.unk_token: 1}
         self.index_to_tag = {0: self.pad_token, 1: self.unk_token}
         self.unk_index = 1
-        
+
         for idx, tag in enumerate(sorted_tags, start=2):
             self.tag_to_index[tag] = idx
             self.index_to_tag[idx] = tag
             self.tag_frequencies[tag] = tag_counts[tag]
 
-        # Update ignored tag indices
-        # Note: Some ignored tags may not be in vocabulary (if below min_frequency or filtered by top_k)
         self.ignored_tag_indices = [
             self.tag_to_index[tag] for tag in self.ignored_tags
             if tag in self.tag_to_index
         ]
-        
-        # Update tags list for compatibility
+
         self.tags = sorted_tags
-        
+
         logger.info(f"Vocabulary built with {len(self.tag_to_index)} tags (incl. special tokens)")
     
     def save_vocabulary(self, vocab_path: Path) -> None:
-        """Save the vocabulary to a JSON file with type consistency.
-
-        The file contains tag_to_index, index_to_tag, and tag_frequencies.
-        All keys and values are explicitly converted to ensure type safety
-        during JSON serialization/deserialization.
-
-        Args:
-            vocab_path: Path to save vocabulary file
-        """
+        """Save the vocabulary to a JSON file."""
         vocab_path = Path(vocab_path)
         vocab_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -355,32 +358,40 @@ class TagVocabulary:
         logger.info(f"Saved vocabulary to {vocab_path}")
     
     def load_vocabulary(self, vocab_path: Path, skip_validation: bool = False) -> None:
-        """Load vocabulary from a JSON file with type conversion and validation.
+        """Load vocabulary from a JSON file with type conversion and validation."""
+        # Use orjson if available (3-5x faster)
+        if HAS_ORJSON:
+            data = orjson.loads(Path(vocab_path).read_bytes())
+        else:
+            with open(vocab_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
 
-        Args:
-            vocab_path: Path to vocabulary JSON file
-            skip_validation: If True, skip integrity validation (faster for trusted sources)
-
-        Raises:
-            ValueError: If vocabulary has inconsistent bidirectional mappings
-        """
-        with open(vocab_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        # Optimized type conversion: avoid dict comprehension overhead for large vocabs
-        # Pre-allocate dictionaries and use direct assignment
+        # Type conversion with full validation (all-or-nothing to prevent partial corruption)
+        # Build temporary dicts first, then assign all at once after successful validation
         tag_to_index_raw = data['tag_to_index']
         index_to_tag_raw = data['index_to_tag']
 
-        # Type conversions cached to avoid repeated work
-        if isinstance(next(iter(tag_to_index_raw.values())), int):
-            # Already correct types, shallow copy is sufficient
-            self.tag_to_index = dict(tag_to_index_raw)
-        else:
-            self.tag_to_index = {str(k): int(v) for k, v in tag_to_index_raw.items()}
+        # Validate and convert tag_to_index: all values must be convertible to int
+        # Use temporary dict to prevent partial state on error
+        _tag_to_index = {}
+        for k, v in tag_to_index_raw.items():
+            try:
+                _tag_to_index[str(k)] = int(v)
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Invalid index value for tag '{k}': {v!r} (must be integer)") from e
 
-        # index_to_tag needs int keys (JSON uses string keys)
-        self.index_to_tag = {int(k): str(v) for k, v in index_to_tag_raw.items()}
+        # Validate and convert index_to_tag: all keys must be convertible to int
+        # Use temporary dict to prevent partial state on error
+        _index_to_tag = {}
+        for k, v in index_to_tag_raw.items():
+            try:
+                _index_to_tag[int(k)] = str(v)
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"Invalid index key '{k}' (must be integer)") from e
+
+        # All validation passed - now assign to self (all-or-nothing)
+        self.tag_to_index = _tag_to_index
+        self.index_to_tag = _index_to_tag
         self.tag_frequencies = data.get('tag_frequencies', {})
         
         # Ensure special tokens are present
@@ -429,20 +440,32 @@ class TagVocabulary:
         if not json_str or not json_str.strip():
             detail = "empty" if not json_str else f"whitespace-only (length {len(json_str)})"
             raise ValueError(f"Cannot create vocabulary from {detail} JSON string")
-        data = json.loads(json_str)
+        # Use orjson if available (3-5x faster)
+        data = orjson.loads(json_str) if HAS_ORJSON else json.loads(json_str)
         vocab = cls()
-        vocab.tag_to_index = {k: int(v) for k, v in data['tag_to_index'].items()}
-        vocab.index_to_tag = {int(k): v for k, v in data['index_to_tag'].items()}
+        # Validate and convert tag_to_index values to int
+        try:
+            vocab.tag_to_index = {k: int(v) for k, v in data['tag_to_index'].items()}
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid index value in tag_to_index: {e}") from e
+        # Validate and convert index_to_tag keys to int
+        try:
+            vocab.index_to_tag = {int(k): v for k, v in data['index_to_tag'].items()}
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid index key in index_to_tag: {e}") from e
         vocab.tag_frequencies = data.get('tag_frequencies', {})
 
-        # Ensure special tokens
-        for token in (vocab.pad_token, vocab.unk_token):
-            if token not in vocab.tag_to_index:
-                idx = len(vocab.tag_to_index)
-                vocab.tag_to_index[token] = idx
-                vocab.index_to_tag[idx] = token
+        # Ensure special tokens exist with standard indices (PAD=0, UNK=1)
+        # This is critical for correct encoding/decoding
+        if vocab.pad_token not in vocab.tag_to_index:
+            vocab.tag_to_index[vocab.pad_token] = 0
+            vocab.index_to_tag[0] = vocab.pad_token
+        if vocab.unk_token not in vocab.tag_to_index:
+            vocab.tag_to_index[vocab.unk_token] = 1
+            vocab.index_to_tag[1] = vocab.unk_token
 
-        vocab.unk_index = vocab.tag_to_index.get(vocab.unk_token, 1)
+        # UNK index must match the actual index in tag_to_index (no hardcoded fallback)
+        vocab.unk_index = vocab.tag_to_index[vocab.unk_token]
         vocab.tags = [t for t in vocab.tag_to_index.keys() if t not in (vocab.pad_token, vocab.unk_token)]
         vocab.ignored_tag_indices = [
             vocab.tag_to_index[t] for t in vocab.ignored_tags
@@ -502,11 +525,13 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH, use_cache: bool =
     """
     vocab_path = Path(vocab_dir).resolve()
 
-    # Check cache first if enabled
+    # Check cache first if enabled (thread-safe with double-checked locking)
     cache_key = str(vocab_path)
-    if use_cache and cache_key in _VOCAB_CACHE:
-        logger.debug(f"Using cached vocabulary from {vocab_path}")
-        return _VOCAB_CACHE[cache_key]
+    if use_cache:
+        with _VOCAB_CACHE_LOCK:
+            if cache_key in _VOCAB_CACHE:
+                logger.debug(f"Using cached vocabulary from {vocab_path}")
+                return _VOCAB_CACHE[cache_key]
 
     vocab = None
     source_path = None
@@ -550,9 +575,10 @@ def load_vocabulary_for_training(vocab_dir: Path = VOCAB_PATH, use_cache: bool =
         # Verify vocabulary integrity
         _verify_vocabulary_integrity(vocab, source_path)
 
-        # Cache the loaded vocabulary
+        # Cache the loaded vocabulary (thread-safe)
         if use_cache:
-            _VOCAB_CACHE[cache_key] = vocab
+            with _VOCAB_CACHE_LOCK:
+                _VOCAB_CACHE[cache_key] = vocab
             logger.debug(f"Cached vocabulary from {vocab_path}")
 
         return vocab
@@ -662,6 +688,8 @@ def create_vocabulary_from_datasets(
     *,
     min_frequency: int = 50,
     top_k: int = 100_000,
+    num_workers: int = 16,
+    chunk_size: int = 2000,
 ):
     """Create vocabulary from datasets (for training).
 
@@ -672,16 +700,39 @@ def create_vocabulary_from_datasets(
         dataset_path: List with a single root directory to scan recursively for ``*.json``
         min_frequency: Minimum tag frequency to include in the vocabulary
         top_k: Maximum number of tags to keep (most frequent first)
+        num_workers: Number of worker processes to use for tag counting
+        chunk_size: Number of files per worker chunk
     """
     from pathlib import Path
 
     json_files: List[str] = []
     data_dir = Path(dataset_path[0])
-    for file in data_dir.rglob('*.json'):
-        json_files.append(str(file))
+    # Scan subdirectories only (skip root-level files like train.json, val.json)
+    for subdir in data_dir.iterdir():
+        if subdir.is_dir():
+            for file in subdir.rglob('*.json'):
+                json_files.append(str(file))
 
     vocab = TagVocabulary(min_frequency=min_frequency)
-    vocab.build_from_annotations([Path(f) for f in json_files], top_k=top_k)
+    num_workers = int(num_workers or 0)
+    chunk_size = max(1, int(chunk_size or 0))
+
+    if num_workers > 1 and json_files:
+        logger.info(
+            f"Building vocabulary from {len(json_files)} files using {num_workers} workers"
+        )
+        tag_counts: Counter = Counter()
+        chunks = _iter_chunks(json_files, chunk_size)
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            for partial in executor.map(
+                _count_tags_in_files,
+                chunks,
+                itertools.repeat(vocab.ignored_tags),
+            ):
+                tag_counts.update(partial)
+        vocab.build_from_tag_counts(tag_counts, top_k=top_k)
+    else:
+        vocab.build_from_annotations([Path(f) for f in json_files], top_k=top_k)
 
     vocab.save_vocabulary(VOCAB_PATH)
     logger.info(f"Created vocabulary with {len(vocab)} tags at {VOCAB_PATH}")

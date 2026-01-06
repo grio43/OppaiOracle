@@ -5,6 +5,15 @@ Builds a real DataModule from dataset_loader.create_dataloaders and aligns
 Lightning settings with the unified configuration.
 """
 
+import warnings
+
+warnings.warn(
+    "The 'train_lightning.py' file is deprecated and will be removed in a future version. "
+    "Please use 'train_direct.py' for training.",
+    DeprecationWarning,
+    stacklevel=2
+)
+
 from __future__ import annotations
 
 import argparse
@@ -172,10 +181,14 @@ def main() -> None:
     # Map AMP settings to PL precision strings
     use_amp = bool(getattr(getattr(config, "training", None), "use_amp", True))
     amp_dtype = str(getattr(getattr(config, "training", None), "amp_dtype", "bfloat16")).lower()
-    if use_amp and amp_dtype in {"bfloat16", "bf16"}:
+    if use_amp:
+        if amp_dtype not in {"bfloat16", "bf16"}:
+            raise ValueError(f"Only bfloat16 AMP is supported, got '{amp_dtype}'.")
+        if not torch.cuda.is_available():
+            raise RuntimeError("bfloat16 AMP requested but CUDA is not available.")
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("bfloat16 AMP requested but CUDA device does not support bf16.")
         precision = "bf16-mixed"
-    elif use_amp:
-        precision = "16-mixed"
     else:
         precision = 32
 

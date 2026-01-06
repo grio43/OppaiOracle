@@ -1,6 +1,6 @@
 from pathlib import Path
 
-shard = Path('Z:/OppaiOracle/test_downsample/shard_00000')
+shard = Path('L:/Dab/OppaiOracle/test_downsample/shard_00000')
 
 jpg = list(shard.glob('*.jpg')) + list(shard.glob('*.jpeg'))
 png = list(shard.glob('*.png'))

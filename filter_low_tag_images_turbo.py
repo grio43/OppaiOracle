@@ -1,11 +1,11 @@
 """
-Ultra-fast low-tag image filtering for NAS - optimized for network I/O.
+Ultra-fast low-tag image filtering.
 
 Key optimizations:
 - Multiprocessing for parallel shard processing
 - Large file batches (500 files at once)
 - Progress tracking for resume capability
-- Efficient NAS I/O patterns
+- Efficient I/O patterns
 
 Usage:
     python filter_low_tag_images_turbo.py --dry-run           # Preview
@@ -23,6 +23,13 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing as mp
 
+# Try to use orjson for faster JSON parsing (3-5x faster than stdlib json)
+try:
+    import orjson
+    HAS_ORJSON = True
+except ImportError:
+    HAS_ORJSON = False
+
 try:
     from tqdm import tqdm
     HAS_TQDM = True
@@ -31,10 +38,10 @@ except ImportError:
 
 # Configuration
 DEFAULT_MIN_TAG_COUNT = 26
-BATCH_SIZE = 500  # Process files in batches for better NAS performance
-NUM_WORKERS = 8   # Parallel shard processing (increased for NAS)
+BATCH_SIZE = 500  # Process files in batches for better performance
+NUM_WORKERS = 8   # Parallel shard processing
 FILE_WORKERS = 4  # Parallel file processing within each shard
-DATASET_BASE = r"Z:\workspace\Dab"
+DATASET_BASE = r"L:\Dab\Dab"
 IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
 
 # Parse command line args
@@ -47,8 +54,8 @@ def get_arg_value(arg_name, default):
         if arg == arg_name and i + 1 < len(sys.argv):
             try:
                 return type(default)(sys.argv[i + 1])
-            except:
-                pass
+            except (ValueError, TypeError, IndexError):
+                return default
     return default
 
 MIN_TAG_COUNT = get_arg_value('--min-tags', DEFAULT_MIN_TAG_COUNT)
@@ -99,8 +106,12 @@ def analyze_json_file(json_path):
     Returns: (json_path, tag_count, image_path, should_delete)
     """
     try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        # Use orjson if available (3-5x faster for batch analysis)
+        if HAS_ORJSON:
+            data = orjson.loads(Path(json_path).read_bytes())
+        else:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
 
         tags_str = data.get('tags', '')
         tag_count = parse_tags_fast(tags_str)
@@ -161,11 +172,11 @@ def process_shard_worker(args):
         # Analyze all files first
         files_to_delete = []
 
-        # Process in batches with parallel I/O for better NAS performance
+        # Process in batches with parallel I/O for better performance
         for i in range(0, len(json_files), BATCH_SIZE):
             batch = json_files[i:i + BATCH_SIZE]
 
-            # Use ThreadPoolExecutor for parallel file I/O (better for NAS)
+            # Use ThreadPoolExecutor for parallel file I/O
             with ThreadPoolExecutor(max_workers=FILE_WORKERS) as executor:
                 futures = [executor.submit(analyze_json_file, json_file) for json_file in batch]
 
@@ -214,7 +225,7 @@ def parse_shard_range(range_str):
     try:
         start, end = map(int, range_str.split('-'))
         return (start, end)
-    except:
+    except (ValueError, AttributeError):
         return None
 
 def main():
@@ -401,8 +412,12 @@ def main():
             # Verify tag count by re-reading the JSON
             if sample['json_exists']:
                 try:
-                    with open(sample['json'], 'r', encoding='utf-8') as f:
-                        data = json.load(f)
+                    # Use orjson if available (3-5x faster)
+                    if HAS_ORJSON:
+                        data = orjson.loads(Path(sample['json']).read_bytes())
+                    else:
+                        with open(sample['json'], 'r', encoding='utf-8') as f:
+                            data = json.load(f)
                     tags_str = data.get('tags', '')
                     verified_count = parse_tags_fast(tags_str)
                     print(f"  Verified tag count: {verified_count} tags")

@@ -42,6 +42,13 @@ import hashlib
 import json
 import logging
 import os
+
+# Try to use orjson for faster JSON parsing (3-5x faster than stdlib json)
+try:
+    import orjson
+    HAS_ORJSON = True
+except ImportError:
+    HAS_ORJSON = False
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -111,7 +118,13 @@ def _iter_sidecar_jsons(root: Path, use_cache: bool = True) -> Tuple[List[Path],
         except Exception:
             pass
 
-    all_jsons = sorted(root.rglob("*.json")) if root.exists() else []
+    # Scan subdirectories only (skip root-level files like train.json, val.json)
+    all_jsons = []
+    if root.exists():
+        for subdir in root.iterdir():
+            if subdir.is_dir():
+                all_jsons.extend(subdir.rglob("*.json"))
+        all_jsons.sort()
     if not all_jsons:
         raise FileNotFoundError(f"No annotation JSON files found under {root}")
     return all_jsons, []  # caller will split
@@ -234,7 +247,8 @@ def _write_manifest_parallel(
 
     def _process_one(jp: Path) -> Optional[dict]:
         try:
-            data = json.loads(jp.read_text(encoding="utf-8"))
+            # Use orjson if available (3-5x faster for batch processing)
+            data = orjson.loads(jp.read_bytes()) if HAS_ORJSON else json.loads(jp.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return None
             src, stem, ext = _find_image_for_json(jp, data)
@@ -336,7 +350,8 @@ def main() -> None:
             if i % 10000 == 0:
                 logger.info("Processed %d / %d", i, len(json_paths))
             try:
-                data = json.loads(jp.read_text(encoding="utf-8"))
+                # Use orjson if available (3-5x faster)
+                data = orjson.loads(jp.read_bytes()) if HAS_ORJSON else json.loads(jp.read_text(encoding="utf-8"))
             except Exception as e:
                 logger.warning("Skipping unreadable JSON %s: %s", jp, e)
                 continue

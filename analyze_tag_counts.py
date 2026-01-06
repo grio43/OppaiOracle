@@ -148,7 +148,7 @@ def calculate_statistics(all_tag_counts):
 
 if __name__ == "__main__":
     # Analyze multiple shards for larger sample
-    base_path = r"Z:\workspace\Dab"
+    base_path = r"L:\Dab\Dab"
     shard_numbers = [0, 1, 2, 3]  # Analyze first 4 shards
 
     all_tag_counts = []

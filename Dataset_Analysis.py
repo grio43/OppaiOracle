@@ -808,13 +808,13 @@ def _analyze_single_image_worker(path_str: str, config: AnalysisConfig) -> Optio
         # Workers shouldn't be too chatty; the main process logs failures on result retrieval.
         return None
 
-# --- Rest of DatasetAnalyzer methods (was incorrectly indented inside worker function) ---
-def _flush_stats_buffer(self):
-    """Flush stats buffer to main list"""
-    self.image_stats.extend(self.image_stats_buffer)
-    self.image_stats_buffer.clear()
+    # --- Rest of DatasetAnalyzer methods ---
+    def _flush_stats_buffer(self):
+        """Flush stats buffer to main list"""
+        self.image_stats.extend(self.image_stats_buffer)
+        self.image_stats_buffer.clear()
 
-def _analyze_tags(self, image_paths: List[Path]) -> Dict[str, Any]:
+    def _analyze_tags(self, image_paths: List[Path]) -> Dict[str, Any]:
         """Analyze tag distributions"""
         logger.info("Analyzing tags...")
         
