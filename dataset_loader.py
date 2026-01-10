@@ -801,6 +801,9 @@ class DatasetLoader(Dataset):
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
 
+        # CPU BF16 cache pipeline (disabled for manifest mode DatasetLoader)
+        self._cpu_bf16_cache = False
+
         # Tag vector dtype
         self._tag_vector_dtype = _canon_dtype(str(tag_vector_dtype).lower())
 
@@ -1713,7 +1716,7 @@ class SidecarJsonDataset(Dataset):
         state = self.__dict__.copy()
         # Remove unpicklable objects before sending to worker
         state['_prefetcher'] = None          # ImagePreFetcher thread pool (if any)
-        state['_orientation_handler'] = None # May contain unpicklable state
+        state['orientation_handler'] = None  # May contain unpicklable state
         state['_stats_queue'] = None         # multiprocessing.Queue (cannot be pickled on Windows spawn)
         return state
 

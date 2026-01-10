@@ -2,6 +2,12 @@
 """
 Shared vocabulary using multiprocessing shared memory.
 
+NOTE: Uses `from __future__ import annotations` to defer type hint evaluation,
+allowing type hints like `shared_memory.SharedMemory` to work even on Python < 3.8
+where `shared_memory` module is not available.
+"""
+from __future__ import annotations
+
 This module provides a way to share vocabulary across multiple worker processes
 without duplicating it in memory, reducing startup overhead and memory usage.
 """
@@ -13,7 +19,6 @@ import logging
 import threading
 from typing import Optional, Set
 import sys
-import weakref
 
 logger = logging.getLogger(__name__)
 

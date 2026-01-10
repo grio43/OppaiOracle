@@ -145,8 +145,6 @@ def compute_vocab_sha256(vocab_path: Optional[Path] = None,
         logger.critical(f"Critical error in compute_vocab_sha256: {type(e).__name__}: {e}", exc_info=True)
         raise
 
-    return "unknown"
-
 
 def validate_schema(data: Union[Dict, Path, str]) -> bool:
     """Validate that data conforms to the standard prediction schema.
@@ -190,7 +188,7 @@ def validate_schema(data: Union[Dict, Path, str]) -> bool:
 
         except OSError as e:
             # Other I/O errors (disk full, network error, etc.)
-            raise ValueError(f"Failed to read schema file {data}: {e}") from e
+            raise ValueError(f"Failed to read schema file {path}: {e}") from e
 
         except Exception as e:
             # Truly unexpected errors (bugs)
@@ -239,7 +237,3 @@ def validate_schema(data: Union[Dict, Path, str]) -> bool:
                 raise ValueError(f"Result {i} tag {j} score must be numeric")
 
     return True
-
-
-# Legacy adapter is in convert_legacy_to_standard() below
-

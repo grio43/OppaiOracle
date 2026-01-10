@@ -9,7 +9,7 @@ import math
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, fields
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -187,7 +187,7 @@ class TransformerBlock(nn.Module):
     _max_cache_entries: int = 100  # Prevent unbounded growth
 
     @classmethod
-    def get_cache_stats(cls) -> Dict[str, any]:
+    def get_cache_stats(cls) -> Dict[str, Any]:
         """Get attention mask cache statistics."""
         total = cls._cache_hits + cls._cache_misses
         hit_rate = cls._cache_hits / total if total > 0 else 0.0
@@ -354,10 +354,10 @@ class TransformerBlock(nn.Module):
             # Standard attention path
             attn_output, _ = self.attn(
                 normed_x, normed_x, normed_x,
-               key_padding_mask=key_padding_mask
+                key_padding_mask=key_padding_mask
             )
             x = x + self.drop_path(attn_output)
-      
+
         # MLP with residual
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x

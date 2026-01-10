@@ -1835,7 +1835,10 @@ class FullConfig(BaseConfig):
 
     def compute_effective_batch_size(self) -> int:
         """Compute the effective batch size for optimization."""
-        return self.data.batch_size * self.training.gradient_accumulation_steps * self.training.world_size
+        result = self.data.batch_size * self.training.gradient_accumulation_steps * self.training.world_size
+        if result <= 0:
+            raise ValueError(f"Effective batch size must be positive, got {result}")
+        return result
 
     def scale_learning_rate(self) -> float:
         """Scale learning rate based on effective batch size."""

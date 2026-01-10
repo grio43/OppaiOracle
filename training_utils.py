@@ -347,7 +347,7 @@ def validate_config_compatibility(
     if not checkpoint_config:
         return True, ["No config in checkpoint - skipping validation"]
 
-    warnings = []
+    warning_messages = []
     errors = []
 
     # Critical parameters that MUST match (will cause training issues if different)
@@ -399,10 +399,10 @@ def validate_config_compatibility(
 
         if ckpt_val != curr_val:
             msg = f"WARNING: {name} changed - checkpoint: {ckpt_val}, current: {curr_val}. {impact}"
-            warnings.append(msg)
+            warning_messages.append(msg)
 
     # Log all warnings
-    for msg in warnings:
+    for msg in warning_messages:
         logger.warning(msg)
 
     # Handle errors based on strict mode
@@ -418,7 +418,7 @@ def validate_config_compatibility(
             )
 
     is_compatible = len(errors) == 0
-    all_messages = errors + warnings
+    all_messages = errors + warning_messages
 
     return is_compatible, all_messages
 
@@ -1071,8 +1071,8 @@ class CheckpointManager:
                     temp_path = None  # Mark as consumed (file was moved)
                     wrote_numbered = True
 
-            except filelock.Timeout if HAS_FILELOCK else Exception as e:
-                if HAS_FILELOCK and isinstance(e, filelock.Timeout):
+            except Exception as e:
+                if HAS_FILELOCK and hasattr(filelock, 'Timeout') and isinstance(e, filelock.Timeout):
                     logger.warning(f"Timeout acquiring checkpoint lock, skipping save for step {step}")
                 else:
                     logger.error(f"Failed to save checkpoint to {checkpoint_path}: {e}")
@@ -2026,7 +2026,6 @@ if __name__ == "__main__":
     print(f"\nCheckpoint directory: {checkpoint_manager.checkpoint_dir}")
     
     # Test scheduler factory
-    import torch.optim as optim
     model = nn.Linear(10, 10)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     

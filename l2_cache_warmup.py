@@ -34,9 +34,7 @@ import atexit
 import random
 import logging
 import argparse
-import hashlib
 import json
-import queue
 from pathlib import Path
 
 # Try to use orjson for faster JSON parsing (3-5x faster than stdlib json)
@@ -45,7 +43,7 @@ try:
     HAS_ORJSON = True
 except ImportError:
     HAS_ORJSON = False
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 
 import torch
 import torch.multiprocessing as mp
@@ -95,6 +93,12 @@ class CacheWarmupConfig:
         self.target_vram_util = args.target_vram_util if hasattr(args, 'target_vram_util') else 0.9
         self.gpu_device_id = args.gpu_device if hasattr(args, 'gpu_device') else 0
         self.max_batch_size = args.max_batch_size if hasattr(args, 'max_batch_size') else 2048
+
+        # Async preload settings
+        self.enable_preload = not (args.no_preload if hasattr(args, 'no_preload') else False)
+        self.preload_workers = args.preload_workers if hasattr(args, 'preload_workers') else 4
+        self.preload_queue_depth = args.preload_queue_depth if hasattr(args, 'preload_queue_depth') else 2
+        self.preload_ram_headroom_gb = args.preload_ram_headroom_gb if hasattr(args, 'preload_ram_headroom_gb') else 8.0
 
         # Extract from unified config
         self.full_config = full_config
@@ -278,7 +282,7 @@ class CacheWarmup:
 
         # Load vocabulary
         self.vocab = load_vocabulary_for_training(self.config.vocab_path)
-        logger.info(f"Vocabulary loaded: {len(self.vocab)} tags")
+        logger.info(f"Vocabulary loaded: {len(self.vocab.tag_to_index)} tags")
 
         # Create shared memory vocabulary for workers
         self.shared_vocab_manager = SharedVocabularyManager()
@@ -331,7 +335,7 @@ class CacheWarmup:
         logger.info(f"Dataset created: {len(dataset)} samples")
         return dataset
 
-    def create_subset(self, dataset: SidecarJsonDataset) -> Subset:
+    def create_subset(self, dataset: SidecarJsonDataset) -> Union[SidecarJsonDataset, Subset]:
         """Create subset based on percentage."""
         total_samples = len(dataset)
         num_samples = int(total_samples * self.config.percentage / 100)
@@ -446,7 +450,7 @@ class CacheWarmup:
 
     def run_gpu_warmup(self, json_files: List[Path], indices: List[int]) -> None:
         """
-        Run GPU-accelerated cache warmup with dynamic batch sizing.
+        Run GPU-accelerated cache warmup with dynamic batch sizing and async preloading.
 
         Args:
             json_files: All dataset JSON files
@@ -456,7 +460,7 @@ class CacheWarmup:
         logger.info("Note: Batch size will dynamically adjust to target VRAM usage")
         logger.info("Note: Failed/corrupted images will be automatically tracked and excluded from training")
 
-        # Initialize GPU batch processor
+        # Initialize GPU batch processor with preload settings
         gpu_processor = GPUBatchProcessor(
             image_size=self.config.image_size,
             pad_color=self.config.pad_color,
@@ -467,207 +471,271 @@ class CacheWarmup:
             target_vram_util=self.config.target_vram_util,
             initial_batch_size=self.config.batch_size,
             max_batch_size=self.config.max_batch_size,
-            cpu_bf16_cache_pipeline=(self.config.sidecar_storage_dtype == 'bfloat16')
+            cpu_bf16_cache_pipeline=(self.config.sidecar_storage_dtype == 'bfloat16'),
+            # Async preload settings
+            enable_preload=self.config.enable_preload,
+            preload_workers=self.config.preload_workers,
+            preload_queue_depth=self.config.preload_queue_depth,
+            preload_ram_headroom_gb=self.config.preload_ram_headroom_gb,
         )
 
-        start_time = time.time()
-        total_items = 0
-        batch_accumulator = []
-        batch_metadata = []  # Store (json_path, image_path, image_id) for each item
+        try:
+            if gpu_processor.has_preloader():
+                logger.info("Async image preloading: ENABLED")
+            else:
+                logger.info("Async image preloading: DISABLED")
 
-        # Progress bar
-        with tqdm(
-            total=len(indices),
-            desc="GPU warmup",
-            unit="img",
-        ) as pbar:
-            for idx in indices:
-                # Check for interrupt
-                if self.interrupted:
-                    logger.warning("Warmup interrupted by user")
-                    break
+            start_time = time.time()
+            total_items = 0
+            batch_accumulator = []
+            batch_metadata = []  # Store (json_path, image_path, sidecar_path, source_mtime) for each item
 
-                # Get JSON file for this index
-                json_path = json_files[idx]
+            # Pending batches for async preloading: (batch_id, paths, metadata)
+            pending_batches: List[Tuple[int, List[str], List[Tuple]]] = []
+            batch_id = 0
 
-                # Load JSON to get image path
+            def process_pending_batch(proc_id: int, proc_paths: List[str], proc_meta: List[Tuple]) -> int:
+                """Process a preloaded batch and write sidecars. Returns items written."""
                 try:
-                    # Use orjson if available (3-5x faster for cache warmup)
-                    if HAS_ORJSON:
-                        annotation = orjson.loads(json_path.read_bytes())
-                    else:
-                        with open(json_path, 'r', encoding='utf-8') as f:
-                            annotation = json.load(f)
+                    images, masks, failed_indices = gpu_processor.process_batch_preloaded(proc_id)
+                    failed_set = set(failed_indices)
 
-                    # Get image path (same logic as dataset_loader.py)
-                    image_filename = annotation.get('filename')
-                    if not image_filename:
-                        logger.warning(f"No filename in {json_path}, skipping")
-                        continue
+                    # Validate batch alignment
+                    if len(images) != len(proc_meta):
+                        logger.error(f"Batch mismatch: {len(images)} images vs {len(proc_meta)} metadata, skipping")
+                        return 0
 
-                    image_path = json_path.parent / image_filename
-                    if not image_path.exists():
-                        logger.warning(f"Image not found: {image_path}, skipping")
-                        continue
+                    # Track failed images for exclusion file
+                    for fail_idx in failed_indices:
+                        if fail_idx < len(proc_meta):
+                            self.failed_images.append(proc_meta[fail_idx][1])  # image_path
 
-                    # Get source file mtime for cache invalidation
-                    try:
-                        source_mtime = os.path.getmtime(image_path)
-                    except OSError:
-                        source_mtime = None
+                    # Write sidecar files (skip failed images)
+                    items_written = 0
+                    for i, (_, _, sidecar_path, source_mtime) in enumerate(proc_meta):
+                        if i in failed_set:
+                            continue
+                        monitor.l2_miss()
+                        if save_sidecar(
+                            sidecar_path,
+                            images[i],
+                            masks[i],
+                            self.config.config_hash,
+                            self.config.image_size,
+                            source_mtime=source_mtime,
+                        ):
+                            items_written += 1
+                            monitor.l2_put_enqueued(images[i].numel() * images[i].element_size())
 
-                    # Check if sidecar already exists (if --check-existing enabled)
-                    sidecar_path = get_sidecar_path(str(image_path))
-                    if self.config.check_existing and os.path.exists(sidecar_path):
-                        # Already cached, skip
-                        pbar.update(1)
-                        continue
-
-                    # Add to batch
-                    batch_accumulator.append(str(image_path))
-                    batch_metadata.append((json_path, image_path, sidecar_path, source_mtime))
-
+                    return items_written
                 except Exception as e:
-                    logger.warning(f"Failed to process {json_path}: {e}")
-                    continue
+                    logger.error(f"Failed to process preloaded batch {proc_id}: {e}", exc_info=True)
+                    return 0
 
-                # Process batch when it reaches current batch size
-                current_batch_size = gpu_processor.get_current_batch_size()
-                if len(batch_accumulator) >= current_batch_size:
-                    # Process batch on GPU
+            def process_sync_batch(paths: List[str], meta: List[Tuple]) -> int:
+                """Process a batch synchronously (no preload). Returns items written."""
+                try:
+                    images, masks, failed_indices = gpu_processor.process_batch(paths)
+                    failed_set = set(failed_indices)
+
+                    if len(images) != len(meta):
+                        logger.error(f"Batch mismatch: {len(images)} images vs {len(meta)} metadata, skipping")
+                        return 0
+
+                    for fail_idx in failed_indices:
+                        if fail_idx < len(meta):
+                            self.failed_images.append(meta[fail_idx][1])
+
+                    items_written = 0
+                    for i, (_, _, sidecar_path, source_mtime) in enumerate(meta):
+                        if i in failed_set:
+                            continue
+                        monitor.l2_miss()
+                        if save_sidecar(
+                            sidecar_path,
+                            images[i],
+                            masks[i],
+                            self.config.config_hash,
+                            self.config.image_size,
+                            source_mtime=source_mtime,
+                        ):
+                            items_written += 1
+                            monitor.l2_put_enqueued(images[i].numel() * images[i].element_size())
+
+                    return items_written
+                except Exception as e:
+                    logger.error(f"Failed to process batch: {e}", exc_info=True)
+                    gpu_processor.clear_cache()
+                    return 0
+
+            # Progress bar
+            with tqdm(
+                total=len(indices),
+                desc="GPU warmup",
+                unit="img",
+            ) as pbar:
+                for idx in indices:
+                    # Check for interrupt
+                    if self.interrupted:
+                        logger.warning("Warmup interrupted by user")
+                        break
+
+                    # Get JSON file for this index
+                    json_path = json_files[idx]
+
+                    # Load JSON to get image path
                     try:
-                        images, masks, failed_indices = gpu_processor.process_batch(batch_accumulator)
-                        failed_set = set(failed_indices)
+                        # Use orjson if available (3-5x faster for cache warmup)
+                        if HAS_ORJSON:
+                            annotation = orjson.loads(json_path.read_bytes())
+                        else:
+                            with open(json_path, 'r', encoding='utf-8') as f:
+                                annotation = json.load(f)
 
-                        # Validate batch alignment
-                        if len(images) != len(batch_metadata):
-                            logger.error(f"Batch mismatch: {len(images)} images vs {len(batch_metadata)} metadata, skipping")
-                            batch_accumulator = []
-                            batch_metadata = []
+                        # Get image path (same logic as dataset_loader.py)
+                        image_filename = annotation.get('filename')
+                        if not image_filename:
+                            logger.warning(f"No filename in {json_path}, skipping")
                             continue
 
-                        # Write sidecar files (skip failed images)
-                        items_written = 0
+                        image_path = json_path.parent / image_filename
+                        if not image_path.exists():
+                            logger.warning(f"Image not found: {image_path}, skipping")
+                            continue
+
+                        # Get source file mtime for cache invalidation
+                        try:
+                            source_mtime = os.path.getmtime(image_path)
+                        except OSError:
+                            source_mtime = None
+
+                        # Check if sidecar already exists (if --check-existing enabled)
+                        sidecar_path = get_sidecar_path(str(image_path))
+                        if self.config.check_existing and os.path.exists(sidecar_path):
+                            # Already cached, skip
+                            pbar.update(1)
+                            continue
+
+                        # Add to batch
+                        batch_accumulator.append(str(image_path))
+                        batch_metadata.append((json_path, str(image_path), sidecar_path, source_mtime))
+
+                    except Exception as e:
+                        logger.warning(f"Failed to process {json_path}: {e}")
+                        continue
+
+                    # Process batch when it reaches current batch size
+                    current_batch_size = gpu_processor.get_current_batch_size()
+                    if len(batch_accumulator) >= current_batch_size:
                         items_attempted = len(batch_metadata)
-                        items_skipped = len(failed_indices)
 
-                        # Track failed images for exclusion file
-                        for fail_idx in failed_indices:
-                            self.failed_images.append(batch_metadata[fail_idx][1])  # image_path
+                        if gpu_processor.has_preloader():
+                            # Async path: submit for preload and process pending batches
+                            if gpu_processor.submit_preload(batch_id, batch_accumulator):
+                                pending_batches.append((batch_id, batch_accumulator, batch_metadata))
+                                batch_id += 1
+                                batch_accumulator = []
+                                batch_metadata = []
 
-                        for i, (_, _, sidecar_path, source_mtime) in enumerate(batch_metadata):
-                            # Skip failed images to avoid writing dummy/corrupted data
-                            if i in failed_set:
-                                continue
-                            # Record cache miss (image being processed for first time)
-                            monitor.l2_miss()
-                            if save_sidecar(
-                                sidecar_path,
-                                images[i],
-                                masks[i],
-                                self.config.config_hash,
-                                self.config.image_size,
-                                source_mtime=source_mtime,
-                            ):
-                                items_written += 1
-                                # Record bytes written to cache
-                                monitor.l2_put_enqueued(images[i].numel() * images[i].element_size())
+                                # Process oldest pending batch if we have more than 1
+                                # (allows overlap: batch N preloads while batch N-1 processes)
+                                if len(pending_batches) > 1:
+                                    proc_id, proc_paths, proc_meta = pending_batches.pop(0)
+                                    items_written = process_pending_batch(proc_id, proc_paths, proc_meta)
+                                    total_items += items_written
 
-                        total_items += items_written
+                                    # Update progress bar
+                                    elapsed = time.time() - start_time
+                                    items_per_sec = total_items / elapsed if elapsed > 0 else 0
+                                    vram_stats = gpu_processor.get_vram_stats()
 
-                        # Update progress bar with items attempted (not just written)
-                        elapsed = time.time() - start_time
-                        items_per_sec = total_items / elapsed if elapsed > 0 else 0
-                        vram_stats = gpu_processor.get_vram_stats()
+                                    pbar.update(len(proc_meta))
+                                    pbar.set_postfix({
+                                        'next_batch': current_batch_size,
+                                        'written': items_written,
+                                        'preload': gpu_processor.get_preload_pending_count(),
+                                        'imgs/s': f'{items_per_sec:.1f}',
+                                        'VRAM': f'{vram_stats["utilization"]*100:.1f}%',
+                                    })
+                            else:
+                                # Preloader at capacity - fall back to sync processing
+                                items_written = process_sync_batch(batch_accumulator, batch_metadata)
+                                total_items += items_written
+                                batch_accumulator = []
+                                batch_metadata = []
 
-                        pbar.update(items_attempted)
-                        pbar.set_postfix({
-                            'batch': current_batch_size,
-                            'written': items_written,
-                            'skipped': items_skipped,
-                            'imgs/s': f'{items_per_sec:.1f}',
-                            'VRAM': f'{vram_stats["utilization"]*100:.1f}%',
-                        })
+                                elapsed = time.time() - start_time
+                                items_per_sec = total_items / elapsed if elapsed > 0 else 0
+                                vram_stats = gpu_processor.get_vram_stats()
 
-                        # Clear batch
-                        batch_accumulator = []
-                        batch_metadata = []
+                                pbar.update(items_attempted)
+                                pbar.set_postfix({
+                                    'batch': current_batch_size,
+                                    'written': items_written,
+                                    'mode': 'sync',
+                                    'imgs/s': f'{items_per_sec:.1f}',
+                                    'VRAM': f'{vram_stats["utilization"]*100:.1f}%',
+                                })
+                        else:
+                            # Sync path (no preloader)
+                            items_written = process_sync_batch(batch_accumulator, batch_metadata)
+                            total_items += items_written
+                            batch_accumulator = []
+                            batch_metadata = []
+
+                            elapsed = time.time() - start_time
+                            items_per_sec = total_items / elapsed if elapsed > 0 else 0
+                            vram_stats = gpu_processor.get_vram_stats()
+
+                            pbar.update(items_attempted)
+                            pbar.set_postfix({
+                                'batch': current_batch_size,
+                                'written': items_written,
+                                'imgs/s': f'{items_per_sec:.1f}',
+                                'VRAM': f'{vram_stats["utilization"]*100:.1f}%',
+                            })
 
                         # Adjust batch size based on VRAM usage
                         new_batch_size = gpu_processor.adjust_batch_size()
                         if new_batch_size != current_batch_size:
                             logger.info(f"Batch size adjusted: {current_batch_size} -> {new_batch_size}")
 
-                    except Exception as e:
-                        logger.error(f"Failed to process batch: {e}", exc_info=True)
-                        # Clear GPU cache FIRST to free memory before clearing lists
-                        gpu_processor.clear_cache()
-                        batch_accumulator = []
-                        batch_metadata = []
+                # Drain remaining pending batches
+                while pending_batches and not self.interrupted:
+                    proc_id, proc_paths, proc_meta = pending_batches.pop(0)
+                    items_written = process_pending_batch(proc_id, proc_paths, proc_meta)
+                    total_items += items_written
+                    pbar.update(len(proc_meta))
 
-            # Process remaining items
-            if batch_accumulator and not self.interrupted:
-                try:
-                    images, masks, failed_indices = gpu_processor.process_batch(batch_accumulator)
-                    failed_set = set(failed_indices)
+                # Process remaining items in accumulator (sync - not worth preloading)
+                if batch_accumulator and not self.interrupted:
+                    items_written = process_sync_batch(batch_accumulator, batch_metadata)
+                    total_items += items_written
+                    pbar.update(len(batch_metadata))
 
-                    # Validate batch alignment
-                    if len(images) != len(batch_metadata):
-                        logger.error(f"Final batch mismatch: {len(images)} images vs {len(batch_metadata)} metadata, skipping")
-                    else:
-                        # Track failed images for exclusion file
-                        for fail_idx in failed_indices:
-                            self.failed_images.append(batch_metadata[fail_idx][1])  # image_path
+            elapsed = time.time() - start_time
+            items_per_sec = total_items / elapsed if elapsed > 0 else 0
+            logger.info(f"GPU warmup completed: {total_items} items in {elapsed:.1f}s ({items_per_sec:.1f} items/s)")
 
-                        # Write remaining sidecar files (skip failed images)
-                        items_written = 0
-                        items_attempted = len(batch_metadata)
-                        for i, (_, _, sidecar_path, source_mtime) in enumerate(batch_metadata):
-                            # Skip failed images to avoid writing dummy/corrupted data
-                            if i in failed_set:
-                                continue
-                            # Record cache miss (image being processed for first time)
-                            monitor.l2_miss()
-                            if save_sidecar(
-                                sidecar_path,
-                                images[i],
-                                masks[i],
-                                self.config.config_hash,
-                                self.config.image_size,
-                                source_mtime=source_mtime,
-                            ):
-                                items_written += 1
-                                # Record bytes written to cache
-                                monitor.l2_put_enqueued(images[i].numel() * images[i].element_size())
+            # Write exclusion file for failed images (append mode for resumable runs)
+            # Store just the image_id (stem) for format-agnostic exclusion
+            if self.failed_images:
+                exclusion_path = self.config.data_path / 'cache_exclusions.txt'
+                with open(exclusion_path, 'a', encoding='utf-8') as f:
+                    for path in self.failed_images:
+                        # Write just the stem (image_id) - works regardless of file extension
+                        image_id = Path(path).stem
+                        f.write(image_id + '\n')
+                logger.warning(f"Wrote {len(self.failed_images)} failed image IDs to {exclusion_path}")
+                logger.warning("These images will be automatically excluded from training.")
 
-                        total_items += items_written
-                        pbar.update(items_attempted)
+            # Log cache monitor summary for debugging
+            if monitor.enabled:
+                logger.info(monitor.format_summary())
 
-                except Exception as e:
-                    logger.error(f"Failed to process final batch: {e}", exc_info=True)
-                    gpu_processor.clear_cache()
-
-        elapsed = time.time() - start_time
-        logger.info(f"GPU warmup completed: {total_items} items in {elapsed:.1f}s ({total_items/elapsed:.1f} items/s)")
-
-        # Write exclusion file for failed images (append mode for resumable runs)
-        # Store just the image_id (stem) for format-agnostic exclusion
-        if self.failed_images:
-            exclusion_path = self.config.data_path / 'cache_exclusions.txt'
-            with open(exclusion_path, 'a', encoding='utf-8') as f:
-                for path in self.failed_images:
-                    # Write just the stem (image_id) - works regardless of file extension
-                    image_id = Path(path).stem
-                    f.write(image_id + '\n')
-            logger.warning(f"Wrote {len(self.failed_images)} failed image IDs to {exclusion_path}")
-            logger.warning("These images will be automatically excluded from training.")
-
-        # Log cache monitor summary for debugging
-        if monitor.enabled:
-            logger.info(monitor.format_summary())
-
-        # Clear GPU cache
-        gpu_processor.clear_cache()
+        finally:
+            # Always cleanup GPU resources, even on exception or interrupt
+            gpu_processor.clear_cache()
 
     def shutdown(self) -> None:
         """Graceful shutdown."""
@@ -701,7 +769,6 @@ class CacheWarmup:
                 )
 
                 if cached_items:
-                    from pathlib import Path
                     json_files = [Path(item['dir']) / f"{item['image_id']}.json" for item in cached_items]
                     logger.info(f"✓ Using {len(json_files)} files from metadata cache")
                 else:
@@ -714,7 +781,7 @@ class CacheWarmup:
             if not json_files:
                 raise ValueError(f"No JSON files found in {self.config.data_path}")
 
-            # Step 3: Determine subset indices
+            # Determine subset indices
             total_samples = len(json_files)
             num_samples = int(total_samples * self.config.percentage / 100)
 
@@ -800,7 +867,7 @@ class CacheWarmup:
             if self.shared_vocab_manager is not None:
                 try:
                     self.shared_vocab_manager.cleanup()
-                except:
+                except Exception:
                     pass
 
 
@@ -905,6 +972,34 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2048,
         help='Maximum batch size for GPU mode (default: 2048 for RTX 5090)'
+    )
+
+    # Async preload arguments
+    parser.add_argument(
+        '--no-preload',
+        action='store_true',
+        help='Disable async image preloading'
+    )
+
+    parser.add_argument(
+        '--preload-workers',
+        type=int,
+        default=4,
+        help='Number of threads for async image preloading (default: 4)'
+    )
+
+    parser.add_argument(
+        '--preload-queue-depth',
+        type=int,
+        default=2,
+        help='Maximum batches to preload ahead (default: 2)'
+    )
+
+    parser.add_argument(
+        '--preload-ram-headroom-gb',
+        type=float,
+        default=8.0,
+        help='Minimum free RAM to maintain during preloading in GB (default: 8.0)'
     )
 
     return parser.parse_args()

@@ -16,7 +16,7 @@ warnings.warn(
 import logging
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -145,9 +145,10 @@ def compute_warmup_steps(
     # Clamp to reasonable range
     warmup_steps = max(min_steps, min(warmup_steps, max_steps))
 
+    ratio_str = f"({warmup_steps/total_steps:.1%})" if total_steps > 0 else "(N/A)"
     logger.info(
         f"Computed warmup schedule: {warmup_steps} steps "
-        f"({warmup_steps/total_steps:.1%} of {total_steps} total steps)"
+        f"{ratio_str} of {total_steps} total steps"
     )
 
     return warmup_steps
@@ -219,7 +220,9 @@ def adjust_beta2_for_long_training(
     Returns:
         Adjusted beta2 value
     """
-    total_steps = (dataset_size / effective_batch_size) * num_epochs
+    if effective_batch_size <= 0:
+        return base_beta2
+    total_steps = math.ceil(dataset_size / effective_batch_size) * num_epochs
 
     # For training runs > 100k steps, increase beta2 slightly
     if total_steps > 100_000:
@@ -339,7 +342,8 @@ def get_adamw8bit_config(
     logger.info(f"Beta1:                     {base_config.beta1}")
     logger.info(f"Beta2:                     {beta2:.6f}")
     logger.info(f"Epsilon:                   {base_config.eps}")
-    logger.info(f"Warmup steps:              {warmup_steps:,} ({warmup_steps/total_steps:.1%})")
+    ratio_str2 = f"({warmup_steps/total_steps:.1%})" if total_steps > 0 else "(N/A)"
+    logger.info(f"Warmup steps:              {warmup_steps:,} {ratio_str2}")
     logger.info("=" * 60)
 
     optimizer_kwargs = {
@@ -369,7 +373,7 @@ def detect_gpu_memory() -> float:
     except Exception as e:
         logger.debug(f"Could not detect GPU memory: {e}")
 
-    logger.info("GPU memory detection failed, using default 24GB")
+    logger.warning("GPU memory detection failed, using default 24GB - verify this matches your hardware")
     return 24.0
 
 
@@ -428,7 +432,7 @@ def get_recommended_batch_size(
     # Adjust batch size if accumulation would be too large
     if grad_accum > 8:
         # Prefer larger batch size over excessive accumulation
-        max_batch_size = min(64, effective_batch // 8)
+        max_batch_size = min(128, effective_batch // 8)
         grad_accum = max(1, effective_batch // max_batch_size)
 
     # Ensure batch size is reasonable

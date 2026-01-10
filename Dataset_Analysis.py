@@ -22,10 +22,10 @@ import random
 import numpy as np
 from PIL import Image
 
-import matplotlib.pyplot as plt
-# Set backend for headless environments
+# Set backend for headless environments (must be before pyplot import)
 import matplotlib
 matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # Cache decorator for compiled regex patterns and other heavy computations
 from functools import lru_cache
@@ -397,7 +397,7 @@ class TagAnalyzer:
         self.tags_per_image = defaultdict(set)
 
     @lru_cache(maxsize=128)
-    def _get_compiled_patterns(self) -> Dict[str, 're.Pattern']:
+    def _get_compiled_patterns(self) -> Dict[str, Any]:
         """Get compiled regex patterns for tag hierarchy analysis"""
         import re
         patterns = {
@@ -795,20 +795,6 @@ class DatasetAnalyzer:
             logger.error(f"Error analyzing {path}: {e}")
             return None
 
-# --- Module-level worker for ProcessPoolExecutor (picklable, avoids bound method) ---
-def _analyze_single_image_worker(path_str: str, config: AnalysisConfig) -> Optional['ImageStats']:
-    """
-    Top-level worker function so ProcessPoolExecutor doesn't need to pickle a bound method.
-    Returns an ImageStats dataclass or None.
-    """
-    try:
-        analyzer = ImageAnalyzer(config)
-        return analyzer.analyze_image(Path(path_str))
-    except Exception:
-        # Workers shouldn't be too chatty; the main process logs failures on result retrieval.
-        return None
-
-    # --- Rest of DatasetAnalyzer methods ---
     def _flush_stats_buffer(self):
         """Flush stats buffer to main list"""
         self.image_stats.extend(self.image_stats_buffer)
@@ -1343,6 +1329,20 @@ def _analyze_single_image_worker(path_str: str, config: AnalysisConfig) -> Optio
                 logger.warning("Could not load cache: %s", e)
 
         return False
+
+
+# --- Module-level worker for ProcessPoolExecutor (picklable, avoids bound method) ---
+def _analyze_single_image_worker(path_str: str, config: AnalysisConfig) -> Optional['ImageStats']:
+    """
+    Top-level worker function so ProcessPoolExecutor doesn't need to pickle a bound method.
+    Returns an ImageStats dataclass or None.
+    """
+    try:
+        analyzer = ImageAnalyzer(config)
+        return analyzer.analyze_image(Path(path_str))
+    except Exception:
+        # Workers shouldn't be too chatty; the main process logs failures on result retrieval.
+        return None
 
 
 def main():

@@ -166,7 +166,12 @@ def decode_tensor(b: bytes, key: Optional[bytes | str] = None) -> torch.Tensor:
         # If HMAC key was provided, digest was already stripped above.
         if not k and len(data) > _LEGACY_DIGEST_SIZE:
             try:
-                return load(data[_LEGACY_DIGEST_SIZE:])["t"]
+                result = load(data[_LEGACY_DIGEST_SIZE:])["t"]
+                logging.warning(
+                    "Loaded tensor using legacy digest-skip fallback format. "
+                    "Consider re-caching data for reliability."
+                )
+                return result
             except (RuntimeError, KeyError):
                 pass  # Fallback failed
         # Re-raise original error
@@ -245,8 +250,12 @@ def save_sidecar(
         img_cpu = image.detach().cpu().contiguous()
         mask_cpu = mask.detach().cpu().contiguous()
 
-        # Convert mask to uint8 for storage efficiency
-        if mask_cpu.dtype == torch.bool:
+        # Convert mask to uint8 for storage efficiency and consistency
+        # Handle any input dtype by converting through bool first
+        if mask_cpu.dtype != torch.uint8:
+            if mask_cpu.dtype != torch.bool:
+                # Convert non-bool dtypes (float, int32, etc.) to bool first
+                mask_cpu = mask_cpu.to(torch.bool)
             mask_cpu = mask_cpu.to(torch.uint8)
 
         tensors = {
@@ -278,11 +287,13 @@ def save_sidecar(
         return False
     finally:
         # Always cleanup temp file if it exists (handles both success and failure cases)
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception as cleanup_err:
-                logging.debug(f"Failed to cleanup temp file {tmp_path}: {cleanup_err}")
+        # Use try/except instead of exists() check to avoid TOCTOU race condition
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass  # Already cleaned up (e.g., after successful rename)
+        except Exception as cleanup_err:
+            logging.debug(f"Failed to cleanup temp file {tmp_path}: {cleanup_err}")
 
 
 def load_sidecar(
@@ -337,19 +348,23 @@ def load_sidecar(
                     logging.debug(f"Sidecar {path} has no metadata, cannot verify source mtime")
                     return None
                 stored_mtime_str = metadata.get("source_mtime")
-                if stored_mtime_str is not None:
-                    try:
-                        stored_mtime = float(stored_mtime_str)
-                        # Allow small tolerance for floating point comparison (0.001 seconds)
-                        if abs(stored_mtime - expected_source_mtime) > 0.001:
-                            logging.debug(
-                                f"Sidecar source mtime mismatch: {stored_mtime} != {expected_source_mtime}"
-                            )
-                            return None
-                    except (ValueError, TypeError):
-                        # Invalid stored mtime, treat as cache miss
-                        logging.debug(f"Sidecar has invalid source_mtime: {stored_mtime_str}")
+                if stored_mtime_str is None:
+                    # Mtime validation requested but cache entry has no stored mtime
+                    # Treat as cache miss to ensure fresh data
+                    logging.debug(f"Sidecar {path} missing source_mtime, cannot verify")
+                    return None
+                try:
+                    stored_mtime = float(stored_mtime_str)
+                    # Allow small tolerance for floating point comparison (0.001 seconds)
+                    if abs(stored_mtime - expected_source_mtime) > 0.001:
+                        logging.debug(
+                            f"Sidecar source mtime mismatch: {stored_mtime} != {expected_source_mtime}"
+                        )
                         return None
+                except (ValueError, TypeError):
+                    # Invalid stored mtime, treat as cache miss
+                    logging.debug(f"Sidecar has invalid source_mtime: {stored_mtime_str}")
+                    return None
 
             # Validate required tensors exist before loading
             keys = set(f.keys())
@@ -393,15 +408,17 @@ def load_sidecar(
         if mask.dtype == torch.uint8:
             # Validate uint8 values are 0 or 1 to prevent silent corruption
             # Values 2-255 would silently become True, corrupting the mask
-            unique_vals = mask.unique()
-            if len(unique_vals) > 0:
-                max_val = unique_vals.max().item()
-                if max_val > 1:
-                    logging.warning(
-                        f"Sidecar {path} mask contains invalid values (max={max_val}), "
-                        "expected 0 or 1 only. Mask may be corrupted."
-                    )
-                    return None
+            # Use efficient check instead of .unique() for large masks
+            if (mask > 1).any():
+                logging.warning(
+                    f"Sidecar {path} mask contains invalid values (>1), "
+                    "expected 0 or 1 only. Mask may be corrupted."
+                )
+                return None
+            mask = mask.to(torch.bool)
+        elif mask.dtype != torch.bool:
+            # Handle unexpected dtypes (e.g., old cache with float/int masks)
+            logging.debug(f"Sidecar mask has dtype {mask.dtype}, converting to bool")
             mask = mask.to(torch.bool)
 
         return image, mask

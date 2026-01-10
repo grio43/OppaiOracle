@@ -9,7 +9,7 @@ import os
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any, Callable
+from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass, asdict
 from datetime import datetime
 import time
@@ -18,7 +18,6 @@ import gc
 import multiprocessing as mp
 import yaml
 import csv
-import pickle
 
 import numpy as np
 import torch
@@ -113,7 +112,7 @@ class ValidationConfig:
     # Tag analysis
     analyze_tag_groups: bool = True
     analyze_by_frequency: bool = True
-    frequency_bins: List[int] = None
+    frequency_bins: Optional[List[Union[int, float]]] = None
     
     # Performance analysis
     measure_inference_time: bool = True
@@ -444,7 +443,7 @@ class ValidationRunner:
         custom collate_fn) into a per-sample list of dicts so downstream
         code can serialize and analyze per-image results easily.
         """
-        size = len(meta.get('paths', []))
+        size = len(meta.get('paths') or [])
         items: List[Dict[str, Any]] = []
         for i in range(size):
             item: Dict[str, Any] = {}
@@ -904,8 +903,10 @@ class ValidationRunner:
         if not tag_indices:
             raise ValueError("No valid tags found in vocabulary")
         
-        # Create tensor on the correct device to avoid CPU-GPU sync during indexing
-        tag_indices = torch.tensor(tag_indices, device=self.device, dtype=torch.long)
+        # Create both CPU and GPU versions of tag_indices
+        # CPU version for indexing tag_labels, GPU version for indexing logits
+        tag_indices_cpu = torch.tensor(tag_indices, dtype=torch.long)
+        tag_indices = tag_indices_cpu.to(self.device)
 
         # Collect predictions for specific tags
         all_predictions = []
@@ -937,7 +938,7 @@ class ValidationRunner:
                 
                 # Get predictions for specific tags only
                 predictions = torch.sigmoid(logits[:, tag_indices])
-                targets = tag_labels[:, tag_indices]
+                targets = tag_labels[:, tag_indices_cpu]
                 
                 all_predictions.append(predictions.cpu())
                 all_targets.append(targets.cpu())
@@ -949,7 +950,7 @@ class ValidationRunner:
         # Compute per-tag metrics
         results = {'specific_tags': {}}
         
-        for i, (tag, tag_idx) in enumerate(zip(self.config.specific_tags, tag_indices)):
+        for i, (tag, tag_idx) in enumerate(zip(self.config.specific_tags, tag_indices_cpu.tolist())):
             tag_preds = all_predictions[:, i]
             tag_targets = all_targets[:, i]
             
@@ -1506,7 +1507,6 @@ def main():
         print(f"Warning: Error during cleanup: {e}")
     finally:
         # Force cleanup of any remaining resources
-        import gc
         gc.collect()    
 
 if __name__ == '__main__':

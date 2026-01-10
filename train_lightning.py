@@ -22,14 +22,13 @@ from pathlib import Path
 from typing import Any
 
 import pytorch_lightning as pl
-from safetensors.torch import save_file
 
 logger = logging.getLogger(__name__)
 import torch
 
 from Configuration_System import load_config
 from lightning_module import LitOppai
-from vocab_utils import load_vocab, compute_vocab_hash, diff_vocab  # noqa: F401 - imported for side effects/logging
+from vocab_utils import load_vocab, compute_vocab_hash
 
 
 class OppaiDataModule(pl.LightningDataModule):
@@ -151,11 +150,29 @@ def main() -> None:
 
     model = LitOppai(config=config, vocab_size=vocab_size)
 
+    # Validate required config attributes for checkpointing
+    if not hasattr(config, "output_root"):
+        raise ValueError(
+            "Configuration missing 'output_root'. "
+            "Please specify output directory in config."
+        )
+    if not hasattr(config, "experiment_name"):
+        raise ValueError(
+            "Configuration missing 'experiment_name'. "
+            "Please specify experiment name in config."
+        )
+
     # Checkpointing & callbacks
     checkpoint_dir = Path(config.output_root) / config.experiment_name / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_callback = pl.callbacks.ModelCheckpoint(dirpath=str(checkpoint_dir), save_top_k=-1)
-    early_stopping = pl.callbacks.EarlyStopping(monitor="val/loss", mode="min", patience=int(getattr(getattr(config, "training", None), "early_stopping_patience", 3) or 3))
+    _training_cfg = getattr(config, "training", None)
+    early_stop_patience = int(getattr(_training_cfg, "early_stopping_patience", 3) or 3)
+    early_stopping = pl.callbacks.EarlyStopping(
+        monitor="val/loss",
+        mode="min",
+        patience=early_stop_patience,
+    )
     lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval="step")
 
     # Optional resume
@@ -166,17 +183,39 @@ def main() -> None:
             candidate = checkpoint_dir / "last.ckpt"
             ckpt_path = str(candidate) if candidate.exists() else None
         elif resume_from == "best":
-            ckpts = sorted(checkpoint_dir.glob("*.ckpt"))
-            ckpt_path = str(ckpts[-1]) if ckpts else None
+            # Find checkpoint with best validation loss by parsing filenames
+            # ModelCheckpoint saves as: epoch=X-step=Y-val_loss=Z.ckpt
+            best_ckpt = None
+            best_loss = float("inf")
+            for ckpt in checkpoint_dir.glob("*.ckpt"):
+                name = ckpt.stem
+                if "val_loss=" in name or "val/loss=" in name:
+                    try:
+                        # Extract loss value from filename
+                        loss_part = name.split("val_loss=")[-1].split("val/loss=")[-1]
+                        loss_val = float(loss_part.split("-")[0].split(".ckpt")[0])
+                        if loss_val < best_loss:
+                            best_loss = loss_val
+                            best_ckpt = ckpt
+                    except (ValueError, IndexError):
+                        continue
+            if best_ckpt is None:
+                # Fallback to most recent by modification time
+                ckpts = list(checkpoint_dir.glob("*.ckpt"))
+                if ckpts:
+                    best_ckpt = max(ckpts, key=lambda p: p.stat().st_mtime)
+            ckpt_path = str(best_ckpt) if best_ckpt else None
         else:
             candidate_path = Path(resume_from)
             ckpt_path = str(candidate_path) if candidate_path.exists() else None
 
     # Strictness for resuming
-    try:
-        model.strict_loading = bool(getattr(getattr(config, "training", None), "resume_strict", False))
-    except Exception:
-        pass
+    _training = getattr(config, "training", None)
+    resume_strict = bool(getattr(_training, "resume_strict", False)) if _training else False
+    if hasattr(model, "strict_loading"):
+        model.strict_loading = resume_strict
+    else:
+        logger.debug("Model does not support strict_loading attribute")
 
     # Map AMP settings to PL precision strings
     use_amp = bool(getattr(getattr(config, "training", None), "use_amp", True))
@@ -190,7 +229,7 @@ def main() -> None:
             raise RuntimeError("bfloat16 AMP requested but CUDA device does not support bf16.")
         precision = "bf16-mixed"
     else:
-        precision = 32
+        precision = "32-true"
 
     # Grad accumulation & clipping
     accumulate = int(getattr(getattr(config, "training", None), "gradient_accumulation_steps", 1) or 1)
