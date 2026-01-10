@@ -10,7 +10,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import multiprocessing as mp
 import sys
 import random
@@ -132,7 +132,7 @@ class RatingValidator:
         rating_labels: torch.Tensor,
         batch: dict,
         global_step: int
-    ) -> tuple[torch.Tensor, bool]:
+    ) -> Tuple[torch.Tensor, bool]:
         """
         Validate rating labels and handle errors based on configured action.
 
@@ -812,15 +812,28 @@ def train_with_orientation_tracking(config: FullConfig):
         f"({total_updates} total updates)"
     )
     warmup_steps = int(getattr(config.training, "warmup_steps", 10_000))
+    num_cycles = int(getattr(config.training, "num_cycles", 1))
+    cycle_decay = float(getattr(config.training, "cycle_decay", 0.9))
+
+    # For multiple cycles, first_cycle_steps = total_updates / num_cycles
+    # This ensures each cycle is roughly equal in length
+    first_cycle_steps = total_updates // num_cycles if num_cycles > 1 else total_updates
 
     scheduler = CosineAnnealingWarmupRestarts(
         optimizer,
-        first_cycle_steps=total_updates,
-        cycle_mult=1.0,
+        first_cycle_steps=first_cycle_steps,
+        cycle_mult=1.0,  # Equal cycle lengths
         max_lr=config.training.learning_rate,
         min_lr=getattr(config.training, "lr_end", 1e-6),
         warmup_steps=warmup_steps,
+        gamma=cycle_decay,  # Decay max_lr by this factor after each restart
     )
+
+    if num_cycles > 1:
+        logger.info(
+            f"SGDR scheduler: {num_cycles} cycles of ~{first_cycle_steps} steps each, "
+            f"gamma={cycle_decay} (LR decays by {(1-cycle_decay)*100:.0f}% per restart)"
+        )
 
     amp_enabled = bool(config.training.use_amp) and device_type == 'cuda'
     amp_dtype_name = str(getattr(config.training, "amp_dtype", "bfloat16")).lower()
@@ -992,7 +1005,7 @@ def train_with_orientation_tracking(config: FullConfig):
         'optimizer_updates': 0,
         'batch_in_epoch': 0,
         'is_epoch_boundary': True,
-        'best_metric': 0.0,
+        'best_metric': float('-inf'),
     }
     for attr, default_val in _state_defaults.items():
         if not hasattr(training_state, attr):
@@ -1000,8 +1013,8 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # Create validation metrics once before training loop (CR-040 fix)
     # These will be reset each epoch instead of being recreated
-    num_tags = len(vocab.index_to_tag)
-    threshold = getattr(getattr(config, "threshold_calibration", {}), "default_threshold", 0.5)
+    tc = getattr(config, "threshold_calibration", {})
+    threshold = tc.get("default_threshold", 0.5) if isinstance(tc, dict) else getattr(tc, "default_threshold", 0.5)
     val_metrics = {
         'f1_macro': MultilabelF1Score(num_labels=num_tags, average="macro", threshold=threshold).to(device),
         'f1_micro': MultilabelF1Score(num_labels=num_tags, average="micro", threshold=threshold).to(device),
@@ -1124,8 +1137,9 @@ def train_with_orientation_tracking(config: FullConfig):
                 if not torch.isfinite(loss):
                     # Avoid calling .item() on non-finite tensor (can crash on some PyTorch versions)
                     logger.warning(f"Found non-finite loss at step {global_step}; skipping step")
-                    if getattr(config.training.overflow_backoff_on_nan, "enabled", False):
-                        factor = getattr(config.training.overflow_backoff_on_nan, "factor", 0.1)
+                    overflow_cfg = getattr(config.training, 'overflow_backoff_on_nan', None)
+                    if overflow_cfg and getattr(overflow_cfg, "enabled", False):
+                        factor = getattr(overflow_cfg, "factor", 0.1)
                         MIN_LR = 1e-8  # Prevent learning rate from going to zero
                         for g in optimizer.param_groups:
                             g["lr"] = max(g["lr"] * factor, MIN_LR)
@@ -1170,8 +1184,9 @@ def train_with_orientation_tracking(config: FullConfig):
                         total_norm = total_norm ** 0.5
                         monitor.log_scalar('train/grad_norm', total_norm, global_step)
 
-                    if getattr(config.training.gradient_clipping, 'enabled', True):
-                        max_norm = getattr(config.training.gradient_clipping, 'max_norm', 1.0)
+                    grad_clip_cfg = getattr(config.training, 'gradient_clipping', None)
+                    if grad_clip_cfg and getattr(grad_clip_cfg, 'enabled', True):
+                        max_norm = getattr(grad_clip_cfg, 'max_norm', 1.0)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
                     grads_finite = all(
@@ -1526,7 +1541,7 @@ def train_with_orientation_tracking(config: FullConfig):
                         topk=config.monitor.tb_image_logging.topk,
                     )
 
-        avg_val_loss = val_loss / len(val_loader)
+        avg_val_loss = val_loss / max(1, len(val_loader))
         val_f1_macro = val_metrics['f1_macro'].compute().item()
         val_f1_micro = val_metrics['f1_micro'].compute().item()
         val_mAP = val_metrics['map_macro'].compute().item()
@@ -1562,8 +1577,9 @@ def train_with_orientation_tracking(config: FullConfig):
         # Handle burn-in (ignore early-stopping decisions for first N epochs)
         if burn_in_epochs > 0 and (epoch + 1) <= burn_in_epochs:
             _burn_in_vals.append(val_f1_macro)
+            prev_best_for_log = training_state.best_metric  # Capture before any modifications
             # Track best during burn-in to avoid losing a great model
-            if val_f1_macro > training_state.best_metric:
+            if val_f1_macro > training_state.best_metric + es_threshold:
                 training_state.best_metric = val_f1_macro
                 training_state.best_epoch = epoch + 1
                 is_best = True  # Save checkpoint for this best model
@@ -1582,7 +1598,7 @@ def train_with_orientation_tracking(config: FullConfig):
                     baseline = float(np.median(_burn_in_vals))
                 # Keep the better of baseline or actual best achieved during burn-in
                 best_during_burnin = float(np.max(_burn_in_vals))
-                prev_best = training_state.best_metric
+                prev_best = prev_best_for_log  # Use value captured before any modifications this epoch
                 training_state.best_metric = max(baseline, best_during_burnin)
                 training_state.patience_counter = 0
                 logger.info(
@@ -1592,13 +1608,22 @@ def train_with_orientation_tracking(config: FullConfig):
                 )
             # During burn-in: patience not updated, but best is still tracked
         else:
+            # LR-aware early stopping: only count patience when LR has dropped
+            # significantly within a cycle (in the "fine-tuning" phase)
+            current_lr = scheduler.get_last_lr()[0]
+            cycle_max_lr = scheduler.max_lr  # Already accounts for gamma decay
+            lr_ratio = current_lr / cycle_max_lr if cycle_max_lr > 0 else 1.0
+
             if val_f1_macro > training_state.best_metric + es_threshold:
                 training_state.best_metric = val_f1_macro
                 training_state.patience_counter = 0
                 training_state.best_epoch = epoch + 1
                 is_best = True
-            else:
+            elif lr_ratio < 0.5:
+                # Only count patience when LR < 50% of cycle max (fine-tuning phase)
                 training_state.patience_counter += 1
+            # else: During warmup/early-cycle phase, don't increment patience
+            # This prevents false early stops during cosine-induced plateaus
 
         # Respect "save_best_only": skip cadence saves unless this is a new best.
         # Only handle best-at-epoch saves here; periodic saves happen in-loop

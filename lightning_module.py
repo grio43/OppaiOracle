@@ -1,10 +1,14 @@
+from __future__ import annotations
+
 import logging
 import torch
 import pytorch_lightning as pl
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 from torchmetrics import MetricCollection
 from torchmetrics.classification import MultilabelF1Score, MultilabelAveragePrecision
+
+from torch.optim.lr_scheduler import LinearLR
 
 from model_architecture import create_model
 from loss_functions import MultiTaskLoss, AsymmetricFocalLoss
@@ -39,8 +43,8 @@ class LitOppai(pl.LightningModule):
 
         # Build model from config; ensure vocab size is set
         model_args = getattr(config, "model", {})
-        if hasattr(model_args, "__dict__"):
-            model_args = vars(model_args)
+        if not isinstance(model_args, dict):
+            model_args = vars(model_args) if hasattr(model_args, "__dict__") else {}
         model_args = dict(model_args)
         model_args["num_tags"] = vocab_size
         self.model = create_model(**model_args)
@@ -49,7 +53,16 @@ class LitOppai(pl.LightningModule):
         self.criterion = MultiTaskLoss(tag_loss_fn=AsymmetricFocalLoss())
 
         # Torchmetrics collections for training and validation
-        threshold = getattr(getattr(config, "threshold_calibration", {}), "default_threshold", 0.5)
+        threshold_cfg = getattr(config, "threshold_calibration", None)
+        if threshold_cfg is not None:
+            if hasattr(threshold_cfg, "default_threshold"):
+                threshold = threshold_cfg.default_threshold
+            elif isinstance(threshold_cfg, dict):
+                threshold = threshold_cfg.get("default_threshold", 0.5)
+            else:
+                threshold = 0.5
+        else:
+            threshold = 0.5
         self.train_metrics = MetricCollection(
             {
                 "f1_macro": MultilabelF1Score(num_labels=vocab_size, average="macro", threshold=threshold),
@@ -122,16 +135,20 @@ class LitOppai(pl.LightningModule):
                 f"This indicates a dataloader issue."
             )
 
-        loss, _ = self.criterion(tag_logits, rating_logits, tag_targets, rating_targets)
+        # Compute loss - handle optional ratings
+        if rating_logits is not None and rating_targets is not None:
+            loss, _ = self.criterion(tag_logits, rating_logits, tag_targets, rating_targets)
+        else:
+            # Compute tag loss only when ratings are absent
+            loss = self.criterion.tag_loss_fn(tag_logits, tag_targets)
 
-        # Update metrics for tag predictions if present
-        if tag_logits is not None and tag_targets is not None:
-            preds = torch.sigmoid(tag_logits)
-            targs = tag_targets.to(dtype=preds.dtype)
-            metrics_dict = self.train_metrics(preds, targs)
-            self.log_dict(metrics_dict, prog_bar=True, on_step=True, on_epoch=False)
+        # Update training metrics
+        preds = torch.sigmoid(tag_logits)
+        targs = tag_targets.to(dtype=preds.dtype)
+        metrics_dict = self.train_metrics(preds, targs)
+        self.log_dict(metrics_dict, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
 
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch: Tuple[torch.Tensor, Dict[str, torch.Tensor]] | Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, Any]:
@@ -159,23 +176,30 @@ class LitOppai(pl.LightningModule):
                 f"Expected 'tag' key, but got keys: {available_keys}"
             )
 
-        loss, _ = self.criterion(tag_logits, rating_logits, tag_targets, rating_targets)
+        # Compute loss - handle optional ratings
+        if rating_logits is not None and rating_targets is not None:
+            loss, _ = self.criterion(tag_logits, rating_logits, tag_targets, rating_targets)
+        else:
+            # Compute tag loss only when ratings are absent
+            loss = self.criterion.tag_loss_fn(tag_logits, tag_targets)
 
-        if tag_logits is not None and tag_targets is not None:
-            preds = torch.sigmoid(tag_logits)
-            targs = tag_targets.to(dtype=preds.dtype)
-            metrics_dict = self.val_metrics(preds, targs)
-            self.log_dict(metrics_dict, prog_bar=True, on_step=False, on_epoch=False)
+        # Update metrics (logged in on_validation_epoch_end)
+        preds = torch.sigmoid(tag_logits)
+        targs = tag_targets.to(dtype=preds.dtype)
+        self.val_metrics.update(preds, targs)
 
-        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         return {"val_loss": loss}
 
     def on_validation_epoch_end(self) -> None:
         metrics = self.val_metrics.compute()
-        self.log_dict(metrics, prog_bar=True, on_step=False, on_epoch=True)
+        self.log_dict(metrics, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         self.val_metrics.reset()
 
     def on_train_epoch_end(self) -> None:
+        # Compute and log epoch-level training metrics before reset
+        metrics = self.train_metrics.compute()
+        self.log_dict(metrics, on_epoch=True, sync_dist=True)
         self.train_metrics.reset()
 
     def configure_optimizers(self):
@@ -194,6 +218,8 @@ class LitOppai(pl.LightningModule):
         num_epochs = getattr(training_cfg, "num_epochs", 50)
         grad_accum = getattr(training_cfg, "gradient_accumulation_steps", 1)
 
+        warmup_steps = 0
+
         # Use adaptive optimizer configuration if dataset_size is available
         if self.dataset_size is not None and self.dataset_size > 0:
             try:
@@ -206,9 +232,6 @@ class LitOppai(pl.LightningModule):
                     gradient_accumulation_steps=grad_accum,
                     num_gpus=torch.cuda.device_count() if torch.cuda.is_available() else 1,
                 )
-
-                # Store warmup_steps for potential scheduler use
-                self.warmup_steps = warmup_steps
 
                 logger.info(f"Using adaptive AdamW8bit config: lr={lr:.6f}, warmup={warmup_steps}")
                 optimizer = bnb.optim.AdamW8bit(self.parameters(), lr=lr, **optim_kwargs)
@@ -233,6 +256,23 @@ class LitOppai(pl.LightningModule):
                 eps=eps,
                 weight_decay=weight_decay
             )
+
+        # Create warmup scheduler if warmup_steps > 0
+        if warmup_steps > 0:
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_steps
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": warmup_scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                }
+            }
 
         return optimizer
 
@@ -262,8 +302,8 @@ class LitOppai(pl.LightningModule):
 
         state_dict = checkpoint.get("state_dict", {})
         current_state = self.state_dict()
-        safe_removed: list[str] = []
-        unsafe_mismatches: list[tuple[str, tuple, tuple]] = []
+        safe_removed: List[str] = []
+        unsafe_mismatches: List[Tuple[str, Tuple, Tuple]] = []
 
         for k in list(state_dict.keys()):
             if k in current_state:

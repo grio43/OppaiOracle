@@ -12,7 +12,7 @@ import numpy as np
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
@@ -41,8 +41,8 @@ class DanbooruDataPreprocessor:
     
     def __init__(self,
                  vocab_path: Path,
-                 output_dir: Path | None = None,
-                 num_workers: int | None = None,
+                 output_dir: Optional[Path] = None,
+                 num_workers: Optional[int] = None,
                  ignore_tags_file: Optional[Path] = None,
                  ignored_tags: Optional[List[str]] = None):
         """
@@ -62,7 +62,7 @@ class DanbooruDataPreprocessor:
         self.num_workers = int(num_workers or cpu_count())
 
         # Tag ignoring: load from file and/or list, union of both is used
-        self.ignore_tags: set[str] = set()
+        self.ignore_tags: Set[str] = set()
         if ignore_tags_file:
             try:
                 with open(ignore_tags_file, 'r', encoding='utf-8') as f:
@@ -325,14 +325,20 @@ class DanbooruDataPreprocessor:
                         continue
 
                     tags_list = parse_tags_field(tags_field)
-                    
+
                     if not tags_list:
                         logger.debug(f"No tags found for {filename} in {json_file}")
                         continue
-                    
+
                     original_count = len(tags_list)
-                    
                     tags_list = dedupe_preserve_order(tags_list)
+
+                    # Track duplicate statistics (before ignore_tags filtering)
+                    dedupe_count = original_count - len(tags_list)
+                    if dedupe_count > 0:
+                        batch_stats['total_duplicates_removed'] += dedupe_count
+                        batch_stats['files_with_duplicates'] += 1
+                        logger.debug(f"Removed {dedupe_count} duplicate tags from {filename}")
 
                     # Remove ignored tags before further processing
                     if self.ignore_tags:
@@ -340,14 +346,6 @@ class DanbooruDataPreprocessor:
                         if not tags_list:
                             logger.debug(f"Skipping {filename}: all tags are in ignore list")
                             continue
-                    
-                    # Track duplicate statistics
-                    dedupe_count = original_count - len(tags_list)
-                    if dedupe_count > 0:
-                        batch_stats['total_duplicates_removed'] += dedupe_count
-                        batch_stats['files_with_duplicates'] += 1
-                        logger.debug(f"Removed {dedupe_count} duplicate tags from {filename}")
-                    
                     # Convert tags to indices (optimized with .get())
                     tag_indices = []
                     oov_count = 0
@@ -437,9 +435,11 @@ class DanbooruDataPreprocessor:
             'quality_scores': []
         }
         
+        # NOTE: Using instance method with ProcessPoolExecutor may cause pickling issues on Windows.
+        # If multiprocessing fails, consider refactoring process_metadata_batch to a module-level function.
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
             futures = []
-            
+
             for i in range(0, len(json_files), batch_size):
                 batch = json_files[i:i+batch_size]
                 futures.append(executor.submit(self.process_metadata_batch, batch))
@@ -545,7 +545,6 @@ class DanbooruDataPreprocessor:
         Handles both lists and numpy arrays correctly. Lists are subset by
         iterating through indices, numpy arrays use numpy's advanced indexing.
         """
-        import numpy as np
         subset = {}
         for key, values in results.items():
             if isinstance(values, list):
@@ -644,7 +643,7 @@ class DanbooruDataPreprocessor:
         }
         
         # Save metadata
-        with open(self.output_dir / 'dataset_metadata.json', 'w') as f:
+        with open(self.output_dir / 'dataset_metadata.json', 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2)
         
         # Save co-occurrence matrix
@@ -699,7 +698,7 @@ class DanbooruDataPreprocessor:
             'n_test': int(n_test)
         }
         
-        with open(self.output_dir / 'splits.json', 'w') as f:
+        with open(self.output_dir / 'splits.json', 'w', encoding='utf-8') as f:
             json.dump(splits, f)
         
         logger.info(f"Created splits: train={n_train:,}, val={n_val:,}, test={n_test:,}")
@@ -778,6 +777,7 @@ def main():
 
     try:
         # Load unified config to get defaults
+        unified_config = None
         try:
             manager = ConfigManager(config_type=ConfigType.FULL)
             unified_config = manager.load_from_file("configs/unified_config.yaml")
@@ -790,9 +790,9 @@ def main():
                 def __getattr__(self, name): return None
             data_cfg = Dummy()
 
-        # Determine default paths from config
-        DEFAULT_VOCAB_PATH = unified_config.vocab_path or data_cfg.vocab_dir
-        DEFAULT_OUTPUT_DIR = data_cfg.output_dir
+        # Determine default paths from config (with fallbacks)
+        DEFAULT_VOCAB_PATH = (unified_config.vocab_path if unified_config else None) or data_cfg.vocab_dir or "vocabulary"
+        DEFAULT_OUTPUT_DIR = data_cfg.output_dir or "./prepared"
 
         parser = argparse.ArgumentParser(description="Prepare Danbooru data for direct training")
         parser.add_argument('--metadata_dir', type=str, required=True, help='Directory with JSON metadata files')

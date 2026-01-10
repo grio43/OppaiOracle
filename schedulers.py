@@ -45,7 +45,7 @@ class LinearWarmupCosineLR(_LRScheduler):
                 stacklevel=2
             )
 
-        self.wwarm = int(warmup_epochs)
+        self._warmup_epochs = int(warmup_epochs)
         self.max_epochs = int(max_epochs)
         self.warmup_start_lr = float(warmup_start_lr)
         self.eta_min = float(eta_min)
@@ -54,7 +54,7 @@ class LinearWarmupCosineLR(_LRScheduler):
     # Maintain backward-compat attribute name used in logic
     @property
     def warmup_epochs(self) -> int:
-        return self.wwarm
+        return self._warmup_epochs
 
     def get_lr(self) -> List[float]:
         e = self.last_epoch  # epoch index starting at 0 after first step()
@@ -75,8 +75,8 @@ class LinearWarmupCosineLR(_LRScheduler):
 
         # Edge case: No cosine phase (warmup == max_epochs)
         if total_cosine <= 0:
-            # Just return base_lr (warmup completed)
-            return list(base_lrs)
+            # No cosine phase - return eta_min (training at minimum LR after warmup)
+            return [self.eta_min for _ in base_lrs]
 
         # Normal cosine schedule
         t = (e - self.warmup_epochs + 1) / total_cosine  # 0..1 over cosine schedule

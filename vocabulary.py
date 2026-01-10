@@ -18,10 +18,14 @@ try:
     HAS_ORJSON = True
 except ImportError:
     HAS_ORJSON = False
+
+# Define JSON decode error types for exception handling (orjson has its own error type)
+_JSON_ERRORS = (json.JSONDecodeError, orjson.JSONDecodeError) if HAS_ORJSON else (json.JSONDecodeError,)
+
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Union
 import torch
 import yaml
 
@@ -141,7 +145,7 @@ def _count_tags_in_files(file_paths: List[str], ignored_tags: Set[str]) -> Dict[
                         continue
                     tag_counts[tag] += 1
 
-        except (KeyError, json.JSONDecodeError) as e:
+        except (KeyError, *_JSON_ERRORS) as e:
             logger.warning(f"Failed to parse {json_file}: {e}")
         except Exception as e:
             logger.warning(f"Unexpected error parsing {json_file}: {e}")
@@ -300,7 +304,7 @@ class TagVocabulary:
                             continue
                         tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
-            except (KeyError, json.JSONDecodeError) as e:
+            except (KeyError, *_JSON_ERRORS) as e:
                 logger.warning(f"Failed to parse {json_file}: {e}")
             except Exception as e:
                 logger.warning(f"Unexpected error parsing {json_file}: {e}")
@@ -684,7 +688,7 @@ def create_dataset_config(vocab: TagVocabulary) -> Dict:
     }
 
 def create_vocabulary_from_datasets(
-    dataset_path: Optional[List[Path]] = None,
+    dataset_path: Optional[List[Union[str, Path]]] = None,
     *,
     min_frequency: int = 50,
     top_k: int = 100_000,
@@ -703,7 +707,8 @@ def create_vocabulary_from_datasets(
         num_workers: Number of worker processes to use for tag counting
         chunk_size: Number of files per worker chunk
     """
-    from pathlib import Path
+    if not dataset_path:
+        raise ValueError("dataset_path is required and must contain at least one path")
 
     json_files: List[str] = []
     data_dir = Path(dataset_path[0])
@@ -742,12 +747,12 @@ def create_vocabulary_from_datasets(
 
 def main():
     # Main function for command-line usage
-    import argparse    
+    import argparse
     parser = argparse.ArgumentParser(description='Generate vocabulary from anime image dataset')
     parser.add_argument('dataset_paths', nargs='+', help='Paths to dataset directories or images')
     args = parser.parse_args()
     create_vocabulary_from_datasets(args.dataset_paths)
-    vocab = load_vocabulary_for_training(Path('./vocabulary'))
+    vocab = load_vocabulary_for_training(VOCAB_PATH)
     logger.info(f"Vocabulary size: {len(vocab)} tags")
     logger.info("Vocabulary preparation complete!")
 

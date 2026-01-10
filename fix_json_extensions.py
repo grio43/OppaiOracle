@@ -22,10 +22,11 @@ import json
 import logging
 import os
 import shutil
+import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Set
 
 try:
     import orjson
@@ -50,25 +51,8 @@ logger = logging.getLogger(__name__)
 # Supported image extensions (in order of preference)
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')
 
-# Directory cache for faster lookups (populated per-directory)
-_dir_cache: Dict[Path, Set[str]] = {}
 
-
-def get_dir_files(dir_path: Path) -> Set[str]:
-    """
-    Get cached set of files in a directory.
-
-    Uses caching to avoid repeated os.listdir calls for the same directory.
-    """
-    if dir_path not in _dir_cache:
-        try:
-            _dir_cache[dir_path] = set(os.listdir(dir_path))
-        except OSError:
-            _dir_cache[dir_path] = set()
-    return _dir_cache[dir_path]
-
-
-def find_actual_image(json_path: Path, claimed_filename: str, dir_files: Optional[Set[str]] = None) -> Optional[str]:
+def find_actual_image(json_path: Path, claimed_filename: str, dir_files: Set[str]) -> Optional[str]:
     """
     Find the actual image file for a JSON sidecar.
 
@@ -80,10 +64,6 @@ def find_actual_image(json_path: Path, claimed_filename: str, dir_files: Optiona
     Returns:
         Actual filename if found with different extension, None if correct or not found
     """
-    # Use provided cache or fetch
-    if dir_files is None:
-        dir_files = get_dir_files(json_path.parent)
-
     # If claimed file exists, no fix needed
     if claimed_filename in dir_files:
         return None
@@ -103,9 +83,9 @@ def find_actual_image(json_path: Path, claimed_filename: str, dir_files: Optiona
 
 def process_json_file(
     json_path: Path,
-    apply: bool = False,
-    backup: bool = False,
-    dir_files: Optional[Set[str]] = None
+    apply: bool,
+    backup: bool,
+    dir_files: Set[str]
 ) -> Dict:
     """
     Process a single JSON file and fix extension if needed.
@@ -114,7 +94,7 @@ def process_json_file(
         json_path: Path to the JSON file
         apply: Whether to actually modify the file
         backup: Whether to create a backup before modifying
-        dir_files: Pre-cached set of files in the directory
+        dir_files: Set of filenames in the directory (from os.scandir)
 
     Returns:
         Dict with status info: {status, old_filename, new_filename, error}
@@ -142,13 +122,9 @@ def process_json_file(
 
         # Get current filename
         current_filename = data.get('filename')
-        if not current_filename:
+        if not current_filename or not isinstance(current_filename, str):
             result['status'] = 'no_filename'
             return result
-
-        # Get dir files cache if not provided
-        if dir_files is None:
-            dir_files = get_dir_files(json_path.parent)
 
         # Check if fix is needed (use cached dir listing)
         actual_filename = find_actual_image(json_path, current_filename, dir_files)
@@ -168,7 +144,7 @@ def process_json_file(
         result['new_filename'] = actual_filename
 
         if apply:
-            # Create backup if requested
+            # Create backup if requested (foo.json -> foo.json.bak)
             if backup:
                 backup_path = json_path.with_suffix('.json.bak')
                 shutil.copy2(json_path, backup_path)
@@ -201,8 +177,14 @@ def process_directory_batch(
 
     Pre-caches the directory listing once and reuses it for all files.
     """
-    # Cache directory listing once for all files in this dir
-    dir_files = set(os.listdir(dir_path))
+    # Cache directory listing once for all files in this dir (scandir is faster)
+    try:
+        dir_files = {entry.name for entry in os.scandir(dir_path)}
+    except OSError:
+        # Directory may have been deleted/moved since discovery
+        return [{'path': str(p), 'status': 'error', 'old_filename': None,
+                 'new_filename': None, 'error': f'Directory inaccessible: {dir_path}'}
+                for p in json_files]
 
     results = []
     for json_path in json_files:
@@ -268,8 +250,8 @@ def main():
     parser.add_argument(
         '--workers',
         type=int,
-        default=20,
-        help='Number of parallel workers'
+        default=64,
+        help='Number of parallel workers (64 recommended for SSD, 20 for HDD)'
     )
 
     parser.add_argument(
@@ -305,7 +287,7 @@ def main():
     # Process files
     mode = "APPLYING FIXES" if args.apply else "DRY RUN (use --apply to fix)"
     logger.info(f"Processing {total_files:,} files in {len(dir_batches):,} directories - {mode}")
-    logger.info(f"Using {args.workers} worker threads (batch processing by directory)")
+    logger.info(f"Using {args.workers} worker processes (batch processing by directory)")
 
     start_time = time.time()
 
@@ -329,44 +311,51 @@ def main():
     # This is much faster than per-file parallelism due to shared dir listing cache
     processed_files = 0
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
         futures = {
-            executor.submit(process_directory_batch, dir_path, json_files, args.apply, args.backup): dir_path
+            executor.submit(process_directory_batch, dir_path, json_files, args.apply, args.backup): (dir_path, len(json_files))
             for dir_path, json_files in dir_batches
         }
 
-        if HAS_TQDM:
-            pbar = tqdm(total=total_files, desc="Processing", unit="files")
-        else:
-            pbar = None
+        pbar = tqdm(total=total_files, desc="Processing", unit="files", mininterval=0.5) if HAS_TQDM else None
+        pending_update = 0  # Batch progress updates for efficiency
 
-        for future in as_completed(futures):
-            try:
-                results = future.result()
+        try:
+            for future in as_completed(futures):
+                try:
+                    results = future.result()
 
-                for result in results:
-                    status = result['status']
-                    stats[status] = stats.get(status, 0) + 1
+                    for result in results:
+                        status = result['status']
+                        stats[status] += 1
 
-                    # Collect samples
-                    if status in ('fixed', 'needs_fix') and len(fix_samples) < 10:
-                        fix_samples.append(result)
-                    elif status == 'missing' and len(missing_samples) < 5:
-                        missing_samples.append(result)
-                    elif status == 'error' and len(error_samples) < 5:
-                        error_samples.append(result)
+                        # Collect samples
+                        if status in ('fixed', 'needs_fix') and len(fix_samples) < 10:
+                            fix_samples.append(result)
+                        elif status == 'missing' and len(missing_samples) < 5:
+                            missing_samples.append(result)
+                        elif status == 'error' and len(error_samples) < 5:
+                            error_samples.append(result)
 
-                processed_files += len(results)
-                if pbar:
-                    pbar.update(len(results))
+                    processed_files += len(results)
+                    pending_update += len(results)
 
-            except Exception as e:
-                stats['error'] += 1
-                if len(error_samples) < 5:
-                    error_samples.append({'error': str(e)})
+                    # Batch tqdm updates every 1000 files to reduce overhead
+                    if pbar and pending_update >= 1000:
+                        pbar.update(pending_update)
+                        pending_update = 0
 
-        if pbar:
-            pbar.close()
+                except Exception as e:
+                    dir_path, file_count = futures[future]
+                    stats['error'] += file_count
+                    if len(error_samples) < 5:
+                        error_samples.append({'path': str(dir_path), 'error': str(e)})
+        finally:
+            # Ensure progress bar is always closed
+            if pbar:
+                if pending_update > 0:
+                    pbar.update(pending_update)
+                pbar.close()
 
     elapsed = time.time() - start_time
     rate = total_files / elapsed if elapsed > 0 else 0
@@ -405,8 +394,8 @@ def main():
         logger.info("")
         logger.info("To apply these fixes, run with --apply flag")
 
-    return 0
+    return 1 if stats['error'] > 0 else 0
 
 
 if __name__ == '__main__':
-    exit(main())
+    sys.exit(main())

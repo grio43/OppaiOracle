@@ -86,14 +86,11 @@ WRITE_BUFFER_SIZE = 8 * 1024 * 1024  # 8MB write buffer for better write perform
 
 # Command line parsing
 DRY_RUN = '--yes' not in sys.argv
-EXECUTE = '--yes' in sys.argv
 VERBOSE = '-v' in sys.argv or '--verbose' in sys.argv
 FORCE = '--force' in sys.argv  # Skip confirmation prompt
 SKIP_CLEANUP = '--skip-cleanup' in sys.argv  # Skip temp file cleanup
 DIRECT_WRITE = '--direct-write' in sys.argv  # Skip temp file, write directly (faster but less safe)
-LOW_PRIORITY = '--low-priority' not in sys.argv or '--low-priority' in sys.argv  # Run at low priority by default (disable with --no-low-priority)
-if '--no-low-priority' in sys.argv:
-    LOW_PRIORITY = False
+LOW_PRIORITY = '--no-low-priority' not in sys.argv  # Run at low priority by default (disable with --no-low-priority)
 
 TARGET_SIZE = DEFAULT_TARGET_SIZE
 SINGLE_SHARD = None  # Process only this shard if specified
@@ -368,7 +365,8 @@ def load_shard_to_ram(shard_path: Path, shard_name: str, verbose: bool = False) 
                 print(f"  [STAT ERROR] Failed to stat {img_path.name}: {type(e).__name__}: {e}")
 
     stat_time = time.time() - stat_start
-    print(f"  [PHASE 1A] File size check complete in {stat_time:.2f}s ({len(image_paths)/stat_time:.1f} files/sec)")
+    stat_rate = len(image_paths) / stat_time if stat_time > 0 else 0
+    print(f"  [PHASE 1A] File size check complete in {stat_time:.2f}s ({stat_rate:.1f} files/sec)")
 
     if not valid_paths:
         if skipped_oversized > 0:
@@ -701,7 +699,11 @@ def main() -> None:
 
         if not all_shards:
             print(f"ERROR: No shards found at or after {RESUME_FROM_SHARD}")
-            print(f"Available shards range: {sorted([d for d in database_path.iterdir() if d.is_dir() and d.name.startswith('shard_')])[0].name} to {sorted([d for d in database_path.iterdir() if d.is_dir() and d.name.startswith('shard_')])[-1].name}")
+            available = sorted([d for d in database_path.iterdir() if d.is_dir() and d.name.startswith('shard_')])
+            if available:
+                print(f"Available shards range: {available[0].name} to {available[-1].name}")
+            else:
+                print("No shards found in database")
             return
 
         skipped_count = original_count - len(all_shards)

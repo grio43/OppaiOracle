@@ -38,7 +38,7 @@ from PIL import Image, ImageOps, ImageFile
 from model_metadata import ModelMetadata
 from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
 from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
-from Configuration_System import load_config, InferenceConfig as BaseInferenceConfig, MonitorConfig
+from Configuration_System import load_config, InferenceConfig as BaseInferenceConfig, MonitorConfig, FullConfig
 from orientation_handler import OrientationHandler  # orientation-aware TTA mapping
 
 # Make cv2 optional - not needed for basic inference
@@ -109,6 +109,7 @@ class InferenceConfig(BaseInferenceConfig):
     save_visualizations: bool = False
     visualization_dir: str = "./visualizations"
     input_image_extensions: List[str] = field(default_factory=lambda: [".jpg", ".jpeg", ".png", ".webp"])
+    enable_profiling: bool = False
 
     @property
     def threshold(self) -> float:
@@ -416,7 +417,8 @@ class ModelWrapper:
             self._tta_index_map = None
             if getattr(self.config, "tta_flip", False) and self.tag_names:
                 try:
-                    map_path = Path(config.data.orientation_map_path) if config.data.orientation_map_path else None
+                    orientation_path = getattr(getattr(config, 'data', None), 'orientation_map_path', None)
+                    map_path = Path(orientation_path) if orientation_path else None
                     if map_path and map_path.exists():
                         oh = OrientationHandler(mapping_file=map_path)
                         mapping = oh.precompute_all_mappings(set(self.tag_names))
@@ -880,8 +882,17 @@ class InferenceEngine:
         
     def _setup(self):
         """Setup inference engine components"""
+        # Load full config for model initialization
+        try:
+            full_config = load_config(PROJECT_ROOT / "configs" / "unified_config.yaml")
+            # Override inference config with our config
+            full_config.inference = self.config
+        except Exception as e:
+            logger.error(f"Failed to load unified_config.yaml: {e}")
+            raise RuntimeError(f"Cannot load configuration: {e}")
+
         # Load model
-        if not self.model_wrapper.load_model():
+        if not self.model_wrapper.load_model(full_config):
             raise RuntimeError("Failed to load model")
         
         # Setup result processor
@@ -1056,12 +1067,14 @@ class InferenceEngine:
         self,
         directory: str,
         output_path: str,
-        extensions: List[str] = ['.jpg', '.jpeg', '.png', '.webp']
+        extensions: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """Process all images in a directory"""
+        if extensions is None:
+            extensions = ['.jpg', '.jpeg', '.png', '.webp']
         directory = Path(directory)
         output_path = Path(output_path)
-        
+
         # Find all image files
         image_paths = []
         for ext in extensions:

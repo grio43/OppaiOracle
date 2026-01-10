@@ -35,14 +35,13 @@ def ensure_pixel_padding_mask(
     if mask.dim() == 3:
         mask = mask.unsqueeze(1)  # (B,1,H,W)
 
-    # Trace-friendly validation: use torch assertions instead of Python conditionals
-    torch._assert(
-        mask.dim() == 4,
-        f"padding_mask must be (B,H,W) or (B,1,H,W) after expansion; got {original_dims}D -> {mask.dim()}D with shape {tuple(mask.shape)}"
-    )
+    # Trace-friendly validation
+    if not torch.jit.is_tracing():
+        assert mask.dim() == 4, \
+            f"padding_mask must be (B,H,W) or (B,1,H,W) after expansion; got {original_dims}D -> {mask.dim()}D with shape {tuple(mask.shape)}"
 
     # Binarize + cast
-    if mask.dtype is not torch.bool:
+    if mask.dtype != torch.bool:
         mask = (mask > 0.5)
 
     # Apply semantics
@@ -53,10 +52,10 @@ def ensure_pixel_padding_mask(
         # Already correct semantics
         pass
     elif mask_semantics == 'auto':
-        # Legacy heuristic (unreliable, deprecated)
-        frac_true = mask.flatten(1).float().mean(dim=1)
-        should_invert = torch.median(frac_true) > 0.5
-        mask = torch.where(should_invert, ~mask, mask)
+        # Legacy heuristic (unreliable, deprecated) - per-sample decision
+        frac_true = mask.flatten(2).float().mean(dim=2)  # (B, 1)
+        should_invert = frac_true > 0.5  # (B, 1)
+        mask = torch.where(should_invert.unsqueeze(-1).unsqueeze(-1), ~mask, mask)
         # Log warning in non-tracing mode
         if not torch.jit.is_tracing():
             import logging
@@ -78,27 +77,18 @@ def pixel_to_token_ignore(mask_b1hw: torch.Tensor, patch: int, threshold: float 
     """
     B, C, H, W = mask_b1hw.shape
 
-    # Use trace-friendly torch assertions instead of Python conditionals
-    torch._assert(
-        mask_b1hw.dim() == 4,
-        f"Expected 4D tensor (B,1,H,W), got {mask_b1hw.dim()}D with shape {tuple(mask_b1hw.shape)}"
-    )
-    torch._assert(
-        C == 1,
-        f"Expected channel dimension of 1, got {C} with shape {tuple(mask_b1hw.shape)}"
-    )
-    torch._assert(
-        mask_b1hw.dtype == torch.bool,
-        f"mask_b1hw must be bool (True=PAD), got dtype {mask_b1hw.dtype}"
-    )
-    torch._assert(
-        H % patch == 0,
-        f"Image height {H} must be divisible by patch size {patch}"
-    )
-    torch._assert(
-        W % patch == 0,
-        f"Image width {W} must be divisible by patch size {patch}"
-    )
+    # Trace-friendly validation
+    if not torch.jit.is_tracing():
+        assert mask_b1hw.dim() == 4, \
+            f"Expected 4D tensor (B,1,H,W), got {mask_b1hw.dim()}D with shape {tuple(mask_b1hw.shape)}"
+        assert C == 1, \
+            f"Expected channel dimension of 1, got {C} with shape {tuple(mask_b1hw.shape)}"
+        assert mask_b1hw.dtype == torch.bool, \
+            f"mask_b1hw must be bool (True=PAD), got dtype {mask_b1hw.dtype}"
+        assert H % patch == 0, \
+            f"Image height {H} must be divisible by patch size {patch}"
+        assert W % patch == 0, \
+            f"Image width {W} must be divisible by patch size {patch}"
 
     # pad_fraction per patch
     pad_frac = F.avg_pool2d(mask_b1hw.float(), kernel_size=patch, stride=patch)  # (B,1,GH,GW)

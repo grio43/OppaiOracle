@@ -83,7 +83,7 @@ data:
   # Data loading (from dataloader.yaml)
   batch_size: 24  # Optimized for RTX 5090 32GB VRAM (effective batch: 24×4=96 with gradient accumulation)
   num_workers: 4  # Reduced from 6 to save ~1GB RAM
-  pin_memory: false  # Disabled - not needed with PCIe 4.0/5.0, saves ~2GB
+  pin_memory: true   # Enables async DMA transfer for PCIe 4.0/5.0
   prefetch_factor: 1   # Reduced from 2 to save ~1GB prefetch buffers
   persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   drop_last: false
@@ -153,7 +153,7 @@ data:
 # Training Configuration (from training_config.yaml)
 training:
     memory_format: "channels_last"
-    num_epochs: 40
+    num_epochs: 30
     learning_rate: 1.0e-4
     weight_decay: 0.01
     gradient_accumulation_steps: 4  # Maintains effective batch size of 96 (24 × 4)
@@ -173,9 +173,9 @@ training:
 
     # Scheduler
     scheduler: "cosine_restarts"
-    warmup_steps: 3000  # number of OPTIMIZER STEPS to warm up (step-based)
+    warmup_steps: 2000  # number of OPTIMIZER STEPS to warm up (step-based)
     warmup_ratio: 0.0
-    num_cycles: 1.0
+    num_cycles: 3
     lr_end: 1.0e-6
 
     # Mixed precision
@@ -260,10 +260,10 @@ training:
     benchmark: true
 
     # Early stopping
-    early_stopping_patience: 10
+    early_stopping_patience: 8
     early_stopping_threshold: 0.0001
     # Ignore first N epochs for early-stopping to avoid initial instability
-    early_stopping_burn_in_epochs: 3
+    early_stopping_burn_in_epochs: 2
     # One of: median, mean, last, max
     early_stopping_burn_in_strategy: median
 
