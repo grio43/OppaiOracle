@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Duplicate Cluster Reviewer</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <h1>Duplicate Reviewer</h1>
+
+            <!-- Stats Panel -->
+            <div class="stats-panel">
+                <div class="stat-row">
+                    <span class="stat-label">Total Clusters</span>
+                    <span class="stat-value" id="stat-total">-</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Pending</span>
+                    <span class="stat-value pending" id="stat-pending">-</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Reviewed</span>
+                    <span class="stat-value reviewed" id="stat-reviewed">-</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Excluded</span>
+                    <span class="stat-value excluded" id="stat-excluded">-</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">To Delete</span>
+                    <span class="stat-value" id="stat-to-delete">-</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Excluded Images</span>
+                    <span class="stat-value excluded" id="stat-excluded-images">-</span>
+                </div>
+            </div>
+
+            <!-- Status Filter -->
+            <div class="filter-section">
+                <h3>Status</h3>
+                <div class="filter-buttons">
+                    <button class="filter-btn" data-status="pending">Pending</button>
+                    <button class="filter-btn" data-status="reviewed">Reviewed</button>
+                    <button class="filter-btn" data-status="excluded">Excluded</button>
+                </div>
+            </div>
+
+            <!-- Size Filter -->
+            <div class="filter-section">
+                <h3>Cluster Size</h3>
+                <div class="filter-buttons">
+                    <button class="filter-btn" data-size="2">2</button>
+                    <button class="filter-btn" data-size="3-5">3-5</button>
+                    <button class="filter-btn" data-size="6-10">6-10</button>
+                    <button class="filter-btn" data-size="10+">10+</button>
+                </div>
+            </div>
+
+            <!-- Search -->
+            <div class="filter-section">
+                <h3>Search</h3>
+                <input type="text"
+                       class="search-box"
+                       id="search-input"
+                       placeholder="Search by path...">
+            </div>
+
+            <!-- Jump to Cluster -->
+            <div class="filter-section">
+                <h3>Jump to Cluster</h3>
+                <div class="jump-input">
+                    <input type="number"
+                           id="jump-input"
+                           placeholder="Cluster ID">
+                    <button id="jump-btn">Go</button>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header class="content-header">
+                <h2 id="showing-count">Loading...</h2>
+                <div class="save-indicator" id="save-indicator">
+                    <span>&#x2713;</span> Saved
+                </div>
+            </header>
+
+            <!-- Clusters Container -->
+            <div id="clusters-container">
+                <div class="loading">
+                    <div class="loading-spinner"></div>
+                    <p>Loading clusters...</p>
+                </div>
+            </div>
+
+            <!-- Load More -->
+            <div id="load-more-container" class="load-more" style="display: none;">
+                <button id="load-more-btn" class="load-more-btn">Load More</button>
+            </div>
+        </main>
+    </div>
+
+    <!-- Image Modal -->
+    <div class="modal-overlay" id="modal-overlay">
+        <button class="modal-close">&times;</button>
+        <div class="modal-content">
+            <img id="modal-image" src="" alt="Full size image">
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

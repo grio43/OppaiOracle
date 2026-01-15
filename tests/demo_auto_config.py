@@ -14,8 +14,8 @@ def demo_config_for_dataset(dataset_size, num_epochs=50):
     print(f"{'='*70}\n")
 
     try:
-        from optimizer_config import get_recommended_batch_size, get_adamw8bit_config
-        from scheduler_config import recommend_scheduler, get_scheduler_config
+        from training_config import get_recommended_batch_size, get_adamw8bit_config
+        from training_config import recommend_scheduler, get_scheduler_config
 
         # Step 1: Get batch size recommendation
         print("Step 1: Determining batch size...")

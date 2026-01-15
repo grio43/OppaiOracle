@@ -192,6 +192,51 @@ def parallel_delete(file_paths, num_threads=DEFAULT_THREADS):
     return deleted_count, error_count
 
 
+def _invalidate_training_caches():
+    """Invalidate split and Arrow caches after file deletion.
+
+    This ensures training will rescan the filesystem instead of
+    using stale file lists that reference deleted files.
+    """
+    # Find OppaiOracle project root (parent of data_preparation)
+    script_dir = Path(__file__).parent
+    project_root = script_dir.parent
+    logs_dir = project_root / "logs"
+
+    if not logs_dir.exists():
+        return
+
+    deleted_caches = []
+
+    # Invalidate split cache
+    splits_dir = logs_dir / "splits"
+    if splits_dir.exists():
+        for cache_file in splits_dir.glob("*.txt"):
+            try:
+                cache_file.unlink()
+                deleted_caches.append(str(cache_file.name))
+            except OSError as e:
+                print(f"  Warning: Could not delete {cache_file}: {e}")
+
+    # Invalidate Arrow metadata cache
+    metadata_dir = logs_dir / "metadata_cache"
+    if metadata_dir.exists():
+        for cache_file in metadata_dir.iterdir():
+            try:
+                if cache_file.is_file():
+                    cache_file.unlink()
+                    deleted_caches.append(str(cache_file.name))
+            except OSError as e:
+                print(f"  Warning: Could not delete {cache_file}: {e}")
+
+    if deleted_caches:
+        print(f"\nInvalidated {len(deleted_caches)} cache file(s) to force fresh rescan:")
+        for f in deleted_caches[:5]:
+            print(f"  - {f}")
+        if len(deleted_caches) > 5:
+            print(f"  ... and {len(deleted_caches) - 5} more")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Find and clean up orphan JSON files and images from dataset"
@@ -272,6 +317,11 @@ def main():
             else:
                 deleted_count, error_count = parallel_delete(all_paths, num_threads)
                 print(f"\nSuccessfully deleted {deleted_count} files!")
+
+                # Invalidate training caches after deleting files
+                # Without this, training may use stale file lists
+                _invalidate_training_caches()
+
                 if error_count > 0:
                     print(f"Failed to delete {error_count} files.")
                     return 1

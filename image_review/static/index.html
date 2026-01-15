@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Review - Validation Results</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar: Run Selection & Navigation -->
+        <aside class="sidebar">
+            <h1>Image Review</h1>
+
+            <!-- Run Selection -->
+            <div class="panel">
+                <h3>TensorBoard Run</h3>
+                <select id="run-select" class="run-select">
+                    <option value="">Select a run...</option>
+                </select>
+                <div id="run-info" class="run-info"></div>
+            </div>
+
+            <!-- Step Filter -->
+            <div class="panel">
+                <h3>Validation Step</h3>
+                <select id="step-select" class="step-select">
+                    <option value="">All steps</option>
+                </select>
+            </div>
+
+            <!-- Navigation -->
+            <div class="panel">
+                <h3>Navigation</h3>
+                <div class="nav-info" id="nav-info">
+                    <span>Sample <span id="current-num">-</span> of <span id="total-num">-</span></span>
+                </div>
+                <div class="nav-buttons">
+                    <button id="btn-prev" class="nav-btn" disabled>&larr; Previous</button>
+                    <button id="btn-next" class="nav-btn" disabled>Next &rarr;</button>
+                </div>
+            </div>
+
+            <!-- Jump to Sample -->
+            <div class="panel">
+                <h3>Jump To</h3>
+                <div class="jump-controls">
+                    <input type="number" id="jump-input" placeholder="Sample #" min="1">
+                    <button id="btn-jump">Go</button>
+                </div>
+            </div>
+
+            <!-- Keyboard Shortcuts -->
+            <div class="panel shortcuts">
+                <h3>Shortcuts</h3>
+                <div class="shortcut-row"><kbd>&larr;</kbd> Previous</div>
+                <div class="shortcut-row"><kbd>&rarr;</kbd> Next</div>
+                <div class="shortcut-row"><kbd>G</kbd> Jump to sample</div>
+                <div class="shortcut-row"><kbd>Esc</kbd> Close modal</div>
+            </div>
+        </aside>
+
+        <!-- Main Content: Three-Column Layout -->
+        <main class="main-content">
+            <!-- Loading State -->
+            <div class="loading-state" id="loading-state">
+                <p>Select a TensorBoard run to begin reviewing images</p>
+            </div>
+
+            <!-- Review Container (hidden until data loads) -->
+            <div class="review-container" id="review-container" style="display: none;">
+                <!-- Left Column: Expected Tags (Ground Truth) -->
+                <section class="column expected-tags">
+                    <h2>Expected Tags</h2>
+                    <p class="column-subtitle">Ground truth labels</p>
+                    <div class="tag-list" id="expected-tags"></div>
+                </section>
+
+                <!-- Center Column: Image View -->
+                <section class="column image-view">
+                    <h2>Sample Image</h2>
+                    <!-- Rating Display -->
+                    <div class="rating-display" id="rating-display" style="display: none;">
+                        <span class="rating-label">Rating:</span>
+                        <span class="rating-predicted" id="rating-predicted">-</span>
+                        <span class="rating-arrow">→</span>
+                        <span class="rating-actual" id="rating-actual">-</span>
+                        <span class="rating-status" id="rating-status">-</span>
+                    </div>
+                    <div class="image-container" id="image-container">
+                        <img id="sample-image" src="" alt="Validation sample">
+                    </div>
+                    <div class="sample-info" id="sample-info">
+                        <span>Step: <span id="info-step">-</span></span>
+                        <span>Index: <span id="info-idx">-</span></span>
+                    </div>
+                </section>
+
+                <!-- Right Column: Model Predictions -->
+                <section class="column predictions">
+                    <h2>Model Predictions</h2>
+                    <div class="stats-row">
+                        <span class="stat tp">TP: <span id="stat-tp">0</span></span>
+                        <span class="stat fp">FP: <span id="stat-fp">0</span></span>
+                        <span class="stat fn">FN: <span id="stat-fn">0</span></span>
+                    </div>
+                    <div class="prediction-list" id="predictions"></div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <!-- Full-size Image Modal -->
+    <div class="modal-overlay" id="image-modal">
+        <button class="modal-close" id="modal-close">&times;</button>
+        <img id="modal-image" src="" alt="Full size">
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,9 +1,24 @@
 #!/usr/bin/env python3
-"""Training script using PyTorch Lightning.
+"""
+================================================================================
+DEPRECATED: This file is deprecated and will be removed in a future version.
+            Please use 'train_direct.py' for training instead.
+================================================================================
+
+Training script using PyTorch Lightning.
 
 Builds a real DataModule from dataset_loader.create_dataloaders and aligns
 Lightning settings with the unified configuration.
+
+This file is kept for backwards compatibility with existing scripts that may
+reference it. New code should use train_direct.py which offers better
+performance and more features.
 """
+
+# Module-level deprecation marker for programmatic detection
+__deprecated__ = True
+__deprecated_since__ = "2025-01"
+__replacement__ = "train_direct.py"
 
 import warnings
 
@@ -18,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -184,26 +200,35 @@ def main() -> None:
             ckpt_path = str(candidate) if candidate.exists() else None
         elif resume_from == "best":
             # Find checkpoint with best validation loss by parsing filenames
-            # ModelCheckpoint saves as: epoch=X-step=Y-val_loss=Z.ckpt
+            # ModelCheckpoint saves as: epoch=X-step=Y-val_loss=Z.ckpt or val/loss=Z
+            # Use regex for robust parsing that handles various filename patterns
             best_ckpt = None
             best_loss = float("inf")
+
+            # Regex pattern to match val_loss=X.XXX or val/loss=X.XXX
+            # Captures the numeric value (possibly negative, with decimals)
+            loss_pattern = re.compile(r'(?:val_loss|val/loss)=(-?[\d.]+)')
+
             for ckpt in checkpoint_dir.glob("*.ckpt"):
                 name = ckpt.stem
-                if "val_loss=" in name or "val/loss=" in name:
+                match = loss_pattern.search(name)
+                if match:
                     try:
-                        # Extract loss value from filename
-                        loss_part = name.split("val_loss=")[-1].split("val/loss=")[-1]
-                        loss_val = float(loss_part.split("-")[0].split(".ckpt")[0])
+                        loss_val = float(match.group(1))
                         if loss_val < best_loss:
                             best_loss = loss_val
                             best_ckpt = ckpt
-                    except (ValueError, IndexError):
+                    except ValueError:
+                        # Could not parse loss value, skip this checkpoint
+                        logger.debug(f"Could not parse loss from checkpoint: {name}")
                         continue
+
             if best_ckpt is None:
                 # Fallback to most recent by modification time
                 ckpts = list(checkpoint_dir.glob("*.ckpt"))
                 if ckpts:
                     best_ckpt = max(ckpts, key=lambda p: p.stat().st_mtime)
+                    logger.info(f"No val_loss in checkpoint names, using most recent: {best_ckpt.name}")
             ckpt_path = str(best_ckpt) if best_ckpt else None
         else:
             candidate_path = Path(resume_from)

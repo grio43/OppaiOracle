@@ -5,6 +5,7 @@ This module provides GPU-accelerated image preprocessing with dynamic batch sizi
 that automatically scales to utilize target VRAM usage (default: 90% of available).
 """
 
+import time
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
@@ -193,7 +194,7 @@ class AsyncImagePreloader:
     def __init__(
         self,
         max_workers: int = 4,
-        max_queue_depth: int = 2,
+        max_queue_depth: int = 4,  # Increased from 2 to maintain GPU saturation
         ram_headroom_gb: float = 8.0,
         image_size: int = 1024,
         pad_color: Tuple[int, int, int] = (255, 255, 255),
@@ -203,7 +204,7 @@ class AsyncImagePreloader:
 
         Args:
             max_workers: Number of parallel loading threads
-            max_queue_depth: Maximum number of batches to preload ahead
+            max_queue_depth: Maximum number of batches to preload ahead (default 4 for GPU saturation)
             ram_headroom_gb: Minimum free RAM to maintain (safety margin)
             image_size: Target image size for memory estimation
             pad_color: RGB tuple for transparency compositing
@@ -241,17 +242,23 @@ class AsyncImagePreloader:
         Returns:
             (idx, tensor or None, (w, h) or None)
         """
+        img = None
+        background = None
         try:
             img = Image.open(path)
             img = ImageOps.exif_transpose(img)
 
-            # Handle transparency (same logic as GPUBatchPreprocessor)
-            if img.mode == 'RGBA' or img.mode == 'LA':
+            # Handle transparency (matches dataset_loader.py for consistency)
+            if img.mode in ('RGBA', 'LA') or ('transparency' in img.info):
                 background = Image.new('RGB', img.size, self.pad_color_int)
-                if img.mode == 'LA':
+                # Convert indexed/grayscale+alpha to RGBA for proper compositing
+                if img.mode not in ('RGBA',):
                     img = img.convert('RGBA')
                 background.paste(img, mask=img.split()[-1])
+                # Close original image, use background
+                img.close()
                 img = background
+                background = None  # Prevent double-close
             elif img.mode != 'RGB':
                 img = img.convert('RGB')
 
@@ -266,6 +273,18 @@ class AsyncImagePreloader:
         except Exception as e:
             logger.error(f"Failed to preload image {path}: {e}")
             return (idx, None, None)
+        finally:
+            # Explicitly close PIL Images to release file handles
+            if img is not None:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+            if background is not None:
+                try:
+                    background.close()
+                except Exception:
+                    pass
 
     def estimate_batch_memory_mb(self, batch_size: int) -> float:
         """
@@ -334,15 +353,30 @@ class AsyncImagePreloader:
     def get_preloaded_batch(
         self,
         batch_id: int,
-        timeout: float = 60.0,
+        timeout: float = 10.0,  # Reduced from 60s - fail fast on slow images
+        per_image_timeout: float = 5.0,  # Individual image timeout
     ) -> Tuple[List[torch.Tensor], List[Tuple[int, int]], List[int]]:
         """
         Get preloaded batch, waiting if necessary.
+
+        OPTIMIZED: Uses concurrent.futures.wait() for parallel completion checking
+        instead of sequential blocking. Reduced timeouts for faster failure recovery.
+
+        Args:
+            batch_id: The batch ID to retrieve
+            timeout: Maximum total wait time for all images (default 10s)
+            per_image_timeout: Timeout for individual slow images (default 5s)
 
         Returns:
             Same format as load_and_prepare_images():
             (images: List[Tensor], original_sizes: List[(w,h)], failed_indices: List[int])
         """
+        from concurrent.futures import wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
+
+        # Check for shutdown before proceeding
+        if self._shutdown:
+            raise RuntimeError("Preloader has been shut down")
+
         with self._lock:
             image_futures = self.futures.pop(batch_id, None)
 
@@ -355,21 +389,42 @@ class AsyncImagePreloader:
         original_sizes: List[Optional[Tuple[int, int]]] = [None] * batch_size
         failed_indices: List[int] = []
 
-        for idx, future in image_futures:
-            try:
-                result_idx, tensor, size = future.result(timeout=timeout)
-                if tensor is not None:
-                    images[result_idx] = tensor
-                    original_sizes[result_idx] = size
-                else:
-                    failed_indices.append(result_idx)
-                    images[result_idx] = torch.zeros(3, self.image_size, self.image_size)
-                    original_sizes[result_idx] = (self.image_size, self.image_size)
-            except Exception as e:
-                logger.error(f"Failed to get preload result for index {idx}: {e}")
-                failed_indices.append(idx)
-                images[idx] = torch.zeros(3, self.image_size, self.image_size)
-                original_sizes[idx] = (self.image_size, self.image_size)
+        # Build mapping of future -> (idx, original_idx)
+        future_to_idx = {future: (i, idx) for i, (idx, future) in enumerate(image_futures)}
+        pending = set(future_to_idx.keys())
+        start_time = time.time()
+
+        # Process futures as they complete (parallel waiting)
+        while pending and (time.time() - start_time) < timeout and not self._shutdown:
+            remaining_time = max(0.1, timeout - (time.time() - start_time))
+            done, pending = wait(pending, timeout=min(remaining_time, per_image_timeout), return_when=FIRST_COMPLETED)
+
+            for future in done:
+                i, idx = future_to_idx[future]
+                try:
+                    result_idx, tensor, size = future.result(timeout=0)  # Already done, no wait
+                    if tensor is not None:
+                        images[result_idx] = tensor
+                        original_sizes[result_idx] = size
+                    else:
+                        failed_indices.append(result_idx)
+                        images[result_idx] = torch.zeros(3, self.image_size, self.image_size)
+                        original_sizes[result_idx] = (self.image_size, self.image_size)
+                except Exception as e:
+                    logger.warning(f"Preload failed for image {idx}: {e}")
+                    failed_indices.append(idx)
+                    images[idx] = torch.zeros(3, self.image_size, self.image_size)
+                    original_sizes[idx] = (self.image_size, self.image_size)
+
+        # Handle any remaining pending futures (timeout)
+        for future in pending:
+            i, idx = future_to_idx[future]
+            logger.warning(f"Image {idx} preload timed out after {timeout}s")
+            failed_indices.append(idx)
+            images[idx] = torch.zeros(3, self.image_size, self.image_size)
+            original_sizes[idx] = (self.image_size, self.image_size)
+            # Cancel the future to free resources
+            future.cancel()
 
         return images, original_sizes, failed_indices
 
@@ -379,11 +434,39 @@ class AsyncImagePreloader:
             return len(self.futures)
 
     def shutdown(self, wait: bool = True) -> None:
-        """Shutdown executor and cleanup resources."""
+        """Shutdown executor and cleanup resources.
+
+        Thread-safe shutdown that coordinates with get_preloaded_batch().
+        """
+        # Set shutdown flag first to signal any waiting operations
         self._shutdown = True
-        self.executor.shutdown(wait=wait)
+
+        # Cancel any pending futures to unblock waiting threads
         with self._lock:
+            for batch_futures in self.futures.values():
+                for idx, future in batch_futures:
+                    future.cancel()
             self.futures.clear()
+
+        # Now shutdown executor (wait for any in-flight operations)
+        self.executor.shutdown(wait=wait)
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures cleanup on exceptions."""
+        self.shutdown(wait=True)
+        return False  # Don't suppress exceptions
+
+    def __del__(self):
+        """Destructor fallback for cleanup."""
+        if not self._shutdown:
+            try:
+                self.shutdown(wait=False)
+            except (RuntimeError, TypeError):
+                pass  # Interpreter may be shutting down
 
 
 class GPUBatchPreprocessor:
@@ -455,19 +538,25 @@ class GPUBatchPreprocessor:
         failed_indices = []
 
         for idx, path in enumerate(image_paths):
+            img = None
+            background = None
             try:
                 # Load image with EXIF correction
                 img = Image.open(path)
                 img = ImageOps.exif_transpose(img)
 
-                # Handle transparency
-                if img.mode == 'RGBA' or img.mode == 'LA':
+                # Handle transparency (matches dataset_loader.py for consistency)
+                if img.mode in ('RGBA', 'LA') or ('transparency' in img.info):
                     # Use original int pad_color to avoid float→int precision loss
                     background = Image.new('RGB', img.size, self.pad_color_int)
-                    if img.mode == 'LA':
+                    # Convert indexed/grayscale+alpha to RGBA for proper compositing
+                    if img.mode not in ('RGBA',):
                         img = img.convert('RGBA')
                     background.paste(img, mask=img.split()[-1])
+                    # Close original image, use background
+                    img.close()
                     img = background
+                    background = None  # Prevent double-close
                 elif img.mode != 'RGB':
                     img = img.convert('RGB')
 
@@ -479,12 +568,39 @@ class GPUBatchPreprocessor:
                 img_tensor = torch.from_numpy(img_array).permute(2, 0, 1)  # HWC -> CHW
                 images.append(img_tensor)
 
-            except Exception as e:
-                logger.error(f"Failed to load image {path}: {e}")
-                # Create dummy image with correct target size
+            except FileNotFoundError:
+                logger.error(f"Image file not found: {path}")
                 images.append(torch.zeros(3, self.image_size, self.image_size))
                 original_sizes.append((self.image_size, self.image_size))
                 failed_indices.append(idx)
+            except Image.DecompressionBombError:
+                logger.error(f"Image too large (decompression bomb protection): {path}")
+                images.append(torch.zeros(3, self.image_size, self.image_size))
+                original_sizes.append((self.image_size, self.image_size))
+                failed_indices.append(idx)
+            except (IOError, OSError) as e:
+                logger.error(f"I/O error loading image {path}: {e}")
+                images.append(torch.zeros(3, self.image_size, self.image_size))
+                original_sizes.append((self.image_size, self.image_size))
+                failed_indices.append(idx)
+            except Exception as e:
+                # Catch-all for unexpected errors (e.g., corrupted images, memory issues)
+                logger.error(f"Unexpected error loading image {path}: {type(e).__name__}: {e}")
+                images.append(torch.zeros(3, self.image_size, self.image_size))
+                original_sizes.append((self.image_size, self.image_size))
+                failed_indices.append(idx)
+            finally:
+                # Explicitly close PIL Images to release file handles
+                if img is not None:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+                if background is not None:
+                    try:
+                        background.close()
+                    except Exception:
+                        pass
 
         return images, original_sizes, failed_indices
 
@@ -492,19 +608,47 @@ class GPUBatchPreprocessor:
         self,
         images: List[torch.Tensor],
         original_sizes: List[Tuple[int, int]]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
         """
         Apply letterbox resize on GPU in batch.
+
+        OPTIMIZED: Uses batched H2D transfer instead of per-image transfers.
+        Images are padded to uniform size on CPU, transferred as a single batch,
+        then processed on GPU. This reduces H2D transfer overhead significantly.
 
         Args:
             images: List of image tensors [C, H, W]
             original_sizes: List of (width, height) tuples
 
         Returns:
-            Tuple of (resized images [B, C, H, W], padding masks [B, H, W])
+            Tuple of (resized images [B, C, H, W], padding masks [B, H, W], invalid_indices)
+            invalid_indices contains batch indices where image dimensions were invalid
         """
         batch_size = len(images)
         target_size = self.image_size
+        invalid_indices: List[int] = []
+
+        # Pre-calculate resize parameters and validate dimensions
+        resize_params: List[Optional[Tuple[int, int, int, int, int, int]]] = []
+        max_h, max_w = 0, 0
+
+        for i, (orig_w, orig_h) in enumerate(original_sizes):
+            if orig_w <= 0 or orig_h <= 0:
+                logger.warning(f"Invalid image dimensions (w={orig_w}, h={orig_h}) at index {i}, marking as failed")
+                invalid_indices.append(i)
+                resize_params.append(None)
+                continue
+
+            # Calculate resize dimensions (downscale only, preserve aspect ratio)
+            scale = min(target_size / orig_w, target_size / orig_h, 1.0)
+            new_w = int(round(orig_w * scale))
+            new_h = int(round(orig_h * scale))
+            pad_top = (target_size - new_h) // 2
+            pad_left = (target_size - new_w) // 2
+
+            resize_params.append((new_w, new_h, pad_top, pad_left, orig_w, orig_h))
+            max_h = max(max_h, orig_h)
+            max_w = max(max_w, orig_w)
 
         # Create output tensors on GPU
         output_images = torch.zeros(
@@ -513,32 +657,48 @@ class GPUBatchPreprocessor:
             device=self.device
         )
 
-        # Fill with pad color
+        # Fill with pad color (vectorized)
         for c in range(3):
             output_images[:, c, :, :] = self.pad_color[c]
 
-        # Create padding masks (True = PAD, False = real content)
-        # Must match dataset_loader.py convention for model compatibility
+        # Padding mask convention (matches dataset_loader.py for model compatibility):
+        #   True  = padding pixel (not real image content)
+        #   False = real image content
         padding_masks = torch.ones(
             batch_size, target_size, target_size,
             dtype=torch.bool,
             device=self.device
         )
 
-        for i, (img, (orig_w, orig_h)) in enumerate(zip(images, original_sizes)):
-            # Validate dimensions to prevent division by zero
-            if orig_w <= 0 or orig_h <= 0:
-                logger.warning(f"Invalid image dimensions {orig_w}x{orig_h} at index {i}, using pad-only")
-                continue  # Image stays as pad color, mask stays as True (all padding)
+        # Early exit if all images are invalid
+        if max_h == 0 or max_w == 0:
+            return output_images, padding_masks, invalid_indices
 
-            # Calculate resize dimensions (downscale only, preserve aspect ratio)
-            scale = min(target_size / orig_w, target_size / orig_h, 1.0)
-            new_w = int(orig_w * scale)
-            new_h = int(orig_h * scale)
+        # OPTIMIZATION: Pad all images to uniform size on CPU, then batch transfer
+        # This replaces N separate H2D transfers with 1 batched transfer
+        padded_batch = torch.zeros(batch_size, 3, max_h, max_w, dtype=torch.float32)
 
-            # Resize image
-            img_gpu = img.unsqueeze(0).to(device=self.device, dtype=self.gpu_dtype)  # Add batch dim and move to GPU
+        # Fill padded batch with images (CPU operation)
+        for i, (img, params) in enumerate(zip(images, resize_params)):
+            if params is None:
+                continue  # Invalid image, leave as zeros
+            h, w = img.shape[1], img.shape[2]
+            padded_batch[i, :, :h, :w] = img
 
+        # Single batched H2D transfer (major optimization)
+        batch_gpu = padded_batch.to(device=self.device, dtype=self.gpu_dtype, non_blocking=True)
+
+        # Process each image on GPU (resize and place in output)
+        for i, params in enumerate(resize_params):
+            if params is None:
+                continue  # Invalid image
+
+            new_w, new_h, pad_top, pad_left, orig_w, orig_h = params
+
+            # Extract original image region from padded batch
+            img_gpu = batch_gpu[i:i+1, :, :orig_h, :orig_w]  # [1, C, H, W]
+
+            # Resize if needed
             if (new_h, new_w) != (orig_h, orig_w):
                 img_resized = F.interpolate(
                     img_gpu,
@@ -549,17 +709,16 @@ class GPUBatchPreprocessor:
             else:
                 img_resized = img_gpu
 
-            # Calculate padding to center the image
-            pad_top = (target_size - new_h) // 2
-            pad_left = (target_size - new_w) // 2
-
-            # Place resized image in center
+            # Place resized image in center of output
             output_images[i, :, pad_top:pad_top+new_h, pad_left:pad_left+new_w] = img_resized.squeeze(0)
 
             # Mark non-padded region in mask (False = real content)
             padding_masks[i, pad_top:pad_top+new_h, pad_left:pad_left+new_w] = False
 
-        return output_images, padding_masks
+        # Free intermediate GPU memory
+        del batch_gpu
+
+        return output_images, padding_masks, invalid_indices
 
     def process_batch(
         self,
@@ -573,13 +732,18 @@ class GPUBatchPreprocessor:
 
         Returns:
             Tuple of (processed images [B, C, H, W], padding masks [B, H, W], failed_indices) on CPU
-            failed_indices contains batch indices where image loading failed (dummy data inserted)
+            failed_indices contains batch indices where image loading or processing failed
         """
         # Load images on CPU
         images, original_sizes, failed_indices = self.load_and_prepare_images(image_paths)
 
         # Apply letterbox resize on GPU
-        images_gpu, masks_gpu = self.letterbox_resize_gpu(images, original_sizes)
+        images_gpu, masks_gpu, invalid_indices = self.letterbox_resize_gpu(images, original_sizes)
+
+        # Merge invalid dimension indices with load failures (avoid duplicates)
+        all_failed = set(failed_indices)
+        all_failed.update(invalid_indices)
+        failed_indices = sorted(all_failed)
 
         # Apply normalization on GPU (tensor is already in self.gpu_dtype from letterbox_resize_gpu)
         images_normalized = self.normalize(images_gpu)
@@ -594,7 +758,7 @@ class GPUBatchPreprocessor:
         self,
         images: List[torch.Tensor],
         original_sizes: List[Tuple[int, int]],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
         """
         GPU processing for pre-loaded images (skips load_and_prepare_images).
 
@@ -603,10 +767,11 @@ class GPUBatchPreprocessor:
             original_sizes: Original (width, height) for each image
 
         Returns:
-            Tuple of (processed images [B, C, H, W], padding masks [B, H, W]) on CPU
+            Tuple of (processed images [B, C, H, W], padding masks [B, H, W], invalid_indices) on CPU
+            invalid_indices contains batch indices where image dimensions were invalid
         """
         # Apply letterbox resize on GPU
-        images_gpu, masks_gpu = self.letterbox_resize_gpu(images, original_sizes)
+        images_gpu, masks_gpu, invalid_indices = self.letterbox_resize_gpu(images, original_sizes)
 
         # Apply normalization on GPU
         images_normalized = self.normalize(images_gpu)
@@ -615,7 +780,7 @@ class GPUBatchPreprocessor:
         images_cpu = images_normalized.cpu()
         masks_cpu = masks_gpu.cpu()
 
-        return images_cpu, masks_cpu
+        return images_cpu, masks_cpu, invalid_indices
 
 
 class GPUBatchProcessor:
@@ -750,13 +915,18 @@ class GPUBatchProcessor:
         if self.preloader is None:
             raise RuntimeError("Preloader not enabled")
 
-        images, original_sizes, failed_indices = self.preloader.get_preloaded_batch(
+        images, original_sizes, preload_failed = self.preloader.get_preloaded_batch(
             batch_id, timeout
         )
 
-        images_cpu, masks_cpu = self.preprocessor.process_batch_from_preloaded(
+        images_cpu, masks_cpu, invalid_indices = self.preprocessor.process_batch_from_preloaded(
             images, original_sizes
         )
+
+        # Merge preload failures with invalid dimension failures
+        all_failed = set(preload_failed)
+        all_failed.update(invalid_indices)
+        failed_indices = sorted(all_failed)
 
         return images_cpu, masks_cpu, failed_indices
 
@@ -767,7 +937,41 @@ class GPUBatchProcessor:
         return self.preloader.get_pending_count()
 
     def clear_cache(self):
-        """Clear GPU cache and shutdown preloader."""
-        self.vram_monitor.clear_cache()
+        """Clear GPU cache and shutdown preloader.
+
+        Performs thorough cleanup of GPU resources including:
+        - Shutting down async preloader threads
+        - Clearing CUDA memory cache
+        - Logging VRAM stats before cleanup for debugging
+        """
+        import gc
+
+        # Log VRAM stats before cleanup for debugging
+        try:
+            stats = self.get_vram_stats()
+            logger.debug(
+                f"GPU cleanup: VRAM before clear - "
+                f"allocated={stats['allocated_gb']:.2f}GB, "
+                f"reserved={stats['reserved_gb']:.2f}GB"
+            )
+        except Exception:
+            pass  # Don't fail cleanup if stats fail
+
+        # Shutdown preloader first to stop any pending operations
         if self.preloader is not None:
             self.preloader.shutdown(wait=False)
+            self.preloader = None
+
+        # Force garbage collection before clearing CUDA cache
+        gc.collect()
+
+        # Clear CUDA cache
+        self.vram_monitor.clear_cache()
+
+        # Synchronize to ensure all GPU operations complete
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception as e:
+                # Log sync failures - these can indicate GPU driver issues or memory corruption
+                logger.warning(f"CUDA synchronize failed during cache clear: {e}. GPU may be in inconsistent state.")

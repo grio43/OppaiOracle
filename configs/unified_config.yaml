@@ -8,8 +8,8 @@ experiment_name: "default_experiment"
 output_root: "./experiments"
 log_level: "INFO"
 log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-# Set a target for total system RAM usage. This is a guideline and not strictly enforced.
-max_memory_gb: 220.0
+# Set a target for total system RAM usage. This is a guideline and not strictly enf
+max_memory_gb: 120.0 # Adjusted for 128GB system (leaves 13GB headroom)
 max_gpu_memory_gb: null
 
 # --------------------------------------------------------------------
@@ -22,10 +22,10 @@ default_output_dir: "./outputs"
 # Model Configuration
 model:
     architecture_type: "vit_large_extended"
-    hidden_size: 1536
+    hidden_size: 1344
     num_hidden_layers: 28
-    num_attention_heads: 24
-    intermediate_size: 6144
+    num_attention_heads: 21
+    intermediate_size: 5376
     image_size: 512
     patch_size: 16
     num_channels: 3
@@ -39,13 +39,14 @@ model:
     drop_path_rate: 0.1   # recommended range 0.08–0.3 (must be < 1.0)
     initializer_range: 0.02
     layer_norm_eps: 1.0e-6
-    use_flash_attention: true
+    use_flex_attention: true  # Enables Flex Attention (PyTorch 2.5+)
     attention_bias: true
+    flex_block_size: 128  # Block size for Flex Attention sparse computation
     token_ignore_threshold: 0.9
     num_labels: 0  # Auto-detect from vocabulary
     num_groups: 20
     tags_per_group: 10000
-    gradient_checkpointing: true  # Enabled for VRAM reduction (~30% slower but saves 30-40GB)
+    gradient_checkpointing: true  # Trades ~30% compute time for ~40% VRAM savings
 
 # Data Configuration (consolidates dataloader.yaml, train_config.yaml, augmentation.yaml)
 data:
@@ -81,19 +82,24 @@ data:
   pad_color: [114, 114, 114]
 
   # Data loading (from dataloader.yaml)
-  batch_size: 24  # Optimized for RTX 5090 32GB VRAM (effective batch: 24×4=96 with gradient accumulation)
-  num_workers: 4  # Reduced from 6 to save ~1GB RAM
+  batch_size: 96  # Optimized for Tensor Core alignment (multiple of 8)
+  num_workers: 8  # Arrow mmap shares metadata (~500MB/worker overhead), provides deeper queue
   pin_memory: true   # Enables async DMA transfer for PCIe 4.0/5.0
-  prefetch_factor: 1   # Reduced from 2 to save ~1GB prefetch buffers
+  prefetch_factor: 4   # 8 workers × 4 = 32 batches queued (~6.7GB runway)
   persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   drop_last: false
-  
+
+  # Validation split limiting
+  # Limits validation set size at split time (before Arrow cache loading).
+  # Set to null to use the full 5% validation split (~276k for 5.5M dataset).
+  max_val_samples: 30000
+
   preload_files: 0
 
   # Sidecar Tensor Cache (replaces L2 LMDB cache)
   # Preprocessed images are stored as .safetensor files alongside original images.
   # No virtual memory issues, pooled SSD-friendly, unlimited parallel reads.
-  sidecar_cache_enabled: true
+  sidecar_cache_enabled: false
   sidecar_extension: ".safetensor"  # File extension for cached tensors
   sidecar_storage_dtype: "bfloat16"  # Storage dtype for cached tensors
   cpu_bf16_cache_pipeline: true  # Use bfloat16 in preprocessing pipeline if CPU supports it
@@ -104,7 +110,7 @@ data:
   # Subsequent runs: ~2-5 seconds to load from cache (940× speedup)
   # Cache size: ~1.8 GB for 5.6M images
   metadata_cache_enabled: true
-  metadata_cache_workers: 16  # Number of parallel workers for cache creation
+  metadata_cache_workers: 20  # Number of parallel workers for cache creation
   force_rebuild_metadata_cache: false  # Set true to force cache rebuild
   metadata_cache_staleness_check_samples: 100  # Base sample size (scaled dynamically by dataset size)
 
@@ -121,7 +127,7 @@ data:
   # NOTE: Most augmentations are NOT IMPLEMENTED yet - only random_flip_prob is active.
   # With 5-6 million images, augmentation is generally unnecessary.
   augmentation_enabled: true
-  random_flip_prob: 0.0  # IMPLEMENTED: Horizontal flipping with orientation tag swapping (disabled by default)
+  random_flip_prob: 0.5  # IMPLEMENTED: Horizontal flipping with orientation tag swapping
 
   # NOT IMPLEMENTED: Color augmentations below are configured but not applied in training
   color_jitter: false
@@ -156,7 +162,7 @@ training:
     num_epochs: 30
     learning_rate: 1.0e-4
     weight_decay: 0.01
-    gradient_accumulation_steps: 4  # Maintains effective batch size of 96 (24 × 4)
+    gradient_accumulation_steps: 1  # Effective batch size of 108 (36 × 3)
 
     # Optimizer
     # NOTE: Using "adamw8bit" for memory-efficient 8-bit quantized optimizer states
@@ -173,7 +179,7 @@ training:
 
     # Scheduler
     scheduler: "cosine_restarts"
-    warmup_steps: 2000  # number of OPTIMIZER STEPS to warm up (step-based)
+    warmup_steps: 100  # number of OPTIMIZER STEPS to warm up (step-based)
     warmup_ratio: 0.0
     num_cycles: 3
     lr_end: 1.0e-6
@@ -205,7 +211,7 @@ training:
     # or point to an exact checkpoint to branch experiments safely.
     resume_from: "latest"
 
-    eval_steps: 1000
+    eval_steps: 15000  # ~3 validations per epoch (46,667 steps/epoch)
     logging_steps: 5000  # Reduced TensorBoard overhead (was 3000)
     # Resume-aware reseeding: avoid replaying the same early-epoch order after resume
     resume_reseed: true
@@ -242,9 +248,9 @@ training:
     # Provides 15-35% speedup through graph optimization and kernel fusion
     # Especially effective for transformer models with attention mechanisms
     use_compile: true
-    compile_mode: "default"  # Options: "default", "reduce-overhead", "max-autotune"
+    compile_mode: "max-autotune-no-cudagraphs"  # Triton autotuning without CUDA graph VRAM overhead
     compile_fullgraph: false  # Allow graph breaks for dynamic shapes (padding masks)
-    compile_dynamic: true  # Support varying padding mask shapes across batches
+    compile_dynamic: false  # Disabled - fixed 512x512 images don't need dynamic kernels
     # First compilation takes 2-5 minutes but is negligible over 60 epochs
 
     # Tracking
@@ -354,10 +360,12 @@ export:
 # Centralized knobs for validation dataloader & preprocessing.
 # These are read by validation_loop.py at runtime.
 validation:
+  max_samples: 30000  # Subsample validation set (30K of 280K) for faster epochs
   dataloader:
-    batch_size: 32  # Increased for RTX 5090 - inference is more memory-efficient
-    num_workers: 12  # Match training workers for consistency
-    prefetch_factor: 3   # NOTE: effective only when num_workers > 0
+    batch_size: 128  # Balanced for validation throughput
+    num_workers: 6  # Increased from 4 for smoother validation throughput
+    pin_memory: true  # Enables async DMA transfer for faster CPU-GPU transfer
+    prefetch_factor: 4   # Match training - deeper queue for consistent throughput
     persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   preprocessing:
     # Uses data.normalize_mean/std by default; keep in sync with
@@ -413,10 +421,11 @@ monitor:
   # --------------------------------------------------------------------
 
   tb_image_logging:
-    max_samples: 2          # Reduced validation image overhead (was 4)
-    topk: 15                # how many tags per sample in Text tab
+    max_samples: 50         # Number of images to grade per logging interval
+    topk: 50                # how many tags per sample in Text tab
     log_native_resolution: true  # keep images crisp in TB
     dpi_for_figures: 220          # only used if you later add composite figures
+    image_log_steps: 10000  # Log training images to TensorBoard every N steps
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Debug

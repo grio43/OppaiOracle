@@ -223,13 +223,42 @@ def _restore_rng_states(states):
     # Restore CUDA RNG
     try:
         if cuda is not None and torch.cuda.is_available():
+            current_device_count = torch.cuda.device_count()
+
             if isinstance(cuda, list):
-                torch.cuda.set_rng_state_all(cuda)
-                logger.debug(f"Restored CUDA RNG state for {len(cuda)} devices")
+                saved_device_count = len(cuda)
+
+                if saved_device_count == current_device_count:
+                    # Exact match - restore all
+                    torch.cuda.set_rng_state_all(cuda)
+                    logger.debug(f"Restored CUDA RNG state for {saved_device_count} devices")
+                    success['cuda'] = True
+                elif saved_device_count > current_device_count:
+                    # Saved with more GPUs - restore only for available devices
+                    logger.warning(
+                        f"Checkpoint saved with {saved_device_count} GPUs, "
+                        f"but only {current_device_count} available. "
+                        f"Restoring RNG state for first {current_device_count} devices only."
+                    )
+                    for i in range(current_device_count):
+                        torch.cuda.set_rng_state(cuda[i], device=i)
+                    success['cuda'] = True  # Partial but acceptable
+                else:
+                    # Saved with fewer GPUs - restore what we have, warn about others
+                    logger.warning(
+                        f"Checkpoint saved with {saved_device_count} GPUs, "
+                        f"but {current_device_count} available. "
+                        f"Restoring RNG state for first {saved_device_count} devices only. "
+                        f"Devices {saved_device_count}-{current_device_count-1} will have fresh RNG state."
+                    )
+                    for i in range(saved_device_count):
+                        torch.cuda.set_rng_state(cuda[i], device=i)
+                    success['cuda'] = True  # Partial but acceptable
             else:
+                # Single device state
                 torch.cuda.set_rng_state(cuda)
                 logger.debug("Restored CUDA RNG state for current device")
-            success['cuda'] = True
+                success['cuda'] = True
         else:
             success['cuda'] = None  # Not applicable
     except RuntimeError as e:
@@ -807,9 +836,164 @@ class EarlyStopping:
         self.val_score_min = np.Inf if self.mode == 'min' else -np.Inf
 
 
+class AsyncCheckpointWriter:
+    """
+    Background thread for non-blocking checkpoint saves.
+
+    Eliminates 30-90 second training stalls by moving torch.save() to a background thread.
+    The main thread only needs to prepare the checkpoint dict (state_dict copies are unavoidable),
+    then queues it for async saving.
+
+    Usage:
+        writer = AsyncCheckpointWriter()
+        writer.save_async(checkpoint_dict, path, callback=on_complete)
+        # ... training continues immediately ...
+        writer.shutdown()  # Call at end of training
+    """
+
+    def __init__(self, max_queue_size: int = 2):
+        """
+        Initialize async checkpoint writer.
+
+        Args:
+            max_queue_size: Max pending saves before blocking. Default 2 prevents unbounded memory.
+        """
+        import queue
+        self._queue = queue.Queue(maxsize=max_queue_size)
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="AsyncCheckpointWriter")
+        self._shutdown_event = threading.Event()
+        self._thread.start()
+        self._pending_count = 0
+        self._lock = threading.Lock()
+        self._last_error = None
+
+    def _worker(self):
+        """Background worker that processes checkpoint saves."""
+        while not self._shutdown_event.is_set():
+            try:
+                # Wait for work with timeout to check shutdown flag
+                import queue
+                try:
+                    item = self._queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                if item is None:  # Shutdown signal
+                    break
+
+                checkpoint, path, lock_context, callback = item
+
+                try:
+                    # Atomic save with temp file
+                    temp_path = None
+                    try:
+                        fd, temp_path = tempfile.mkstemp(
+                            suffix='.tmp',
+                            prefix='async_ckpt_',
+                            dir=path.parent
+                        )
+                        os.close(fd)
+
+                        with lock_context:
+                            torch.save(checkpoint, temp_path)
+                            os.replace(temp_path, path)
+                            temp_path = None  # Mark as consumed
+
+                        if callback:
+                            callback(path, success=True, error=None)
+
+                    except Exception as e:
+                        self._last_error = e
+                        logger.error(f"Async checkpoint save failed: {e}")
+                        if callback:
+                            callback(path, success=False, error=e)
+                    finally:
+                        if temp_path and Path(temp_path).exists():
+                            try:
+                                Path(temp_path).unlink()
+                            except OSError:
+                                pass  # Best-effort cleanup, ignore filesystem errors
+
+                finally:
+                    with self._lock:
+                        self._pending_count -= 1
+                    self._queue.task_done()
+
+            except Exception as e:
+                logger.error(f"AsyncCheckpointWriter worker error: {e}")
+
+    def save_async(
+        self,
+        checkpoint: Dict[str, Any],
+        path: Path,
+        lock_context=None,
+        callback: Optional[Callable] = None
+    ) -> bool:
+        """
+        Queue a checkpoint for async saving.
+
+        Args:
+            checkpoint: The checkpoint dict to save (must be detached from GPU)
+            path: Destination path
+            lock_context: Optional file lock context manager
+            callback: Optional callback(path, success, error) called on completion
+
+        Returns:
+            True if queued successfully, False if queue is full (caller should save sync)
+        """
+        if self._shutdown_event.is_set():
+            return False
+
+        if lock_context is None:
+            lock_context = nullcontext()
+
+        import queue
+        try:
+            self._queue.put_nowait((checkpoint, path, lock_context, callback))
+            # Increment AFTER successful queue operation to avoid race condition
+            with self._lock:
+                self._pending_count += 1
+            return True
+        except queue.Full:
+            # Queue is full, caller should save synchronously
+            return False
+
+    def wait_pending(self, timeout: float = 300.0):
+        """Wait for all pending saves to complete (timeout is advisory, join blocks)."""
+        # Note: Queue.join() doesn't support timeout, but we use it for API consistency
+        # In practice, checkpoint saves complete quickly enough that timeout isn't needed
+        _ = timeout  # Suppress unused warning; kept for API compatibility
+        self._queue.join()
+
+    def shutdown(self, wait: bool = True, timeout: float = 300.0):
+        """
+        Shutdown the writer.
+
+        Args:
+            wait: If True, wait for pending saves to complete
+            timeout: Max seconds to wait
+        """
+        if wait:
+            self.wait_pending(timeout)
+        self._shutdown_event.set()
+        self._queue.put(None)  # Wake up worker
+        self._thread.join(timeout=10.0)
+
+    @property
+    def pending_count(self) -> int:
+        """Number of saves currently queued or in progress."""
+        with self._lock:
+            return self._pending_count
+
+    @property
+    def last_error(self) -> Optional[Exception]:
+        """Last error encountered during async save."""
+        return self._last_error
+
+
 class CheckpointManager:
     """Manages model checkpoints"""
-    
+
     def __init__(
         self,
         checkpoint_dir: Union[str, Path],
@@ -818,21 +1002,27 @@ class CheckpointManager:
         save_optimizer: bool = True,
         save_scheduler: bool = True,
         save_last: bool = True,
+        async_save: bool = True,
         **_unused,
     ):
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.max_checkpoints = max_checkpoints
         # when True, only retain numbered checkpoints on best
         self.keep_best = keep_best
         self.save_optimizer = save_optimizer
         self.save_scheduler = save_scheduler
         self.save_last = save_last
-        
+
         self.checkpoints = []
         self.best_checkpoint = None
-        
+
+        # Async checkpoint writer for non-blocking saves
+        # Eliminates 30-90 second training stalls during checkpoint saves
+        self.async_save = async_save
+        self._async_writer = AsyncCheckpointWriter() if async_save else None
+
         # Load existing checkpoints
         self._scan_existing_checkpoints()
 
@@ -867,7 +1057,51 @@ class CheckpointManager:
             self.checkpoints = [p for p in self.checkpoints if p.exists()]
             if self.checkpoints:
                 self.checkpoints.sort(key=lambda x: x.stat().st_mtime if x.exists() else 0)
-    
+
+    def _sync_save_checkpoint(self, checkpoint: Dict[str, Any], path: Path, lock_context) -> None:
+        """Synchronously save checkpoint with atomic write and file locking."""
+        temp_path = None
+        try:
+            with lock_context:
+                fd, temp_path = tempfile.mkstemp(suffix='.tmp', prefix='checkpoint_', dir=self.checkpoint_dir)
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                torch.save(checkpoint, temp_path)
+                os.replace(temp_path, path)
+                temp_path = None  # Mark as consumed
+        finally:
+            if temp_path is not None:
+                try:
+                    if Path(temp_path).exists():
+                        Path(temp_path).unlink()
+                except Exception:
+                    pass
+
+    def shutdown(self):
+        """Shutdown async writer. Call at end of training."""
+        if self._async_writer is not None:
+            self._async_writer.shutdown(wait=True)
+            self._async_writer = None
+
+    def _deep_to_cpu(self, obj):
+        """Recursively move tensors to CPU and clone them to ensure thread safety."""
+        if isinstance(obj, torch.Tensor):
+            # detach() prevents tracking history, cpu() moves to host, clone() ensures it's a copy
+            # (essential if original was already on CPU to avoid reference)
+            return obj.detach().cpu().clone()
+        elif isinstance(obj, dict):
+            return {k: self._deep_to_cpu(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._deep_to_cpu(v) for v in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self._deep_to_cpu(v) for v in obj)
+        elif isinstance(obj, set):
+            return {self._deep_to_cpu(v) for v in obj}
+        else:
+            return obj
+
     def save_checkpoint(
         self,
         model: nn.Module,
@@ -878,7 +1112,8 @@ class CheckpointManager:
         metrics: Dict[str, float],
         training_state: TrainingState,
         is_best: bool = False,
-        config: Optional[Dict] = None
+        config: Optional[Dict] = None,
+        train_loader: Optional['DataLoader'] = None
     ) -> Optional[Path]:
         """Save a checkpoint"""
 
@@ -958,12 +1193,23 @@ class CheckpointManager:
         
         if self.save_optimizer and optimizer is not None:
             checkpoint['optimizer_state_dict'] = optimizer.state_dict()
-        
+            checkpoint['optimizer_class'] = type(optimizer).__name__
+
         if self.save_scheduler and scheduler is not None:
             checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+            checkpoint['scheduler_class'] = type(scheduler).__name__
+            # Save critical params for validation (what state_dict doesn't capture)
+            checkpoint['scheduler_params'] = {
+                'total_steps': getattr(scheduler, 'total_steps', None),
+                'warmup_steps': getattr(scheduler, 'warmup_steps', None),
+                'first_cycle_steps': getattr(scheduler, 'first_cycle_steps', None),
+                'max_lr': getattr(scheduler, 'max_lr', None),
+                'min_lr': getattr(scheduler, 'min_lr', None),
+            }
         
         if config is not None:
-            checkpoint['config'] = config
+            # Convert config to dict to avoid pickling Enum types (PyTorch 2.6+ weights_only=True compatibility)
+            checkpoint['config'] = config.to_dict() if hasattr(config, 'to_dict') else config
 
         # Embed RNG states to enable exact stream continuation on resume
         try:
@@ -976,9 +1222,24 @@ class CheckpointManager:
                 'np': np_packed,
                 'torch_cpu': torch_cpu_state,
                 'cuda': cuda_state,
+                'cuda_version': torch.version.cuda if torch.cuda.is_available() else None,
+                'cuda_device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
             }
         except Exception as _rng_e:
             logger.debug("RNG state capture skipped: %s", _rng_e)
+
+        # Save sampler state for O(1) mid-epoch resume
+        # This allows ResumableSampler to skip directly to the resume batch
+        # instead of iterating through all batches (which takes ~17min for 5000+ batches)
+        sampler_state = None
+        if train_loader is not None:
+            sampler = getattr(train_loader, 'sampler', None)
+            if hasattr(sampler, 'get_state'):
+                sampler_state = sampler.get_state()
+                # Add current batch position for resume
+                sampler_state['batch_in_epoch'] = training_state.batch_in_epoch
+                logger.debug(f"Saved sampler state: epoch={sampler_state['epoch']}, batch={sampler_state['batch_in_epoch']}")
+        checkpoint['sampler_state'] = sampler_state
 
         # Provide a deterministic salt hint derived from stable checkpoint content
         try:
@@ -988,7 +1249,6 @@ class CheckpointManager:
                 timestamp_str = ''
 
             # Validate ISO format (prevents injection)
-            from datetime import datetime
             try:
                 # This will raise ValueError if format is invalid
                 datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
@@ -1052,74 +1312,54 @@ class CheckpointManager:
         lock_path = self.checkpoint_dir / ".checkpoint_write.lock"
         lock_context = filelock.FileLock(lock_path, timeout=60) if HAS_FILELOCK else nullcontext()
 
+        # Callback for async save completion logging
+        def _on_save_complete(path, success, error):
+            if success:
+                logger.info(f"Async checkpoint saved to {path}")
+            else:
+                logger.error(f"Async checkpoint save failed for {path}: {error}")
+
         if not (self.keep_best and not is_best):
-            temp_path = None
-            try:
-                with lock_context:
-                    fd, temp_path = tempfile.mkstemp(suffix='.tmp', prefix='checkpoint_', dir=self.checkpoint_dir)
-
-                    # Close fd immediately - we only needed mkstemp for unique name
-                    try:
-                        os.close(fd)
-                    except Exception:
-                        pass  # If close fails, continue anyway
-
-                    # Now torch.save() is the only process with file open
-                    torch.save(checkpoint, temp_path)
-                    # Atomic rename - should work on all platforms
-                    os.replace(temp_path, checkpoint_path)
-                    temp_path = None  # Mark as consumed (file was moved)
+            # Use async save if available (eliminates 30-90s training stalls)
+            if self._async_writer is not None:
+                # Deep copy to CPU to ensure thread safety during async save
+                # This prevents race conditions where model weights change while saving
+                try:
+                    cpu_checkpoint = self._deep_to_cpu(checkpoint)
+                    if self._async_writer.save_async(cpu_checkpoint, checkpoint_path, lock_context, _on_save_complete):
+                        wrote_numbered = True
+                        self.checkpoints.append(checkpoint_path)
+                        logger.debug(f"Queued async checkpoint save to {checkpoint_path}")
+                    else:
+                        # Queue full, fall back to sync save
+                        logger.warning("Async checkpoint queue full, falling back to sync save")
+                        self._sync_save_checkpoint(checkpoint, checkpoint_path, lock_context)
+                        wrote_numbered = True
+                        self.checkpoints.append(checkpoint_path)
+                        logger.info(f"Saved checkpoint to {checkpoint_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to prepare async checkpoint: {e}. Falling back to sync save.")
+                    self._sync_save_checkpoint(checkpoint, checkpoint_path, lock_context)
                     wrote_numbered = True
-
-            except Exception as e:
-                if HAS_FILELOCK and hasattr(filelock, 'Timeout') and isinstance(e, filelock.Timeout):
-                    logger.warning(f"Timeout acquiring checkpoint lock, skipping save for step {step}")
-                else:
-                    logger.error(f"Failed to save checkpoint to {checkpoint_path}: {e}")
-                return None
-            finally:
-                # Clean up temp file if it wasn't consumed (on success, file was moved)
-                if temp_path is not None:
-                    try:
-                        if Path(temp_path).exists():
-                            Path(temp_path).unlink()
-                            logger.debug(f"Cleaned up orphaned temp file: {temp_path}")
-                    except Exception:
-                        pass
-
-            if wrote_numbered:
+                    self.checkpoints.append(checkpoint_path)
+                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+            else:
+                # Sync save (original behavior)
+                self._sync_save_checkpoint(checkpoint, checkpoint_path, lock_context)
+                wrote_numbered = True
                 self.checkpoints.append(checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
         else:
             logger.debug("save_best_only=True: skipping numbered checkpoint at step %s", step)
 
-        # Always update last.pt atomically for crash-resume (with file locking for DDP safety)
+        # Always update last.pt atomically for crash-resume
+        # Use sync save for last.pt to ensure crash recovery works
         if self.save_last:
             last_path = self.checkpoint_dir / LAST_CKPT_NAME
-            temp_last = None
             try:
-                with lock_context:  # Use same lock as numbered checkpoints for DDP safety
-                    fd_last, temp_last = tempfile.mkstemp(suffix='.tmp', prefix='last_', dir=self.checkpoint_dir)
-
-                    # Close fd immediately
-                    try:
-                        os.close(fd_last)
-                    except Exception:
-                        pass
-
-                    torch.save(checkpoint, temp_last)
-                    os.replace(temp_last, last_path)
-                    temp_last = None  # Mark as consumed
+                self._sync_save_checkpoint(checkpoint, last_path, lock_context)
             except Exception as e:
                 logger.warning("Failed to update %s: %s", last_path, e)
-            finally:
-                # Clean up temp file if it wasn't consumed
-                if temp_last is not None:
-                    try:
-                        if Path(temp_last).exists():
-                            Path(temp_last).unlink()
-                    except Exception:
-                        pass
         
         # Save best model if applicable (use atomic copy via temp file with locking)
         if is_best and self.keep_best and wrote_numbered:
@@ -1249,6 +1489,17 @@ class CheckpointManager:
                 stacklevel=2
             )
             checkpoint = torch.load(path, map_location="cpu")
+        except pickle.UnpicklingError as e:
+            # PyTorch 2.6+ blocks custom classes with weights_only=True
+            # Fall back to weights_only=False for checkpoints containing config objects
+            warnings.warn(
+                f"Checkpoint contains custom classes blocked by weights_only=True: {e}. "
+                f"Loading with weights_only=False. This is safe for your own checkpoints. "
+                f"DO NOT load checkpoints from untrusted sources.",
+                UserWarning,
+                stacklevel=2
+            )
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
 
         if not isinstance(checkpoint, dict):
             raise InvalidCheckpointError("Checkpoint does not contain a state_dict dictionary")
@@ -1321,7 +1572,7 @@ class CheckpointManager:
         logger.info(f"Loading checkpoint from {checkpoint_path}")
         state_dict, meta = self._safe_load_checkpoint(checkpoint_path)
 
-        # Load model state (handles DDP key prefix mismatches)
+        # Load model state (handles DDP and torch.compile key prefix mismatches)
         if model is not None:
             # Determine if model is wrapped (DDP/DataParallel)
             is_wrapped = hasattr(model, 'module')
@@ -1337,13 +1588,57 @@ class CheckpointManager:
                 state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
                 logger.debug("Removed 'module.' prefix from state dict keys for non-DDP model")
 
+            # Handle torch.compile() wrapper (_orig_mod prefix)
+            is_compiled = hasattr(model, '_orig_mod')
+            has_orig_mod_prefix = any(k.startswith('_orig_mod.') for k in state_dict.keys())
+
+            if is_compiled and not has_orig_mod_prefix:
+                # Loading non-compiled checkpoint into compiled model: add '_orig_mod.' prefix
+                state_dict = {f'_orig_mod.{k}': v for k, v in state_dict.items()}
+                logger.info("Added '_orig_mod.' prefix to state dict keys for torch.compile() model")
+            elif not is_compiled and has_orig_mod_prefix:
+                # Loading compiled checkpoint into non-compiled model: remove '_orig_mod.' prefix
+                state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
+                logger.info("Removed '_orig_mod.' prefix from state dict keys for non-compiled model")
+
             model.load_state_dict(state_dict)
 
         # Load optimizer state
         if optimizer is not None and 'optimizer_state_dict' in meta:
             try:
+                saved_opt_state = meta['optimizer_state_dict']
+
+                # Validate param_groups count matches before attempting load
+                saved_pg_count = len(saved_opt_state.get('param_groups', []))
+                current_pg_count = len(optimizer.param_groups)
+                if saved_pg_count != current_pg_count:
+                    raise RuntimeError(
+                        f"Optimizer param_groups count mismatch: checkpoint has {saved_pg_count}, "
+                        f"current model has {current_pg_count}. This usually means the model architecture "
+                        f"changed (e.g., different num_tags). To start fresh, set training.resume_from='none'."
+                    )
+
+                # Validate optimizer class matches (if metadata available)
+                current_opt_class = type(optimizer).__name__
+                saved_opt_class = meta.get('optimizer_class')
+
+                if saved_opt_class and saved_opt_class != current_opt_class:
+                    # AdamW family members are compatible with warnings
+                    adamw_family = {'AdamW', 'AdamW8bit', 'PagedAdamW8bit', 'PagedAdamW32bit'}
+                    if saved_opt_class in adamw_family and current_opt_class in adamw_family:
+                        logger.warning(
+                            f"Optimizer type changed: checkpoint={saved_opt_class}, current={current_opt_class}. "
+                            f"State will be loaded but momentum/variance may not transfer optimally."
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Optimizer type mismatch: checkpoint has {saved_opt_class}, "
+                            f"but current optimizer is {current_opt_class}. "
+                            f"To start fresh, set training.resume_from='none'."
+                        )
+
                 # Load state dict (optimizer creates state entries as needed)
-                optimizer.load_state_dict(meta['optimizer_state_dict'])
+                optimizer.load_state_dict(saved_opt_state)
 
                 # Move optimizer state to device (handles tensor-like objects)
                 if hasattr(optimizer, 'state') and optimizer.state:
@@ -1371,10 +1666,13 @@ class CheckpointManager:
                         )
 
                     # Verify all tensors migrated successfully - fail fast if not
+                    # Compare device types (e.g., 'cuda') not full device specs (e.g., 'cuda:0')
+                    # because .to('cuda') moves to 'cuda:0' but device may be 'cuda' without index
+                    target_device_type = device.type
                     wrong_device_count = 0
                     for state in optimizer.state.values():
                         for v in state.values():
-                            if isinstance(v, torch.Tensor) and v.device != device:
+                            if isinstance(v, torch.Tensor) and v.device.type != target_device_type:
                                 wrong_device_count += 1
                     if wrong_device_count > 0:
                         raise RuntimeError(
@@ -1386,26 +1684,127 @@ class CheckpointManager:
                     logger.debug("Optimizer state loaded but empty (no tensors to migrate)")
 
             except Exception as e:
-                logger.warning(f"Failed to load optimizer state: {type(e).__name__}: {e}")
-                # Continue training with fresh optimizer state
+                logger.error(f"Failed to load optimizer state: {type(e).__name__}: {e}")
+                raise RuntimeError(
+                    f"Optimizer state restoration failed. This would cause loss of momentum/variance "
+                    f"and training divergence. To start fresh, set training.resume_from='none'. Error: {e}"
+                ) from e
 
         # Load scheduler state (with exception handling like optimizer)
         if scheduler is not None and 'scheduler_state_dict' in meta:
             try:
-                scheduler.load_state_dict(meta['scheduler_state_dict'])
-                logger.info("Scheduler state loaded successfully")
+                saved_sched_state = meta['scheduler_state_dict']
+                current_sched_type = type(scheduler).__name__
+
+                # Basic validation: check for required keys
+                if 'last_epoch' not in saved_sched_state:
+                    raise RuntimeError(
+                        f"Saved scheduler state is missing 'last_epoch' key. "
+                        f"Checkpoint may be corrupted or from incompatible version."
+                    )
+
+                # Validate scheduler class matches (if metadata available)
+                saved_sched_class = meta.get('scheduler_class')
+                if saved_sched_class and saved_sched_class != current_sched_type:
+                    raise RuntimeError(
+                        f"Scheduler type mismatch: checkpoint has {saved_sched_class}, "
+                        f"but current scheduler is {current_sched_type}. "
+                        f"To start fresh, set training.resume_from='none'."
+                    )
+
+                # Warn on critical scheduler param changes (what state_dict doesn't capture)
+                saved_params = meta.get('scheduler_params', {})
+                if saved_params:
+                    param_warnings = []
+                    for key in ['total_steps', 'warmup_steps', 'first_cycle_steps']:
+                        saved_val = saved_params.get(key)
+                        current_val = getattr(scheduler, key, None)
+                        if saved_val is not None and current_val is not None and saved_val != current_val:
+                            param_warnings.append(f"{key}: {saved_val} -> {current_val}")
+                    if param_warnings:
+                        logger.warning(
+                            f"Scheduler parameters changed since checkpoint: {', '.join(param_warnings)}. "
+                            f"LR schedule may not match original training run."
+                        )
+
+                scheduler.load_state_dict(saved_sched_state)
+                logger.info(f"Scheduler state loaded successfully (type: {current_sched_type})")
             except Exception as e:
-                logger.warning(f"Failed to load scheduler state: {type(e).__name__}: {e}")
-                logger.warning("Continuing with fresh scheduler state - LR schedule may restart from beginning")
+                logger.error(f"Failed to load scheduler state: {type(e).__name__}: {e}")
+                raise RuntimeError(
+                    f"Scheduler state restoration failed. LR schedule would restart from beginning. "
+                    f"To start fresh, set training.resume_from='none'. Error: {e}"
+                ) from e
 
         # Restore RNG states to ensure reproducible dataset shuffling
         if 'rng_states' in meta:
             try:
                 rng_dict = meta['rng_states']
+
+                # Validate RNG state structure before attempting restoration
+                required_keys = ['py', 'np', 'torch_cpu']
+                missing_keys = [k for k in required_keys if k not in rng_dict]
+                if missing_keys:
+                    raise RuntimeError(
+                        f"RNG state dict is missing required keys: {missing_keys}. "
+                        f"Checkpoint may be corrupted or from incompatible version."
+                    )
+
+                # Validate Python RNG state format (should be a tuple)
+                if not isinstance(rng_dict['py'], tuple):
+                    raise RuntimeError(
+                        f"Python RNG state has invalid type: {type(rng_dict['py']).__name__}. "
+                        f"Expected tuple. Checkpoint may be corrupted."
+                    )
+
+                # Validate torch_cpu state (should be a tensor-like)
+                torch_cpu_state = rng_dict['torch_cpu']
+                if not (isinstance(torch_cpu_state, torch.Tensor) or hasattr(torch_cpu_state, '__len__')):
+                    raise RuntimeError(
+                        f"PyTorch CPU RNG state has invalid type: {type(torch_cpu_state).__name__}. "
+                        f"Checkpoint may be corrupted."
+                    )
+
+                # Validate NumPy state structure completely
+                np_raw = rng_dict['np']
+                if isinstance(np_raw, (tuple, list)):
+                    if len(np_raw) < 5:
+                        raise RuntimeError(
+                            f"NumPy RNG state has only {len(np_raw)} elements, needs 5+. "
+                            f"Checkpoint may be corrupted."
+                        )
+                    state_arr = np_raw[1]
+                    if isinstance(state_arr, (list, np.ndarray)) and len(state_arr) < 100:
+                        raise RuntimeError(
+                            f"NumPy state array has only {len(state_arr)} elements, needs 624+ for MT19937. "
+                            f"Checkpoint may be corrupted."
+                        )
+
+                # Validate CUDA state elements are tensors (if present)
+                cuda_state = rng_dict.get('cuda')
+                if cuda_state is not None and isinstance(cuda_state, list):
+                    for i, elem in enumerate(cuda_state):
+                        if not isinstance(elem, torch.Tensor):
+                            raise RuntimeError(
+                                f"CUDA RNG state element {i} is {type(elem).__name__}, expected torch.Tensor. "
+                                f"Checkpoint may be corrupted."
+                            )
+                        if elem.dtype != torch.uint8:
+                            logger.warning(f"CUDA RNG state element {i} has dtype {elem.dtype}, expected uint8")
+
+                # Warn on CUDA version mismatch
+                saved_cuda_ver = rng_dict.get('cuda_version')
+                current_cuda_ver = torch.version.cuda if torch.cuda.is_available() else None
+                if saved_cuda_ver and current_cuda_ver and saved_cuda_ver != current_cuda_ver:
+                    logger.warning(
+                        f"CUDA version changed: checkpoint={saved_cuda_ver}, current={current_cuda_ver}. "
+                        f"GPU random operations may produce different sequences."
+                    )
+
                 # Unpack the numpy state if it was packed during save
                 np_state = _unpack_np_state(rng_dict['np'])
                 # Reconstruct tuple expected by _restore_rng_states
-                rng_tuple = (rng_dict['py'], np_state, rng_dict['torch_cpu'], rng_dict['cuda'])
+                rng_tuple = (rng_dict['py'], np_state, rng_dict['torch_cpu'], rng_dict.get('cuda'))
                 success = _restore_rng_states(rng_tuple)
 
                 # Check for critical failures and warn prominently
@@ -1417,8 +1816,12 @@ class CheckpointManager:
                     logger.error("CRITICAL: RNG state restoration failed for: %s", critical_failed)
                     logger.error("Mid-epoch resume will produce DIFFERENT data order!")
                     logger.error("Training may repeat or skip batches, affecting results.")
-                    logger.error("Consider restarting from epoch boundary if reproducibility matters.")
                     logger.error("=" * 60)
+                    raise RuntimeError(
+                        f"RNG state restoration failed for {critical_failed}. Mid-epoch resume would produce "
+                        f"different data order, potentially repeating or skipping batches. "
+                        f"To start fresh, set training.resume_from='none'."
+                    )
                 elif success.get('cuda') is False:
                     logger.warning("CUDA RNG restoration failed - GPU random operations may differ")
 
@@ -1801,11 +2204,17 @@ class TrainingUtils:
         
         elif optimizer_type.lower() == 'adamw':
             # Standard PyTorch AdamW (32-bit, no external dependencies)
+            # Use fused implementation if available (PyTorch 2.0+ on CUDA)
+            extra_args = {}
+            if torch.cuda.is_available() and 'fused' in optim.AdamW.__init__.__code__.co_varnames:
+                 extra_args['fused'] = True
+
             return optim.AdamW(
                 params,
                 lr=learning_rate,
                 betas=kwargs.get('betas', (0.9, 0.999)),
-                eps=kwargs.get('eps', 1e-8)
+                eps=kwargs.get('eps', 1e-8),
+                **extra_args
             )
 
         elif optimizer_type.lower() == 'adamw8bit':

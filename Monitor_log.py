@@ -234,26 +234,50 @@ class GradientHistogramLogger:
 
 class AlertSystem:
     """System for sending alerts and notifications"""
-    
+
+    # Maximum number of unique alert keys to track (prevents unbounded memory growth)
+    MAX_ALERT_KEYS = 1000
+
     def __init__(self, config: MonitorConfig):
         self.config = config
         self.alert_history = deque(maxlen=100)
-        self.alert_counts = defaultdict(int)
-        self.last_alert_time = defaultdict(float)
+        self.alert_counts: Dict[str, int] = {}
+        self.last_alert_time: Dict[str, float] = {}
         self.min_alert_interval = 300  # 5 minutes between same alerts
+
+    def _prune_old_alerts(self, current_time: float) -> None:
+        """Remove stale alert tracking entries to prevent unbounded memory growth."""
+        # Remove entries older than 1 hour
+        stale_threshold = current_time - 3600
+        stale_keys = [k for k, t in self.last_alert_time.items() if t < stale_threshold]
+        for key in stale_keys:
+            self.last_alert_time.pop(key, None)
+            self.alert_counts.pop(key, None)
+
+        # If still over limit, remove oldest entries
+        if len(self.last_alert_time) > self.MAX_ALERT_KEYS:
+            sorted_keys = sorted(self.last_alert_time.items(), key=lambda x: x[1])
+            keys_to_remove = [k for k, _ in sorted_keys[:len(sorted_keys) - self.MAX_ALERT_KEYS]]
+            for key in keys_to_remove:
+                self.last_alert_time.pop(key, None)
+                self.alert_counts.pop(key, None)
         
     def send_alert(self, title: str, message: str, severity: str = "info"):
         """Send an alert through configured channels"""
         # Check if we should suppress this alert
         alert_key = f"{title}_{severity}"
         current_time = time.time()
-        
+
+        # Periodically prune old alert tracking data to prevent memory growth
+        if len(self.last_alert_time) > self.MAX_ALERT_KEYS // 2:
+            self._prune_old_alerts(current_time)
+
         if alert_key in self.last_alert_time:
             if current_time - self.last_alert_time[alert_key] < self.min_alert_interval:
                 return  # Suppress duplicate alerts
-        
+
         self.last_alert_time[alert_key] = current_time
-        self.alert_counts[alert_key] += 1
+        self.alert_counts[alert_key] = self.alert_counts.get(alert_key, 0) + 1
         
         # Record alert
         alert = {
@@ -403,7 +427,7 @@ class ThreadSafeMetricsTracker:
         self.config = config
         self.metrics = defaultdict(lambda: deque(maxlen=config.max_history_size))
         self.counters = defaultdict(int)
-        self.timers = defaultdict(list)
+        self.timers = defaultdict(lambda: deque(maxlen=100))
         self.current_timers = {}
         self.lock = threading.RLock()
         
@@ -684,8 +708,8 @@ class SystemMonitor:
                     try:
                         self.metrics_queue.get_nowait()
                         self.metrics_queue.put_nowait(metrics)
-                    except:
-                        pass
+                    except (queue.Empty, queue.Full):
+                        pass  # Queue state changed between operations
                 
                 # Reset error count on success
                 self.error_count = 0
@@ -1018,31 +1042,13 @@ class TrainingMonitor:
     
        
     def _register_cleanup(self):
-        """Register cleanup handlers for graceful shutdown"""
-        def signal_handler(signum, frame):
-            """Signal handler function"""
-            logger.info(f"Received signal {signum}, shutting down...")
-            if getattr(self, '_closed', False):
-                sys.exit(0)  # Already cleaned up
-            if getattr(self, 'system_monitor', None):
-                self.system_monitor.stop()
-            if hasattr(self, 'writer') and self.writer:
-                try:
-                    self.writer.flush()
-                    self.writer.close()
-                except:
-                    pass
-            sys.exit(0)
+        """Register atexit cleanup handler.
 
-        # Only register signals that are available on the platform
-        signal_names = {signal.SIGINT: 'SIGINT', signal.SIGTERM: 'SIGTERM'}
-        for sig, sig_name in signal_names.items():
-            try:
-                signal.signal(sig, signal_handler)
-                logger.debug(f"Registered signal handler for {sig_name}")
-            except (OSError, ValueError, AttributeError) as e:
-                logger.debug(f"Could not register signal {sig_name}: {e}")
-
+        NOTE: Signal handlers (SIGINT/SIGTERM) are NOT registered here.
+        The training loop in train_direct.py owns signal handling to ensure
+        checkpoints are saved before shutdown. Monitor cleanup happens via
+        monitor.close() called by the training loop, or via atexit as backup.
+        """
         def cleanup():
             """Cleanup function for atexit"""
             if getattr(self, '_closed', False):
@@ -1053,9 +1059,9 @@ class TrainingMonitor:
                 try:
                     self.writer.flush()
                     self.writer.close()
-                except:
-                    pass
-                
+                except (IOError, OSError, AttributeError):
+                    pass  # Writer may already be closed or in bad state
+
         # Register atexit handler
         atexit.register(cleanup)
 
@@ -1273,6 +1279,9 @@ class TrainingMonitor:
             images[:num_images], predictions=predictions, labels=targets, step=step
         )
 
+    # Rating index to name mapping
+    RATING_NAMES = ['safe', 'sensitive', 'questionable', 'explicit', 'unknown']
+
     def log_predictions(
         self,
         *,
@@ -1283,15 +1292,30 @@ class TrainingMonitor:
         tag_names: List[str],
         prefix: str = "val",
         max_images: int = 4,
-        topk: int = 15,
+        topk: int = 35,
+        threshold: float = 0.4,
+        rating_logits: Optional[torch.Tensor] = None,
+        rating_labels: Optional[torch.Tensor] = None,
     ):
-        """Log per-sample images and top-k predictions/targets as TensorBoard entries."""
+        """Log per-sample images with ground truth tags and predictions to TensorBoard.
+
+        Shows ground truth tags + top predictions, sorted by probability (strongest first).
+        Table format: tag | predicted_prob | expected (YES/no) | status (TP/FN/FP)
+        Also logs rating prediction vs actual if rating_logits/rating_labels provided.
+        """
         if getattr(self, "writer", None) is None:
             return
 
         images = images.detach().cpu()
         predictions = predictions.detach().cpu()
         targets = targets.detach().cpu()
+
+        # Process rating data if provided
+        has_rating = rating_logits is not None and rating_labels is not None
+        if has_rating:
+            rating_logits = rating_logits.detach().cpu()
+            rating_labels = rating_labels.detach().cpu()
+            rating_probs = torch.softmax(rating_logits, dim=-1)
 
         num_samples = min(images.shape[0], max_images)
         for i in range(num_samples):
@@ -1321,14 +1345,49 @@ class TrainingMonitor:
             probs = predictions[i]
             tgt = targets[i]
             k = min(topk, probs.numel())
-            topk_indices = torch.topk(probs, k=k).indices.tolist()
 
-            lines = ["| tag | prob | target |", "| --- | --- | --- |"]
-            for idx in topk_indices:
+            # Get ground truth tag indices (expected tags)
+            gt_indices = (tgt > 0.5).nonzero(as_tuple=True)[0].tolist()
+            gt_set = set(gt_indices)
+            # Get top-k predictions
+            pred_topk = torch.topk(probs, k=k).indices.tolist()
+            # Combine: ground truth + top predictions not already included
+            combined_indices = gt_indices + [idx for idx in pred_topk if idx not in gt_set]
+            # Limit to k total entries
+            combined_indices = combined_indices[:k]
+            # Sort by probability (strongest to weakest)
+            combined_indices = sorted(combined_indices, key=lambda idx: probs[idx].item(), reverse=True)
+
+            # Build rating header if available
+            rating_lines = []
+            if has_rating and i < len(rating_labels):
+                actual_rating_idx = int(rating_labels[i].item())
+                actual_rating = self.RATING_NAMES[actual_rating_idx] if 0 <= actual_rating_idx < len(self.RATING_NAMES) else 'unknown'
+
+                # Get predicted rating (highest probability)
+                sample_probs = rating_probs[i]
+                pred_rating_idx = int(sample_probs.argmax().item())
+                pred_rating = self.RATING_NAMES[pred_rating_idx] if 0 <= pred_rating_idx < len(self.RATING_NAMES) else 'unknown'
+                pred_conf = sample_probs[pred_rating_idx].item()
+
+                # Rating match status
+                rating_match = "CORRECT" if pred_rating_idx == actual_rating_idx else "WRONG"
+                rating_lines = [
+                    f"**Rating:** {pred_rating} ({pred_conf:.1%}) | Actual: {actual_rating} | {rating_match}",
+                    ""
+                ]
+
+            lines = rating_lines + ["| tag | prob | expected | status |", "| --- | --- | --- | --- |"]
+            for idx in combined_indices:
                 tag = tag_names[idx] if idx < len(tag_names) else str(idx)
                 prob = probs[idx].item()
-                target_val = tgt[idx].item()
-                lines.append(f"| {tag} | {prob:.4f} | {int(target_val)} |")
+                is_expected = tgt[idx].item() > 0.5
+                # Status: TP if expected and predicted high, FN if expected but low, FP if not expected
+                if is_expected:
+                    status = "TP" if prob > threshold else "FN"
+                else:
+                    status = "FP"
+                lines.append(f"| {tag} | {prob:.4f} | {'YES' if is_expected else 'no'} | {status} |")
 
             markdown = "\n".join(lines)
             self.writer.add_text(
@@ -1409,6 +1468,11 @@ class TrainingMonitor:
             
             logger.debug(f"Data pipeline stats - Load: {avg_load_time:.3f}s, "
                         f"Batch: {avg_batch_size:.1f}, Aug: {avg_aug_time:.3f}s")
+
+            # Clear lists to prevent memory accumulation
+            self.data_stats['load_times'].clear()
+            self.data_stats['batch_sizes'].clear()
+            self.data_stats['augmentation_times'].clear()
     
     def log_augmentations(self, step: int, stats: Any):
         """Log augmentation statistics to TensorBoard.
@@ -1632,8 +1696,8 @@ class TrainingMonitor:
                             self.metrics.prom_metrics['gauges']['gpu_memory_used'].labels(
                                 gpu_id=str(gpu_id)
                             ).set(gpu.get('memory_used_gb', 0))
-                        except:
-                            pass
+                        except (ValueError, TypeError, KeyError):
+                            pass  # Prometheus metric error or missing data
         
         # Log to backends
         self._log_to_backends(step, system_metrics)
@@ -1704,8 +1768,8 @@ class TrainingMonitor:
         try:
             if hasattr(self, 'prefetch_controller'):
                 summary['prefetch_metrics'] = self.prefetch_controller.get_metrics()
-        except:
-            pass
+        except (AttributeError, RuntimeError):
+            pass  # Prefetch controller not properly initialized
 
         # Add metric statistics
         for metric_name in ['loss', 'learning_rate', 'val_loss']:

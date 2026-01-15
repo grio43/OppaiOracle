@@ -193,7 +193,7 @@ class ModelMetadata:
             return {
                 'normalize_mean': legacy.get('mean', [0.5, 0.5, 0.5]),
                 'normalize_std': legacy.get('std', [0.5, 0.5, 0.5]),
-                'image_size': checkpoint.get('image_size', 640),
+                'image_size': checkpoint.get('image_size', 512),
                 'patch_size': checkpoint.get('patch_size', 16),
             }
 

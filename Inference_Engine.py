@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from training_utils import CheckpointManager
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from torchvision.transforms import v2 as transforms_v2
 from PIL import Image, ImageOps, ImageFile
 
 # Vocabulary utilities
@@ -76,6 +77,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
 ORIENTATION_MAP_PATH = PROJECT_ROOT / "configs" / "orientation_map.json"
 
+# Legacy image size constant - older models used 448x448 images.
+# If config specifies this size, we assume it's a legacy config and default to 512.
+_LEGACY_IMAGE_SIZE = 448
+
 
 
 @dataclass
@@ -92,7 +97,7 @@ class InferenceConfig(BaseInferenceConfig):
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
-    image_size: int = 640
+    image_size: int = 512
     normalize_mean: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
     normalize_std: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
     use_torch_compile: bool = False
@@ -110,6 +115,22 @@ class InferenceConfig(BaseInferenceConfig):
     visualization_dir: str = "./visualizations"
     input_image_extensions: List[str] = field(default_factory=lambda: [".jpg", ".jpeg", ".png", ".webp"])
     enable_profiling: bool = False
+
+    def __post_init__(self):
+        """Validate configuration values."""
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if self.image_size <= 0:
+            raise ValueError(f"image_size must be positive, got {self.image_size}")
+        if self.device not in ("cuda", "cpu") and not self.device.startswith("cuda:"):
+            raise ValueError(f"device must be 'cuda', 'cpu', or 'cuda:N', got {self.device}")
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            logger.warning(f"CUDA requested but not available, falling back to CPU")
+            object.__setattr__(self, 'device', 'cpu')
+        if self.cache_size < 0:
+            raise ValueError(f"cache_size must be non-negative, got {self.cache_size}")
+        if self.num_workers < 0:
+            raise ValueError(f"num_workers must be non-negative, got {self.num_workers}")
 
     @property
     def threshold(self) -> float:
@@ -170,14 +191,19 @@ class ImagePreprocessor:
         if hasattr(config, 'input_dir') and config.input_dir:
             self.allowed_dirs.append(Path(config.input_dir).resolve())
         else:
-            # Allow current working directory as fallback
+            # Warn when using permissive default - security concern for production
+            logger.warning(
+                "No input_dir configured. Using current working directory as allowed path. "
+                "Set input_dir in config for stricter path validation in production."
+            )
             self.allowed_dirs.append(Path.cwd().resolve())
 
     def _build_transform(self):
         """Build tensor + normalize transform (geometry handled manually to avoid stretching/upscale)."""
-        return transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(
+        return transforms_v2.Compose([
+            transforms_v2.ToImage(),
+            transforms_v2.ToDtype(torch.float32, scale=True),
+            transforms_v2.Normalize(
                 mean=self.config.normalize_mean,
                 std=self.config.normalize_std
             )
@@ -232,16 +258,37 @@ class ImagePreprocessor:
             raise
 
     @staticmethod
-    def _letterbox_downscale_only(img: Image.Image, target: int, pad_color=(114, 114, 114)) -> Image.Image:
+    def _letterbox_downscale_only(
+        img: Image.Image,
+        target: int,
+        pad_color=(114, 114, 114),
+        return_mask: bool = False
+    ) -> Union[Image.Image, Tuple[Image.Image, torch.Tensor]]:
         """Letterbox to square target without upscaling.
 
         - Preserves aspect ratio
         - Downscales if larger than target
         - Never upscales; pads to target with pad_color
+
+        Args:
+            img: Input PIL Image
+            target: Target square size
+            pad_color: RGB tuple for padding color
+            return_mask: If True, also returns padding mask (True=PAD)
+
+        Returns:
+            If return_mask=False: letterboxed Image
+            If return_mask=True: (letterboxed Image, padding mask tensor)
         """
         w, h = img.size
         if w <= 0 or h <= 0:
-            return Image.new("RGB", (target, target), tuple(pad_color))
+            canvas = Image.new("RGB", (target, target), tuple(pad_color))
+            if return_mask:
+                # Entire image is padding
+                pmask = torch.ones(target, target, dtype=torch.bool)
+                return canvas, pmask
+            return canvas
+
         ratio = min(target / float(w), target / float(h))
         scale = min(1.0, ratio)
         nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
@@ -250,10 +297,30 @@ class ImagePreprocessor:
         left = (target - nw) // 2
         top = (target - nh) // 2
         canvas.paste(resized, (left, top))
+
+        if return_mask:
+            # Create padding mask: True where padding, False where actual image
+            pmask = torch.ones(target, target, dtype=torch.bool)
+            pmask[top:top + nh, left:left + nw] = False
+            return canvas, pmask
+
         return canvas
     
-    def preprocess_image(self, image: Union[str, np.ndarray, Image.Image]) -> torch.Tensor:
-        """Preprocess a single image"""
+    def preprocess_image(
+        self,
+        image: Union[str, np.ndarray, Image.Image],
+        return_mask: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Preprocess a single image.
+
+        Args:
+            image: Input image (path, numpy array, or PIL Image)
+            return_mask: If True, also returns padding mask for flex attention
+
+        Returns:
+            If return_mask=False: preprocessed tensor (C, H, W)
+            If return_mask=True: (preprocessed tensor, padding mask (H, W) with True=PAD)
+        """
         # Load image if path
         if isinstance(image, str):
             # Validate path to prevent path traversal
@@ -278,29 +345,56 @@ class ImagePreprocessor:
             image = Image.fromarray(image)
 
         # Geometry: letterbox to target without upscaling, no stretching
-        lb = self._letterbox_downscale_only(image, int(self.config.image_size))
-        # Apply tensor + normalize
-        return self.transform(lb)
+        if return_mask:
+            lb, pmask = self._letterbox_downscale_only(
+                image, int(self.config.image_size), return_mask=True
+            )
+            # Apply tensor + normalize
+            return self.transform(lb), pmask
+        else:
+            lb = self._letterbox_downscale_only(image, int(self.config.image_size))
+            # Apply tensor + normalize
+            return self.transform(lb)
     
-    def preprocess_batch(self, images: List[Union[str, np.ndarray, Image.Image]]) -> Tuple[torch.Tensor, List[bool]]:
-        """Preprocess a batch of images
+    def preprocess_batch(
+        self,
+        images: List[Union[str, np.ndarray, Image.Image]],
+        return_masks: bool = False
+    ) -> Union[Tuple[torch.Tensor, List[bool]], Tuple[torch.Tensor, torch.Tensor, List[bool]]]:
+        """Preprocess a batch of images.
+
+        Args:
+            images: List of input images
+            return_masks: If True, also returns stacked padding masks
 
         Returns:
-            tuple: (tensor of shape [N, 3, H, W], list of bool indicating valid images)
+            If return_masks=False: (tensor [N, 3, H, W], valid flags list)
+            If return_masks=True: (tensor [N, 3, H, W], masks [N, H, W], valid flags list)
         """
         processed = []
+        masks = []
         valid_flags = []
 
         for img in images:
             try:
-                processed.append(self.preprocess_image(img))
+                if return_masks:
+                    tensor, pmask = self.preprocess_image(img, return_mask=True)
+                    processed.append(tensor)
+                    masks.append(pmask)
+                else:
+                    processed.append(self.preprocess_image(img))
                 valid_flags.append(True)
-            except Exception as e:
+            except (IOError, OSError, ValueError, RuntimeError) as e:
                 logger.error(f"Failed to preprocess image {img}: {e}")
                 # Add black image as placeholder to maintain batch shape
                 processed.append(torch.zeros(3, self.config.image_size, self.config.image_size))
+                if return_masks:
+                    # Full padding mask for invalid images
+                    masks.append(torch.ones(self.config.image_size, self.config.image_size, dtype=torch.bool))
                 valid_flags.append(False)
 
+        if return_masks:
+            return torch.stack(processed), torch.stack(masks), valid_flags
         return torch.stack(processed), valid_flags
 
 
@@ -401,6 +495,8 @@ class ModelWrapper:
                     logger.info(f"Successfully loaded {len(self.tag_names)} tags from embedded vocabulary")
                     # Compute vocabulary hash
                     self.vocab_sha256 = compute_vocab_sha256(vocab_data=vocab_data)
+                    # Track vocabulary source for verification
+                    self._vocab_source = "embedded"
                 else:
                     logger.error("Failed to extract embedded vocabulary")
                     # Fall back to external vocabulary file
@@ -433,12 +529,38 @@ class ModelWrapper:
                     logger.warning(f"Failed to build TTA left↔right index map: {e}")
 
             # Load preprocessing parameters from checkpoint
+            # Store original config values for mismatch detection
+            config_mean = list(self.config.normalize_mean)
+            config_std = list(self.config.normalize_std)
+            config_image_size = self.config.image_size
+
             if 'preprocessing_params' in meta:
                 preprocessing = ModelMetadata.extract_preprocessing_params(meta)
                 if preprocessing:
-                    self.config.normalize_mean = preprocessing.get('normalize_mean', [0.5, 0.5, 0.5])
-                    self.config.normalize_std = preprocessing.get('normalize_std', [0.5, 0.5, 0.5])
-                    self.config.image_size = preprocessing.get('image_size', 640)
+                    checkpoint_mean = preprocessing.get('normalize_mean', [0.5, 0.5, 0.5])
+                    checkpoint_std = preprocessing.get('normalize_std', [0.5, 0.5, 0.5])
+                    checkpoint_image_size = preprocessing.get('image_size', 512)
+
+                    # Warn if user config differs from checkpoint (potential accuracy issue)
+                    if config_mean != list(checkpoint_mean):
+                        logger.warning(
+                            f"Normalization mean mismatch! Config: {config_mean}, Checkpoint: {checkpoint_mean}. "
+                            f"Using checkpoint values for correct inference."
+                        )
+                    if config_std != list(checkpoint_std):
+                        logger.warning(
+                            f"Normalization std mismatch! Config: {config_std}, Checkpoint: {checkpoint_std}. "
+                            f"Using checkpoint values for correct inference."
+                        )
+                    if config_image_size != checkpoint_image_size:
+                        logger.warning(
+                            f"Image size mismatch! Config: {config_image_size}, Checkpoint: {checkpoint_image_size}. "
+                            f"Using checkpoint values for correct inference."
+                        )
+
+                    self.config.normalize_mean = checkpoint_mean
+                    self.config.normalize_std = checkpoint_std
+                    self.config.image_size = checkpoint_image_size
                     self.normalization_params = preprocessing
                     logger.info(f"Loaded preprocessing params from checkpoint: {preprocessing}")
             elif 'normalization_params' in meta:
@@ -462,7 +584,7 @@ class ModelWrapper:
 
             # Ensure critical parameters are present with sensible defaults
             vit_config_defaults = {
-                'image_size': self.config.image_size if self.config.image_size != 448 else 640,
+                'image_size': self.config.image_size if self.config.image_size != _LEGACY_IMAGE_SIZE else 512,
                 'patch_size': 16,
                 'num_channels': 3,
                 'hidden_size': 1280,
@@ -473,8 +595,11 @@ class ModelWrapper:
                 'dropout': 0.1,
                 'attention_dropout': 0.1,
                 'layer_norm_eps': 1e-6,
-                'use_flash_attention': True,
-                'padding_mask_keep_threshold': 0.9,
+                'use_flex_attention': True,
+                'flex_block_size': 128,
+                'attention_bias': True,
+                'token_ignore_threshold': 0.9,
+                'use_fp32_layernorm': False,  # Inference doesn't need FP32 LayerNorm
                 'gradient_checkpointing': False  # Disable for inference
             }
             self.patch_size = vit_config_dict.get('patch_size', 16)
@@ -514,15 +639,29 @@ class ModelWrapper:
             if self.config.use_torch_compile and hasattr(torch, 'compile'):
                 self.model = torch.compile(self.model)
             
-            # Setup mixed precision
+            # Setup mixed precision with fallback support
             precision = str(getattr(self.config, "precision", "bf16")).lower()
-            if precision not in {"bf16", "bfloat16"}:
-                raise ValueError(f"Only bf16 precision is supported, got '{precision}'.")
-            if self.config.device == 'cuda':
-                if not (hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported()):
-                    raise RuntimeError("bf16 requested for inference but CUDA device does not support bf16.")
-            logger.info("Using bf16 for inference.")
-            self.model = self.model.to(torch.bfloat16)
+            if precision in {"bf16", "bfloat16"}:
+                if self.config.device == 'cuda':
+                    if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+                        self.model = self.model.to(torch.bfloat16)
+                        logger.info("Using bf16 for inference.")
+                    else:
+                        logger.warning("bf16 not supported on this GPU, falling back to fp16")
+                        self.model = self.model.to(torch.float16)
+                else:
+                    # CPU inference with bf16
+                    self.model = self.model.to(torch.bfloat16)
+                    logger.info("Using bf16 for CPU inference.")
+            elif precision in {"fp16", "float16"}:
+                self.model = self.model.to(torch.float16)
+                logger.info("Using fp16 for inference.")
+            elif precision in {"fp32", "float32"}:
+                # Model is already fp32 by default, no conversion needed
+                logger.info("Using fp32 for inference.")
+            else:
+                logger.warning(f"Unknown precision '{precision}', defaulting to bf16")
+                self.model = self.model.to(torch.bfloat16)
             
             logger.info(f"SimplifiedTagger model loaded successfully:")
             logger.info(f"  - Image size: {vit_config.image_size}")
@@ -562,28 +701,61 @@ class ModelWrapper:
         ]
         # Compute vocabulary hash for external vocabulary
         self.vocab_sha256 = compute_vocab_sha256(vocab_data={'tag_to_index': self.vocabulary.tag_to_index})
+        # Track vocabulary source for verification
+        self._vocab_source = str(vocab_path)
 
     def _verify_vocabulary(self):
         """Verify vocabulary contains real tags, not placeholders"""
+        # Use the tracked vocabulary source for accurate error messages
+        vocab_source = getattr(self, '_vocab_source', None)
+        if vocab_source == "embedded":
+            source_desc = "embedded vocabulary from checkpoint"
+        elif vocab_source:
+            source_desc = vocab_source
+        else:
+            source_desc = str(Path(self.config.vocab_path))
         # Use centralized verification
-        verify_vocabulary_integrity(self.vocabulary, Path(self.config.vocab_path))
+        verify_vocabulary_integrity(self.vocabulary, source_desc)
 
     @torch.no_grad()
-    def predict(self, images: torch.Tensor) -> torch.Tensor:
-        """Run inference on batch of images"""
-        images = images.to(self.device, non_blocking=True)
-        if getattr(self.config, "memory_format", "contiguous") == "channels_last":
-            images = images.contiguous(memory_format=torch.channels_last)
-        
-        # Match model precision
+    def predict(
+        self,
+        images: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Run inference on batch of images.
+
+        Args:
+            images: Batch of images (N, C, H, W)
+            padding_mask: Optional padding mask (N, H, W) with True=PAD semantics.
+                         Enables proper flex attention masking for letterboxed images.
+
+        Returns:
+            Prediction probabilities (N, num_tags)
+        """
+        # Match model precision and device in a single transfer
+        # Using non_blocking=False to ensure transfer completes before model forward
         model_dtype = next(self.model.parameters()).dtype
-        if images.dtype != model_dtype:
-            images = images.to(dtype=model_dtype)
-        
-        outputs = self.model(images)
+        memory_format = (torch.channels_last
+                        if getattr(self.config, "memory_format", "contiguous") == "channels_last"
+                        else torch.contiguous_format)
+        images = images.to(
+            device=self.device,
+            dtype=model_dtype,
+            memory_format=memory_format,
+            non_blocking=False  # Ensure transfer completes before model.forward()
+        )
+
+        # Transfer padding mask to device if provided
+        if padding_mask is not None:
+            padding_mask = padding_mask.to(device=self.device, dtype=torch.bool)
+
+        outputs = self.model(images, padding_mask=padding_mask)
         if self.config.tta_flip:
             images_flipped = torch.flip(images, dims=[-1])
-            outputs_flipped = self.model(images_flipped)
+            # Flip the padding mask horizontally for TTA (if provided)
+            padding_mask_flipped = torch.flip(padding_mask, dims=[-1]) if padding_mask is not None else None
+            outputs_flipped = self.model(images_flipped, padding_mask=padding_mask_flipped)
             # Orientation-aware averaging if we have a mapping
             if isinstance(outputs, dict):
                 if 'tag_logits' in outputs and self._tta_index_map is not None:
@@ -609,8 +781,8 @@ class ModelWrapper:
                     try:
                         for k in outputs:
                             outputs[k] = 0.5 * (outputs[k] + outputs_flipped[k])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"TTA averaging failed for key '{k}', using original outputs: {e}")
             else:
                 # outputs is a tensor – simple average
                 outputs = 0.5 * (outputs + outputs_flipped)
@@ -801,33 +973,44 @@ class InferenceCache:
         self._expired = 0
 
     def get(self, key: str) -> Optional[Any]:
-        """Get item from cache, checking TTL if applicable."""
+        """Get item from cache, checking TTL if applicable.
+
+        Thread-safe implementation that avoids nested lock acquisition
+        by separating cache operations from stats updates.
+        """
+        # Perform cache lookup with cache_lock only
+        result_status = None  # 'hit', 'miss', or 'expired'
+        value = None
+
         with self.cache_lock:
             if key not in self.cache:
-                # Fast path: not in cache
-                with self.stats_lock:
-                    self._misses += 1
-                return None
-
-            # Check TTL
-            if self.ttl:
+                result_status = 'miss'
+            elif self.ttl:
                 timestamp = self.timestamps[key]
                 if datetime.now() - timestamp > self.ttl:
                     del self.cache[key]
                     del self.timestamps[key]
-                    with self.stats_lock:
-                        self._expired += 1
-                        self._misses += 1
-                    return None
+                    result_status = 'expired'
+                else:
+                    value = self.cache[key]
+                    self.cache.move_to_end(key)
+                    result_status = 'hit'
+            else:
+                value = self.cache[key]
+                self.cache.move_to_end(key)
+                result_status = 'hit'
 
-            # Cache hit
-            value = self.cache[key]
-            self.cache.move_to_end(key)
-
-            with self.stats_lock:
+        # Update stats outside cache_lock to avoid nested lock contention
+        with self.stats_lock:
+            if result_status == 'miss':
+                self._misses += 1
+            elif result_status == 'expired':
+                self._expired += 1
+                self._misses += 1
+            else:  # hit
                 self._hits += 1
 
-            return value
+        return value
 
     def put(self, key: str, value: Any):
         """Put item in cache, evicting if necessary."""
@@ -865,6 +1048,12 @@ class InferenceCache:
             'size': size
         }
 
+    def clear(self):
+        """Thread-safe cache clearing."""
+        with self.cache_lock:
+            self.cache.clear()
+            self.timestamps.clear()
+
 
 class InferenceEngine:
     """Main inference engine for anime image tagging"""
@@ -882,84 +1071,100 @@ class InferenceEngine:
         
     def _setup(self):
         """Setup inference engine components"""
-        # Load full config for model initialization
+        # Track resources created for cleanup on failure
+        monitor_created = None
+
         try:
-            full_config = load_config(PROJECT_ROOT / "configs" / "unified_config.yaml")
-            # Override inference config with our config
-            full_config.inference = self.config
-        except Exception as e:
-            logger.error(f"Failed to load unified_config.yaml: {e}")
-            raise RuntimeError(f"Cannot load configuration: {e}")
-
-        # Load model
-        if not self.model_wrapper.load_model(full_config):
-            raise RuntimeError("Failed to load model")
-        
-        # Setup result processor
-        self.result_processor = ResultProcessor(
-            self.config,
-            self.model_wrapper.tag_names,
-            self.model_wrapper
-        )
-
-        # Update preprocessor with loaded normalization params if available
-        if self.model_wrapper.normalization_params:
-            self.preprocessor = ImagePreprocessor(self.config)        
-        
-        # Setup monitoring
-        if self.config.enable_monitoring and MONITORING_AVAILABLE:
-            monitor_config = None
+            # Load full config for model initialization
             try:
-                # Assuming unified_config.yaml is the single source of truth
-                unified_config_path = PROJECT_ROOT / "configs" / "unified_config.yaml"
-                if unified_config_path.exists():
-                    unified_config = load_config(unified_config_path)
-                    if hasattr(unified_config, 'monitor'):
-                        monitor_config = unified_config.monitor
-                        logger.info("Loaded monitor configuration from unified_config.yaml")
+                full_config = load_config(PROJECT_ROOT / "configs" / "unified_config.yaml")
+                # Override inference config with our config
+                full_config.inference = self.config
             except Exception as e:
-                logger.warning(f"Could not load monitor settings from unified_config.yaml: {e}")
+                logger.error(f"Failed to load unified_config.yaml: {e}")
+                raise RuntimeError(f"Cannot load configuration: {e}")
 
-            if monitor_config is None:
-                monitor_config = self.config.monitor_config or MonitorConfig(
-                    log_level="INFO",
-                    use_tensorboard=False,
-                    use_wandb=False,
-                    track_gpu_metrics=True,
-                    enable_alerts=False,
-                    alert_webhook_url=None  # Ensure webhook is not used by default
-                )
-                logger.info("Using default or legacy monitor configuration for inference.")
+            # Load model
+            if not self.model_wrapper.load_model(full_config):
+                raise RuntimeError("Failed to load model")
 
-            self.monitor = TrainingMonitor(monitor_config)
-            logger.info("Monitoring enabled for inference")
-        
-        # Setup cache
-        if self.config.enable_cache:
-            self.cache = InferenceCache(
-                max_size=self.config.cache_size,
-                ttl_seconds=self.config.cache_ttl_seconds
+            # Setup result processor
+            self.result_processor = ResultProcessor(
+                self.config,
+                self.model_wrapper.tag_names,
+                self.model_wrapper
             )
-            logger.info(f"Cache enabled with size {self.config.cache_size} and TTL {self.config.cache_ttl_seconds}s")
+
+            # Update preprocessor with loaded normalization params if available
+            if self.model_wrapper.normalization_params:
+                self.preprocessor = ImagePreprocessor(self.config)
+
+            # Setup monitoring
+            if self.config.enable_monitoring and MONITORING_AVAILABLE:
+                monitor_config = None
+                try:
+                    # Assuming unified_config.yaml is the single source of truth
+                    unified_config_path = PROJECT_ROOT / "configs" / "unified_config.yaml"
+                    if unified_config_path.exists():
+                        unified_config = load_config(unified_config_path)
+                        if hasattr(unified_config, 'monitor'):
+                            monitor_config = unified_config.monitor
+                            logger.info("Loaded monitor configuration from unified_config.yaml")
+                except Exception as e:
+                    logger.warning(f"Could not load monitor settings from unified_config.yaml: {e}")
+
+                if monitor_config is None:
+                    monitor_config = self.config.monitor_config or MonitorConfig(
+                        log_level="INFO",
+                        use_tensorboard=False,
+                        use_wandb=False,
+                        track_gpu_metrics=True,
+                        enable_alerts=False,
+                        alert_webhook_url=None  # Ensure webhook is not used by default
+                    )
+                    logger.info("Using default or legacy monitor configuration for inference.")
+
+                monitor_created = TrainingMonitor(monitor_config)
+                self.monitor = monitor_created
+                logger.info("Monitoring enabled for inference")
+
+            # Setup cache
+            if self.config.enable_cache:
+                self.cache = InferenceCache(
+                    max_size=self.config.cache_size,
+                    ttl_seconds=self.config.cache_ttl_seconds
+                )
+                logger.info(f"Cache enabled with size {self.config.cache_size} and TTL {self.config.cache_ttl_seconds}s")
+
+        except Exception:
+            # Clean up monitor if it was created before failure
+            if monitor_created is not None:
+                try:
+                    monitor_created.close()
+                    logger.info("Cleaned up monitor after setup failure")
+                except Exception as cleanup_err:
+                    logger.warning(f"Failed to cleanup monitor: {cleanup_err}")
+            raise
     
     def predict_single(self, image: Union[str, np.ndarray, Image.Image]) -> ImagePrediction:
         """Predict tags for a single image"""
         start_time = time.time()
-        
+
         # Check cache if using file path
         if self.cache and isinstance(image, str):
             cached = self.cache.get(image)
             if cached is not None:
                 logger.debug(f"Cache hit for {image}")
                 return cached
-        
+
         try:
-            # Preprocess
-            processed = self.preprocessor.preprocess_image(image)
+            # Preprocess with padding mask for proper flex attention masking
+            processed, pmask = self.preprocessor.preprocess_image(image, return_mask=True)
             processed = processed.unsqueeze(0)  # Add batch dimension
-            
-            # Predict
-            predictions = self.model_wrapper.predict(processed)
+            pmask = pmask.unsqueeze(0)  # Add batch dimension
+
+            # Predict with padding mask
+            predictions = self.model_wrapper.predict(processed, padding_mask=pmask)
             
             # Process results
             image_path = image if isinstance(image, str) else "array"
@@ -1019,11 +1224,13 @@ class InferenceEngine:
             
             # Process uncached images
             if uncached_images:
-                # Preprocess batch - GET VALIDITY FLAGS
-                processed_tensor, valid_flags = self.preprocessor.preprocess_batch(uncached_images)
+                # Preprocess batch with padding masks for proper flex attention masking
+                processed_tensor, padding_masks, valid_flags = self.preprocessor.preprocess_batch(
+                    uncached_images, return_masks=True
+                )
 
-                # Predict - pass tensor
-                predictions = self.model_wrapper.predict(processed_tensor)
+                # Predict with padding masks
+                predictions = self.model_wrapper.predict(processed_tensor, padding_mask=padding_masks)
 
                 # Process results - USE ACTUAL VALIDITY FLAGS
                 batch_results = self.result_processor.process_predictions(
@@ -1053,15 +1260,19 @@ class InferenceEngine:
             return results
             
         except Exception as e:
-            logger.error(f"Batch inference failed: {e}")
-            return [
-                ImagePrediction(
-                    image=img if isinstance(img, str) else f"array_{i}",
-                    tags=[],
-                    processing_time=(time.time() - start_time) * 1000 / len(images)
-                )
-                for i, img in enumerate(images)
-            ]
+            logger.error(f"Batch inference failed: {e}", exc_info=True)
+            # Preserve partial results and fill in missing with empty predictions
+            partial_count = sum(1 for r in results if r is not None)
+            if partial_count > 0:
+                logger.info(f"Returning {partial_count} partial results out of {len(images)}")
+            for i, img in enumerate(images):
+                if results[i] is None:
+                    results[i] = ImagePrediction(
+                        image=img if isinstance(img, str) else f"array_{i}",
+                        tags=[],
+                        processing_time=(time.time() - start_time) * 1000 / len(images)
+                    )
+            return results
     
     def process_directory(
         self,
@@ -1216,8 +1427,7 @@ class InferenceEngine:
         if self.cache:
             try:
                 logger.info(f"Cache stats at cleanup: {self.cache.get_stats()}")
-                self.cache.cache.clear()
-                self.cache.timestamps.clear()
+                self.cache.clear()  # Thread-safe clearing
             except Exception as e:
                 logger.warning(f"Error clearing cache: {e}")
             self.cache = None
@@ -1226,8 +1436,8 @@ class InferenceEngine:
         if hasattr(self, 'model_wrapper') and self.model_wrapper:
             try:
                 if hasattr(self.model_wrapper, 'model') and self.model_wrapper.model:
-                    # Move to CPU first
-                    self.model_wrapper.model.cpu()
+                    # Move to CPU first - must reassign to release GPU memory
+                    self.model_wrapper.model = self.model_wrapper.model.cpu()
                     # Delete model
                     del self.model_wrapper.model
                 del self.model_wrapper
@@ -1311,7 +1521,7 @@ if __name__ == "__main__":
             "std": [0.5, 0.5, 0.5]    # Must match training config  
         },
         "vit_config": {
-            "image_size": 640,
+            "image_size": 512,
             "patch_size": 16,
             "num_channels": 3,
             "hidden_size": 1280,
@@ -1323,8 +1533,11 @@ if __name__ == "__main__":
             "dropout": 0.1,
             "attention_dropout": 0.1,
             "layer_norm_eps": 1e-6,
-            "use_flash_attention": True,
-            "padding_mask_keep_threshold": 0.9,
+            "use_flex_attention": True,
+            "flex_block_size": 128,
+            "attention_bias": True,
+            "token_ignore_threshold": 0.9,
+            "use_fp32_layernorm": False,
             "gradient_checkpointing": False  # Disabled for inference
         }
     }

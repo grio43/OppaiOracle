@@ -5,11 +5,15 @@ Vision Transformer adjusted for orientation-aware tagger
 """
 
 import functools
+import logging
 import math
+import threading
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, fields
 from typing import Any, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 import torch
 import torch.nn as nn
@@ -17,54 +21,28 @@ import torch.nn.functional as F
 from mask_utils import ensure_pixel_padding_mask, pixel_to_token_ignore
 from custom_drop_path import SafeDropPath
 
+# Import Flex Attention (PyTorch 2.5+)
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask, BlockMask
 
-def _check_flash_attention_available() -> bool:
-    """Check if flash attention (SDPA) is available and properly supported.
+logger.info("Using PyTorch Flex Attention")
 
-    Returns:
-        True if scaled_dot_product_attention is available and the PyTorch version
-        is recent enough to support it reliably.
-    """
-    if not hasattr(F, 'scaled_dot_product_attention'):
-        return False
 
-    # Parse PyTorch version robustly
+def _check_flex_attention_available() -> bool:
+    """Check if Flex Attention is available (PyTorch 2.5+)."""
+    return hasattr(torch.nn.attention, 'flex_attention')
+
+
+def _check_triton_available() -> bool:
+    """Check if Triton is available for compiled block mask creation."""
     try:
-        version_str = torch.__version__
-
-        # Strip common suffixes: +cu118, +rocm5.2, a0+git123, etc.
-        # Keep only the numeric version: "2.1.0+cu118" -> "2.1.0"
-        version_clean = version_str.split('+')[0]  # Remove + and everything after
-
-        # Handle dev/alpha/beta versions: "2.1.0a0" -> "2.1.0"
-        for suffix in ['a', 'b', 'rc', 'dev']:
-            if suffix in version_clean:
-                version_clean = version_clean.split(suffix)[0]
-
-        # Parse major.minor only
-        parts = version_clean.split('.')[:2]
-        torch_version = tuple(int(p) for p in parts)
-
-    except (ValueError, AttributeError, IndexError) as e:
-        # Log the parsing failure for diagnostics
-        warnings.warn(
-            f"Failed to parse PyTorch version '{torch.__version__}': {e}. "
-            f"Assuming flash attention is not supported. "
-            f"If you believe this is an error, please report it."
-        )
+        import triton
+        return True
+    except ImportError:
         return False
 
-    if torch_version < (2, 0):
-        return False
 
-    # Warn if using older version with potential issues
-    if torch_version < (2, 1):
-        warnings.warn(
-            f"PyTorch {torch.__version__} has scaled_dot_product_attention "
-            "but it may not be fully stable. Consider upgrading to 2.1+."
-        )
-
-    return True
+# Cache the Triton availability check at module load time
+_TRITON_AVAILABLE = _check_triton_available()
 
 
 class LayerNormFp32(nn.LayerNorm):
@@ -92,7 +70,7 @@ class LayerNormFp32(nn.LayerNorm):
 @dataclass
 class VisionTransformerConfig:
     """Configuration for the Vision Transformer used in direct training."""
-    image_size: int = 640
+    image_size: int = 512
     # Patch size must divide image_size evenly to avoid losing border information (validated in __post_init__)
     patch_size: int = 16
     num_channels: int = 3
@@ -105,7 +83,9 @@ class VisionTransformerConfig:
     dropout: float = 0.1
     attention_dropout: float = 0.1
     layer_norm_eps: float = 1e-6
-    use_flash_attention: bool = True
+    use_flex_attention: bool = True  # Use Flex Attention (PyTorch 2.5+)
+    flex_block_size: int = 128  # Block size for Flex Attention sparse computation
+    attention_bias: bool = True  # Use bias in attention QKV and projection layers
     # Token ignore threshold: a token is ignored if >= this fraction of its pixels are PAD
     token_ignore_threshold: float = 0.9
     # Enable gradient checkpointing by default to reduce memory usage
@@ -177,69 +157,25 @@ class VisionTransformerConfig:
 
 
 class TransformerBlock(nn.Module):
-    """Single transformer block"""
-    # Class-level LRU cache shared across all blocks and epochs
-    # Key: (batch_size, seq_len, device) -> Value: inverted mask tensor
-    # OrderedDict maintains insertion order; move_to_end() for LRU behavior
-    _mask_cache: OrderedDict = OrderedDict()
-    _cache_hits: int = 0
-    _cache_misses: int = 0
-    _max_cache_entries: int = 100  # Prevent unbounded growth
-
-    @classmethod
-    def get_cache_stats(cls) -> Dict[str, Any]:
-        """Get attention mask cache statistics."""
-        total = cls._cache_hits + cls._cache_misses
-        hit_rate = cls._cache_hits / total if total > 0 else 0.0
-        cache_size_mb = sum(
-            m.element_size() * m.nelement() for m in cls._mask_cache.values()
-        ) / (1024 * 1024)
-        return {
-            'hits': cls._cache_hits,
-            'misses': cls._cache_misses,
-            'hit_rate': hit_rate,
-            'entries': len(cls._mask_cache),
-            'size_mb': cache_size_mb,
-        }
-
-    @classmethod
-    def clear_cache(cls):
-        """Clear the attention mask cache and reset statistics."""
-        cls._mask_cache.clear()
-        cls._cache_hits = 0
-        cls._cache_misses = 0
+    """Single transformer block using Flex Attention."""
 
     def __init__(self, config: VisionTransformerConfig, drop_path: float = 0.):
         super().__init__()
         self.config = config
         self.norm1 = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps, use_fp32=config.use_fp32_layernorm)
 
-        # Use flash attention if available and requested
-        self.use_flash = config.use_flash_attention and _check_flash_attention_available()
+        # Flex Attention setup
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.scale = self.head_dim ** -0.5
+        self.flex_block_size = config.flex_block_size
 
-        if config.use_flash_attention and not self.use_flash:
-            warnings.warn(
-                "Flash attention was requested but is not available. "
-                "Falling back to standard attention. "
-                f"PyTorch version: {torch.__version__}"
-            )
-        
-        if self.use_flash:
-            # For flash attention, we need separate projection layers
-            self.num_heads = config.num_attention_heads
-            self.head_dim = config.hidden_size // config.num_attention_heads
-            self.qkv = nn.Linear(config.hidden_size, 3 * config.hidden_size)
-            self.proj = nn.Linear(config.hidden_size, config.hidden_size)
-            self.attn_dropout = config.attention_dropout
-        else:
-            # Standard MultiheadAttention
-            self.attn = nn.MultiheadAttention(
-                config.hidden_size,
-                config.num_attention_heads,
-                dropout=config.attention_dropout,
-                batch_first=True
-            )
+        # QKV projection (fused linear for efficiency)
+        self.qkv = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=config.attention_bias)
+        self.proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
+        self.attn_dropout = config.attention_dropout
 
+        # Drop path and MLP
         self.drop_path = SafeDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps, use_fp32=config.use_fp32_layernorm)
         self.mlp = nn.Sequential(
@@ -250,116 +186,53 @@ class TransformerBlock(nn.Module):
             nn.Dropout(config.dropout)
         )
 
-    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Forward pass through transformer block.
+    def forward(self, x: torch.Tensor, block_mask: Optional[BlockMask] = None) -> torch.Tensor:
+        """Forward pass using Flex Attention.
 
         Args:
             x: Input tensor of shape (batch_size, seq_len, hidden_size)
-            key_padding_mask: Optional attention mask of shape (batch_size, seq_len)
-                            where True indicates positions that should be ignored.
+            block_mask: Optional pre-computed BlockMask for padding-aware attention.
+                       Created once by SimplifiedTagger and shared across all layers.
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, seq_len, hidden_size)
-                        after self-attention and feed-forward layers.
 
         Note:
-            This implementation uses pre-layer normalization (LayerNorm -> Attention -> Residual)
-            rather than post-layer normalization for better training stability.
+            Uses pre-layer normalization (LayerNorm -> Attention -> Residual).
         """
-        # Self-attention with residual
         normed_x = self.norm1(x)
-        
-        if self.use_flash:
-            # Flash attention path
-            B, L, D = normed_x.shape
-            qkv = self.qkv(normed_x).reshape(B, L, 3, self.num_heads, self.head_dim)
-            q, k, v = qkv.unbind(2)
-            q = q.transpose(1, 2)  # (B, num_heads, L, head_dim)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            
-            # Build attention mask with SDPA semantics:
-            # PyTorch SDPA expects boolean attn_mask where True = KEEP (participate),
-            # False = MASK (disallow attention). Our key_padding_mask uses True = IGNORE.
-            # Invert it for SDPA.
-            attn_mask = None
-            if key_padding_mask is not None:
-                # Production-level validation: Ensure at least one token per sample is unmasked
-                # This prevents the model from attempting attention with all-masked sequences
-                # Skip during tracing to avoid control flow issues
-                if not torch.jit.is_tracing():
-                    # Fast GPU check: ensure NOT all tokens are masked (i.e., at least one False exists)
-                    if key_padding_mask.all(dim=1).any():
-                        # At least one sample has all tokens masked - this is invalid
-                        if self.config.check_numerical_stability:
-                            # In debug mode, provide detailed error
-                            raise RuntimeError(
-                                "key_padding_mask masks all keys for at least one sample. "
-                                "At least one token (e.g., CLS) must be unmasked."
-                            )
-                        else:
-                            # In production, log warning but continue (assumes CLS is unmasked)
-                            warnings.warn(
-                                "Detected potentially invalid mask with all tokens masked. "
-                                "Continuing with assumption that CLS token is unmasked.",
-                                RuntimeWarning
-                            )
+        B, L, D = normed_x.shape
 
-                # Smart caching: For large datasets with fixed image sizes, padding masks are often identical
-                # Cache key: (batch_size, seq_len, device, mask_pattern_hash)
-                # This persists across epochs and works with orientation flipping (which affects tags, not geometry)
-                B_mask, L_mask = key_padding_mask.shape
-                cache_key = (B_mask, L_mask, str(key_padding_mask.device))
+        # QKV projection and reshape
+        qkv = self.qkv(normed_x).reshape(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(2)  # Each: (B, L, num_heads, head_dim)
 
-                # Try cache lookup first (no CPU transfer, pure GPU check)
-                cached_mask = TransformerBlock._mask_cache.get(cache_key)
+        # Transpose to (B, num_heads, L, head_dim) for flex_attention
+        # IMPORTANT: Make tensors contiguous after transpose to ensure proper memory layout.
+        # Non-contiguous tensors from reshape->unbind->transpose cause stride assertion
+        # failures when torch.compile traces the graph (inductor expects contiguous strides).
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
 
-                if cached_mask is not None and cached_mask.shape[0] == B_mask:
-                    # Cache hit: verify mask pattern matches using fast GPU comparison
-                    # Only compare first sample as heuristic (batch usually has identical masks)
-                    if torch.equal(key_padding_mask[0], (~cached_mask[0, 0, 0, :]).to(key_padding_mask.dtype)):
-                        attn_mask = cached_mask
-                        TransformerBlock._cache_hits += 1
-                        # LRU: move accessed entry to end (most recently used)
-                        TransformerBlock._mask_cache.move_to_end(cache_key)
-                    else:
-                        # Cache invalidation: pattern changed (e.g., different data split)
-                        cached_mask = None
-                        TransformerBlock._cache_misses += 1
-                else:
-                    TransformerBlock._cache_misses += 1
+        # Flex Attention computation (block_mask is pre-computed and shared across layers)
+        attn_out = flex_attention(
+            q, k, v,
+            block_mask=block_mask,
+            scale=self.scale,
+        )
 
-                # Cache miss or invalidated: compute and cache
-                if cached_mask is None:
-                    # Invert for SDPA: True=keep, False=mask
-                    # This is a very cheap operation on GPU (simple element-wise NOT + reshape)
-                    attn_mask = (~key_padding_mask).unsqueeze(1).unsqueeze(2)  # (B,1,1,L)
+        # Reshape back to (B, L, D) - ensure contiguous for torch.compile compatibility
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, D).contiguous()
 
-                    # Cache for future use with LRU eviction
-                    if len(TransformerBlock._mask_cache) >= TransformerBlock._max_cache_entries:
-                        # LRU eviction: remove oldest entry (first item in OrderedDict)
-                        oldest_key = next(iter(TransformerBlock._mask_cache))
-                        del TransformerBlock._mask_cache[oldest_key]
-                    TransformerBlock._mask_cache[cache_key] = attn_mask
+        # Apply attention dropout (post-attention, flex_attention doesn't have built-in dropout)
+        if self.training and self.attn_dropout > 0:
+            attn_out = F.dropout(attn_out, p=self.attn_dropout, training=True)
 
-            # Use scaled_dot_product_attention with flash backend when available
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_dropout if self.training else 0.0
-            )
-            attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
-            x = x + self.drop_path(self.proj(attn_out))
-        else:
-            # Standard attention path
-            attn_output, _ = self.attn(
-                normed_x, normed_x, normed_x,
-                key_padding_mask=key_padding_mask
-            )
-            x = x + self.drop_path(attn_output)
-
-        # MLP with residual
+        # Residual connections
+        x = x + self.drop_path(self.proj(attn_out))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
+
         return x
 
 
@@ -467,6 +340,43 @@ class SimplifiedTagger(nn.Module):
                 f"(max abs value: {rating_logits.abs().max():.2f})"
             )
 
+    def _create_block_mask(self, key_padding_mask: torch.Tensor, seq_len: int) -> BlockMask:
+        """Create BlockMask for padding-aware attention.
+
+        This method creates the mask once per forward pass, which is then shared
+        across all transformer layers for efficiency (instead of creating per-layer).
+
+        Args:
+            key_padding_mask: (B, L) bool, True=IGNORE (padding tokens)
+            seq_len: Sequence length
+
+        Returns:
+            BlockMask for use with flex_attention
+        """
+        B = key_padding_mask.shape[0]
+        attend_mask = ~key_padding_mask  # (B, L) True=ATTEND
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            # Both query and key must be non-padding for attention
+            # This prevents padding tokens from attending (wasteful) and being attended to
+            # Use bitwise & instead of logical 'and' for Triton 3.4+ compatibility
+            return attend_mask[b, q_idx] & attend_mask[b, kv_idx]
+
+        # Use first block's config for flex_block_size
+        flex_block_size = self.config.flex_block_size
+
+        # Use _compile=True for faster mask creation when Triton is available
+        return create_block_mask(
+            mask_mod,
+            B=B,
+            H=None,  # Broadcast across heads - mask is head-independent (saves memory)
+            Q_LEN=seq_len,
+            KV_LEN=seq_len,
+            device=str(key_padding_mask.device),
+            BLOCK_SIZE=min(flex_block_size, seq_len),
+            _compile=_TRITON_AVAILABLE,  # Requires Triton for compilation
+        )
+
     def forward(
         self,
         pixel_values: torch.Tensor,
@@ -496,7 +406,7 @@ class SimplifiedTagger(nn.Module):
             x = x.to(pixel_values.dtype)
         else:
             x = self.patch_embed(pixel_values)
-        x = x.flatten(2).transpose(1, 2)
+        x = x.flatten(2).transpose(1, 2).contiguous()
         # Add CLS token
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat([cls_tokens, x], dim=1)
@@ -521,6 +431,11 @@ class SimplifiedTagger(nn.Module):
                 if attn_kpm.all(dim=1).any().item():
                     raise RuntimeError("attn_kpm masks all keys for at least one sample.")
 
+        # Create BlockMask once for all layers (optimization: avoids creating per-layer)
+        block_mask: Optional[BlockMask] = None
+        if attn_kpm is not None and attn_kpm.any():
+            block_mask = self._create_block_mask(attn_kpm, x.size(1))
+
         # Transformer blocks with optional gradient checkpointing
         for block in self.blocks:
             if self.config.gradient_checkpointing and self.training:
@@ -528,19 +443,19 @@ class SimplifiedTagger(nn.Module):
                 # complex inputs like attention masks. It's also more memory efficient.
                 # See: https://pytorch.org/docs/stable/checkpoint.html
 
-                def create_block_forward(b, kpm):
+                def create_block_forward(b, mask):
                     """Create a closure that captures block and mask for checkpointing."""
                     def block_forward(hidden_states):
-                        return b(hidden_states, key_padding_mask=kpm)
+                        return b(hidden_states, block_mask=mask)
                     return block_forward
 
                 x = torch.utils.checkpoint.checkpoint(
-                    create_block_forward(block, attn_kpm),
+                    create_block_forward(block, block_mask),
                     x,
                     use_reentrant=False
                 )
             else:
-                x = block(x, key_padding_mask=attn_kpm)
+                x = block(x, block_mask=block_mask)
         # Final norm
         x = self.norm(x)
         # Use CLS token for classification
@@ -630,11 +545,11 @@ def create_model(config: Optional[VisionTransformerConfig] = None, **kwargs) -> 
 
     Examples:
         # Using config object
-        config = VisionTransformerConfig(image_size=640, num_tags=10000)
+        config = VisionTransformerConfig(image_size=512, num_tags=10000)
         model = create_model(config=config)
 
         # Using kwargs
-        model = create_model(image_size=640, num_tags=10000)
+        model = create_model(image_size=512, num_tags=10000)
     """
     if config is None:
         # Get the names of the fields in the VisionTransformerConfig dataclass

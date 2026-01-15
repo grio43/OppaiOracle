@@ -4,29 +4,19 @@ Metadata cache for SidecarJsonDataset.
 Caches parsed JSON metadata (image_id, tags, rating, dir) to avoid
 re-parsing millions of JSON files on every training run.
 
-Uses parallel processing with ThreadPoolExecutor to speed up initial cache
-creation, and safetensors for safe, fast serialization.
+Uses PyArrow IPC format for zero-copy memory-mapped access across workers.
 """
 
 from __future__ import annotations
-import gc
 import hashlib
-import io
 import json
 import logging
 import os
 import random
-import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-try:
-    from tqdm import tqdm
-    HAS_TQDM = True
-except ImportError:
-    HAS_TQDM = False
 
 # Try to use orjson for faster JSON parsing (5-10x faster than stdlib json)
 try:
@@ -39,9 +29,15 @@ except ImportError:
 from utils.path_utils import sanitize_identifier
 from utils.metadata_ingestion import parse_tags_field
 
-# Import safetensors for serialization
-from safetensors.torch import save_file, load_file
-import torch
+# PyArrow for zero-copy metadata cache (memory-mapped, shared across workers)
+try:
+    import pyarrow as pa
+    import pyarrow.ipc as pa_ipc
+    HAS_PYARROW = True
+except ImportError:
+    pa = None
+    pa_ipc = None
+    HAS_PYARROW = False
 
 # File locking for concurrent access prevention (required for data integrity)
 try:
@@ -58,10 +54,7 @@ except ImportError:
 
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent
-_CACHE_VERSION = "2.0"
-
-# Staleness check timeout (seconds) - configurable via env var for NAS/slow filesystems
-_STALENESS_TIMEOUT = int(os.environ.get("CACHE_STALENESS_TIMEOUT", "120"))
+_ARROW_CACHE_VERSION = "2.0"  # Arrow IPC format (added json_stem column)
 
 
 def _compute_file_list_hash(json_files: List[Path]) -> str:
@@ -69,18 +62,25 @@ def _compute_file_list_hash(json_files: List[Path]) -> str:
 
     For large datasets (>3000 files), samples first 1000, middle 1000, and last 1000
     files for performance while maintaining good coverage.
+
+    IMPORTANT: Sampling is done BEFORE path resolution to avoid O(n) filesystem
+    calls on huge datasets (5M+ files would take 10+ minutes otherwise).
     """
-    # Sort to ensure consistency
-    sorted_paths = sorted(str(p.resolve()) for p in json_files)
+    total = len(json_files)
 
-    # Sample if too large (hash first 1000, last 1000, middle 1000)
-    if len(sorted_paths) > 3000:
-        mid = len(sorted_paths) // 2
-        sample = sorted_paths[:1000] + sorted_paths[mid-500:mid+500] + sorted_paths[-1000:]
+    # Sample FIRST (before any resolve() calls) for large datasets
+    if total > 3000:
+        # Sort indices by string path for deterministic sampling
+        sorted_indices = sorted(range(total), key=lambda i: str(json_files[i]))
+        mid = total // 2
+        sample_indices = sorted_indices[:1000] + sorted_indices[mid-500:mid+500] + sorted_indices[-1000:]
+        # Only resolve the sampled paths (3000 max instead of 5M+)
+        sample_paths = [str(json_files[i].resolve()) for i in sample_indices]
     else:
-        sample = sorted_paths
+        # Small dataset: resolve all
+        sample_paths = sorted(str(p.resolve()) for p in json_files)
 
-    combined = "\n".join(sample)
+    combined = "\n".join(sample_paths)
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
 
 
@@ -101,10 +101,25 @@ def _compute_sample_size(total_files: int, requested_samples: int) -> int:
 
 
 def _stratified_sample(json_files: List[Path], sample_size: int) -> List[Path]:
-    """Sample files from different directories for better coverage."""
+    """Sample files from different directories for better coverage.
+
+    For huge datasets (>1M files), uses simple random sampling to avoid
+    O(n) iteration overhead. For smaller datasets, uses stratified sampling
+    across directories for better coverage.
+    """
     if sample_size >= len(json_files):
         return json_files
 
+    total = len(json_files)
+
+    # For huge datasets (>1M files), use simple random sampling
+    # Stratified grouping requires O(n) iteration which is too slow for 5M+ files
+    # Random sampling is O(sample_size) and provides sufficient coverage for staleness checks
+    if total > 1_000_000:
+        indices = random.sample(range(total), sample_size)
+        return [json_files[i] for i in indices]
+
+    # For smaller datasets, use stratified sampling across directories
     # Group by parent directory
     by_dir = {}
     for f in json_files:
@@ -128,204 +143,20 @@ def _stratified_sample(json_files: List[Path], sample_size: int) -> List[Path]:
     return samples[:sample_size]
 
 
-def _metadata_cache_path(root: Path) -> Path:
-    """Return cache file path for metadata cache for a given dataset root.
+def _arrow_cache_path(root: Path) -> Path:
+    """Return cache file path for Arrow IPC metadata cache.
 
-    Uses same hashing as split cache for consistency.
-    Files live under ./logs/metadata_cache/<sha1(root)>.metadata.safetensors
+    Files live under ./logs/metadata_cache/<sha1(root)>.metadata.arrow
     """
     cache_dir = _PROJ_ROOT / "logs" / "metadata_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha1(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
-    return cache_dir / f"{key}.metadata.safetensors"
+    return cache_dir / f"{key}.metadata.arrow"
 
 
-def _validate_cache(
-    cache_data: Dict[str, Any],
-    expected_count: int,
-    json_files: Optional[List[Path]],
-    logger: logging.Logger
-) -> bool:
-    """Validate loaded cache data for integrity (v2.0 with file list validation).
-
-    Args:
-        cache_data: Loaded cache dictionary
-        expected_count: Expected number of items
-        json_files: Optional list of JSON files for hash validation (None for backward compat)
-        logger: Logger instance
-
-    Returns:
-        True if valid, False otherwise
-    """
-    try:
-        # Check version field exists
-        if "version" not in cache_data:
-            logger.warning("Metadata cache missing version field. Cache will be rebuilt.")
-            return False
-
-        version = cache_data["version"]
-        # Decode version from tensor/array of ASCII bytes (robust handling)
-        if hasattr(version, 'tolist'):
-            # Works for both torch.Tensor and numpy arrays
-            version_bytes = version.tolist()
-        elif isinstance(version, (list, tuple)):
-            version_bytes = list(version)
-        else:
-            version_bytes = None
-
-        if version_bytes and all(isinstance(x, (int, float)) for x in version_bytes):
-            # Decode ASCII bytes to string
-            version = "".join(chr(int(x)) for x in version_bytes)
-        else:
-            version = str(version)
-
-        if version != _CACHE_VERSION:
-            logger.info(
-                f"Metadata cache version mismatch: {version} != {_CACHE_VERSION}. "
-                "Rebuilding with current version..."
-            )
-            return False
-
-        # Check required fields exist
-        required_fields = ["image_ids", "tags", "ratings", "dirs", "created_at"]
-        for field in required_fields:
-            if field not in cache_data:
-                logger.warning(f"Metadata cache missing required field: {field}. Cache will be rebuilt.")
-                return False
-
-        # Validate file list if json_files provided (v2.0 feature)
-        if json_files is not None:
-            # NOTE: Skipping file_list_hash validation - it's too expensive for large datasets
-            # (recomputing hash requires resolving all 5M+ paths which blocks for minutes).
-            # The file count check below provides sufficient validation.
-            # The file_list_hash field is still stored in the cache for future use.
-
-            # Validate file count
-            if "file_list_count" in cache_data:
-                cached_count_tensor = cache_data["file_list_count"]
-                cached_count = int(cached_count_tensor.item() if isinstance(cached_count_tensor, torch.Tensor) else cached_count_tensor)
-                actual_count = len(json_files)
-
-                # Tighter tolerance: 0.1% (down from 1%)
-                tolerance = max(100, int(actual_count * 0.001))
-                if abs(cached_count - actual_count) > tolerance:
-                    logger.info(
-                        f"File count changed: cache={cached_count}, current={actual_count}, "
-                        f"diff={abs(cached_count - actual_count)}, tolerance={tolerance} (0.1%). "
-                        "Rebuilding metadata cache..."
-                    )
-                    return False
-
-        # Check stored count field (v2.0: replaces incorrect byte-length comparison)
-        # NOTE: Previously compared tensor.size(0) which returns BYTE count, not entry count.
-        # Each field is stored as raw bytes (uint8), so byte lengths differ by field type.
-        if "count" not in cache_data:
-            logger.warning("Cache missing 'count' field. Cache will be rebuilt.")
-            return False
-
-        count_tensor = cache_data["count"]
-        cached_count = int(count_tensor.item() if isinstance(count_tensor, torch.Tensor) else count_tensor)
-
-        # Check count matches expectation (v2.0: tighter 0.1% tolerance, down from 1%)
-        tolerance_threshold = max(100, int(expected_count * 0.001))
-        if abs(cached_count - expected_count) > tolerance_threshold:
-            logger.info(
-                f"Metadata cache count mismatch: cached={cached_count}, expected={expected_count}, "
-                f"diff={abs(cached_count - expected_count)}, tolerance={tolerance_threshold} (0.1%). "
-                "Cache will be rebuilt."
-            )
-            return False
-
-        return True
-
-    except Exception as e:
-        logger.warning(f"Metadata cache validation error: {e}. Cache will be rebuilt.")
-        return False
-
-
-def _is_cache_stale(
-    cache_path: Path,
-    json_files: List[Path],
-    sample_size: int,
-    logger: logging.Logger
-) -> bool:
-    """Check if cache is stale using improved v2.0 sampling approach.
-
-    Uses:
-    - Dynamic sample size (scales with dataset size)
-    - Stratified sampling (directory-aware for better coverage)
-    - Parallel checking (16 workers for faster stat calls)
-
-    Args:
-        cache_path: Path to cache file
-        json_files: List of JSON file paths
-        sample_size: Base sample size (will be scaled dynamically)
-        logger: Logger instance
-
-    Returns:
-        True if cache is stale, False otherwise
-    """
-    try:
-        # Get cache creation time
-        cache_mtime = cache_path.stat().st_mtime
-
-        # Compute dynamic sample size based on dataset size
-        total_files = len(json_files)
-        if total_files == 0:
-            return False
-
-        effective_sample_size = _compute_sample_size(total_files, sample_size)
-
-        # Use stratified sampling for better coverage
-        sample_files = _stratified_sample(json_files, effective_sample_size)
-
-        logger.debug(
-            f"Staleness check: sampling {len(sample_files)} files "
-            f"({len(sample_files)/total_files*100:.2f}%) from {total_files} total"
-        )
-
-        # Parallel staleness checking with ThreadPoolExecutor
-        stale_files = []
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            def check_file(json_file: Path) -> Optional[Path]:
-                """Return file path if stale, None otherwise."""
-                try:
-                    if json_file.stat().st_mtime > cache_mtime:
-                        return json_file
-                except (OSError, FileNotFoundError):
-                    # File no longer exists - might indicate staleness
-                    pass
-                return None
-
-            futures = [executor.submit(check_file, f) for f in sample_files]
-            # Use configurable timeout (default 120s) for NAS/slow filesystem compatibility
-            for future in as_completed(futures, timeout=_STALENESS_TIMEOUT):
-                try:
-                    result = future.result()
-                    if result is not None:
-                        stale_files.append(result)
-                        # Early exit on first stale file found
-                        if len(stale_files) >= 1:
-                            break
-                except TimeoutError:
-                    logger.warning("Staleness check timed out")
-                    return True
-                except Exception:
-                    continue
-
-        if stale_files:
-            logger.info(
-                f"Metadata cache stale: {stale_files[0]} modified after cache creation "
-                f"(found {len(stale_files)} stale in sample)"
-            )
-            return True
-
-        return False
-
-    except Exception as e:
-        logger.warning(f"Staleness check failed: {e}")
-        # On error, assume cache is stale to be safe
-        return True
+def _arrow_meta_path(root: Path) -> Path:
+    """Return path for Arrow cache metadata file (.arrow.meta)."""
+    return _arrow_cache_path(root).with_suffix(".arrow.meta")
 
 
 def _parse_json_batch(
@@ -368,6 +199,7 @@ def _parse_json_batch(
                 "tags": tags_list,
                 "rating": rating,
                 "dir": str(jp.parent),  # Store as string for serialization
+                "json_stem": jp.stem,  # Original JSON filename stem for path reconstruction
             })
         except Exception as e:
             # Log warning but continue processing
@@ -377,456 +209,372 @@ def _parse_json_batch(
     return items
 
 
-def _encode_to_bytes(
-    items: List[Dict[str, Any]],
-    key: str,
-    transform=str,
-    logger: Optional[logging.Logger] = None,
-    field_name: str = ""
-) -> bytearray:
-    """Incrementally encode items to bytes without huge string allocations.
-
-    Uses io.BytesIO for efficient incremental encoding instead of joining
-    millions of strings into a massive intermediate string.
-
-    Args:
-        items: List of metadata dicts
-        key: Key to extract from each item
-        transform: Function to convert value to string (default: str)
-        logger: Optional logger for progress reporting
-        field_name: Name of field being encoded (for progress messages)
-
-    Returns:
-        bytearray containing newline-separated encoded values
-    """
-    buffer = io.BytesIO()
-    total = len(items)
-    progress_interval = max(500000, total // 10)  # Log every 10% or 500K items
-    start_time = time.time()
-
-    for i, item in enumerate(items):
-        if i > 0:
-            buffer.write(b"\n")
-        # Use errors='surrogateescape' to handle invalid UTF-8 sequences gracefully
-        # This prevents encoding failures on malformed metadata while preserving data
-        buffer.write(transform(item[key]).encode("utf-8", errors="surrogateescape"))
-
-        # Progress logging
-        if logger and (i + 1) % progress_interval == 0:
-            pct = (i + 1) * 100 // total
-            elapsed = time.time() - start_time
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            logger.info(f"  Encoding {field_name}: {i + 1:,}/{total:,} ({pct}%) @ {rate:,.0f}/s")
-
-    return bytearray(buffer.getvalue())
+# =============================================================================
+# Arrow IPC Cache Functions (Zero-Copy, Memory-Mapped)
+# =============================================================================
 
 
-def _build_metadata_cache(
+def _load_arrow_cache(
     cache_path: Path,
-    json_files: List[Path],
-    num_workers: int,
-    logger: logging.Logger
-) -> Optional[List[Dict[str, Any]]]:
-    """Build metadata cache using parallel processing.
+    logger: Optional[logging.Logger] = None
+) -> Optional["pa.Table"]:
+    """Load Arrow IPC cache as memory-mapped table.
+
+    The returned table is backed by a memory-mapped file, meaning:
+    - No data is copied to RAM on load (just sets up virtual memory mapping)
+    - Multiple processes can share the same physical memory pages
+    - Accessing any row triggers a page fault that loads just that data
 
     Args:
-        cache_path: Path where cache will be saved
-        json_files: List of JSON file paths to parse
-        num_workers: Number of parallel workers
-        logger: Logger instance
+        cache_path: Path to the Arrow IPC file
+        logger: Optional logger
 
     Returns:
-        List of parsed metadata dicts, or None on failure
+        PyArrow Table (memory-mapped), or None on failure
     """
+    if not HAS_PYARROW:
+        if logger:
+            logger.error("PyArrow not installed - cannot load Arrow cache")
+        return None
+
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
     try:
-        logger.info(
-            f"Building metadata cache with {num_workers} workers "
-            f"({len(json_files)} files)..."
-        )
         start_time = time.time()
 
-        # Split json_files into chunks for parallel processing
-        # Larger chunks (4096) reduce thread coordination overhead for huge datasets
-        # Target ~200-500 chunks for optimal parallelism
-        total_files = len(json_files)
-        if total_files > 1_000_000:
-            chunk_size = 8192  # 8K chunks for 5M+ files (~700 chunks)
-        elif total_files > 100_000:
-            chunk_size = 4096  # 4K chunks for 100K-1M files
-        else:
-            chunk_size = 1024  # Original size for smaller datasets
-        chunks = [
-            json_files[i:i + chunk_size]
-            for i in range(0, len(json_files), chunk_size)
-        ]
-
-        # Process chunks in parallel
-        all_items = []
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Submit all chunks
-            futures = {
-                executor.submit(_parse_json_batch, chunk, logger): chunk
-                for chunk in chunks
-            }
-
-            # Collect results with progress bar
-            if HAS_TQDM:
-                progress = tqdm(
-                    total=len(json_files),
-                    desc="Parsing metadata",
-                    unit="files",
-                    unit_scale=True
-                )
-            else:
-                progress = None
-
-            for future in as_completed(futures):
-                try:
-                    batch_items = future.result()
-                    all_items.extend(batch_items)
-
-                    if progress:
-                        progress.update(len(futures[future]))
-                    elif len(all_items) % 10000 == 0:
-                        logger.info(
-                            f"Parsed {len(all_items):,} / {len(json_files):,} files"
-                        )
-                except Exception as e:
-                    logger.warning(f"Batch processing failed: {e}")
-                    continue
-
-            if progress:
-                progress.close()
+        # Memory-map the file - this is nearly instant (no data copied)
+        source = pa.memory_map(str(cache_path), 'r')
+        reader = pa_ipc.open_file(source)
+        table = reader.read_all()
 
         elapsed = time.time() - start_time
         logger.info(
-            f"Parsed {len(all_items):,} files in {elapsed:.1f}s "
-            f"({len(all_items)/elapsed:.0f} files/sec)"
+            f"Loaded Arrow cache: {len(table):,} items in {elapsed:.2f}s "
+            f"(memory-mapped, {cache_path.stat().st_size / 1e6:.1f} MB)"
         )
+        return table
 
-        # Convert to columnar format for safetensors
-        logger.info("Serializing metadata cache...")
+    except Exception as e:
+        logger.error(f"Failed to load Arrow cache: {e}")
+        return None
 
-        # Build byte buffers incrementally (avoids huge string allocations)
-        # Using _encode_to_bytes instead of "\n".join() reduces memory pressure
-        # and speeds up serialization for millions of items
-        image_ids_bytes = _encode_to_bytes(
-            all_items, "image_id", logger=logger, field_name="image_ids"
-        )
-        # Use orjson for serialization if available (faster than json.dumps)
-        if HAS_ORJSON:
-            def tags_transform(tags):
-                return orjson.dumps(tags).decode("utf-8")
+
+def _build_arrow_cache(
+    json_files: List[Path],
+    cache_path: Path,
+    num_workers: int = 16,
+    logger: Optional[logging.Logger] = None
+) -> bool:
+    """Build Arrow IPC metadata cache from JSON files.
+
+    Uses parallel JSON parsing (reuses existing _parse_json_batch) and
+    writes to Arrow IPC format for memory-mapped access.
+
+    Args:
+        json_files: List of JSON file paths to parse
+        cache_path: Path where Arrow cache will be saved
+        num_workers: Number of parallel workers for JSON parsing
+        logger: Optional logger
+
+    Returns:
+        True on success, False on failure
+    """
+    if not HAS_PYARROW:
+        if logger:
+            logger.error("PyArrow not installed - cannot build Arrow cache")
+        return False
+
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    try:
+        total_files = len(json_files)
+        logger.info(f"Building Arrow metadata cache from {total_files:,} JSON files...")
+        start_time = time.time()
+
+        # --- Phase 1: Parse JSON files in parallel ---
+        # Reuse existing parallel parsing logic
+        # Determine chunk size based on dataset size
+        if total_files < 100000:
+            chunk_size = 1024
+        elif total_files < 1000000:
+            chunk_size = 4096
         else:
-            tags_transform = json.dumps
-        tags_bytes = _encode_to_bytes(
-            all_items, "tags", transform=tags_transform, logger=logger, field_name="tags"
-        )
-        ratings_bytes = _encode_to_bytes(
-            all_items, "rating", logger=logger, field_name="ratings"
-        )
-        dirs_bytes = _encode_to_bytes(
-            all_items, "dir", logger=logger, field_name="dirs"
-        )
-        logger.info("  Writing cache file...")
+            chunk_size = 8192
 
-        # Compute file list hash for v2.0 validation
-        file_list_hash = _compute_file_list_hash(json_files)
-        logger.debug(f"Metadata cache file list hash: {file_list_hash}")
+        chunks = [json_files[i:i + chunk_size] for i in range(0, total_files, chunk_size)]
+        all_items = []
 
-        # Create tensors from byte buffers with explicit clone to prevent dangling refs
-        # Using clone() ensures data is copied before bytearrays can be garbage collected
-        cache_tensors = {
-            "image_ids": torch.frombuffer(image_ids_bytes, dtype=torch.uint8).clone(),
-            "tags": torch.frombuffer(tags_bytes, dtype=torch.uint8).clone(),
-            "ratings": torch.frombuffer(ratings_bytes, dtype=torch.uint8).clone(),
-            "dirs": torch.frombuffer(dirs_bytes, dtype=torch.uint8).clone(),
-            "version": torch.tensor([ord(c) for c in _CACHE_VERSION], dtype=torch.uint8),
-            "created_at": torch.tensor([time.time()], dtype=torch.float64),
-            "count": torch.tensor([len(all_items)], dtype=torch.int64),
-            # v2.0 fields for validation
-            "file_list_hash": torch.tensor([ord(c) for c in file_list_hash], dtype=torch.uint8),
-            "file_list_count": torch.tensor([len(json_files)], dtype=torch.int64),
-        }
+        logger.info(f"  Parsing {total_files:,} files in {len(chunks)} chunks using {num_workers} workers...")
+        parse_start = time.time()
 
-        # Calculate expected minimum size for post-write verification
-        expected_data_size = (
-            len(image_ids_bytes) + len(tags_bytes) + len(ratings_bytes) + len(dirs_bytes)
-        )
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(_parse_json_batch, chunk, logger) for chunk in chunks]
 
-        # Atomic write with optional file locking for concurrent access prevention
-        temp_path = cache_path.with_suffix(".tmp")
-        lock_path = cache_path.with_suffix(".lock")
+            for i, future in enumerate(as_completed(futures)):
+                try:
+                    items = future.result()
+                    all_items.extend(items)
+                except Exception as e:
+                    logger.warning(f"Chunk parsing failed: {e}")
 
-        def _do_atomic_write():
+                # Progress logging
+                if (i + 1) % max(1, len(chunks) // 10) == 0:
+                    pct = (i + 1) * 100 // len(chunks)
+                    logger.info(f"  Parsing progress: {i + 1}/{len(chunks)} chunks ({pct}%)")
+
+        parse_elapsed = time.time() - parse_start
+        logger.info(f"  Parsed {len(all_items):,} items in {parse_elapsed:.1f}s")
+
+        if not all_items:
+            logger.error("No items parsed from JSON files")
+            return False
+
+        # --- Phase 2: Build PyArrow Table ---
+        logger.info("  Building Arrow table...")
+        arrow_start = time.time()
+
+        # Extract columns
+        image_ids = [item["image_id"] for item in all_items]
+        tags_lists = [item["tags"] for item in all_items]
+        ratings = [item["rating"] for item in all_items]
+        dirs = [item["dir"] for item in all_items]
+        json_stems = [item["json_stem"] for item in all_items]
+
+        # Create PyArrow arrays
+        # Tags use list type for variable-length arrays
+        table = pa.table({
+            "image_id": pa.array(image_ids, type=pa.string()),
+            "tags": pa.array(tags_lists, type=pa.list_(pa.string())),
+            "rating": pa.array(ratings, type=pa.string()),
+            "dir": pa.array(dirs, type=pa.string()),
+            "json_stem": pa.array(json_stems, type=pa.string()),
+        })
+
+        arrow_elapsed = time.time() - arrow_start
+        logger.info(f"  Built Arrow table in {arrow_elapsed:.1f}s")
+
+        # --- Phase 3: Write to IPC file ---
+        logger.info("  Writing Arrow IPC file...")
+        write_start = time.time()
+
+        # Write to temp file first, then atomic rename
+        temp_path = cache_path.with_suffix(".arrow.tmp")
+        lock_path = cache_path.with_suffix(".arrow.lock")
+
+        def _do_arrow_write():
             """Perform the atomic write operations."""
-            save_file(cache_tensors, str(temp_path))
-            # Atomic rename using os.replace() - works on all platforms and
-            # automatically overwrites destination without TOCTOU race
-            os.replace(str(temp_path), str(cache_path))
+            try:
+                with pa.OSFile(str(temp_path), 'wb') as sink:
+                    with pa_ipc.new_file(sink, table.schema) as writer:
+                        # Write in batches to control memory
+                        batch_size = 100000
+                        for i in range(0, len(table), batch_size):
+                            batch = table.slice(i, min(batch_size, len(table) - i))
+                            writer.write_table(batch)
+
+                # Atomic rename
+                os.replace(temp_path, cache_path)
+
+            except Exception:
+                # Clean up temp file on error
+                if temp_path.exists():
+                    temp_path.unlink()
+                raise
 
         # Use file locking if available (prevents concurrent write corruption)
         if HAS_FILELOCK:
-            with filelock.FileLock(lock_path, timeout=600):  # 10 min timeout for large caches
-                _do_atomic_write()
+            try:
+                with filelock.FileLock(lock_path, timeout=600):  # 10 min timeout for large caches
+                    _do_arrow_write()
+            except filelock.Timeout:
+                logger.error(
+                    f"Timeout acquiring cache lock after 600s - another process may be building. "
+                    f"Lock file: {lock_path}"
+                )
+                return False
         else:
-            _do_atomic_write()
+            _do_arrow_write()
 
-        # Post-write verification: ensure file is complete and valid
-        # Use safetensors safe_open to verify file integrity, not just size
-        from safetensors import safe_open
-        try:
-            with safe_open(str(cache_path), framework="pt") as f:
-                # Verify all expected keys are present
-                saved_keys = set(f.keys())
-                expected_keys = {"image_ids", "tags", "ratings", "dirs", "version", "created_at", "count"}
-                missing_keys = expected_keys - saved_keys
-                if missing_keys:
-                    raise ValueError(f"Cache file missing keys after write: {missing_keys}")
-        except Exception as e:
-            raise ValueError(f"Cache file verification failed: {e}") from e
+        write_elapsed = time.time() - write_start
+        file_size_mb = cache_path.stat().st_size / 1e6
+        logger.info(f"  Wrote Arrow IPC file in {write_elapsed:.1f}s ({file_size_mb:.1f} MB)")
 
-        saved_size = cache_path.stat().st_size
-        if saved_size < expected_data_size * 0.3:  # Safetensors has some compression
-            raise ValueError(
-                f"Cache file too small after write: {saved_size} bytes "
-                f"(expected at least {expected_data_size * 0.3:.0f} bytes)"
-            )
+        # --- Phase 4: Write metadata file ---
+        meta_path = cache_path.with_suffix(".arrow.meta")
+        meta_data = {
+            "version": _ARROW_CACHE_VERSION,
+            "count": len(table),
+            "file_list_hash": _compute_file_list_hash(json_files),
+            "file_count": len(json_files),
+            "created_at": time.time(),
+        }
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta_data, f, indent=2)
 
-        cache_size_mb = saved_size / (1024 * 1024)
+        total_elapsed = time.time() - start_time
         logger.info(
-            f"Metadata cache saved to {cache_path} ({cache_size_mb:.1f} MB)"
+            f"Arrow metadata cache built: {len(table):,} items in {total_elapsed:.1f}s "
+            f"({file_size_mb:.1f} MB)"
         )
-
-        return all_items
+        return True
 
     except Exception as e:
-        logger.error(f"Failed to build metadata cache: {e}", exc_info=True)
-        # Clean up partial cache file
-        try:
-            if cache_path.exists():
-                cache_path.unlink()
-            temp_path = cache_path.with_suffix(".tmp")
-            if temp_path.exists():
-                temp_path.unlink()
-        except Exception:
-            pass
-        return None
+        logger.error(f"Failed to build Arrow cache: {e}", exc_info=True)
+        return False
 
 
-def _load_cached_metadata(
+def _is_arrow_cache_stale(
     cache_path: Path,
-    expected_count: int,
-    json_files: Optional[List[Path]],
-    logger: logging.Logger
-) -> Optional[List[Dict[str, Any]]]:
-    """Load metadata from cache file with v2.0 validation.
+    json_files: List[Path],
+    staleness_check_samples: int = 100,
+    logger: Optional[logging.Logger] = None
+) -> bool:
+    """Check if Arrow cache is stale.
 
     Args:
-        cache_path: Path to cache file
-        expected_count: Expected number of items
-        json_files: Optional list of JSON files for validation (v2.0 feature)
-        logger: Logger instance
+        cache_path: Path to Arrow cache file
+        json_files: Current list of JSON files
+        staleness_check_samples: Base sample size for staleness check
+        logger: Optional logger
 
     Returns:
-        List of parsed metadata dicts, or None on failure
+        True if cache is stale, False otherwise
     """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
     try:
-        logger.info(f"Loading metadata cache from {cache_path}...")
-        start_time = time.time()
+        meta_path = cache_path.with_suffix(".arrow.meta")
 
-        # Load cache file
-        cache_data = load_file(str(cache_path))
-        load_elapsed = time.time() - start_time
-        logger.info(f"  Cache file loaded in {load_elapsed:.1f}s, validating...")
+        # Check meta file exists
+        if not meta_path.exists():
+            logger.info("Arrow cache meta file not found")
+            return True
 
-        # Validate cache (v2.0: includes file list validation)
-        if not _validate_cache(cache_data, expected_count, json_files, logger):
-            return None
+        # Load and validate meta
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
 
-        # Pre-validate tensor sizes before expensive decode operation
-        # This catches corruption early without wasting memory on decoding
-        tensor_sizes = {
-            "image_ids": cache_data["image_ids"].size(0),
-            "tags": cache_data["tags"].size(0),
-            "ratings": cache_data["ratings"].size(0),
-            "dirs": cache_data["dirs"].size(0),
-        }
-        # Quick sanity check: all tensors should have some data
-        if any(s == 0 for s in tensor_sizes.values()):
-            logger.error(f"Empty tensor detected in cache: {tensor_sizes}")
-            del cache_data
-            return None
+        # Version check
+        if meta.get("version") != _ARROW_CACHE_VERSION:
+            logger.info(f"Arrow cache version mismatch: {meta.get('version')} != {_ARROW_CACHE_VERSION}")
+            return True
 
-        # Decode string tensors - process each field separately to reduce peak memory
-        logger.info("  Decoding tensors to strings...")
-        decode_start = time.time()
+        # File count check (with tolerance)
+        cached_count = meta.get("file_count", 0)
+        current_count = len(json_files)
+        tolerance = max(100, int(current_count * 0.001))  # 0.1% tolerance
+        if abs(cached_count - current_count) > tolerance:
+            logger.info(
+                f"Arrow cache file count drift: {cached_count:,} cached vs {current_count:,} current "
+                f"(tolerance: {tolerance})"
+            )
+            return True
 
-        # Decode each field and immediately free intermediate bytes to reduce memory
-        # Use errors='surrogateescape' to match encoding and filter empty strings from trailing newlines
-        image_ids_bytes = cache_data["image_ids"].numpy().tobytes()
-        image_ids = [s for s in image_ids_bytes.decode("utf-8", errors="surrogateescape").split("\n") if s]
-        del image_ids_bytes
+        # Sample-based mtime check (reuse existing logic)
+        cache_mtime = cache_path.stat().st_mtime
+        sample_size = _compute_sample_size(current_count, staleness_check_samples)
+        samples = _stratified_sample(json_files, sample_size)
 
-        tags_bytes = cache_data["tags"].numpy().tobytes()
-        tags_json = [s for s in tags_bytes.decode("utf-8", errors="surrogateescape").split("\n") if s]
-        del tags_bytes
-
-        ratings_bytes = cache_data["ratings"].numpy().tobytes()
-        ratings = [s for s in ratings_bytes.decode("utf-8", errors="surrogateescape").split("\n") if s]
-        del ratings_bytes
-
-        dirs_bytes = cache_data["dirs"].numpy().tobytes()
-        dirs = [s for s in dirs_bytes.decode("utf-8", errors="surrogateescape").split("\n") if s]
-        del dirs_bytes
-
-        # Force garbage collection after heavy allocations
-        gc.collect()
-
-        # Validate array lengths match (critical for data integrity)
-        array_lengths = {
-            "image_ids": len(image_ids),
-            "tags": len(tags_json),
-            "ratings": len(ratings),
-            "dirs": len(dirs),
-        }
-        if len(set(array_lengths.values())) != 1:
-            logger.error(f"Array length mismatch in cache: {array_lengths}")
-            return None  # Force rebuild
-
-        decode_elapsed = time.time() - decode_start
-        total_items = array_lengths["image_ids"]
-        logger.info(f"  Decoded {total_items:,} items in {decode_elapsed:.1f}s, deserializing tags...")
-
-        # Choose JSON parser (orjson is 5-10x faster)
-        if HAS_ORJSON:
-            json_loads = orjson.loads
-        else:
-            json_loads = json.loads
-
-        # Reconstruct items list with progress logging
-        items = []
-        failed_indices = []
-        progress_interval = max(100000, total_items // 10)  # Log every 10% or 100K items
-        deserialize_start = time.time()
-
-        for i in range(total_items):
+        # Check if any sampled file is newer than cache
+        for jp in samples:
             try:
-                items.append({
-                    "image_id": image_ids[i],
-                    "tags": json_loads(tags_json[i]),
-                    "rating": ratings[i],
-                    "dir": Path(dirs[i]),
-                })
-            except Exception as e:
-                failed_indices.append(i)
-                if len(failed_indices) <= 10:  # Log first 10 errors for debugging
-                    logger.warning(f"Failed to deserialize item {i}: {e}")
+                if jp.stat().st_mtime > cache_mtime:
+                    logger.info(f"Arrow cache stale: {jp} modified after cache")
+                    return True
+            except OSError:
                 continue
 
-            # Progress logging
-            if (i + 1) % progress_interval == 0:
-                pct = (i + 1) * 100 // total_items
-                elapsed_deser = time.time() - deserialize_start
-                rate = (i + 1) / elapsed_deser if elapsed_deser > 0 else 0
-                remaining = (total_items - i - 1) / rate if rate > 0 else 0
-                logger.info(
-                    f"  Deserializing: {i + 1:,}/{total_items:,} ({pct}%) "
-                    f"@ {rate:,.0f} items/s, ~{remaining:.0f}s remaining"
-                )
-
-        # Check error rate - zero tolerance for deserialization errors
-        # Any failed item could cause training crashes later
-        if failed_indices:
-            error_rate = len(failed_indices) / total_items
-            logger.error(
-                f"Deserialization failed for {len(failed_indices):,} items ({error_rate:.2%}). "
-                "Cache will be rebuilt to ensure data integrity."
-            )
-            # Zero tolerance: any deserialization error triggers rebuild
-            return None
-
-        elapsed = time.time() - start_time
-        logger.info(
-            f"Loaded {len(items):,} items from metadata cache in {elapsed:.1f}s"
-            + (f" (using orjson)" if HAS_ORJSON else "")
-        )
-
-        return items
+        return False
 
     except Exception as e:
-        logger.error(f"Failed to load metadata cache: {e}", exc_info=True)
-        return None
+        logger.warning(f"Arrow staleness check failed: {e}")
+        return True  # Assume stale on error
 
 
-def try_load_metadata_cache(
+def try_load_arrow_cache(
     root_dir: Path,
     json_files: List[Path],
     force_rebuild: bool = False,
     num_workers: int = 16,
     staleness_check_samples: int = 100,
     logger: Optional[logging.Logger] = None
-) -> Optional[List[Dict[str, Any]]]:
-    """Try to load metadata from cache, building if necessary.
+) -> Optional["pa.Table"]:
+    """Load or build Arrow metadata cache.
 
-    Main entry point for metadata caching. Attempts to load from cache,
-    validates freshness, and rebuilds if needed.
+    Main entry point for Arrow-based metadata caching. Attempts to load
+    from existing cache, validates freshness, and rebuilds if needed.
 
     Args:
         root_dir: Dataset root directory
-        json_files: List of JSON file paths
+        json_files: List of JSON metadata files
         force_rebuild: Force cache rebuild even if valid
-        num_workers: Number of parallel workers for cache building
-        staleness_check_samples: Number of files to sample for staleness check
-        logger: Logger instance (creates default if None)
+        num_workers: Workers for parallel JSON parsing
+        staleness_check_samples: Base sample size for staleness check
+        logger: Logger instance
 
     Returns:
-        List of parsed metadata dicts, or None on failure (triggers fallback)
+        PyArrow Table (memory-mapped) on success, None on failure
     """
+    if not HAS_PYARROW:
+        if logger:
+            logger.warning(
+                "PyArrow not installed - falling back to legacy cache. "
+                "Install with: pip install pyarrow>=14.0.0"
+            )
+        return None
+
     if logger is None:
         logger = logging.getLogger(__name__)
 
     try:
-        cache_path = _metadata_cache_path(root_dir)
-        expected_count = len(json_files)
-
-        # Check if we should use cache
+        cache_path = _arrow_cache_path(root_dir)
         cache_exists = cache_path.exists()
-        should_rebuild = force_rebuild
 
+        # Try existing cache
         if cache_exists and not force_rebuild:
-            # Check if cache is stale
-            if _is_cache_stale(cache_path, json_files, staleness_check_samples, logger):
-                logger.info("Metadata cache is stale, rebuilding...")
-                should_rebuild = True
-            else:
-                # Try to load cache (v2.0: with file list validation)
-                items = _load_cached_metadata(cache_path, expected_count, json_files, logger)
-                if items is not None:
-                    return items
-                else:
-                    logger.warning("Failed to load cache, rebuilding...")
-                    should_rebuild = True
+            if not _is_arrow_cache_stale(cache_path, json_files, staleness_check_samples, logger):
+                table = _load_arrow_cache(cache_path, logger)
+                if table is not None:
+                    # Validate row count against metadata
+                    meta_path = cache_path.with_suffix(".arrow.meta")
+                    if not meta_path.exists():
+                        logger.warning(
+                            "Arrow cache metadata file missing - treating as invalid"
+                        )
+                        # Fall through to rebuild
+                    else:
+                        with open(meta_path, 'r', encoding='utf-8') as f:
+                            meta = json.load(f)
+                        expected_count = meta.get("count", 0)
+                        if len(table) != expected_count:
+                            logger.warning(
+                                f"Arrow cache count mismatch: {len(table)} vs {expected_count}"
+                            )
+                            # Fall through to rebuild
+                        else:
+                            return table
 
-        # Build cache if needed
-        if should_rebuild or not cache_exists:
-            # Delete old cache if it exists
-            if cache_exists:
-                try:
-                    cache_path.unlink()
-                except Exception:
-                    pass
+            logger.info("Arrow cache is stale or invalid, rebuilding...")
 
-            # Build new cache
-            items = _build_metadata_cache(
-                cache_path, json_files, num_workers, logger
-            )
-            return items
+        # Build new cache
+        if cache_exists:
+            try:
+                cache_path.unlink()
+                meta_path = cache_path.with_suffix(".arrow.meta")
+                if meta_path.exists():
+                    meta_path.unlink()
+            except Exception:
+                pass
 
-        # Should not reach here
-        return None
+        success = _build_arrow_cache(json_files, cache_path, num_workers, logger)
+        if success:
+            return _load_arrow_cache(cache_path, logger)
+        else:
+            return None
 
     except Exception as e:
-        logger.error(f"Metadata cache error: {e}", exc_info=True)
-        # Return None to trigger fallback to sequential parsing
+        logger.error(f"Arrow cache error: {e}", exc_info=True)
         return None

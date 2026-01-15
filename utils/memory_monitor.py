@@ -18,21 +18,51 @@ class MemoryMonitor:
         Args:
             warn_threshold_gb: System memory threshold for warning.
                 Can be overridden via MEMORY_WARN_THRESHOLD_GB env var.
-                Default: 115 GB
+                Default: 90% of system memory
             critical_threshold_gb: System memory threshold for critical alert.
                 Can be overridden via MEMORY_CRITICAL_THRESHOLD_GB env var.
-                Default: 125 GB
+                Default: 95% of system memory
         """
+        # Get system memory for auto-scaling defaults
+        total_memory_gb = psutil.virtual_memory().total / (1024**3)
+
+        # Auto-scale defaults based on system memory (90% warn, 95% critical)
+        default_warn = total_memory_gb * 0.90
+        default_critical = total_memory_gb * 0.95
+
         # Allow env var override for different system configurations
         if warn_threshold_gb is None:
-            warn_threshold_gb = float(os.environ.get("MEMORY_WARN_THRESHOLD_GB", "115.0"))
+            warn_threshold_gb = float(os.environ.get("MEMORY_WARN_THRESHOLD_GB", str(default_warn)))
         if critical_threshold_gb is None:
-            critical_threshold_gb = float(os.environ.get("MEMORY_CRITICAL_THRESHOLD_GB", "125.0"))
+            critical_threshold_gb = float(os.environ.get("MEMORY_CRITICAL_THRESHOLD_GB", str(default_critical)))
+
+        # Validate thresholds
+        if warn_threshold_gb <= 0:
+            raise ValueError(f"warn_threshold_gb must be positive, got {warn_threshold_gb}")
+        if critical_threshold_gb <= 0:
+            raise ValueError(f"critical_threshold_gb must be positive, got {critical_threshold_gb}")
+        if warn_threshold_gb >= critical_threshold_gb:
+            logging.warning(
+                f"warn_threshold_gb ({warn_threshold_gb:.1f}) >= critical_threshold_gb ({critical_threshold_gb:.1f}), "
+                f"adjusting warn to 90% of critical"
+            )
+            warn_threshold_gb = critical_threshold_gb * 0.90
 
         self.warn_threshold_gb = warn_threshold_gb
         self.critical_threshold_gb = critical_threshold_gb
+        self.total_memory_gb = total_memory_gb
         self.last_warning = 0
         self.warning_interval = 300  # Warn every 5 minutes max
+
+        # Cache for expensive children process enumeration
+        self._children_mem_cache = 0.0
+        self._children_cache_time = 0.0
+        self._children_cache_interval = 30.0  # Refresh children mem every 30 seconds
+
+        logging.debug(
+            f"MemoryMonitor initialized: system={total_memory_gb:.1f}GB, "
+            f"warn={warn_threshold_gb:.1f}GB, critical={critical_threshold_gb:.1f}GB"
+        )
 
     def check_memory(self) -> Dict[str, float]:
         """Check current memory usage and alert if needed.
@@ -57,21 +87,27 @@ class MemoryMonitor:
         process_mem_gb = process.memory_info().rss / (1024**3)
 
         # Children memory (DataLoader workers, L2 writer, etc.)
-        children_mem_gb = 0
-        try:
-            for child in process.children(recursive=True):
-                try:
-                    children_mem_gb += child.memory_info().rss / (1024**3)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    # Child may have died between iteration and memory query
-                    pass
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
+        # Use cached value if recent enough to avoid expensive process tree traversal
+        now = time.time()
+        if now - self._children_cache_time > self._children_cache_interval:
+            children_mem_gb = 0
+            try:
+                for child in process.children(recursive=True):
+                    try:
+                        children_mem_gb += child.memory_info().rss / (1024**3)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        # Child may have died between iteration and memory query
+                        pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            self._children_mem_cache = children_mem_gb
+            self._children_cache_time = now
+        else:
+            children_mem_gb = self._children_mem_cache
 
         total_process_gb = process_mem_gb + children_mem_gb
 
-        # Alert if needed
-        now = time.time()
+        # Alert if needed (reuse 'now' from cache check above)
         if used_gb > self.critical_threshold_gb:
             if now - self.last_warning > self.warning_interval:
                 logging.error(

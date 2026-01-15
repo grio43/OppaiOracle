@@ -80,27 +80,62 @@ def _check_versions_and_env(opset: int) -> None:
         _fail(f"opset >= 18 required (requested {opset}). Set export.opset_version to 18 or 19.")
 
 class InferenceWrapper(nn.Module):
-    def __init__(self, model, image_size, normalize_mean, normalize_std):
+    """Wrapper that adds preprocessing matching the training pipeline.
+
+    Preprocessing steps (matching dataset_loader.py):
+    1. Convert from uint8 (B, H, W, C) to float32 (B, C, H, W)
+    2. Letterbox resize: scale to fit target while preserving aspect ratio
+    3. Pad to square with gray background (114, 114, 114)
+    4. Normalize with mean/std
+    """
+
+    def __init__(self, model, image_size, normalize_mean, normalize_std, pad_color=(114, 114, 114)):
         super().__init__()
         self.model = model
         self.image_size = image_size
         self.register_buffer('mean', torch.tensor(normalize_mean).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor(normalize_std).view(1, 3, 1, 1))
+        # Pad color normalized to 0-1 range for canvas creation
+        self.register_buffer('pad_color', torch.tensor(pad_color).float() / 255.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Assuming input is (B, H, W, C) uint8
-        x = x.permute(0, 3, 1, 2).contiguous()  # to (B, C, H, W)
-        x = x.to(torch.float32) / 255.0
-        
-        # Resize
-        x = F.interpolate(x, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
-        
+        # Input: (B, H, W, C) uint8
+        B, H, W, C = x.shape
+        target = self.image_size
+
+        # Convert to (B, C, H, W) float32 in 0-1 range
+        x = x.permute(0, 3, 1, 2).contiguous().to(torch.float32) / 255.0
+
+        # Letterbox resize: compute scale to fit inside target while preserving aspect ratio
+        # Match training: scale = min(target/w, target/h), capped at 1.0 (no upscaling)
+        scale_w = target / W
+        scale_h = target / H
+        scale = min(scale_w, scale_h, 1.0)  # Never upscale, only downscale
+
+        new_w = max(1, int(round(W * scale)))
+        new_h = max(1, int(round(H * scale)))
+
+        # Resize with bilinear interpolation (matching PIL BILINEAR in training)
+        if new_w != W or new_h != H:
+            x = F.interpolate(x, size=(new_h, new_w), mode='bilinear', align_corners=False)
+
+        # Create canvas with pad color and center the image
+        # pad_color is (3,) tensor, expand to (1, 3, 1, 1) for broadcasting
+        canvas = self.pad_color.view(1, 3, 1, 1).expand(B, 3, target, target).clone()
+
+        # Calculate centering offsets
+        left = (target - new_w) // 2
+        top = (target - new_h) // 2
+
+        # Paste resized image onto canvas
+        canvas[:, :, top:top + new_h, left:left + new_w] = x
+
         # Normalize
-        x = (x - self.mean) / self.std
-        
+        x = (canvas - self.mean) / self.std
+
         # Run model
         outputs = self.model(x)
-        
+
         # Return only tag_logits for ONNX export
         if isinstance(outputs, dict):
             return outputs['tag_logits']
@@ -266,7 +301,7 @@ class ONNXExporter:
                                 config['hidden_size'] = layer.self_attn.embed_dim
         
         # Calculate sequence length
-        num_patches = (self.config.image_size // config['patch_size']) ** 2
+        num_patches = (self.config.model.image_size // config['patch_size']) ** 2
         config['sequence_length'] = num_patches + 2  # +2 for special tokens (CLS, etc.)
         
         return config
@@ -324,12 +359,14 @@ class ONNXExporter:
         
         model.eval()
         
-        # Wrap model for inference
+        # Wrap model for inference with preprocessing matching training pipeline
+        pad_color = getattr(self.config.data, 'pad_color', (114, 114, 114))
         wrapped_model = InferenceWrapper(
             model,
             image_size=self.config.data.image_size,
             normalize_mean=self.config.data.normalize_mean,
-            normalize_std=self.config.data.normalize_std
+            normalize_std=self.config.data.normalize_std,
+            pad_color=pad_color
         )
         wrapped_model.to(self.device)
         
@@ -501,7 +538,7 @@ class ONNXExporter:
                 )
         except Exception as e:
             logger.warning(f"Could not determine opset version: {e}")
-            opset_version = self.config.opset_version
+            opset_version = self.export_config.opset_version
 
         try:
             # Try to use ONNX Runtime transformer optimizer (correct API)
@@ -566,14 +603,17 @@ class ONNXExporter:
 
             model = onnx.load(str(model_path))
 
+            batch_size = self.config.data.batch_size
+            image_size = self.config.data.image_size
+
             # Simplify with onnx-simplifier
+            # Input shape is (B, H, W, C) for the raw image input
             model_simp, check = simplify(
                 model,
                 check_n=3,
                 perform_optimization=True,
                 skip_fuse_bn=False,
-                input_shapes={'input_image': [self.config.batch_size, 3,
-                             self.config.image_size, self.config.image_size]}
+                input_shapes={'input_image': [batch_size, image_size, image_size, 3]}
             )
 
             if check:
@@ -594,12 +634,15 @@ class ONNXExporter:
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         try:
             session = ort.InferenceSession(str(model_path), providers=providers)
-            # Test with dummy input
-            test_input = np.random.randn(
-                self.config.batch_size, 3,
-                self.config.image_size, self.config.image_size
-            ).astype(np.float32)
-            session.run(None, {self.config.input_names[0]: test_input})
+            # Test with dummy input matching export format: (B, H, W, C) uint8
+            batch_size = self.config.data.batch_size
+            image_size = self.config.data.image_size
+            test_input = np.random.randint(
+                0, 255,
+                (batch_size, image_size, image_size, 3),
+                dtype=np.uint8
+            )
+            session.run(None, {"input_image": test_input})
             logger.info("✓ Model inference validation passed")
             return True
         except Exception as e:
@@ -621,7 +664,7 @@ class ONNXExporter:
             )
             
             # Validate quantized model
-            if self.config.validate_export:
+            if self.export_config.validate_export:
                 self._validate_model(output_path)
             
             logger.info("✓ Dynamic quantization complete")
@@ -654,6 +697,7 @@ class ONNXExporter:
             # Prepare vocabulary for embedding
             vocab_b64 = ''
             vocab_sha = ''
+            vocab_embedded_successfully = False  # Initialize to prevent NameError
 
             # First, try to use the vocabulary we already loaded
             if hasattr(self, 'vocab') and self.vocab is not None:
@@ -784,19 +828,21 @@ class ONNXExporter:
         '''DEPRECATED: Old validation method that combines structure and inference checks'''
         logger.info("Validating ONNX model...")
 
+        batch_size = self.config.data.batch_size
+        image_size = self.config.data.image_size
+
         try:
             # Check model structure
             model = onnx.load(str(model_path))
             onnx.checker.check_model(model)
             logger.info("✓ ONNX model structure is valid")
 
-            # Create test input
-            test_input = np.random.randn(
-                self.config.batch_size,
-                3,
-                self.config.image_size,
-                self.config.image_size
-            ).astype(np.float32)
+            # Create test input matching export format: (B, H, W, C) uint8
+            test_input = np.random.randint(
+                0, 255,
+                (batch_size, image_size, image_size, 3),
+                dtype=np.uint8
+            )
 
             # Run inference with PyTorch
             torch_input = torch.from_numpy(test_input).to(self.device)
@@ -817,7 +863,7 @@ class ONNXExporter:
 
             onnx_outputs = session.run(
                 None,
-                {self.config.input_names[0]: test_input}
+                {"input_image": test_input}
             )
 
             onnx_scores = onnx_outputs[0]
@@ -826,8 +872,8 @@ class ONNXExporter:
             max_diff = np.max(np.abs(torch_scores - onnx_scores))
             mean_diff = np.mean(np.abs(torch_scores - onnx_scores))
 
-            rtol = self.config.tolerance_rtol
-            atol = self.config.tolerance_atol
+            rtol = getattr(self.export_config, 'tolerance_rtol', 1e-3)
+            atol = getattr(self.export_config, 'tolerance_atol', 1e-5)
             if max_diff < 5e-4:
                 rtol = max(rtol, 1e-3)
                 atol = max(atol, 5e-4)
@@ -932,41 +978,43 @@ class ONNXExporter:
     def benchmark(self, model_path: Path, num_runs: int = 100):
         """Benchmark ONNX model performance"""
         logger.info(f"\nBenchmarking model: {model_path}")
-        
+
         if not model_path.exists():
             logger.error(f"Model not found: {model_path}")
             return None
-        
+
+        batch_size = self.config.data.batch_size
+        image_size = self.config.data.image_size
+
         try:
             # Create session
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
             session = ort.InferenceSession(str(model_path), providers=providers)
-            
+
             # Log which provider is being used
             logger.info(f"Using providers: {session.get_providers()}")
-            
-            # Prepare input
-            input_data = np.random.randn(
-                self.config.batch_size,
-                3,
-                self.config.image_size,
-                self.config.image_size
-            ).astype(np.float32)
-            
+
+            # Prepare input matching export format: (B, H, W, C) uint8
+            input_data = np.random.randint(
+                0, 255,
+                (batch_size, image_size, image_size, 3),
+                dtype=np.uint8
+            )
+
             # Warmup runs
             logger.info("Warming up...")
             for _ in range(5):
-                _ = session.run(None, {self.config.input_names[0]: input_data})
-            
+                _ = session.run(None, {"input_image": input_data})
+
             # Benchmark runs
             logger.info(f"Running {num_runs} inference iterations...")
             times = []
             for _ in tqdm(range(num_runs), desc="Benchmarking"):
                 start = time.perf_counter()
-                _ = session.run(None, {self.config.input_names[0]: input_data})
+                _ = session.run(None, {"input_image": input_data})
                 end = time.perf_counter()
                 times.append((end - start) * 1000)  # Convert to ms
-            
+
             # Compute statistics
             times = np.array(times)
             results = {
@@ -977,15 +1025,15 @@ class ONNXExporter:
                 'median_ms': np.median(times),
                 'p95_ms': np.percentile(times, 95),
                 'p99_ms': np.percentile(times, 99),
-                'throughput_fps': 1000 / np.mean(times) * self.config.batch_size
+                'throughput_fps': 1000 / np.mean(times) * batch_size
             }
-            
+
             logger.info("\n" + "="*60)
             logger.info("BENCHMARK RESULTS")
             logger.info("="*60)
             logger.info(f"Model: {model_path.name}")
-            logger.info(f"Batch size: {self.config.batch_size}")
-            logger.info(f"Image size: {self.config.image_size}x{self.config.image_size}")
+            logger.info(f"Batch size: {batch_size}")
+            logger.info(f"Image size: {image_size}x{image_size}")
             logger.info(f"Device: {self.device}")
             logger.info(f"Iterations: {num_runs}")
             logger.info("-"*60)

@@ -96,15 +96,39 @@ def analyze_shard(shard_path, dry_run=True):
     # Delete files if not dry run
     if not dry_run and files_to_delete:
         for file_pair in files_to_delete:
-            try:
-                # Delete JSON file
-                file_pair['json'].unlink()
-                stats['deleted_json'] += 1
+            json_deleted = False
+            image_deleted = False
 
-                # Delete image file
+            try:
+                # Try to delete image first (if it exists)
+                # This order is safer: if JSON exists without image, it's still usable
+                # But if image exists without JSON, it's an orphan that's hard to clean up
                 if file_pair['image']:
-                    file_pair['image'].unlink()
-                    stats['deleted_images'] += 1
+                    try:
+                        if file_pair['image'].exists():
+                            file_pair['image'].unlink()
+                            image_deleted = True
+                            stats['deleted_images'] += 1
+                    except FileNotFoundError:
+                        # Image was already deleted (race condition with another process)
+                        image_deleted = True
+                    except Exception as e:
+                        print(f"Warning: Could not delete image {file_pair['image']}: {e}")
+                        # Continue to try deleting JSON anyway
+
+                # Now delete JSON file
+                try:
+                    if file_pair['json'].exists():
+                        file_pair['json'].unlink()
+                        json_deleted = True
+                        stats['deleted_json'] += 1
+                except FileNotFoundError:
+                    # JSON was already deleted
+                    json_deleted = True
+
+                # Log warning if we have an inconsistent state
+                if json_deleted and not image_deleted and file_pair['image']:
+                    print(f"Warning: Orphaned image file may exist: {file_pair['image']}")
 
             except Exception as e:
                 print(f"Error deleting {file_pair['json']}: {e}")
@@ -253,7 +277,7 @@ def main():
         try:
             start, end = map(int, args.shard_range.split('-'))
             shard_range = (start, end)
-        except:
+        except (ValueError, TypeError):
             print(f"Invalid shard range: {args.shard_range}")
             print("Use format: --shard-range 0-10")
             return

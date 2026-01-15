@@ -2,6 +2,11 @@
 """
 Sidecar Cache Warmup Script for OppaiOracle Training Pipeline
 
+NOTE: This file is named "l2_cache_warmup.py" for historical reasons. It
+originally warmed an LMDB-based L2 cache. The current implementation uses
+a sidecar .safetensor cache instead. The "l2" name has been retained for
+backwards compatibility with existing scripts and documentation.
+
 Pre-populates the sidecar cache by processing a configurable percentage of the
 dataset through the existing data loading pipeline. This reduces first-epoch
 overhead and makes subsequent training runs start fast immediately.
@@ -17,10 +22,12 @@ PERFORMANCE RECOMMENDATION:
 
 Usage:
     # GPU-accelerated mode (RECOMMENDED - 3-5x faster):
-    python l2_cache_warmup.py --config configs/unified_config.yaml --use-gpu --target-vram-gb 31.5
+    python -m cache_warmup --config configs/unified_config.yaml --use-gpu --target-vram-gb 31.5
+    # Or directly:
+    python cache_warmup/l2_cache_warmup.py --config configs/unified_config.yaml --use-gpu --target-vram-gb 31.5
 
     # CPU multi-process mode (fallback if GPU unavailable):
-    python l2_cache_warmup.py --config configs/unified_config.yaml --percentage 50 --workers 16
+    python -m cache_warmup --config configs/unified_config.yaml --percentage 50 --workers 16
 
 See GPU_WARMUP_GUIDE.md for detailed GPU configuration and performance tuning.
 """
@@ -43,7 +50,8 @@ try:
     HAS_ORJSON = True
 except ImportError:
     HAS_ORJSON = False
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 import torch.multiprocessing as mp
@@ -56,10 +64,11 @@ from dataset_loader import SidecarJsonDataset, load_vocabulary_for_training, Sha
 from cache_codec import get_sidecar_path, save_sidecar
 from utils.cache_monitor import monitor
 from utils.cache_keys import compute_cache_config_hash
+from utils.exclusion_manager import write_exclusions_deduplicated
 
 # GPU batch processing (optional)
 try:
-    from gpu_batch_processor import GPUBatchProcessor
+    from .gpu_batch_processor import GPUBatchProcessor
     GPU_AVAILABLE = torch.cuda.is_available()
 except ImportError:
     GPU_AVAILABLE = False
@@ -72,6 +81,111 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+
+def _load_single_json_metadata(
+    json_path: Path,
+    check_existing: bool,
+    sidecar_extension: str = ".safetensor",
+) -> Optional[Tuple[Path, str, str, Optional[float]]]:
+    """
+    Load JSON metadata for a single image (runs in thread pool).
+
+    Returns:
+        Tuple of (json_path, image_path, sidecar_path, source_mtime) or None if should skip
+    """
+    try:
+        # Use orjson if available (3-5x faster)
+        if HAS_ORJSON:
+            annotation = orjson.loads(json_path.read_bytes())
+        else:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                annotation = json.load(f)
+
+        # Get image path
+        image_filename = annotation.get('filename')
+        if not image_filename:
+            return None
+
+        image_path = json_path.parent / image_filename
+        if not image_path.exists():
+            return None
+
+        # Get source mtime
+        try:
+            source_mtime = os.path.getmtime(image_path)
+        except OSError:
+            source_mtime = None
+
+        # Check if sidecar exists
+        sidecar_path = get_sidecar_path(str(image_path), extension=sidecar_extension)
+        if check_existing and os.path.exists(sidecar_path):
+            return None  # Already cached
+
+        return (json_path, str(image_path), sidecar_path, source_mtime)
+
+    except Exception:
+        return None
+
+
+def _batch_load_json_metadata(
+    json_paths: List[Path],
+    check_existing: bool,
+    sidecar_extension: str = ".safetensor",
+    max_workers: int = 8,
+    chunk_size: int = 50000,
+) -> List[Tuple[Path, str, str, Optional[float]]]:
+    """
+    Load JSON metadata for multiple files in parallel, processing in chunks.
+
+    Args:
+        json_paths: List of JSON file paths to load
+        check_existing: Whether to skip files with existing sidecars
+        sidecar_extension: File extension for sidecar files
+        max_workers: Number of parallel threads (default 8)
+        chunk_size: Number of files to process per chunk (default 50k)
+
+    Returns:
+        List of (json_path, image_path, sidecar_path, source_mtime) tuples
+    """
+    if not json_paths:
+        return []
+
+    results = []
+    total_files = len(json_paths)
+    num_chunks = (total_files + chunk_size - 1) // chunk_size
+    skipped = 0
+
+    logger.info(f"Processing {total_files:,} files in {num_chunks} chunks of ~{chunk_size:,}")
+
+    # Process in chunks to avoid memory pressure from millions of futures
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="json_load") as executor:
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min(start_idx + chunk_size, total_files)
+            chunk_paths = json_paths[start_idx:end_idx]
+
+            # Submit only this chunk's futures
+            futures = {
+                executor.submit(_load_single_json_metadata, path, check_existing, sidecar_extension): path
+                for path in chunk_paths
+            }
+
+            chunk_valid = 0
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+                    chunk_valid += 1
+                else:
+                    skipped += 1
+
+            # Progress update after each chunk
+            processed = end_idx
+            pct = (processed / total_files) * 100
+            logger.info(f"  Chunk {chunk_idx + 1}/{num_chunks}: {processed:,}/{total_files:,} ({pct:.1f}%) - {len(results):,} valid, {skipped:,} skipped")
+
+    return results
 
 
 class CacheWarmupConfig:
@@ -113,6 +227,9 @@ class CacheWarmupConfig:
 
         # Cache configuration
         self.sidecar_storage_dtype = getattr(data_cfg, 'sidecar_storage_dtype', 'bfloat16')
+        self.sidecar_extension = getattr(data_cfg, 'sidecar_extension', '.safetensor')
+        if not self.sidecar_extension.startswith('.'):
+            self.sidecar_extension = f".{self.sidecar_extension}"
 
         # Preprocessing parameters (must match training exactly!)
         self.image_size = data_cfg.image_size
@@ -132,8 +249,14 @@ class CacheWarmupConfig:
             except Exception as e:
                 logger.warning(f"Could not load vocabulary for cache hash: {e}")
 
+        # Disable flipping (only cache unflipped versions)
+        # This is set before config hash so it's included in the hash
+        self.random_flip_prob = 0.0
+        self.has_orientation_handler = False
+
         # Compute config hash once (must match dataset_loader computation exactly!)
         # Warmup does NOT support joint transforms, so has_joint_transforms=False
+        # Flip params are explicitly set to 0.0/False since warmup caches unflipped versions
         self.config_hash = compute_cache_config_hash(
             image_size=self.image_size,
             pad_color=self.pad_color,
@@ -142,10 +265,9 @@ class CacheWarmupConfig:
             storage_dtype=self.sidecar_storage_dtype,
             vocab_size=self._vocab_size,
             has_joint_transforms=False,  # Warmup never uses joint transforms
+            random_flip_prob=self.random_flip_prob,  # Always 0.0 for warmup
+            has_orientation_handler=self.has_orientation_handler,  # Always False for warmup
         )
-
-        # Disable flipping (only cache unflipped versions)
-        self.random_flip_prob = 0.0
 
     def validate(self) -> None:
         """Validate configuration parameters."""
@@ -174,7 +296,7 @@ class CacheWarmupConfig:
             if GPUBatchProcessor is None:
                 raise ImportError(
                     "GPU mode requested but gpu_batch_processor module not found. "
-                    "Ensure gpu_batch_processor.py is in the same directory."
+                    "Ensure cache_warmup/gpu_batch_processor.py exists."
                 )
             if not torch.cuda.is_bf16_supported():
                 raise RuntimeError("bfloat16 GPU warmup requested but CUDA device does not support bf16.")
@@ -182,22 +304,80 @@ class CacheWarmupConfig:
             logger.info(f"  Target VRAM: {self.target_vram_gb:.1f} GB")
             logger.info(f"  Target utilization: {self.target_vram_util * 100:.1f}%")
 
-        # Enforce bfloat16-only cache to avoid fp32/fp16 VRAM usage.
-        if self.sidecar_storage_dtype != 'bfloat16':
-            raise ValueError(f"Only bfloat16 sidecar storage is supported, got '{self.sidecar_storage_dtype}'.")
-        if not hasattr(torch, 'bfloat16'):
+        # Validate sidecar_storage_dtype is a supported type
+        valid_dtypes = ['bfloat16', 'float16', 'float32']
+        if self.sidecar_storage_dtype not in valid_dtypes:
+            raise ValueError(f"sidecar_storage_dtype must be one of {valid_dtypes}, got '{self.sidecar_storage_dtype}'")
+
+        # Check PyTorch support for the chosen dtype
+        if self.sidecar_storage_dtype == 'bfloat16' and not hasattr(torch, 'bfloat16'):
             raise RuntimeError("bfloat16 sidecar storage requested but PyTorch does not support bfloat16.")
 
-        # IMPORTANT: Warmup does NOT support joint transforms (geometry augmentations).
-        # If your training config uses joint_transforms, the cache will be invalidated
-        # at training time due to config hash mismatch (has_joint_transforms=False vs True).
-        # This is by design: joint transforms should be applied at training time, not cached.
-        logger.warning(
-            "IMPORTANT: Cache warmup does NOT support joint transforms (geometry augmentations). "
-            "If your training config uses joint_transforms, ALL cached images will be "
-            "automatically invalidated and reprocessed during training (config hash mismatch). "
-            "This is expected behavior - joint transforms must be applied fresh each epoch."
-        )
+        # Check if training config has joint_transforms enabled
+        # Warmup does NOT support joint transforms - cache will be invalidated at training time
+        has_joint_transforms = False
+        if hasattr(self.full_config, 'data'):
+            data_cfg = self.full_config.data
+            if hasattr(data_cfg, 'joint_transforms') and data_cfg.joint_transforms:
+                has_joint_transforms = True
+            # Also check augmentation section if present
+            if hasattr(data_cfg, 'augmentation'):
+                aug_cfg = data_cfg.augmentation
+                if hasattr(aug_cfg, 'joint_transforms') and aug_cfg.joint_transforms:
+                    has_joint_transforms = True
+
+        if has_joint_transforms:
+            if not self.force:
+                raise ValueError(
+                    "Training config has joint_transforms enabled. Cache warmup does NOT support joint transforms. "
+                    "ALL cached images will be invalidated during training (config hash mismatch). "
+                    "Use --force to acknowledge this and continue anyway, or disable joint_transforms in your config."
+                )
+            else:
+                logger.warning(
+                    "--force used: Proceeding despite joint_transforms mismatch. "
+                    "Cache will be invalidated at training time - warmup provides no benefit when joint_transforms are enabled."
+                )
+        else:
+            # No joint transforms detected - cache will be usable
+            logger.info("Joint transforms: not detected in config (cache will be valid at training time)")
+
+        # Check if training config has flip augmentation enabled
+        # Warmup caches with flip_prob=0.0 - if training uses different value, hash will mismatch
+        training_flip_prob = 0.0
+        training_has_orientation = False
+        if hasattr(self.full_config, 'data'):
+            data_cfg = self.full_config.data
+            if hasattr(data_cfg, 'random_flip_prob'):
+                training_flip_prob = float(data_cfg.random_flip_prob or 0.0)
+            if hasattr(data_cfg, 'orientation_handler') and data_cfg.orientation_handler:
+                training_has_orientation = True
+            # Also check augmentation section if present
+            if hasattr(data_cfg, 'augmentation'):
+                aug_cfg = data_cfg.augmentation
+                if hasattr(aug_cfg, 'random_flip_prob'):
+                    training_flip_prob = float(aug_cfg.random_flip_prob or 0.0)
+                if hasattr(aug_cfg, 'orientation_handler') and aug_cfg.orientation_handler:
+                    training_has_orientation = True
+
+        flip_mismatch = (training_flip_prob != self.random_flip_prob or
+                         training_has_orientation != self.has_orientation_handler)
+        if flip_mismatch:
+            if not self.force:
+                raise ValueError(
+                    f"Training config has different flip settings (prob={training_flip_prob}, "
+                    f"orientation_handler={training_has_orientation}) than warmup (prob=0.0, orientation_handler=False). "
+                    "ALL cached images will be invalidated during training (config hash mismatch). "
+                    "Use --force to acknowledge this and continue anyway, or set random_flip_prob=0 in training config."
+                )
+            else:
+                logger.warning(
+                    f"--force used: Proceeding despite flip config mismatch "
+                    f"(training: prob={training_flip_prob}, orientation={training_has_orientation}). "
+                    "Cache will be invalidated at training time - warmup provides no benefit when flip settings differ."
+                )
+        else:
+            logger.info("Flip settings: match warmup config (cache will be valid at training time)")
 
         logger.info(f"Cache warmup configuration validated successfully")
         logger.info(f"  Mode: {'GPU-accelerated' if self.use_gpu else 'CPU multi-process'}")
@@ -230,31 +410,20 @@ def discover_json_files(data_path: Path) -> List[Path]:
 
 
 class SidecarCacheWorkerInitializer:
-    """Picklable worker initialization for sidecar cache warmup DataLoader."""
+    """Picklable worker initialization for sidecar cache warmup DataLoader.
 
-    def __init__(self, shared_vocab_info: Optional[Tuple[str, int]] = None):
-        """
-        Args:
-            shared_vocab_info: Tuple of (shm_name, vocab_size) for shared vocabulary
-        """
-        self.shared_vocab_info = shared_vocab_info
+    Note: Vocabulary loading is handled lazily in dataset's __getitem__,
+    so this initializer only sets up random seed for reproducibility.
+    """
 
     def __call__(self, worker_id: int):
-        """Initialize worker with random seed and vocabulary.
+        """Initialize worker with random seed for reproducibility.
 
         Args:
             worker_id: Worker process ID
         """
-        # Set random seed for reproducibility
         worker_seed = torch.initial_seed() % 2**32
         random.seed(worker_seed)
-
-        # Load vocabulary from shared memory if provided
-        # Currently a no-op as vocabulary loading happens in dataset's __getitem__
-        if self.shared_vocab_info is not None:
-            shm_name, vocab_size = self.shared_vocab_info
-            # Vocabulary loading happens in dataset's __getitem__ via lazy init
-            pass
 
 
 class CacheWarmup:
@@ -272,8 +441,9 @@ class CacheWarmup:
         signal.signal(signal.SIGTERM, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
-        """Handle Ctrl+C gracefully."""
-        logger.warning("\nReceived interrupt signal, shutting down gracefully...")
+        """Handle interrupt signals by setting flag (logging is unsafe in signal handlers)."""
+        # NOTE: logger.warning() is not async-signal-safe and can cause deadlocks.
+        # Only set the flag here; logging happens in the main processing loops.
         self.interrupted = True
 
     def load_vocabulary(self) -> None:
@@ -318,6 +488,7 @@ class CacheWarmup:
             # Sidecar cache configuration
             sidecar_cache_enabled=True,
             sidecar_storage_dtype=self.config.sidecar_storage_dtype,
+            sidecar_extension=self.config.sidecar_extension,
             cpu_bf16_cache_pipeline=True,
 
             # Flip configuration (disabled - only cache unflipped)
@@ -356,7 +527,7 @@ class CacheWarmup:
 
     def create_dataloader(self, dataset) -> DataLoader:
         """Create DataLoader with worker initialization."""
-        worker_init_fn = SidecarCacheWorkerInitializer(self.shared_vocab_info)
+        worker_init_fn = SidecarCacheWorkerInitializer()
 
         # Use spawn context to avoid fork issues
         mp_context = mp.get_context('spawn')
@@ -440,10 +611,10 @@ class CacheWarmup:
 
                 if failed_ids:
                     exclusion_path = self.config.data_path / 'cache_exclusions.txt'
-                    with open(exclusion_path, 'a', encoding='utf-8') as f:
-                        for image_id in failed_ids:
-                            f.write(image_id + '\n')
-                    logger.warning(f"Wrote {len(failed_ids)} failed image IDs to {exclusion_path}")
+                    new_count = write_exclusions_deduplicated(exclusion_path, failed_ids)
+                    dup_count = len(failed_ids) - new_count
+                    logger.warning(f"Added {new_count} new failed image IDs to {exclusion_path}" +
+                                   (f" ({dup_count} duplicates skipped)" if dup_count > 0 else ""))
                     logger.warning("These images will be automatically excluded from training.")
         except Exception as e:
             logger.warning(f"Could not write exclusion list from CPU warmup: {e}")
@@ -494,27 +665,54 @@ class CacheWarmup:
             pending_batches: List[Tuple[int, List[str], List[Tuple]]] = []
             batch_id = 0
 
+            # OPTIMIZATION: Pre-load all JSON metadata in parallel
+            # This replaces sequential JSON loading with parallel I/O
+            logger.info(f"Pre-loading JSON metadata for {len(indices)} files...")
+            json_paths_to_load = [json_files[idx] for idx in indices]
+            preloaded_metadata = _batch_load_json_metadata(
+                json_paths_to_load,
+                check_existing=self.config.check_existing,
+                sidecar_extension=self.config.sidecar_extension,
+                max_workers=8,  # 8 threads for parallel JSON I/O
+            )
+            logger.info(f"Pre-loaded {len(preloaded_metadata)} valid entries (skipped {len(indices) - len(preloaded_metadata)} cached/invalid)")
+
+            # Build lookup for fast access: json_path -> metadata
+            metadata_lookup: Dict[Path, Tuple[Path, str, str, Optional[float]]] = {
+                meta[0]: meta for meta in preloaded_metadata
+            }
+
             def process_pending_batch(proc_id: int, proc_paths: List[str], proc_meta: List[Tuple]) -> int:
                 """Process a preloaded batch and write sidecars. Returns items written."""
                 try:
                     images, masks, failed_indices = gpu_processor.process_batch_preloaded(proc_id)
                     failed_set = set(failed_indices)
 
-                    # Validate batch alignment
-                    if len(images) != len(proc_meta):
-                        logger.error(f"Batch mismatch: {len(images)} images vs {len(proc_meta)} metadata, skipping")
-                        return 0
+                    # Validate batch size consistency
+                    num_images = len(images)
+                    num_meta = len(proc_meta)
+                    if num_images != num_meta:
+                        # Raise error for significant mismatches to prevent silent data loss
+                        # Minor mismatches (1-2 items) due to load failures are expected
+                        if abs(num_images - num_meta) > len(failed_indices) + 2:
+                            raise ValueError(
+                                f"Critical batch size mismatch: {num_images} images vs {num_meta} metadata "
+                                f"(failed_indices={len(failed_indices)}). This indicates a data pipeline bug."
+                            )
+                        logger.warning(f"Batch size mismatch: {num_images} images vs {num_meta} metadata. Processing {min(num_images, num_meta)} items.")
 
                     # Track failed images for exclusion file
                     for fail_idx in failed_indices:
-                        if fail_idx < len(proc_meta):
+                        if fail_idx < num_meta:
                             self.failed_images.append(proc_meta[fail_idx][1])  # image_path
 
-                    # Write sidecar files (skip failed images)
+                    # Write sidecar files (skip failed images, process up to min of both sizes)
                     items_written = 0
-                    for i, (_, _, sidecar_path, source_mtime) in enumerate(proc_meta):
+                    process_count = min(num_images, num_meta)
+                    for i in range(process_count):
                         if i in failed_set:
                             continue
+                        _, _, sidecar_path, source_mtime = proc_meta[i]
                         monitor.l2_miss()
                         if save_sidecar(
                             sidecar_path,
@@ -530,6 +728,7 @@ class CacheWarmup:
                     return items_written
                 except Exception as e:
                     logger.error(f"Failed to process preloaded batch {proc_id}: {e}", exc_info=True)
+                    gpu_processor.clear_cache()  # Match process_sync_batch behavior
                     return 0
 
             def process_sync_batch(paths: List[str], meta: List[Tuple]) -> int:
@@ -538,18 +737,30 @@ class CacheWarmup:
                     images, masks, failed_indices = gpu_processor.process_batch(paths)
                     failed_set = set(failed_indices)
 
-                    if len(images) != len(meta):
-                        logger.error(f"Batch mismatch: {len(images)} images vs {len(meta)} metadata, skipping")
-                        return 0
+                    # Validate batch size consistency
+                    num_images = len(images)
+                    num_meta = len(meta)
+                    if num_images != num_meta:
+                        # Raise error for significant mismatches to prevent silent data loss
+                        # Minor mismatches (1-2 items) due to load failures are expected
+                        if abs(num_images - num_meta) > len(failed_indices) + 2:
+                            raise ValueError(
+                                f"Critical batch size mismatch: {num_images} images vs {num_meta} metadata "
+                                f"(failed_indices={len(failed_indices)}). This indicates a data pipeline bug."
+                            )
+                        logger.warning(f"Batch size mismatch: {num_images} images vs {num_meta} metadata. Processing {min(num_images, num_meta)} items.")
 
                     for fail_idx in failed_indices:
-                        if fail_idx < len(meta):
+                        if fail_idx < num_meta:
                             self.failed_images.append(meta[fail_idx][1])
 
+                    # Write sidecar files (skip failed images, process up to min of both sizes)
                     items_written = 0
-                    for i, (_, _, sidecar_path, source_mtime) in enumerate(meta):
+                    process_count = min(num_images, num_meta)
+                    for i in range(process_count):
                         if i in failed_set:
                             continue
+                        _, _, sidecar_path, source_mtime = meta[i]
                         monitor.l2_miss()
                         if save_sidecar(
                             sidecar_path,
@@ -568,61 +779,21 @@ class CacheWarmup:
                     gpu_processor.clear_cache()
                     return 0
 
-            # Progress bar
+            # Progress bar - iterate through preloaded metadata (already filtered)
             with tqdm(
-                total=len(indices),
+                total=len(preloaded_metadata),
                 desc="GPU warmup",
                 unit="img",
             ) as pbar:
-                for idx in indices:
+                for json_path, image_path, sidecar_path, source_mtime in preloaded_metadata:
                     # Check for interrupt
                     if self.interrupted:
                         logger.warning("Warmup interrupted by user")
                         break
 
-                    # Get JSON file for this index
-                    json_path = json_files[idx]
-
-                    # Load JSON to get image path
-                    try:
-                        # Use orjson if available (3-5x faster for cache warmup)
-                        if HAS_ORJSON:
-                            annotation = orjson.loads(json_path.read_bytes())
-                        else:
-                            with open(json_path, 'r', encoding='utf-8') as f:
-                                annotation = json.load(f)
-
-                        # Get image path (same logic as dataset_loader.py)
-                        image_filename = annotation.get('filename')
-                        if not image_filename:
-                            logger.warning(f"No filename in {json_path}, skipping")
-                            continue
-
-                        image_path = json_path.parent / image_filename
-                        if not image_path.exists():
-                            logger.warning(f"Image not found: {image_path}, skipping")
-                            continue
-
-                        # Get source file mtime for cache invalidation
-                        try:
-                            source_mtime = os.path.getmtime(image_path)
-                        except OSError:
-                            source_mtime = None
-
-                        # Check if sidecar already exists (if --check-existing enabled)
-                        sidecar_path = get_sidecar_path(str(image_path))
-                        if self.config.check_existing and os.path.exists(sidecar_path):
-                            # Already cached, skip
-                            pbar.update(1)
-                            continue
-
-                        # Add to batch
-                        batch_accumulator.append(str(image_path))
-                        batch_metadata.append((json_path, str(image_path), sidecar_path, source_mtime))
-
-                    except Exception as e:
-                        logger.warning(f"Failed to process {json_path}: {e}")
-                        continue
+                    # Add to batch (metadata already validated and filtered by preloader)
+                    batch_accumulator.append(image_path)
+                    batch_metadata.append((json_path, image_path, sidecar_path, source_mtime))
 
                     # Process batch when it reaches current batch size
                     current_batch_size = gpu_processor.get_current_batch_size()
@@ -717,16 +888,16 @@ class CacheWarmup:
             items_per_sec = total_items / elapsed if elapsed > 0 else 0
             logger.info(f"GPU warmup completed: {total_items} items in {elapsed:.1f}s ({items_per_sec:.1f} items/s)")
 
-            # Write exclusion file for failed images (append mode for resumable runs)
+            # Write exclusion file for failed images (with deduplication for resumable runs)
             # Store just the image_id (stem) for format-agnostic exclusion
             if self.failed_images:
                 exclusion_path = self.config.data_path / 'cache_exclusions.txt'
-                with open(exclusion_path, 'a', encoding='utf-8') as f:
-                    for path in self.failed_images:
-                        # Write just the stem (image_id) - works regardless of file extension
-                        image_id = Path(path).stem
-                        f.write(image_id + '\n')
-                logger.warning(f"Wrote {len(self.failed_images)} failed image IDs to {exclusion_path}")
+                # Extract image IDs (stems) from paths
+                failed_ids = [Path(path).stem for path in self.failed_images]
+                new_count = write_exclusions_deduplicated(exclusion_path, failed_ids)
+                dup_count = len(failed_ids) - new_count
+                logger.warning(f"Added {new_count} new failed image IDs to {exclusion_path}" +
+                               (f" ({dup_count} duplicates skipped)" if dup_count > 0 else ""))
                 logger.warning("These images will be automatically excluded from training.")
 
             # Log cache monitor summary for debugging
@@ -753,14 +924,14 @@ class CacheWarmup:
             # Discover JSON files first (required for metadata cache validation)
             json_files = discover_json_files(self.config.data_path)
 
-            # Try to use metadata cache for consistency with training pipeline
+            # Try to use Arrow metadata cache for consistency with training pipeline
             try:
-                from utils.metadata_cache import try_load_metadata_cache
+                from utils.metadata_cache import try_load_arrow_cache
 
-                logger.info("Loading metadata cache (same source as training)...")
+                logger.info("Loading Arrow metadata cache (same source as training)...")
                 force_rebuild = getattr(self.config, 'force_rebuild_metadata_cache', False)
 
-                cached_items = try_load_metadata_cache(
+                arrow_table = try_load_arrow_cache(
                     root_dir=self.config.data_path,
                     json_files=json_files,  # Pass actual list for validation
                     force_rebuild=force_rebuild,
@@ -768,15 +939,29 @@ class CacheWarmup:
                     logger=logger
                 )
 
-                if cached_items:
-                    json_files = [Path(item['dir']) / f"{item['image_id']}.json" for item in cached_items]
-                    logger.info(f"✓ Using {len(json_files)} files from metadata cache")
+                if arrow_table is not None:
+                    # Check if Arrow cache has json_stem column (v2.0+)
+                    if "json_stem" in arrow_table.column_names:
+                        # Extract file paths from Arrow table columns
+                        # Use json_stem (original JSON filename) for correct path reconstruction
+                        dirs = arrow_table.column("dir").to_pylist()
+                        json_stems = arrow_table.column("json_stem").to_pylist()
+                        json_files = [Path(d) / f"{stem}.json" for d, stem in zip(dirs, json_stems)]
+                        logger.info(f"✓ Using {len(json_files)} files from Arrow metadata cache")
+                    else:
+                        # Old cache format (v1.0) - missing json_stem column
+                        # Fall back to filesystem discovery to avoid path reconstruction bugs
+                        logger.warning(
+                            "Arrow cache is outdated (missing json_stem column). "
+                            "Delete logs/metadata_cache/*.arrow* and re-run to rebuild."
+                        )
+                        logger.info(f"Using {len(json_files)} files from filesystem discovery")
                 else:
                     logger.info(f"Using {len(json_files)} files from filesystem discovery")
             except ImportError:
-                logger.warning("Metadata cache module not found, using filesystem discovery")
+                logger.warning("Arrow metadata cache module not found, using filesystem discovery")
             except Exception as e:
-                logger.warning(f"Error loading metadata cache: {e}, using filesystem discovery")
+                logger.warning(f"Error loading Arrow metadata cache: {e}, using filesystem discovery")
 
             if not json_files:
                 raise ValueError(f"No JSON files found in {self.config.data_path}")
@@ -829,7 +1014,7 @@ class CacheWarmup:
                             if image_filename:
                                 image_path = json_path.parent / image_filename
                                 # Check if sidecar file exists
-                                sidecar_path = get_sidecar_path(str(image_path))
+                                sidecar_path = get_sidecar_path(str(image_path), extension=self.config.sidecar_extension)
                                 if not os.path.exists(sidecar_path):
                                     # Not in cache, keep it
                                     filtered_indices.append(idx)

@@ -21,8 +21,8 @@ from torch.optim.optimizer import Optimizer
 
 
 class MultiTensorApply(object):
+    """Helper class for applying fused operations across multiple tensors."""
     available = False
-    warned = False
 
     def __init__(self, chunk_size):
         MultiTensorApply.available = True
@@ -65,7 +65,7 @@ class Adan(Optimizer):
         params (iterable): iterable of parameters to optimize or
             dicts defining parameter groups.
         lr (float, optional): learning rate. (default: 1e-3)
-        betas (Tuple[float, float, flot], optional): coefficients used for
+        betas (Tuple[float, float, float], optional): coefficients used for
             first- and second-order moments. (default: (0.98, 0.92, 0.99))
         eps (float, optional): term added to the denominator to improve
             numerical stability. (default: 1e-8)
@@ -91,20 +91,17 @@ class Adan(Optimizer):
                  foreach: bool = True,
                  fused: bool = False):
         if not 0.0 <= max_grad_norm:
-            raise ValueError('Invalid Max grad norm: {}'.format(max_grad_norm))
+            raise ValueError(f'Invalid Max grad norm: {max_grad_norm}')
         if not 0.0 <= lr:
-            raise ValueError('Invalid learning rate: {}'.format(lr))
+            raise ValueError(f'Invalid learning rate: {lr}')
         if not 0.0 <= eps:
-            raise ValueError('Invalid epsilon value: {}'.format(eps))
+            raise ValueError(f'Invalid epsilon value: {eps}')
         if not 0.0 <= betas[0] < 1.0:
-            raise ValueError('Invalid beta parameter at index 0: {}'.format(
-                betas[0]))
+            raise ValueError(f'Invalid beta parameter at index 0: {betas[0]}')
         if not 0.0 <= betas[1] < 1.0:
-            raise ValueError('Invalid beta parameter at index 1: {}'.format(
-                betas[1]))
+            raise ValueError(f'Invalid beta parameter at index 1: {betas[1]}')
         if not 0.0 <= betas[2] < 1.0:
-            raise ValueError('Invalid beta parameter at index 2: {}'.format(
-                betas[2]))
+            raise ValueError(f'Invalid beta parameter at index 2: {betas[2]}')
         if fused:
             _check_fused_available()
 
@@ -119,9 +116,13 @@ class Adan(Optimizer):
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
-        super(Adan, self).__setstate__(state)
+        super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault('no_prox', False)
+
+    def __repr__(self):
+        return (f"Adan(lr={self.defaults['lr']}, betas={self.defaults['betas']}, "
+                f"eps={self.defaults['eps']}, weight_decay={self.defaults['weight_decay']})")
 
     @torch.no_grad()
     def restart_opt(self):
@@ -138,6 +139,8 @@ class Adan(Optimizer):
                     state['exp_avg_sq'] = torch.zeros_like(p)
                     # Exponential moving average of gradient difference
                     state['exp_avg_diff'] = torch.zeros_like(p)
+                    # Clear previous gradient to avoid polluting first step
+                    state.pop('neg_pre_grad', None)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -149,35 +152,39 @@ class Adan(Optimizer):
                 loss = closure()
 
         if self.defaults['max_grad_norm'] > 0:
-            # Find first parameter with gradient to determine device
-            device = None
+            # Optimized: Single pass using foreach operations
+            # Collect all gradients in one loop, compute norm with vectorized ops
+            all_grads = []
             for group in self.param_groups:
                 for p in group['params']:
                     if p.grad is not None:
-                        device = p.grad.device
-                        break
-                if device is not None:
-                    break
+                        all_grads.append(p.grad)
 
-            if device is None:
+            if not all_grads:
                 # No parameters with gradients, skip clipping
                 clip_global_grad_norm = 1.0
             else:
-                global_grad_norm = torch.zeros(1, device=device)
-                max_grad_norm = torch.tensor(self.defaults['max_grad_norm'],
-                                             device=device)
+                # Check if all gradients are on the same device (required for stacking)
+                if len(set(g.device for g in all_grads)) > 1:
+                    # Multi-device: fall back to manual norm computation
+                    # Compute sum of squared norms across all devices
+                    total_norm_sq = 0.0
+                    for g in all_grads:
+                        total_norm_sq += g.norm(2).item() ** 2
+                    global_grad_norm_val = total_norm_sq ** 0.5
+                else:
+                    # Single device: use optimized foreach operations
+                    per_param_norms = torch._foreach_norm(all_grads, ord=2)
+                    # Stack norms and compute global norm (sqrt of sum of squares)
+                    stacked_norms = torch.stack(per_param_norms)
+                    global_grad_norm_val = stacked_norms.pow(2).sum().sqrt().item()
 
-                for group in self.param_groups:
-                    for p in group['params']:
-                        if p.grad is not None:
-                            grad = p.grad
-                            global_grad_norm.add_(grad.pow(2).sum())
-
-                global_grad_norm = torch.sqrt(global_grad_norm)
-
-                clip_global_grad_norm = torch.clamp(
-                    max_grad_norm / (global_grad_norm + self.defaults['eps']),
-                    max=1.0).item()
+                max_grad_norm = self.defaults['max_grad_norm']
+                # Compute clip factor, clamped to max=1.0
+                clip_global_grad_norm = min(
+                    max_grad_norm / (global_grad_norm_val + self.defaults['eps']),
+                    1.0
+                )
         else:
             clip_global_grad_norm = 1.0
 
@@ -206,7 +213,12 @@ class Adan(Optimizer):
                 if p.grad is None:
                     continue
                 params_with_grad.append(p)
-                grads.append(p.grad)
+                # Always clone gradient to avoid mutation of original p.grad
+                # Apply clipping at clone time when needed
+                if clip_global_grad_norm != 1.0:
+                    grads.append(p.grad.clone().mul_(clip_global_grad_norm))
+                else:
+                    grads.append(p.grad.clone())
 
                 state = self.state[p]
                 if len(state) == 0:
@@ -283,7 +295,7 @@ def _single_tensor_adan(
     weight_decay: float,
     eps: float,
     no_prox: bool,
-    clip_global_grad_norm: Tensor,
+    clip_global_grad_norm: float,
 ):
     for i, param in enumerate(params):
         grad = grads[i]
@@ -292,7 +304,7 @@ def _single_tensor_adan(
         exp_avg_diff = exp_avg_diffs[i]
         neg_grad_or_diff = neg_pre_grads[i]
 
-        grad.mul_(clip_global_grad_norm)
+        # Clipping is now applied at clone time in step(), no multiply needed here
 
         # for memory saving, we use `neg_grad_or_diff`
         # to get some temp variable in a inplace way
@@ -341,12 +353,12 @@ def _multi_tensor_adan(
     weight_decay: float,
     eps: float,
     no_prox: bool,
-    clip_global_grad_norm: Tensor,
+    clip_global_grad_norm: float,
 ):
     if len(params) == 0:
         return
 
-    torch._foreach_mul_(grads, clip_global_grad_norm)
+    # Clipping is now applied at clone time in step(), no multiply needed here
 
     # for memory saving, we use `neg_pre_grads`
     # to get some temp variable in a inplace way
@@ -410,10 +422,13 @@ def _fused_adan_multi_tensor(
     weight_decay: float,
     eps: float,
     no_prox: bool,
-    clip_global_grad_norm: Tensor,
+    clip_global_grad_norm: float,
 ):
     import fused_adan
-    multi_tensor_applier = MultiTensorApply(2048 * 32)
+    # Chunk size for fused multi-tensor operations (65536 elements per chunk)
+    # Balances GPU kernel launch overhead vs. memory usage
+    FUSED_CHUNK_SIZE = 2048 * 32
+    multi_tensor_applier = MultiTensorApply(FUSED_CHUNK_SIZE)
     _dummy_overflow_buf = torch.cuda.IntTensor([0])
     multi_tensor_applier(
         fused_adan.adan_multi_tensor, _dummy_overflow_buf,
@@ -443,7 +458,7 @@ def _fused_adan_single_tensor(
     weight_decay: float,
     eps: float,
     no_prox: bool,
-    clip_global_grad_norm: Tensor,
+    clip_global_grad_norm: float,
 ):
     for i, param in enumerate(params):
         p_data_fp32 = param.data.float()

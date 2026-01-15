@@ -8,6 +8,8 @@ import os
 import json
 import logging
 import hashlib
+import sqlite3
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Set
 from dataclasses import dataclass, field, asdict
@@ -51,9 +53,28 @@ try:
         return _tqdm(iterable, **kwargs)
 except ImportError:
     TQDM_AVAILABLE = False
+    class _TqdmNoOp:
+        def __init__(self, iterable=None, **_kwargs):
+            self._iterable = iterable
+
+        def __iter__(self):
+            return iter(self._iterable or [])
+
+        def update(self, _n=1):
+            return None
+
+        def close(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
     def tqdm(iterable=None, **kwargs):
         # Fallback: no-op progress wrapper
-        return iterable
+        return _TqdmNoOp(iterable, **kwargs)
 
 # networkx not required; planned for future graph-based analyses
 
@@ -94,6 +115,7 @@ class AnalysisConfig:
     analyze_duplicates: bool = True
     analyze_quality: bool = True
     analyze_cooccurrence: bool = True
+    duplicates_only: bool = False
     
     # Image analysis
     compute_image_stats: bool = True
@@ -113,6 +135,10 @@ class AnalysisConfig:
     use_perceptual_hash: bool = True
     perceptual_hash_size: int = 16
     duplicate_threshold: float = 0.95
+    duplicate_db_path: Optional[str] = None
+    duplicate_db_skip_unchanged: bool = True
+    duplicate_db_report_all: bool = False
+    duplicate_db_commit_interval: int = 1000
     
     # Quality metrics
     check_resolution: bool = True
@@ -198,6 +224,8 @@ class DatasetStats:
     tag_statistics: Dict[str, Any] = field(default_factory=dict)
     duplicate_groups: Dict[str, List[str]] = field(default_factory=dict)
     near_duplicates: List[Tuple[str, str, float]] = field(default_factory=list)
+    near_duplicate_similarity_distribution: Dict[str, int] = field(default_factory=dict)
+    near_duplicate_similarity_stats: Dict[str, Union[int, float]] = field(default_factory=dict)
 
 
 class ImageAnalyzer:
@@ -233,11 +261,11 @@ class ImageAnalyzer:
             # Get file stats (may raise PermissionError)
             file_size_kb = image_path.stat().st_size / 1024
         except PermissionError as e:
-            logger.error(f"Permission denied accessing {image_path}")
-            raise
+            logger.error(f"Permission denied accessing {image_path}: {e}")
+            return None  # Skip inaccessible files instead of crashing
         except OSError as e:
             logger.error(f"OS error accessing {image_path}: {e}")
-            raise
+            return None  # Skip problematic files instead of crashing
         
         stats = ImageStats(
             path=str(image_path),
@@ -294,9 +322,11 @@ class ImageAnalyzer:
             stats.quality_issues.append("corrupted")
             return stats  # Return partial stats for corrupted images
         except Exception as e:
-            # Unexpected error - should not happen
+            # Unexpected error - log and skip instead of crashing
             logger.error(f"Unexpected error analyzing {image_path}: {e}")
-            raise RuntimeError(f"Unexpected error analyzing image {image_path}") from e
+            stats.is_corrupted = True
+            stats.quality_issues.append("analysis_error")
+            return stats
         
         # File hash
         try:
@@ -318,6 +348,24 @@ class ImageAnalyzer:
             self._check_quality(stats)
         
         return stats
+
+    def compute_hashes(self, image_path: Path) -> Tuple[str, str]:
+        """Compute file/perceptual hashes without full image analysis."""
+        if not image_path.exists():
+            logger.warning("Image file not found: %s", image_path)
+            return "", ""
+
+        if not image_path.is_file():
+            logger.warning("Path is not a file: %s", image_path)
+            return "", ""
+
+        file_hash = self._compute_file_hash(image_path)
+
+        perceptual_hash = ""
+        if self.config.use_perceptual_hash and IMAGEHASH_AVAILABLE:
+            perceptual_hash = self._compute_perceptual_hash(image_path)
+
+        return file_hash, perceptual_hash
     
     def _compute_file_hash(self, path: Path) -> str:
         """Compute file hash using SHA-256"""
@@ -416,11 +464,14 @@ class TagAnalyzer:
         """Add tags for an image"""
         # Update counts
         self.tag_counts.update(tags)
-        
+
         # Update mappings
         for tag in tags:
             self.images_per_tag[tag].add(image_path)
-        self.tags_per_image[image_path] = set(tags)
+        # Merge tags instead of replacing (in case called multiple times)
+        if image_path not in self.tags_per_image:
+            self.tags_per_image[image_path] = set()
+        self.tags_per_image[image_path].update(tags)
         
         # Update co-occurrence
         for i, tag1 in enumerate(tags):
@@ -500,6 +551,7 @@ class TagAnalyzer:
                     else:
                         similarity = 0
                     similarity_matrix[i, j] = similarity
+        np.fill_diagonal(similarity_matrix, 1.0)
         
         # Cluster using DBSCAN (if scikit-learn available)
         try:
@@ -539,6 +591,14 @@ class DuplicateDetector:
         
         if stats.perceptual_hash:
             self.perceptual_hashes[stats.perceptual_hash].append(stats.path)
+
+    def add_hashes(self, path: Union[str, Path], file_hash: str, perceptual_hash: str):
+        """Add hashes directly for duplicate detection"""
+        path_str = str(path)
+        if file_hash:
+            self.file_hashes[file_hash].append(path_str)
+        if perceptual_hash:
+            self.perceptual_hashes[perceptual_hash].append(path_str)
     
     def find_exact_duplicates(self) -> Dict[str, List[str]]:
         """Find exact file duplicates"""
@@ -549,54 +609,209 @@ class DuplicateDetector:
         return duplicates
     
     def find_near_duplicates(self) -> List[Tuple[str, str, float]]:
-        """Find near-duplicate images"""
+        """Find near-duplicate images using LSH multi-block bucketing.
+
+        Uses Locality Sensitive Hashing (LSH) to reduce O(n^2) comparisons.
+        Splits each hash into multiple blocks and compares images that share
+        ANY bucket, improving recall over simple prefix matching.
+
+        Note: LSH may miss some near-duplicates where differences are spread
+        across all hash blocks with no matching block values.
+        """
         if not IMAGEHASH_AVAILABLE:
             logger.warning("imagehash not available, skipping near-duplicate detection")
             return []
-        
-        near_duplicates = []
+
         hashes = list(self.perceptual_hashes.keys())
-        
+
         if len(hashes) < 2:
             return []
-        
+
+        near_duplicates = []
+
         try:
-            import imagehash
-            # Simple bucketing by hex prefix to reduce O(n^2) comparisons
             from collections import defaultdict
-            buckets = defaultdict(list)
+
+            # Convert hex hashes to integers for efficient comparison
+            hash_ints = []
+            valid_hashes = []
             for h in hashes:
                 if h:
-                    buckets[h[:6]].append(h)
+                    try:
+                        h_int = int(h, 16)
+                        hash_ints.append(h_int)
+                        valid_hashes.append(h)
+                    except ValueError:
+                        continue
 
-            for bucket in buckets.values():
-                if len(bucket) < 2:
+            if len(hash_ints) < 2:
+                return []
+
+            # LSH: split 256-bit hash into 16 blocks of 16 bits each
+            # Images are compared if they share ANY bucket
+            NUM_BUCKETS = 16
+            buckets = [defaultdict(list) for _ in range(NUM_BUCKETS)]
+
+            # Determine hash bits and max distance from threshold
+            # Assume 256-bit hash (64 hex chars = 256 bits)
+            hash_bits = len(valid_hashes[0]) * 4 if valid_hashes else 256
+            max_distance = round((1 - self.config.duplicate_threshold) * hash_bits)
+
+            # Track already-checked pairs to avoid duplicates
+            checked_pairs = set()
+
+            for idx, (h_hex, h_int) in enumerate(zip(valid_hashes, hash_ints)):
+                # Convert to bytes for block extraction
+                num_bytes = (hash_bits + 7) // 8
+                try:
+                    h_bytes = h_int.to_bytes(num_bytes, "big")
+                except OverflowError:
                     continue
-                for i in range(len(bucket)):
-                    for j in range(i + 1, len(bucket)):
-                        try:
-                            h1, h2 = bucket[i], bucket[j]
-                            if not h1 or not h2:
-                                continue
-                            hash1 = imagehash.hex_to_hash(h1)
-                            hash2 = imagehash.hex_to_hash(h2)
-                        except (ValueError, TypeError) as e:
-                            logger.debug("Invalid hash format: %s", e)
+
+                # Check existing buckets for duplicates
+                for block_idx in range(NUM_BUCKETS):
+                    if block_idx * 2 + 1 < len(h_bytes):
+                        val = (h_bytes[block_idx * 2] << 8) | h_bytes[block_idx * 2 + 1]
+                    else:
+                        continue
+
+                    bucket = buckets[block_idx].get(val, [])
+                    for j in bucket:
+                        # Avoid checking same pair twice
+                        pair = (min(j, idx), max(j, idx))
+                        if pair in checked_pairs:
                             continue
+                        checked_pairs.add(pair)
+
                         # Calculate hamming distance
-                        distance = hash1 - hash2
-                        max_distance = len(hash1.hash) ** 2
-                        similarity = 1 - (distance / max_distance) if max_distance > 0 else 1.0
-                        if similarity >= self.config.duplicate_threshold:
+                        dist = (h_int ^ hash_ints[j]).bit_count()
+                        if dist <= max_distance:
+                            similarity = 1 - (dist / hash_bits) if hash_bits > 0 else 1.0
+                            h1, h2 = valid_hashes[j], h_hex
                             for p1 in self.perceptual_hashes[h1]:
                                 for p2 in self.perceptual_hashes[h2]:
                                     if p1 != p2:
                                         near_duplicates.append((p1, p2, similarity))
+
+                # Add current hash to buckets
+                for block_idx in range(NUM_BUCKETS):
+                    if block_idx * 2 + 1 < len(h_bytes):
+                        val = (h_bytes[block_idx * 2] << 8) | h_bytes[block_idx * 2 + 1]
+                        buckets[block_idx][val].append(idx)
+
         except Exception as e:
             logger.warning(f"Error in near-duplicate detection: {e}")
-        
+
         return near_duplicates
 
+
+class DuplicateIndex:
+    """Persistent duplicate index backed by SQLite."""
+
+    def __init__(self, db_path: Union[str, Path], commit_interval: int = 1000):
+        self.db_path = Path(db_path)
+        self.commit_interval = max(1, commit_interval)
+        self.run_id = time.time_ns()
+        self._pending = 0
+
+        self._conn = sqlite3.connect(str(self.db_path), timeout=60)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA temp_store=MEMORY")
+        self._conn.execute("PRAGMA busy_timeout=60000")
+        self._init_schema()
+
+    def _init_schema(self):
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY,
+                size INTEGER,
+                mtime_ns INTEGER,
+                file_hash TEXT,
+                perceptual_hash TEXT,
+                ph_prefix TEXT,
+                last_seen INTEGER
+            )
+            """
+        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(file_hash)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_files_ph_prefix ON files(ph_prefix)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_files_last_seen ON files(last_seen)")
+        self._conn.commit()
+
+    def get_entry(self, path: Union[str, Path]) -> Optional[Tuple[int, int, str, str]]:
+        cur = self._conn.execute(
+            "SELECT size, mtime_ns, file_hash, perceptual_hash FROM files WHERE path = ?",
+            (str(path),)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return row[0], row[1], row[2] or "", row[3] or ""
+
+    def upsert(self, path: Union[str, Path], size: int, mtime_ns: int,
+               file_hash: str, perceptual_hash: str):
+        ph_prefix = perceptual_hash[:6] if perceptual_hash else ""
+        self._conn.execute(
+            """
+            INSERT INTO files(path, size, mtime_ns, file_hash, perceptual_hash, ph_prefix, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                size=excluded.size,
+                mtime_ns=excluded.mtime_ns,
+                file_hash=excluded.file_hash,
+                perceptual_hash=excluded.perceptual_hash,
+                ph_prefix=excluded.ph_prefix,
+                last_seen=excluded.last_seen
+            """,
+            (str(path), size, mtime_ns, file_hash, perceptual_hash, ph_prefix, self.run_id)
+        )
+        self._pending += 1
+        if self._pending >= self.commit_interval:
+            self._conn.commit()
+            self._pending = 0
+
+    def get_exact_duplicates(self, report_all: bool = False) -> Dict[str, List[str]]:
+        if self._pending:
+            self._conn.commit()
+            self._pending = 0
+        if report_all:
+            query = (
+                "SELECT file_hash, GROUP_CONCAT(path, '\n') "
+                "FROM files "
+                "WHERE file_hash IS NOT NULL AND file_hash != '' "
+                "GROUP BY file_hash "
+                "HAVING COUNT(*) > 1"
+            )
+            params = ()
+        else:
+            query = (
+                "SELECT f.file_hash, GROUP_CONCAT(f.path, '\n') "
+                "FROM files f "
+                "JOIN ("
+                "  SELECT DISTINCT file_hash FROM files "
+                "  WHERE last_seen = ? AND file_hash IS NOT NULL AND file_hash != ''"
+                ") t ON f.file_hash = t.file_hash "
+                "GROUP BY f.file_hash "
+                "HAVING COUNT(*) > 1"
+            )
+            params = (self.run_id,)
+
+        duplicates: Dict[str, List[str]] = {}
+        for file_hash, paths_blob in self._conn.execute(query, params):
+            if not file_hash or not paths_blob:
+                continue
+            paths = [p for p in paths_blob.split('\n') if p]
+            if len(paths) > 1:
+                duplicates[file_hash] = paths
+        return duplicates
+
+    def close(self):
+        if self._pending:
+            self._conn.commit()
+            self._pending = 0
+        self._conn.close()
 
 class DatasetAnalyzer:
     """Main dataset analyzer class"""
@@ -606,6 +821,13 @@ class DatasetAnalyzer:
         self.image_analyzer = ImageAnalyzer(config)
         self.tag_analyzer = TagAnalyzer(config)
         self.duplicate_detector = DuplicateDetector(config)
+        self.duplicate_index = None
+        if self.config.duplicate_db_path:
+            self.duplicate_index = DuplicateIndex(
+                self.config.duplicate_db_path,
+                commit_interval=self.config.duplicate_db_commit_interval
+            )
+            logger.info("Using duplicate index: %s", self.duplicate_index.db_path)
         
         # Results storage
         self.image_stats = []
@@ -632,7 +854,13 @@ class DatasetAnalyzer:
         # Discover images
         image_paths = self._discover_images()
         logger.info(f"Found {len(image_paths)} images")
-        
+        self.dataset_stats.total_images = len(image_paths)
+
+        sampling_for_stats = False
+        if self.config.sample_size_for_stats and len(image_paths) > self.config.sample_size_for_stats:
+            sampling_for_stats = True
+        need_hashes = self.config.analyze_duplicates or self.duplicate_index is not None
+
         if not image_paths:
             logger.warning("No images found to analyze")
             self.dataset_stats.analysis_duration_seconds = (datetime.now() - start_time).total_seconds()
@@ -646,7 +874,12 @@ class DatasetAnalyzer:
         
         # Analyze images
         if self.config.analyze_images:
-            self._analyze_images(image_paths)
+            record_hashes = need_hashes and not sampling_for_stats
+            self._analyze_images(image_paths, record_hashes=record_hashes)
+            if need_hashes and sampling_for_stats:
+                self._hash_images_for_duplicates(image_paths)
+        elif need_hashes:
+            self._hash_images_for_duplicates(image_paths)
         
         # Analyze tags
         if self.config.analyze_tags:
@@ -686,13 +919,16 @@ class DatasetAnalyzer:
                 if path.suffix.lower() in image_extensions:
                     image_paths.append(path)
             elif path.is_dir():
-                for ext in image_extensions:
-                    image_paths.extend(path.rglob(f'*{ext}'))
-                    image_paths.extend(path.rglob(f'*{ext.upper()}'))
-        
+                for root, _, files in os.walk(path):
+                    for filename in files:
+                        if Path(filename).suffix.lower() in image_extensions:
+                            image_paths.append(Path(root) / filename)
+
+        if self.config.duplicates_only:
+            return list(set(image_paths))
         return sorted(set(image_paths))
     
-    def _analyze_images(self, image_paths: List[Path]):
+    def _analyze_images(self, image_paths: List[Path], record_hashes: bool = True):
         """Analyze image properties"""
         logger.info("Analyzing image properties...")
         
@@ -714,7 +950,7 @@ class DatasetAnalyzer:
             
             if self.config.enable_parallel and self.config.num_workers > 1:
                 # Parallel processing for better performance
-                self._analyze_images_parallel(chunk_paths)
+                self._analyze_images_parallel(chunk_paths, record_hashes=record_hashes)
             else:
                 # Sequential processing (more stable for debugging)
                 for path in tqdm(chunk_paths, desc=f"Analyzing images (chunk {chunk_idx + 1})"):
@@ -722,14 +958,20 @@ class DatasetAnalyzer:
                         stats = self.image_analyzer.analyze_image(path)
                         if stats:
                             self.image_stats_buffer.append(stats)
-                            self.duplicate_detector.add_image(stats)
+                            if record_hashes:
+                                try:
+                                    size, mtime_ns = self._get_file_metadata(path)
+                                    self._record_hashes(path, size, mtime_ns,
+                                                        stats.file_hash or "", stats.perceptual_hash or "")
+                                except Exception as e:
+                                    logger.error(f"Error updating duplicate index for {path}: {e}")
                     except Exception as e:
                         logger.error(f"Error analyzing {path}: {e}")
             
             # Flush buffer periodically to manage memory
             self._flush_stats_buffer()
 
-    def _analyze_images_parallel(self, image_paths: List[Path]):
+    def _analyze_images_parallel(self, image_paths: List[Path], record_hashes: bool = True):
         """Analyze images in parallel with proper resource cleanup."""
         from itertools import repeat
         import concurrent.futures
@@ -758,7 +1000,14 @@ class DatasetAnalyzer:
                                 stats = fut.result()
                             if stats:
                                 self.image_stats_buffer.append(stats)
-                                self.duplicate_detector.add_image(stats)
+                                if record_hashes:
+                                    try:
+                                        path_obj = Path(path_str)
+                                        size, mtime_ns = self._get_file_metadata(path_obj)
+                                        self._record_hashes(path_obj, size, mtime_ns,
+                                                            stats.file_hash or "", stats.perceptual_hash or "")
+                                    except Exception as e:
+                                        logger.error(f"Error updating duplicate index for {path_str}: {e}")
                         except concurrent.futures.TimeoutError:
                             logger.error(f"Timeout analyzing {path_str}")
                             fut.cancel()  # Cancel the timed-out future
@@ -785,7 +1034,137 @@ class DatasetAnalyzer:
             raise
         finally:
             # Ensure executor shuts down cleanly
-            executor.shutdown(wait=True, cancel_futures=True)
+            # cancel_futures requires Python 3.9+
+            import sys
+            if sys.version_info >= (3, 9):
+                executor.shutdown(wait=True, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
+
+    def _get_file_metadata(self, path: Path) -> Tuple[int, int]:
+        stat = path.stat()
+        mtime_ns = getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+        return stat.st_size, mtime_ns
+
+    def _get_cached_hashes(self, path: Path, size: int, mtime_ns: int) -> Optional[Tuple[str, str]]:
+        if not self.duplicate_index or not self.config.duplicate_db_skip_unchanged:
+            return None
+        entry = self.duplicate_index.get_entry(path)
+        if entry:
+            e_size, e_mtime_ns, e_file_hash, e_perceptual = entry
+            if e_size == size and e_mtime_ns == mtime_ns and e_file_hash:
+                if not self.config.use_perceptual_hash or e_perceptual:
+                    return e_file_hash, e_perceptual
+        return None
+
+    def _record_hashes(self, path: Path, size: int, mtime_ns: int,
+                       file_hash: str, perceptual_hash: str):
+        if not self.config.analyze_duplicates and not self.duplicate_index:
+            return
+        if self.duplicate_index:
+            self.duplicate_index.upsert(path, size, mtime_ns, file_hash, perceptual_hash)
+
+        # When using duplicate_index, exact duplicates come from DB; only need perceptual for near-dups
+        # When not using duplicate_index, add both hashes to in-memory detector
+        if self.duplicate_index:
+            # Only add perceptual hash for near-duplicate detection (exact dups come from DB)
+            if self.config.use_perceptual_hash and perceptual_hash:
+                self.duplicate_detector.add_hashes(path, "", perceptual_hash)
+        else:
+            # Add both hashes for in-memory duplicate detection
+            self.duplicate_detector.add_hashes(path, file_hash, perceptual_hash)
+
+    def _hash_images_for_duplicates(self, image_paths: List[Path]):
+        """Compute hashes needed for duplicate detection without full analysis."""
+        logger.info("Hashing images for duplicate detection...")
+
+        if self.config.enable_parallel and self.config.num_workers > 1:
+            self._hash_images_parallel(image_paths)
+        else:
+            for path in tqdm(image_paths, desc="Hashing images"):
+                try:
+                    size, mtime_ns = self._get_file_metadata(path)
+                    cached = self._get_cached_hashes(path, size, mtime_ns)
+                    if cached:
+                        file_hash, perceptual_hash = cached
+                    else:
+                        file_hash, perceptual_hash = self.image_analyzer.compute_hashes(path)
+                    self._record_hashes(path, size, mtime_ns, file_hash, perceptual_hash)
+                except Exception as e:
+                    logger.error(f"Error hashing {path}: {e}")
+
+    def _hash_images_parallel(self, image_paths: List[Path]):
+        """Hash images in parallel for duplicate detection."""
+        n = len(image_paths)
+        max_outstanding = max(self.config.num_workers * 4, self.config.num_workers)
+
+        executor = ThreadPoolExecutor(max_workers=self.config.num_workers)
+        futures = {}
+
+        try:
+            it = iter(image_paths)
+
+            with tqdm(total=n, desc="Hashing images (parallel)") as pbar:
+                def submit_if_needed(next_path: Path):
+                    try:
+                        size, mtime_ns = self._get_file_metadata(next_path)
+                        cached = self._get_cached_hashes(next_path, size, mtime_ns)
+                        if cached:
+                            file_hash, perceptual_hash = cached
+                            self._record_hashes(next_path, size, mtime_ns, file_hash, perceptual_hash)
+                            pbar.update(1)
+                            return
+                        futures[executor.submit(self.image_analyzer.compute_hashes, next_path)] = (next_path, size, mtime_ns)
+                    except Exception as e:
+                        logger.error(f"Error preparing {next_path}: {e}")
+                        pbar.update(1)
+
+                exhausted = False
+                while True:
+                    while len(futures) < max_outstanding and not exhausted:
+                        try:
+                            next_path = next(it)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        submit_if_needed(next_path)
+
+                    if not futures:
+                        if exhausted:
+                            break
+                        continue
+
+                    for fut in as_completed(list(futures.keys())):
+                        path, size, mtime_ns = futures.pop(fut)
+                        try:
+                            if self.config.per_image_timeout_seconds:
+                                file_hash, perceptual_hash = fut.result(timeout=self.config.per_image_timeout_seconds)
+                            else:
+                                file_hash, perceptual_hash = fut.result()
+                            self._record_hashes(path, size, mtime_ns, file_hash, perceptual_hash)
+                        except Exception as e:
+                            logger.error(f"Error hashing {path}: {e}")
+                        pbar.update(1)
+
+                        if not exhausted:
+                            try:
+                                next_path = next(it)
+                            except StopIteration:
+                                exhausted = True
+                            else:
+                                submit_if_needed(next_path)
+        except Exception as e:
+            logger.error(f"Error in parallel hashing: {e}")
+            for fut in futures:
+                fut.cancel()
+            raise
+        finally:
+            # cancel_futures requires Python 3.9+
+            import sys
+            if sys.version_info >= (3, 9):
+                executor.shutdown(wait=True, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
     
     def _analyze_single_image_safe(self, path: Path) -> Optional[ImageStats]:
         """Safely analyze a single image (for parallel processing)"""
@@ -802,8 +1181,9 @@ class DatasetAnalyzer:
 
     def _analyze_tags(self, image_paths: List[Path]) -> Dict[str, Any]:
         """Analyze tag distributions"""
+        import re  # Import once at function level, not inside loop
         logger.info("Analyzing tags...")
-        
+
         for image_path in tqdm(image_paths, desc="Loading tags"):
             # Try different tag file formats
             tag_files = [
@@ -811,13 +1191,12 @@ class DatasetAnalyzer:
                 image_path.with_suffix('.tags'),
                 image_path.parent / f"{image_path.stem}_tags.txt"
             ]
-            
+
             for tag_file in tag_files:
                 if tag_file.exists():
                     tags = []
                     try:
                         # Read once; support JSON arrays, comma/semicolon/whitespace delimited
-                        import re
                         with open(tag_file, 'r', encoding='utf-8', errors='replace') as f:
                             content = f.read()
                         stripped = content.strip()
@@ -846,7 +1225,7 @@ class DatasetAnalyzer:
                             self.tag_analyzer.add_image_tags(str(image_path), tags)
                             break
                         except Exception as e:
-                            logger.error(f"Error parsing tags from {tag_file}: {e}")
+                            logger.error(f"Error adding tags from {tag_file}: {e}")
                             continue
         
         # Get tag statistics
@@ -870,24 +1249,68 @@ class DatasetAnalyzer:
         logger.info("Detecting duplicates...")
         
         # Find exact duplicates
-        exact_duplicates = self.duplicate_detector.find_exact_duplicates()
+        if self.duplicate_index:
+            exact_duplicates = self.duplicate_index.get_exact_duplicates(
+                report_all=self.config.duplicate_db_report_all
+            )
+        else:
+            exact_duplicates = self.duplicate_detector.find_exact_duplicates()
         self.dataset_stats.duplicate_groups = exact_duplicates
         self.dataset_stats.duplicate_images = sum(len(paths) - 1 for paths in exact_duplicates.values())
         
         # Find near duplicates
         near_duplicates = self.duplicate_detector.find_near_duplicates()
         self.dataset_stats.near_duplicates = near_duplicates
+        distribution, stats = self._summarize_near_duplicates(near_duplicates)
+        self.dataset_stats.near_duplicate_similarity_distribution = distribution
+        self.dataset_stats.near_duplicate_similarity_stats = stats
         
         logger.info(f"Found {self.dataset_stats.duplicate_images} exact duplicates")
         logger.info(f"Found {len(near_duplicates)} near-duplicate pairs")
+
+    def _summarize_near_duplicates(
+        self,
+        near_duplicates: List[Tuple[str, str, float]]
+    ) -> Tuple[Dict[str, int], Dict[str, float]]:
+        """Summarize perceptual hash similarity for near-duplicate pairs."""
+        if not near_duplicates:
+            return {}, {}
+
+        buckets = [
+            (0.99, ">=0.99"),
+            (0.97, "0.97-0.99"),
+            (0.95, "0.95-0.97"),
+            (0.90, "0.90-0.95"),
+            (0.85, "0.85-0.90"),
+            (0.80, "0.80-0.85"),
+            (0.00, "<0.80"),
+        ]
+        distribution = {label: 0 for _, label in buckets}
+        similarities: List[float] = []
+
+        for _, _, similarity in near_duplicates:
+            similarities.append(similarity)
+            for threshold, label in buckets:
+                if similarity >= threshold:
+                    distribution[label] += 1
+                    break
+
+        stats = {
+            'pairs': len(similarities),
+            'min': float(min(similarities)),
+            'max': float(max(similarities)),
+            'mean': float(np.mean(similarities)),
+            'median': float(np.median(similarities)),
+        }
+        return distribution, stats
     
     def _compute_dataset_stats(self):
         """Compute overall dataset statistics"""
         logger.info("Computing dataset statistics...")
-        
+
         if self.image_stats:
-            # Basic counts
-            self.dataset_stats.total_images = len(self.image_stats)
+            # Note: total_images is set from discovered images count in analyze_dataset()
+            # image_stats may be smaller due to sampling, so we don't override total_images here
             
             # Image statistics
             widths = [s.width for s in self.image_stats if s.width > 0]
@@ -1104,7 +1527,7 @@ class DatasetAnalyzer:
         }
         
         output_path = self.output_dir / 'analysis_report.json'
-        with open(output_path, 'w') as f:
+        with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(report_data, f, indent=2, default=str)
         
         logger.info(f"Saved JSON report to {output_path}")
@@ -1134,6 +1557,22 @@ class DatasetAnalyzer:
         report.append(f"- **Corrupted Images:** {self.dataset_stats.corrupted_images}\n")
         report.append(f"- **Low Quality Images:** {self.dataset_stats.low_quality_images}\n")
         report.append(f"- **Duplicate Images:** {self.dataset_stats.duplicate_images}\n")
+
+        # Near-duplicate similarity
+        if self.dataset_stats.near_duplicate_similarity_distribution:
+            report.append("\n## Near-Duplicate Similarity\n")
+            for bucket, count in self.dataset_stats.near_duplicate_similarity_distribution.items():
+                report.append(f"- **{bucket}:** {count}\n")
+            stats = self.dataset_stats.near_duplicate_similarity_stats
+            if stats:
+                report.append(f"- **Pairs:** {stats.get('pairs', 0)}\n")
+                report.append(
+                    f"- **Min/Mean/Median/Max:** "
+                    f"{stats.get('min', 0.0):.3f} / "
+                    f"{stats.get('mean', 0.0):.3f} / "
+                    f"{stats.get('median', 0.0):.3f} / "
+                    f"{stats.get('max', 0.0):.3f}\n"
+                )
         
         # Format Distribution
         if self.dataset_stats.format_distribution:
@@ -1149,7 +1588,7 @@ class DatasetAnalyzer:
         
         # Save report
         output_path = self.output_dir / 'analysis_report.md'
-        with open(output_path, 'w') as f:
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(''.join(report))
         
         logger.info(f"Saved Markdown report to {output_path}")
@@ -1220,6 +1659,24 @@ class DatasetAnalyzer:
             html.append(f'<tr><td>{metric}</td><td>{count}</td><td class="{status}">{icon}</td></tr>')
         
         html.append("</table>")
+
+        # Near-duplicate similarity
+        if self.dataset_stats.near_duplicate_similarity_distribution:
+            html.append("<h2>Near-Duplicate Similarity</h2>")
+            html.append("<table>")
+            html.append("<tr><th>Similarity Band</th><th>Pairs</th></tr>")
+            for bucket, count in self.dataset_stats.near_duplicate_similarity_distribution.items():
+                html.append(f"<tr><td>{bucket}</td><td>{count}</td></tr>")
+            html.append("</table>")
+            stats = self.dataset_stats.near_duplicate_similarity_stats
+            if stats:
+                html.append(
+                    "<p><strong>Min/Mean/Median/Max:</strong> "
+                    f"{stats.get('min', 0.0):.3f} / "
+                    f"{stats.get('mean', 0.0):.3f} / "
+                    f"{stats.get('median', 0.0):.3f} / "
+                    f"{stats.get('max', 0.0):.3f}</p>"
+                )
         
         # Top Tags
         if self.dataset_stats.tag_statistics and 'most_common_tags' in self.dataset_stats.tag_statistics:
@@ -1319,7 +1776,15 @@ class DatasetAnalyzer:
                 if cache_data.get('schema') != 1:
                     raise ValueError('cache schema mismatch')
 
-                self.image_stats = [ImageStats(**s) for s in cache_data['image_stats']]
+                # Convert lists back to tuples for tuple fields in ImageStats
+                def convert_image_stats(s: dict) -> ImageStats:
+                    if s.get('mean_color') is not None:
+                        s['mean_color'] = tuple(s['mean_color'])
+                    if s.get('std_color') is not None:
+                        s['std_color'] = tuple(s['std_color'])
+                    return ImageStats(**s)
+
+                self.image_stats = [convert_image_stats(s) for s in cache_data['image_stats']]
                 self.dataset_stats = DatasetStats(**cache_data['dataset_stats'])
                 self.tag_analyzer.tag_counts = Counter(cache_data['tag_counts'])
 
@@ -1329,6 +1794,11 @@ class DatasetAnalyzer:
                 logger.warning("Could not load cache: %s", e)
 
         return False
+
+    def close(self):
+        if self.duplicate_index:
+            self.duplicate_index.close()
+            self.duplicate_index = None
 
 
 # --- Module-level worker for ProcessPoolExecutor (picklable, avoids bound method) ---
@@ -1351,6 +1821,7 @@ def main():
     from utils.logging_setup import setup_logging
     
     listener = setup_logging()
+    analyzer = None
 
     try:
         parser = argparse.ArgumentParser(description='Analyze anime image dataset')
@@ -1362,11 +1833,22 @@ def main():
         parser.add_argument('--no-images', action='store_true', help='Skip image analysis')
         parser.add_argument('--no-tags', action='store_true', help='Skip tag analysis')
         parser.add_argument('--no-duplicates', action='store_true', help='Skip duplicate detection')
+        parser.add_argument('--duplicates-only', action='store_true', help='Run duplicate checks only')
+        parser.add_argument('--no-perceptual', action='store_true', help='Skip perceptual hashes (exact duplicates only)')
+        parser.add_argument('--duplicate-db', default=None, help='SQLite database path for persistent duplicate index')
+        parser.add_argument('--duplicate-db-report-all', action='store_true', help='Report duplicates across entire DB')
+        parser.add_argument('--duplicate-db-rehash', action='store_true', help='Rehash even if DB entry is unchanged')
+        parser.add_argument('--duplicate-db-commit', type=int, default=1000, help='DB commit interval')
         parser.add_argument('--no-visualizations', action='store_true', help='Skip creating visualizations')
         parser.add_argument('--report-format', choices=['html', 'markdown', 'json'], default='html', help='Report format')
         parser.add_argument('--use-cache', action='store_true', help='Use cached results if available')
         
         args = parser.parse_args()
+
+        if args.duplicates_only and args.no_duplicates:
+            parser.error("--duplicates-only conflicts with --no-duplicates")
+        if args.duplicate_db_report_all and not args.duplicate_db:
+            parser.error("--duplicate-db-report-all requires --duplicate-db")
 
         # Create configuration
         config = AnalysisConfig(
@@ -1379,8 +1861,25 @@ def main():
             analyze_tags=not args.no_tags,
             analyze_duplicates=not args.no_duplicates,
             create_visualizations=not args.no_visualizations,
-            report_format=args.report_format
+            report_format=args.report_format,
+            use_perceptual_hash=not args.no_perceptual,
+            duplicates_only=args.duplicates_only,
+            duplicate_db_path=args.duplicate_db,
+            duplicate_db_skip_unchanged=not args.duplicate_db_rehash,
+            duplicate_db_report_all=args.duplicate_db_report_all,
+            duplicate_db_commit_interval=args.duplicate_db_commit
         )
+
+        if args.duplicates_only:
+            config.analyze_images = False
+            config.analyze_tags = False
+            config.analyze_quality = False
+            config.analyze_tag_hierarchy = False
+            config.analyze_cooccurrence = False
+            config.compute_image_stats = False
+            config.extract_color_stats = False
+            config.check_corrupted = False
+            config.create_visualizations = False
 
         # Create analyzer
         analyzer = DatasetAnalyzer(config)
@@ -1395,7 +1894,7 @@ def main():
                 analyzer._generate_report()
         else:
             # Run analysis
-            stats = analyzer.analyze_dataset()
+            analyzer.analyze_dataset()
 
             # Save cache
             analyzer.save_cache()
@@ -1408,9 +1907,24 @@ def main():
         print(f"Unique Tags: {analyzer.dataset_stats.unique_tags:,}")
         print(f"Corrupted Images: {analyzer.dataset_stats.corrupted_images}")
         print(f"Duplicate Images: {analyzer.dataset_stats.duplicate_images}")
+        if analyzer.dataset_stats.near_duplicate_similarity_distribution:
+            print("Near-Duplicate Similarity:")
+            for bucket, count in analyzer.dataset_stats.near_duplicate_similarity_distribution.items():
+                print(f"  {bucket}: {count}")
+            sim_stats = analyzer.dataset_stats.near_duplicate_similarity_stats
+            if sim_stats:
+                print(
+                    "  Min/Mean/Median/Max: "
+                    f"{sim_stats.get('min', 0.0):.3f} / "
+                    f"{sim_stats.get('mean', 0.0):.3f} / "
+                    f"{sim_stats.get('median', 0.0):.3f} / "
+                    f"{sim_stats.get('max', 0.0):.3f}"
+                )
         print(f"Analysis Duration: {analyzer.dataset_stats.analysis_duration_seconds:.2f}s")
         print(f"\nResults saved to: {analyzer.output_dir}")
     finally:
+        if analyzer:
+            analyzer.close()
         if listener:
             listener.stop()
 
