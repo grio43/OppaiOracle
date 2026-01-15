@@ -61,6 +61,7 @@ import hashlib
 import json
 import logging
 import shutil
+import zlib
 
 # Try to use orjson for faster JSON parsing (3-5x faster than stdlib json)
 try:
@@ -77,6 +78,17 @@ try:
     HAS_FILELOCK = True
 except ImportError:
     HAS_FILELOCK = False
+
+# PyArrow for zero-copy metadata cache (memory-mapped, shared across workers)
+try:
+    import pyarrow as pa
+    import pyarrow.ipc as pa_ipc
+    HAS_PYARROW = True
+except ImportError:
+    pa = None
+    pa_ipc = None
+    HAS_PYARROW = False
+
 import logging.handlers
 import multiprocessing as mp
 import os
@@ -115,8 +127,9 @@ from cache_codec import get_sidecar_path, save_sidecar, load_sidecar
 from utils.cache_keys import compute_cache_config_hash
 from utils.cache_monitor import monitor
 from utils.metadata_ingestion import parse_tags_field
-from utils.metadata_cache import try_load_metadata_cache
+# Safetensors fallback removed - Arrow is now the only metadata cache format
 from utils.path_utils import sanitize_identifier, validate_image_path, resolve_and_confine
+from utils.exclusion_manager import ExclusionManager
 from vocabulary import load_vocabulary_for_training, TagVocabulary
 from shared_vocabulary import (
     SharedVocabularyManager,
@@ -126,9 +139,10 @@ from shared_vocabulary import (
 
 # Orientation-aware flipping (optional; keeps file usable in legacy setups)
 try:
-    from orientation_handler import OrientationHandler  # noqa: F401
+    from orientation_handler import OrientationHandler, SwapResult  # noqa: F401
 except (ImportError, ModuleNotFoundError):  # pragma: no cover
     OrientationHandler = None  # type: ignore
+    SwapResult = None  # type: ignore
 
 # Pillow resampling compatibility and truncated image handling
 try:  # Pillow ≥10
@@ -136,11 +150,24 @@ try:  # Pillow ≥10
 except AttributeError:  # Pillow <10
     RESAMPLE_BILINEAR = Image.BILINEAR
 
-# Optionally allow loading truncated/corrupt files (opt-in via env)
+# Strict mode by default: truncated/corrupt images are rejected immediately.
+# Set OO_ALLOW_TRUNCATED=1 to enable lenient mode which fills missing bytes
+# with gray pixels (useful for datasets with minor corruption issues).
+# Most "truncated" images are missing just a few bytes at the end (< 100 bytes)
+# which Pillow would fill with gray - but this can mask data quality issues.
 ALLOW_TRUNCATED = bool(int(os.environ.get("OO_ALLOW_TRUNCATED", "0")))
 if ALLOW_TRUNCATED:
     ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+# Memory bounds for error tracking to prevent unbounded growth
+# These limits prevent memory exhaustion during long training runs with many failures
+_MAX_RETRY_COUNTS = 10000        # Max samples to track retry counts for
+_MAX_FAILED_SAMPLES = 50000     # Max permanently failed samples to track
+_MAX_ERROR_STATS_TAGS = 5000    # Max unique tags to track error stats for
+
+# Exclusion file reload interval (seconds) - how often to check for new exclusions
+# from other workers. Lower = faster sync, Higher = less I/O overhead
+_EXCLUSION_RELOAD_INTERVAL = 120.0
 
 # Minimal dtype mapping for cache plumbing
 _DTYPE_MAP = {
@@ -178,11 +205,19 @@ def _is_cpu_bf16_supported() -> bool:
     return _CPU_BF16_SUPPORTED
 
 
+# Module-level cache for Normalize transforms (avoids mutable default argument antipattern)
+# Key: (mean, std) tuple, Value: transforms.Normalize instance
+_NORMALIZE_TRANSFORM_CACHE: Dict[Tuple[Tuple[float, ...], Tuple[float, ...]], Any] = {}
+
+
 def _normalize_preserve_dtype(img: torch.Tensor, mean: tuple, std: tuple) -> torch.Tensor:
     """Apply normalization while preserving the input tensor's dtype.
 
     torchvision.transforms.Normalize may convert bfloat16 tensors to float32 in some
     PyTorch versions. This helper ensures the original dtype is preserved.
+
+    Uses a module-level cache to avoid recreating Normalize objects for each sample.
+    Cache key is (mean, std) tuple - typically only one unique combination per training run.
 
     Args:
         img: Input tensor of shape (C, H, W)
@@ -195,14 +230,110 @@ def _normalize_preserve_dtype(img: torch.Tensor, mean: tuple, std: tuple) -> tor
     original_dtype = img.dtype
     if transforms is None:
         raise ImportError("torchvision is required for normalization")
-    normalized = transforms.Normalize(mean=mean, std=std)(img)
+
+    # Cache the Normalize transform to avoid recreating it per sample
+    # This provides ~5-10% speedup for large datasets
+    cache_key = (mean, std)
+    if cache_key not in _NORMALIZE_TRANSFORM_CACHE:
+        _NORMALIZE_TRANSFORM_CACHE[cache_key] = transforms.Normalize(mean=mean, std=std)
+
+    normalized = _NORMALIZE_TRANSFORM_CACHE[cache_key](img)
     # Ensure dtype is preserved (may be converted to float32 by Normalize)
     if normalized.dtype != original_dtype:
         normalized = normalized.to(original_dtype)
     return normalized
 
 
+def process_image_cpu(
+    img: Image.Image,
+    target_size: int,
+    pad_color: Tuple[int, int, int]
+) -> Tuple[Image.Image, torch.Tensor]:
+    """
+    Process PIL image on CPU: resizing, letterboxing, and padding mask generation.
+    Moves heavy PIL operations to background threads when used with ImagePreFetcher.
+
+    Args:
+        img: Source PIL Image (RGB)
+        target_size: Target dimension (square)
+        pad_color: RGB tuple for padding
+
+    Returns:
+        (canvas, pmask): Processed PIL Image and boolean padding mask
+    """
+    w, h = img.size
+    # Downscale-only letterbox: preserve aspect, never upscale
+    ratio = min(target_size / float(w), target_size / float(h)) if (w > 0 and h > 0) else 1.0
+    scale = min(1.0, ratio)
+    nw, nh = int(round(w * scale)), int(round(h * scale))
+    
+    resized = img.resize((max(1, nw), max(1, nh)), RESAMPLE_BILINEAR)
+
+    canvas = Image.new("RGB", (target_size, target_size), pad_color)
+    left = (target_size - resized.size[0]) // 2
+    top = (target_size - resized.size[1]) // 2
+    canvas.paste(resized, (left, top))
+
+    pmask = torch.ones(target_size, target_size, dtype=torch.bool)
+    pmask[top:top + resized.size[1], left:left + resized.size[0]] = False
+    
+    return canvas, pmask
+
+
 ## moved to utils/cache_keys.py: compute_cache_config_hash
+
+
+class ResumableSampler(DistributedSampler):
+    """DistributedSampler with O(1) mid-epoch resume support.
+
+    Standard DistributedSampler requires iterating through all batches to maintain
+    RNG order, which takes ~17 minutes for 5000+ batches. This sampler allows
+    setting a start_index to skip directly to the resume point.
+
+    State is serializable for checkpoint embedding.
+    """
+
+    def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True,
+                 seed=0, drop_last=False):
+        super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
+        self._start_index = 0
+        self._cached_indices = None
+
+    def set_start_index(self, index: int):
+        """Set the starting index for iteration (for mid-epoch resume)."""
+        self._start_index = index
+
+    def get_state(self) -> dict:
+        """Get sampler state for checkpointing."""
+        return {
+            'epoch': self.epoch,
+            'start_index': self._start_index,
+            'total_size': self.total_size,
+            'num_replicas': self.num_replicas,
+            'rank': self.rank,
+        }
+
+    def load_state(self, state: dict):
+        """Restore sampler state from checkpoint."""
+        self.set_epoch(state['epoch'])
+        self._start_index = state.get('start_index', 0)
+
+    def __iter__(self):
+        # Generate indices using parent's logic
+        indices = list(super().__iter__())
+        self._cached_indices = indices
+
+        # Skip to start_index for mid-epoch resume
+        for i in range(self._start_index, len(indices)):
+            yield indices[i]
+
+        # Reset for next epoch
+        self._start_index = 0
+
+    def __len__(self):
+        base_len = super().__len__()
+        return max(0, base_len - self._start_index)
+
 
 # Guarded DataLoader wrapper:
 # - If num_workers == 0, drop prefetch_factor and force persistent_workers=False.
@@ -242,7 +373,7 @@ def _split_cache_paths(root: Path) -> tuple[Path, Path]:
     )
 
 def _try_load_cached_split(root: Path, seed: int = 42) -> Optional[tuple[list[Path], list[Path]]]:
-    """Load cached split files with v2.0 validation.
+    """Load cached split files with v2.1 validation.
 
     Args:
         root: Dataset root directory
@@ -253,11 +384,14 @@ def _try_load_cached_split(root: Path, seed: int = 42) -> Optional[tuple[list[Pa
       - Parallel existence checks using ThreadPoolExecutor
       - Early return on cache hit without full validation
 
-    v2.0 Validation:
+    v2.1 Validation (added filesystem count check):
       - Version check
       - Exclusion hash check (detects changes to manifest file filtering)
-      - File count tolerance check (0.1%)
+      - Cache internal consistency check (header FILE_COUNT matches path count)
       - Seed check (detects when seed changes between runs)
+      - FILESYSTEM COUNT CHECK: Scans actual filesystem to detect new/deleted files
+        (prevents stale cache from silently ignoring new dataset files)
+      - Sample existence check (verifies subset of cached paths still exist)
     """
     logger = logging.getLogger(__name__)
     train_file, val_file = _split_cache_paths(root)
@@ -333,6 +467,28 @@ def _try_load_cached_split(root: Path, seed: int = 42) -> Optional[tuple[list[Pa
                 )
                 return None
 
+            # CRITICAL: Validate cached count against ACTUAL filesystem count
+            # This catches new files added after the cache was created
+            # Without this check, new files would be silently ignored!
+            if "FILE_COUNT" in train_header:
+                cached_count = int(train_header["FILE_COUNT"])
+                logger.debug(f"Counting current JSON files in {root} to validate split cache...")
+                # Count files on filesystem (generator avoids memory overhead)
+                filesystem_count = sum(
+                    1 for jp in root.rglob("*.json")
+                    if jp.name not in _EXCLUSION_PATTERNS
+                )
+                tolerance = max(100, int(max(cached_count, filesystem_count) * 0.001))  # 0.1% of larger count
+
+                if abs(filesystem_count - cached_count) > tolerance:
+                    logger.info(
+                        f"Split cache stale: filesystem has {filesystem_count:,} JSON files, "
+                        f"cache has {cached_count:,} (diff={abs(filesystem_count - cached_count):,}, "
+                        f"tolerance={tolerance}). Rebuilding split cache..."
+                    )
+                    return None
+                logger.debug(f"Filesystem count validated: {filesystem_count:,} files match cache")
+
             # Stratified sampling: check files from beginning, end, and random middle
             # This catches orphan files anywhere in the list, not just at the start
             sample_paths = []
@@ -382,17 +538,19 @@ def _try_load_cached_split(root: Path, seed: int = 42) -> Optional[tuple[list[Pa
                         return None
                 except TimeoutError:
                     logging.getLogger(__name__).warning(
-                        "Cached split validation timed out after 30s. Skipping validation and using cache anyway."
+                        "Cached split validation timed out after 30s. Invalidating cache to ensure data integrity. "
+                        "Consider checking filesystem health if this occurs frequently."
                     )
-                    # On timeout, trust the cache anyway rather than re-scanning
-                    pass
+                    # Invalidate cache on timeout - files may have been moved/deleted
+                    # Re-scanning is safer than using potentially stale cache
+                    return None
 
             logging.getLogger(__name__).info(
                 f"Using cached JSON split lists (train={len(train_list)}, val={len(val_list)})"
             )
             return train_list, val_list
-        except Exception:
-            pass
+        except Exception as e:
+            logging.getLogger(__name__).debug(f"Failed to load cached split: {e}")
     return None
 
 def _write_cached_split(root: Path, train_list: list[Path], val_list: list[Path], seed: int = 42) -> None:
@@ -527,6 +685,79 @@ def _save_manifest_cache(path: Path, annotations: list) -> None:
             pass
 
 
+class ArrowMetadataAccessor:
+    """Zero-copy accessor for Arrow-backed metadata.
+
+    Provides dict-like access to Arrow table rows without copying data.
+    Used by SidecarJsonDataset to access metadata without RAM duplication
+    across DataLoader workers.
+
+    When pickled for multiprocessing, only the cache path is serialized.
+    Workers re-open the memory-mapped file independently, allowing the OS
+    to share the same physical memory pages across all workers.
+
+    Memory savings: ~15 GB per worker for 5.6M images dataset.
+    """
+
+    def __init__(self, table: "pa.Table", cache_path: Path):
+        """Initialize accessor.
+
+        Args:
+            table: PyArrow Table (memory-mapped)
+            cache_path: Path to the Arrow IPC file (for pickling)
+        """
+        self._table = table
+        self._cache_path = cache_path
+        self._len = len(table)
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Get metadata for a single sample.
+
+        Returns a dict matching the legacy format:
+        {"image_id": str, "tags": List[str], "rating": str, "dir": Path}
+        Plus "json_stem" if available (v2.0+ cache format).
+        """
+        # Slice single row - Arrow handles this efficiently
+        row = self._table.slice(idx, 1)
+        result = {
+            "image_id": row.column("image_id")[0].as_py(),
+            "tags": row.column("tags")[0].as_py(),
+            "rating": row.column("rating")[0].as_py(),
+            "dir": Path(row.column("dir")[0].as_py()),
+        }
+        # Include json_stem if available (v2.0+ cache format)
+        if "json_stem" in self._table.column_names:
+            result["json_stem"] = row.column("json_stem")[0].as_py()
+        return result
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Prepare for pickling - only serialize the cache path."""
+        return {
+            "_cache_path": self._cache_path,
+            "_len": self._len,
+        }
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """Restore from pickle in worker process - re-open the mmap."""
+        self._cache_path = state["_cache_path"]
+        self._len = state["_len"]
+        # Re-open memory-mapped file in worker
+        # Import here to avoid issues if pyarrow not installed
+        from utils.metadata_cache import _load_arrow_cache
+        import logging
+        logger = logging.getLogger(__name__)
+        self._table = _load_arrow_cache(self._cache_path, logger)
+        if self._table is None:
+            raise RuntimeError(
+                f"Failed to reload Arrow metadata cache in worker process: {self._cache_path}. "
+                "The cache file may be missing, corrupted, or locked. "
+                "Try deleting the cache file and restarting training."
+            )
+
+
 class ImagePreFetcher:
     """Background thread pool for pre-fetching image files.
 
@@ -537,28 +768,32 @@ class ImagePreFetcher:
     Performance gains:
       - ~20-40% faster dataset iteration when cache misses are common
       - Hides disk I/O latency behind computation
+      - Moves resizing/padding to background threads (new in this version)
       - Minimal memory overhead (< 100MB for typical settings)
     """
 
-    def __init__(self, max_workers: int = 2, cache_size: int = 8):
+    def __init__(self, max_workers: int = 2, cache_size: int = 8, target_size: int = 512, pad_color: tuple = (114, 114, 114)):
         """Initialize pre-fetcher.
 
         Args:
             max_workers: Number of background threads (default 2)
             cache_size: Maximum number of pre-fetched images to cache
+            target_size: Target image size for resizing/padding
+            pad_color: RGB tuple for padding
         """
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="prefetch")
-        self.cache: Dict[int, Any] = {}  # idx -> (pil_img, img_path)
+        self.cache: Dict[int, Any] = {}  # idx -> (pil_img, padding_mask)
         self.cache_size = cache_size
         self.futures: Dict[int, Any] = {}  # idx -> Future
         self._lock = threading.Lock()
         self._last_idx = -1
+        self.target_size = target_size
+        self.pad_color = pad_color
 
-    def _load_image(self, img_path: Path, pad_color: tuple) -> Optional[Image.Image]:
-        """Load and decode image in background thread.
+    def _load_image(self, img_path: Path) -> Optional[Tuple[Image.Image, torch.Tensor]]:
+        """Load, decode, and process image in background thread.
 
-        Returns a fully-loaded copy of the image to avoid file handle leaks.
-        PIL's convert() can return lazy objects that reference the original file.
+        Returns a fully-loaded and processed (resized/padded) image + mask.
         """
         try:
             with Image.open(img_path) as pil_img:
@@ -568,97 +803,128 @@ class ImagePreFetcher:
                 # Handle transparency
                 if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
                     rgba = pil_img.convert("RGBA")
-                    bg = Image.new("RGB", rgba.size, pad_color)
+                    bg = Image.new("RGB", rgba.size, self.pad_color)
                     alpha = rgba.getchannel("A")
                     bg.paste(rgba, mask=alpha)
                     img = bg
                 else:
                     img = pil_img.convert("RGB")
-
-                # Return a fully loaded copy to ensure file handle is released
-                # PIL's convert() can return lazy objects that hold file references
-                return img.copy()
+                
+                # Perform resizing and padding in background thread
+                return process_image_cpu(img, self.target_size, self.pad_color)
         except Exception:
             # Silent failure - will be retried in main thread
             return None
 
-    def prefetch(self, idx: int, img_path: Path, pad_color: tuple) -> None:
+    def prefetch(self, idx: int, img_path: Path) -> None:
         """Start pre-fetching an image in the background.
 
         Args:
             idx: Dataset index for this image
             img_path: Path to image file
-            pad_color: RGB tuple for transparency handling
         """
         with self._lock:
             # Only prefetch if not already cached or in-flight
             if idx not in self.cache and idx not in self.futures:
-                future = self.executor.submit(self._load_image, img_path, pad_color)
+                future = self.executor.submit(self._load_image, img_path)
                 self.futures[idx] = (future, img_path)
 
-    def get(self, idx: int) -> Optional[Image.Image]:
-        """Get pre-fetched image if available.
+    def get(self, idx: int, wait_timeout: Optional[float] = 0.05) -> Optional[Tuple[Image.Image, torch.Tensor]]:
+        """Get pre-fetched image, optionally waiting for completion.
+
+        Args:
+            idx: Dataset index to retrieve
+            wait_timeout: Max seconds to wait for prefetch (default 0.05s = 50ms).
+                         Set to 0 for non-blocking, None for unlimited wait.
 
         Returns:
-            PIL Image if pre-fetched, None otherwise
+            (PIL Image, padding_mask) if pre-fetched, None otherwise
         """
+        future_to_wait = None
+
         with self._lock:
             # Check cache first
             if idx in self.cache:
                 return self.cache.pop(idx)
 
-            # Check if future completed
+            # Check if future exists
             if idx in self.futures:
-                future, img_path = self.futures.pop(idx)
+                future, img_path = self.futures[idx]
+
                 if future.done():
+                    # Future completed - pop and return
+                    self.futures.pop(idx)
                     try:
-                        img = future.result(timeout=0)
-                        return img
+                        result = future.result(timeout=0)
+                        return result
                     except Exception:
-                        pass
+                        return None
+
+                # Future not done - optionally wait outside lock to avoid blocking
+                # wait_timeout: None=unlimited, >0=wait with timeout, 0=non-blocking
+                if wait_timeout is None or wait_timeout > 0:
+                    # Pop from futures while holding lock (safe), wait outside lock
+                    self.futures.pop(idx)
+                    future_to_wait = future
+
+        # Wait for future OUTSIDE of lock (no race condition since we already popped it)
+        if future_to_wait is not None:
+            try:
+                # None means unlimited wait, positive means timeout in seconds
+                return future_to_wait.result(timeout=wait_timeout)
+            except Exception:
+                return None
 
         return None
 
     def trigger_lookahead(self, current_idx: int, dataset_len: int,
-                         get_path_func, pad_color: tuple, lookahead: int = 4) -> None:
+                         get_path_func, lookahead: int = 4) -> None:
         """Trigger pre-fetching for upcoming indices.
 
         Args:
             current_idx: Current dataset index being accessed
             dataset_len: Total dataset length
             get_path_func: Function to get image path for an index (idx -> Path)
-            pad_color: RGB tuple for transparency handling
             lookahead: Number of indices to pre-fetch ahead (default 4)
         """
-        # Detect sequential access pattern
-        if current_idx == self._last_idx + 1 or self._last_idx < 0:
+        # Detect sequential access pattern (thread-safe read of _last_idx)
+        with self._lock:
+            last_idx = self._last_idx
+            self._last_idx = current_idx
+
+        if current_idx == last_idx + 1 or last_idx < 0:
             # Pre-fetch next N images
             for offset in range(1, lookahead + 1):
                 next_idx = current_idx + offset
                 if next_idx < dataset_len:
                     try:
                         img_path = get_path_func(next_idx)
-                        self.prefetch(next_idx, img_path, pad_color)
+                        self.prefetch(next_idx, img_path)
                     except Exception:
                         pass  # Invalid path, skip
 
-        self._last_idx = current_idx
-
         # Cleanup: remove stale futures and enforce cache size
         with self._lock:
-            # Move completed futures to cache (up to cache_size)
-            completed_idxs = [
-                idx for idx, (future, _) in self.futures.items()
-                if future.done() and len(self.cache) < self.cache_size
-            ]
-            for idx in completed_idxs:
+            # Check for completed futures
+            # We must process ALL completed futures to prevent memory leaks in self.futures
+            # If cache is full, we still need to remove them from self.futures (discarding the result)
+            idxs_to_remove = []
+            
+            for idx, (future, _) in list(self.futures.items()):  # List copy for safe iteration
+                if future.done():
+                    idxs_to_remove.append(idx)
+                    
+            for idx in idxs_to_remove:
                 future, img_path = self.futures.pop(idx)
-                try:
-                    img = future.result(timeout=0)
-                    if img is not None:
-                        self.cache[idx] = img
-                except Exception:
-                    pass
+                # Only add to cache if we have space
+                if len(self.cache) < self.cache_size:
+                    try:
+                        result = future.result(timeout=0)
+                        if result is not None:
+                            self.cache[idx] = result
+                    except Exception:
+                        pass
+                # else: implicit discard (future removed from futures, result ignored)
 
             # Evict old cache entries if we exceed size
             while len(self.cache) > self.cache_size:
@@ -669,7 +935,11 @@ class ImagePreFetcher:
         """Shutdown background threads and cleanup resources."""
         self.executor.shutdown(wait=True)
         # Close any cached PIL Images to release file handles
-        for img in self.cache.values():
+        for item in self.cache.values():
+            if isinstance(item, tuple):
+                 img = item[0]
+            else:
+                 img = item
             if hasattr(img, 'close'):
                 try:
                     img.close()
@@ -717,6 +987,10 @@ class WorkerInitializer:
             try:
                 from logging.handlers import QueueHandler
                 logger.addHandler(QueueHandler(self.log_queue))
+                # Set worker log level to CRITICAL to minimize queue traffic from workers
+                # WARNING-level logs still have overhead (queue serialization, main process dequeue)
+                # With 8+ workers, even infrequent warnings add measurable latency (~1-2ms/batch)
+                logger.setLevel(logging.CRITICAL)
             except Exception:
                 pass
 
@@ -754,10 +1028,10 @@ class DatasetLoader(Dataset):
         dataset_root: Optional[str] = None,
         transform=None,
         joint_transforms=None,  # NEW: torchvision v2 transforms applied to (image, mask) together
-        max_retries=3,
+        max_retries=2,
         num_classes=None,
         # Image pipeline params
-        image_size: int = 640,
+        image_size: int = 512,
         pad_color: Tuple[int, int, int] = (114, 114, 114),
         normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
@@ -785,6 +1059,7 @@ class DatasetLoader(Dataset):
         self.num_classes = num_classes
         self.retry_counts = {}
         self.failed_samples = set()
+        self._sample_error_log_count = 0  # Rate-limit error logs
         self.logger = logging.getLogger(__name__)
         # Track error distribution per tag to detect bias
         from collections import defaultdict
@@ -792,6 +1067,18 @@ class DatasetLoader(Dataset):
         self._error_warn_counts = defaultdict(int)  # Rate limit warnings per tag
         # For manifest mode, allow symlink targets to resolve within this dataset root
         self.dataset_root = dataset_root
+
+        # Exclusion manager for bad/corrupted images - supports live persistence
+        # and periodic reload for multi-worker synchronization
+        exclusion_base = Path(dataset_root) if dataset_root else Path(image_dir).parent
+        exclusion_path = exclusion_base / 'cache_exclusions.txt'
+        self._exclusion_manager = ExclusionManager(
+            exclusion_path,
+            reload_interval_seconds=_EXCLUSION_RELOAD_INTERVAL
+        )
+        self.excluded_image_ids = self._exclusion_manager.load()
+        if self.excluded_image_ids:
+            self.logger.info(f"Loaded {len(self.excluded_image_ids)} excluded image IDs from {exclusion_path}")
 
         # Image pipeline settings
         self.image_size = int(image_size)
@@ -838,6 +1125,18 @@ class DatasetLoader(Dataset):
         # --- Shared vocabulary flag (for worker_init_fn) ---
         self._shared_vocab_loaded = False
 
+        # --- Pre-created transforms for performance (avoid recreating per sample) ---
+        # Use v2 API to avoid deprecation warning (ToTensor is deprecated)
+        if T is not None:
+            self._to_tensor_v2 = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
+            self._to_tensor = self._to_tensor_v2  # Use v2 for v1 fallback too
+        elif transforms is not None:
+            self._to_tensor_v2 = None
+            self._to_tensor = transforms.ToTensor()  # Legacy fallback
+        else:
+            self._to_tensor_v2 = None
+            self._to_tensor = None
+
     # ---------- Pre-fetcher ----------
     def _ensure_prefetcher(self):
         """Create image pre-fetcher lazily (per-worker)."""
@@ -845,12 +1144,17 @@ class DatasetLoader(Dataset):
             return
         # Configurable prefetch settings (increased defaults to hide I/O latency)
         # DATASET_PREFETCH_SIZE: Number of images to prefetch (default 32, was 8)
-        # DATASET_PREFETCH_WORKERS: Number of background threads (default 4, was 2)
-        # This reduces synchronous image loading bottlenecks (10-50ms per image)
+        # DATASET_PREFETCH_WORKERS: Number of background threads (default 2)
+        # Reduced from 4 to avoid thread oversubscription with num_workers=6 (would be 24+6=30 threads)
         # Memory overhead: ~3MB per cached image, so 32 images = ~96MB per worker
         cache_size = int(os.getenv("DATASET_PREFETCH_SIZE", "32"))
-        max_workers = int(os.getenv("DATASET_PREFETCH_WORKERS", "4"))
-        self._prefetcher = ImagePreFetcher(max_workers=max_workers, cache_size=cache_size)
+        max_workers = int(os.getenv("DATASET_PREFETCH_WORKERS", "2"))
+        self._prefetcher = ImagePreFetcher(
+            max_workers=max_workers, 
+            cache_size=cache_size,
+            target_size=self.image_size,
+            pad_color=self.pad_color
+        )
 
     # ---------- Pickling support for multiprocessing ----------
     def __getstate__(self):
@@ -944,6 +1248,13 @@ class DatasetLoader(Dataset):
         """
         tag_vec = self._encode_labels(annotation)
         rating_idx = _map_rating(annotation.get("rating", "unknown"))
+
+        # Ensure tensors are contiguous before returning for efficient pin_memory
+        # Non-contiguous tensors force implicit copies during DataLoader collation/pinning
+        if not image.is_contiguous():
+            image = image.contiguous()
+        if not padding_mask.is_contiguous():
+            padding_mask = padding_mask.contiguous()
 
         return {
             "images": image,
@@ -1089,11 +1400,33 @@ class DatasetLoader(Dataset):
         self.logger.debug(f"Dataset epoch set to {self._current_epoch}")
 
     def __getitem__(self, idx):
+        # Periodically reload exclusions to pick up failures from other workers
+        if self._exclusion_manager:
+            if self._exclusion_manager.reload_if_stale():
+                new_exclusions = self._exclusion_manager.get_excluded_ids()
+                if len(new_exclusions) > len(self.excluded_image_ids):
+                    self.excluded_image_ids = new_exclusions
+
         # HL002 Fix: Return error sample immediately on failure, don't bias distribution
         if idx in self.failed_samples:
             return self._create_error_sample(idx, "Previously failed sample")
 
+        # Check if this sample was excluded by another worker (cross-worker sync)
+        if idx < len(self.annotations):
+            item_image_id = sanitize_identifier(str(self.annotations[idx].get('image_id', '')))
+            if item_image_id and item_image_id in self.excluded_image_ids:
+                if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
+                    self.failed_samples.add(idx)
+                return self._create_error_sample(idx, f"Excluded: {item_image_id}")
+
+        # Track retries with memory bounds to prevent unbounded growth
         if idx not in self.retry_counts:
+            # Evict oldest entries if at capacity (simple FIFO-like eviction)
+            if len(self.retry_counts) >= _MAX_RETRY_COUNTS:
+                # Remove ~10% of entries to amortize eviction cost
+                keys_to_remove = list(self.retry_counts.keys())[:_MAX_RETRY_COUNTS // 10]
+                for k in keys_to_remove:
+                    del self.retry_counts[k]
             self.retry_counts[idx] = 0
 
         try:
@@ -1112,16 +1445,16 @@ class DatasetLoader(Dataset):
 
             # Try to use pre-fetched image first (reduces I/O latency by ~20-40%)
             self._ensure_prefetcher()
-            img = None
+            prefetch_result = None
             if self._prefetcher is not None:
-                img = self._prefetcher.get(idx)
+                prefetch_result = self._prefetcher.get(idx)
                 # Trigger lookahead for next images
                 self._prefetcher.trigger_lookahead(
-                    idx, len(self), self._get_image_path_for_idx, tuple(self.pad_color)
+                    idx, len(self), self._get_image_path_for_idx
                 )
 
             # If not pre-fetched, load synchronously
-            if img is None:
+            if prefetch_result is None:
                 # Fully decode while file is open; fix EXIF rotations.
                 with Image.open(img_path) as pil_img:
                     pil_img.load()
@@ -1129,31 +1462,17 @@ class DatasetLoader(Dataset):
 
                     if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
                         rgba = pil_img.convert("RGBA")
-                        bg = Image.new("RGB", rgba.size, tuple(self.pad_color))
+                        bg = Image.new("RGB", rgba.size, self.pad_color)
                         alpha = rgba.getchannel("A")
                         bg.paste(rgba, mask=alpha)
                         img = bg
                     else:
                         img = pil_img.convert("RGB")
-
-            # 2) Keep aspect ratio via letterbox to square + build padding mask (True = PAD)
-            target = int(self.image_size)
-            w, h = img.size
-            # Downscale-only letterbox: preserve aspect, never upscale
-            ratio = min(target / float(w), target / float(h)) if (w > 0 and h > 0) else 1.0
-            scale = min(1.0, ratio)
-            nw, nh = int(round(w * scale)), int(round(h * scale))
-            # (Optional) modern Pillow name to avoid deprecation noise:
-            # from PIL import Image; resample = Image.Resampling.BILINEAR
-            resized = img.resize((max(1, nw), max(1, nh)), RESAMPLE_BILINEAR)
-
-            canvas = Image.new("RGB", (target, target), tuple(self.pad_color))
-            left = (target - resized.size[0]) // 2
-            top = (target - resized.size[1]) // 2
-            canvas.paste(resized, (left, top))
-
-            pmask = torch.ones(target, target, dtype=torch.bool)
-            pmask[top:top + resized.size[1], left:left + resized.size[0]] = False
+                
+                # Process on CPU (resize/pad)
+                canvas, pmask = process_image_cpu(img, self.image_size, self.pad_color)
+            else:
+                canvas, pmask = prefetch_result
 
             # If provided, run joint v2 transforms to keep image & mask aligned
             if self.joint_transforms is not None and T is not None and tv_tensors is not None:
@@ -1162,7 +1481,7 @@ class DatasetLoader(Dataset):
                 # v2 ops automatically use NEAREST for Mask; geometry stays in sync
                 img_tv, mask_tv = self.joint_transforms(img_tv, mask_tv)
                 # Pre-norm 0..1 tensor for L1; then normalize for model
-                img_01 = T.ToTensor()(img_tv)  # 0..1 float
+                img_01 = self._to_tensor_v2(img_tv)  # 0..1 float
                 if self._cpu_bf16_cache:
                     img_01 = img_01.to(torch.bfloat16)
                 t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
@@ -1172,25 +1491,27 @@ class DatasetLoader(Dataset):
                 if self.transform:
                     try:
                         transformed = self.transform(canvas)
-                        if transforms is None:
+                        if self._to_tensor is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         # Ensure we can derive 0..1 image for L1 regardless of transform type
-                        img_01 = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
+                        img_01 = transformed if isinstance(transformed, torch.Tensor) else self._to_tensor(transformed)
                         # Keep dtype as-is; bf16 preferred when configured
                         if self._cpu_bf16_cache:
                             img_01 = img_01.to(torch.bfloat16)
                         t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
-                    except Exception:
-                        if transforms is None:
+                    except Exception as e:
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            self.logger.debug(f"Transform failed, using fallback: {e}")
+                        if self._to_tensor is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                        img_01 = transforms.ToTensor()(canvas)
+                        img_01 = self._to_tensor(canvas)
                         if self._cpu_bf16_cache:
                             img_01 = img_01.to(torch.bfloat16)
                         t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
                 else:
-                    if transforms is None:
+                    if self._to_tensor is None:
                         raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                    img_01 = transforms.ToTensor()(canvas)
+                    img_01 = self._to_tensor(canvas)
                     if self._cpu_bf16_cache:
                         img_01 = img_01.to(torch.bfloat16)
                     t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
@@ -1205,14 +1526,35 @@ class DatasetLoader(Dataset):
 
         except Exception as e:
             self.retry_counts[idx] += 1
-            self.logger.warning(f"Failed to load sample {idx}: {e}")
+            self._sample_error_log_count += 1
+            # Rate-limit warning logs: log first, then every 100th
+            if self._sample_error_log_count == 1 or self._sample_error_log_count % 100 == 0:
+                self.logger.warning(f"Failed to load sample {idx}: {e} (total errors: {self._sample_error_log_count})")
 
             # Track error distribution to detect bias
             error_type = 'load_failed' if 'load' in str(e).lower() else 'decode_failed'
             self._track_error_distribution(idx, error_type)
 
             if self.retry_counts[idx] >= self.max_retries:
-                self.failed_samples.add(idx)
+                # Add to failed set with memory bounds
+                if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
+                    self.failed_samples.add(idx)
+
+                # Persist failed sample to exclusion file immediately
+                try:
+                    failed_image_id = sanitize_identifier(str(self.annotations[idx].get('image_id', '')))
+                    if failed_image_id and self._exclusion_manager:
+                        was_new = self._exclusion_manager.add_exclusion(failed_image_id, immediate=True)
+                        if was_new:
+                            self.excluded_image_ids.add(failed_image_id)
+                            self.logger.info(
+                                f"Persisted exclusion for {failed_image_id} (sample {idx}) - "
+                                f"will be skipped in future runs"
+                            )
+                except Exception as persist_err:
+                    self.logger.warning(f"Could not persist exclusion for sample {idx}: {persist_err}")
+
+                # Always log when sample permanently fails (rate-limited by max_retries)
                 self.logger.error(f"Sample {idx} exceeded max retries, marking as failed")
                 return self._create_error_sample(idx, str(e))
 
@@ -1226,10 +1568,20 @@ class DatasetLoader(Dataset):
             idx: Sample index that failed
             error_type: Type of error (e.g., 'load_failed', 'decode_failed')
         """
-        if idx >= len(self.annotations):
+        # Enforce memory bounds on error tracking structures
+        if len(self.error_stats) >= _MAX_ERROR_STATS_TAGS:
+            # Stop tracking new tags once limit reached to prevent memory bloat
+            # Existing tags continue to be tracked
+            pass  # Will skip adding new tags below
+
+        # Bounds check with try-except for safety in case of concurrent access
+        try:
+            if idx < 0 or idx >= len(self.annotations):
+                return
+            annotation = self.annotations[idx]
+        except (IndexError, TypeError):
             return
 
-        annotation = self.annotations[idx]
         tag_indices = annotation.get("labels") or []
 
         # Track errors for each tag in this sample
@@ -1237,6 +1589,10 @@ class DatasetLoader(Dataset):
             if isinstance(tag_idx, (int, float)) and self.num_classes:
                 tag_idx = int(tag_idx)
                 if 0 <= tag_idx < self.num_classes:
+                    # Only track if tag already tracked or we have room for new tags
+                    if tag_idx not in self.error_stats and len(self.error_stats) >= _MAX_ERROR_STATS_TAGS:
+                        continue  # Skip new tags when at capacity
+
                     self.error_stats[tag_idx][error_type] += 1
                     self.error_stats[tag_idx]['total'] += 1
 
@@ -1259,13 +1615,22 @@ class DatasetLoader(Dataset):
         """Create a clearly marked error sample"""
         # Default to a common square size when transform is unknown
         sz = int(getattr(self, "image_size", 224) or 224)
+        # Ensure num_classes is valid to prevent shape mismatches during batching
+        if not self.num_classes or self.num_classes <= 0:
+            raise ValueError(
+                f"Cannot create error sample: num_classes={self.num_classes} is invalid. "
+                "Pass num_classes=len(vocab.tag_to_index) when creating DatasetLoader."
+            )
         return {
             "images": torch.zeros((3, sz, sz)),  # Placeholder tensor
             "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
-            "tag_labels": torch.zeros(self.num_classes or 1, dtype=self._tag_vector_dtype),
+            "tag_labels": torch.zeros(self.num_classes, dtype=self._tag_vector_dtype),
             "rating_labels": torch.tensor(4, dtype=torch.long),  # unknown
             "image_id": f"error_{idx}",
             "cached": False,
+            "flip_applied": False,
+            "flip_mode": "none",
+            "has_tag_mismatch": False,
             "error": True,
             "error_reason": reason,
         }
@@ -1331,7 +1696,9 @@ class BackgroundValidator(Thread):
     """Background validation thread with explicit cleanup and registry tracking."""
 
     def __init__(self, dataset_loader):
-        super().__init__(daemon=False)
+        # Use daemon=True so thread doesn't block process exit
+        # Validation is non-critical and can be safely interrupted
+        super().__init__(daemon=True)
         self.dataset_loader = dataset_loader
         self.validation_queue = queue.Queue(maxsize=1000)
         self.running = True
@@ -1503,9 +1870,9 @@ class SidecarJsonDataset(Dataset):
         vocab: TagVocabulary,
         transform=None,
         joint_transforms=None,  # NEW
-        max_retries: int = 3,
+        max_retries: int = 2,
         # Image pipeline params
-        image_size: int = 640,
+        image_size: int = 512,
         pad_color: Tuple[int, int, int] = (114, 114, 114),
         normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
@@ -1527,6 +1894,7 @@ class SidecarJsonDataset(Dataset):
         metadata_cache_workers: int = 16,
         force_rebuild_metadata_cache: bool = False,
         metadata_cache_staleness_check_samples: int = 100,
+        prebuilt_arrow_table: Optional[Any] = None,  # Pre-loaded Arrow table to avoid rebuild
     ):
         self.root = Path(root_dir)
         self.json_files = list(json_files)
@@ -1536,25 +1904,19 @@ class SidecarJsonDataset(Dataset):
         self.max_retries = max_retries
         self.retry_counts: Dict[int, int] = {}
         self.failed_samples = set()
+        self._sample_error_log_count = 0  # Rate-limit error logs
         self.logger = logging.getLogger(__name__)
 
-        # Load exclusion list for bad/corrupted images (written by l2_cache_warmup.py)
-        # Stores image_ids (stems) for format-agnostic matching
-        self.excluded_image_ids: Set[str] = set()
+        # Exclusion manager for bad/corrupted images - supports live persistence
+        # and periodic reload for multi-worker synchronization
         exclusion_path = self.root / 'cache_exclusions.txt'
-        if exclusion_path.exists():
-            try:
-                with open(exclusion_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            # Handle both old format (full path) and new format (just id)
-                            # Path().stem extracts just the filename without extension
-                            self.excluded_image_ids.add(Path(line).stem)
-                if self.excluded_image_ids:
-                    self.logger.info(f"Loaded {len(self.excluded_image_ids)} excluded image IDs from {exclusion_path}")
-            except Exception as e:
-                self.logger.warning(f"Failed to load exclusion list from {exclusion_path}: {e}")
+        self._exclusion_manager = ExclusionManager(
+            exclusion_path,
+            reload_interval_seconds=_EXCLUSION_RELOAD_INTERVAL
+        )
+        self.excluded_image_ids = self._exclusion_manager.load()
+        if self.excluded_image_ids:
+            self.logger.info(f"Loaded {len(self.excluded_image_ids)} excluded image IDs from {exclusion_path}")
 
         # Image pipeline settings
         self.image_size = int(image_size)
@@ -1597,10 +1959,35 @@ class SidecarJsonDataset(Dataset):
                 )
         else:
             self._cpu_bf16_cache = False
+            # Force sidecar dtype to float32 for consistency with non-cached images
+            # Without this, cached images would be bfloat16 but non-cached would be float32,
+            # causing batch collation to crash with "expected all tensors to be same dtype"
+            if self._sidecar_dtype is torch.bfloat16:
+                self._sidecar_dtype = torch.float32
+                self._sidecar_dtype_str = "float32"
+                self.logger.warning(
+                    "cpu_bf16_cache_pipeline disabled but sidecar_storage_dtype was bfloat16. "
+                    "Forcing sidecar_storage_dtype to float32 for batch consistency. "
+                    "Existing bfloat16 caches will be re-processed (config hash changed)."
+                )
+
+        # Defensive validation: ensure sidecar dtype matches what non-cached processing produces
+        # This prevents batch collation crashes from dtype mismatches between cached and non-cached images
+        if self._sidecar_enabled:
+            expected_dtype = torch.bfloat16 if self._cpu_bf16_cache else torch.float32
+            if self._sidecar_dtype != expected_dtype:
+                raise ValueError(
+                    f"Dtype inconsistency detected: sidecar_storage_dtype={self._sidecar_dtype}, "
+                    f"but cpu_bf16_cache_pipeline would produce {expected_dtype}. "
+                    "This would cause batch collation failures with mixed cached/uncached images. "
+                    "Either set cpu_bf16_cache_pipeline=true with sidecar_storage_dtype=bfloat16, "
+                    "or set both to use float32."
+                )
 
         # Compute config hash for sidecar cache invalidation
         # Include vocab_size to invalidate cache if vocabulary changes
         # Include has_joint_transforms to invalidate cache if transforms change
+        # Include flip params to invalidate cache if flip augmentation settings change
         self._config_hash = compute_cache_config_hash(
             image_size=self.image_size,
             pad_color=self.pad_color,
@@ -1609,6 +1996,8 @@ class SidecarJsonDataset(Dataset):
             storage_dtype=self._sidecar_dtype_str,
             vocab_size=len(self.vocab.tag_to_index),
             has_joint_transforms=(self.joint_transforms is not None),
+            random_flip_prob=float(random_flip_prob or 0.0),
+            has_orientation_handler=(orientation_handler is not None),
         )
 
         # --- Orientation / flipping state ---
@@ -1643,39 +2032,110 @@ class SidecarJsonDataset(Dataset):
         # This ensures that the same image can flip/not-flip differently in different epochs
         # Default to 0 for first epoch; updated by set_epoch() in training loop
         self._current_epoch = 0
+        self._epoch_was_set = False  # Track if set_epoch() was ever called
+        self._epoch_warning_issued = False  # Avoid spamming warnings
+
+        # --- Mismatch tracking for orientation tag-image consistency ---
+        # Tracks when flip is applied but some orientation tags couldn't be swapped
+        self._mismatch_stats: dict = {
+            'force_flip_mismatches': 0,
+            'random_flip_mismatches': 0,
+            'mismatch_samples': [],  # Store (image_id, unmapped_tags) for debugging
+        }
+        self._mismatch_warning_threshold = 100  # Warn after this many mismatches
+        self._mismatch_warned = False
+
+        # --- Pre-created transforms for performance (avoid recreating per sample) ---
+        # Use v2 API to avoid deprecation warning (ToTensor is deprecated)
+        if T is not None:
+            self._to_tensor_v2 = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
+            self._to_tensor = self._to_tensor_v2  # Use v2 for v1 fallback too
+        elif transforms is not None:
+            self._to_tensor_v2 = None
+            self._to_tensor = transforms.ToTensor()  # Legacy fallback
+        else:
+            self._to_tensor_v2 = None
+            self._to_tensor = None
+
+        # --- Image pre-fetching (per-worker; created lazily) ---
+        # Provides 20-40% speedup by loading next images in background threads
+        self._prefetcher: Optional[ImagePreFetcher] = None
+        self._enable_prefetch = os.getenv("DATASET_PREFETCH", "1") != "0"
 
         # Pre-parse minimal fields for speed
-        self.items: List[Dict[str, Any]] = []
+        # items can be List[Dict] (legacy) or ArrowMetadataAccessor (zero-copy)
+        self.items: Any = []
+        self._using_arrow = False
+        self._arrow_cache_path: Optional[Path] = None
 
         # Try loading from metadata cache if enabled
         if metadata_cache_enabled:
-            cache_result = try_load_metadata_cache(
-                root_dir=self.root,
-                json_files=self.json_files,
-                force_rebuild=force_rebuild_metadata_cache,
-                num_workers=metadata_cache_workers,
-                staleness_check_samples=metadata_cache_staleness_check_samples,
-                logger=self.logger
-            )
+            # Try Arrow cache first (zero-copy, memory-mapped)
+            from utils.metadata_cache import try_load_arrow_cache, _arrow_cache_path
 
-            if cache_result is not None:
-                # Filter out excluded images by image_id (format-agnostic)
-                if self.excluded_image_ids:
-                    original_count = len(cache_result)
-                    self.items = [
-                        item for item in cache_result
-                        if item['image_id'] not in self.excluded_image_ids
-                    ]
-                    excluded_count = original_count - len(self.items)
-                    if excluded_count > 0:
-                        self.logger.info(f"Filtered out {excluded_count} excluded images from metadata cache")
-                else:
-                    self.items = cache_result
-                self.logger.info(f"Loaded {len(self.items):,} items from metadata cache")
+            # Use prebuilt table if provided (avoids rebuilding for train/val splits)
+            if prebuilt_arrow_table is not None:
+                arrow_table = prebuilt_arrow_table
+                self.logger.info("Using prebuilt Arrow table from parent context")
             else:
-                # Cache unavailable, fall back to sequential parsing
-                self.logger.warning("Metadata cache unavailable, parsing sequentially...")
-                metadata_cache_enabled = False  # Skip cache for fallback
+                arrow_table = try_load_arrow_cache(
+                    root_dir=self.root,
+                    json_files=self.json_files,
+                    force_rebuild=force_rebuild_metadata_cache,
+                    num_workers=metadata_cache_workers,
+                    staleness_check_samples=metadata_cache_staleness_check_samples,
+                    logger=self.logger
+                )
+
+            if arrow_table is not None:
+                # Use ArrowMetadataAccessor for zero-copy access
+                self._arrow_cache_path = _arrow_cache_path(self.root)
+
+                # If using prebuilt table (contains ALL files), filter to this dataset's files
+                if prebuilt_arrow_table is not None and "json_stem" in arrow_table.column_names:
+                    # Build lookup set of (dir, stem) from our json_files
+                    our_files = {(str(jp.parent), jp.stem) for jp in self.json_files}
+                    dirs = arrow_table.column("dir").to_pylist()
+                    stems = arrow_table.column("json_stem").to_pylist()
+                    # Create boolean mask for filtering
+                    mask = [(d, s) in our_files for d, s in zip(dirs, stems)]
+                    arrow_table = arrow_table.filter(mask)
+                    self.logger.info(f"Filtered Arrow table to {len(arrow_table):,} rows for this split")
+
+                if self.excluded_image_ids:
+                    # If there are exclusions, we need to filter them out
+                    # Build a filtered list (loses zero-copy but handles exclusions correctly)
+                    # This is rare - exclusions are only for bad/corrupted images
+                    self.logger.info(
+                        f"Filtering {len(self.excluded_image_ids)} exclusions from Arrow cache..."
+                    )
+                    accessor = ArrowMetadataAccessor(arrow_table, self._arrow_cache_path)
+                    original_count = len(accessor)
+                    filtered_items = []
+                    for i in range(original_count):
+                        item = accessor[i]
+                        if item['image_id'] not in self.excluded_image_ids:
+                            filtered_items.append(item)
+                    self.items = filtered_items
+                    excluded_count = original_count - len(self.items)
+                    self._using_arrow = False  # Using list, not Arrow accessor
+                    self.logger.info(
+                        f"Filtered {excluded_count} excluded images, {len(self.items):,} items remaining "
+                        "(note: zero-copy disabled due to exclusions)"
+                    )
+                else:
+                    # No exclusions - use zero-copy Arrow accessor
+                    self.items = ArrowMetadataAccessor(arrow_table, self._arrow_cache_path)
+                    self._using_arrow = True
+                    self.logger.info(f"Loaded {len(self.items):,} items from Arrow cache (zero-copy)")
+            else:
+                # Arrow cache unavailable (PyArrow not installed or build failed)
+                # Fall back to sequential parsing
+                self.logger.warning(
+                    "Arrow metadata cache unavailable. Falling back to sequential JSON parsing. "
+                    "Install PyArrow for faster loading: pip install pyarrow>=14.0.0"
+                )
+                metadata_cache_enabled = False  # Trigger fallback path
 
         # Fallback: sequential parsing (if cache disabled or failed)
         if not metadata_cache_enabled or len(self.items) == 0:
@@ -1712,12 +2172,21 @@ class SidecarJsonDataset(Dataset):
 
     # ---------- Pickling support for multiprocessing ----------
     def __getstate__(self):
-        """Prepare for pickling - exclude unpicklable objects."""
+        """Prepare for pickling - exclude unpicklable objects.
+
+        Note: When using Arrow cache, self.items is an ArrowMetadataAccessor
+        which handles its own serialization. It only pickles the cache path,
+        then re-opens the memory-mapped file in each worker. This allows all
+        workers to share the same physical memory pages via OS virtual memory.
+        """
         state = self.__dict__.copy()
         # Remove unpicklable objects before sending to worker
         state['_prefetcher'] = None          # ImagePreFetcher thread pool (if any)
         state['orientation_handler'] = None  # May contain unpicklable state
         state['_stats_queue'] = None         # multiprocessing.Queue (cannot be pickled on Windows spawn)
+        state['_exclusion_manager'] = None   # Contains threading lock (will be recreated)
+        # ArrowMetadataAccessor handles its own __getstate__/__setstate__
+        # It only pickles the path, then re-opens the mmap in worker
         return state
 
     def __setstate__(self, state):
@@ -1726,9 +2195,52 @@ class SidecarJsonDataset(Dataset):
         # These will be lazily recreated when needed:
         # - _prefetcher and _orientation_handler if needed
         # - _stats_queue stays None in workers (telemetry only from main process)
+        # - ArrowMetadataAccessor re-opens the memory-mapped file automatically
+
+        # Recreate exclusion manager in worker process
+        # This allows each worker to persist failed samples independently
+        exclusion_path = self.root / 'cache_exclusions.txt'
+        self._exclusion_manager = ExclusionManager(
+            exclusion_path,
+            reload_interval_seconds=_EXCLUSION_RELOAD_INTERVAL
+        )
+        # Load current exclusions (may have been updated by other workers)
+        self.excluded_image_ids = self._exclusion_manager.load()
 
     def __len__(self) -> int:
         return len(self.items)
+
+    # ---------- Pre-fetcher ----------
+    def _ensure_prefetcher(self):
+        """Create image pre-fetcher lazily (per-worker)."""
+        if not self._enable_prefetch or self._prefetcher is not None:
+            return
+        # Configurable prefetch settings (increased defaults to hide I/O latency)
+        # DATASET_PREFETCH_SIZE: Number of images to prefetch (default 32)
+        # DATASET_PREFETCH_WORKERS: Number of background threads (default 4)
+        # Memory overhead: ~3MB per cached image, so 32 images = ~96MB per worker
+        cache_size = int(os.getenv("DATASET_PREFETCH_SIZE", "32"))
+        max_workers = int(os.getenv("DATASET_PREFETCH_WORKERS", "4"))
+        self._prefetcher = ImagePreFetcher(
+            max_workers=max_workers, 
+            cache_size=cache_size,
+            target_size=self.image_size,
+            pad_color=self.pad_color
+        )
+
+    def _get_image_path_for_idx(self, idx: int) -> Path:
+        """Get image path for a given index (for prefetching).
+
+        Returns:
+            Path to image file
+
+        Raises:
+            Exception on any error (caught by prefetcher)
+        """
+        ann = self.items[idx]
+        image_id = ann["image_id"]
+        img_root = ann.get("dir", self.root)
+        return validate_image_path(Path(img_root), image_id)
 
     def set_epoch(self, epoch: int) -> None:
         """Set the current epoch for deterministic-yet-varying flip decisions.
@@ -1746,15 +2258,19 @@ class SidecarJsonDataset(Dataset):
             - Essential for proper cache invalidation and augmentation diversity
         """
         self._current_epoch = int(epoch)
+        self._epoch_was_set = True
         self.logger.debug(f"Dataset epoch set to {self._current_epoch}")
 
     def _deterministic_coin(self, image_id: str) -> bool:
-        """Stable per-image, per-epoch coin flip based on SHA256(image_id + epoch).
+        """Stable per-image, per-epoch coin flip using fast CRC32 hash.
 
         This ensures deterministic yet epoch-varying flip decisions:
         - Same (image_id, epoch) always produces the same flip decision (reproducible)
         - Different epochs produce different flip decisions (augmentation diversity)
         - Cache-friendly: unflipped versions cached, flipped computed on-demand
+
+        Performance: CRC32 is ~20x faster than SHA256 (~0.1μs vs ~2-5μs per call).
+        At 5.6M samples/epoch, this saves ~11-28 seconds per epoch.
 
         Args:
             image_id: Unique image identifier
@@ -1764,10 +2280,22 @@ class SidecarJsonDataset(Dataset):
         """
         if self.random_flip_prob <= 0:
             return False
+        # Warn once if flip is enabled but set_epoch() was never called
+        # This helps catch training loops that forget to set the epoch
+        if not self._epoch_was_set and not self._epoch_warning_issued:
+            self._epoch_warning_issued = True
+            self.logger.warning(
+                "Random flip is enabled (prob=%.2f) but set_epoch() was never called. "
+                "All images will use epoch=0 for flip decisions, meaning the same images "
+                "will flip the same way every epoch. Call dataset.set_epoch(epoch) at the "
+                "start of each epoch for proper augmentation diversity.",
+                self.random_flip_prob
+            )
         # Include epoch in hash to get different flips across epochs
-        seed_str = f"{image_id}|epoch{self._current_epoch}"
-        h = hashlib.sha256(seed_str.encode("utf-8")).digest()
-        v = int.from_bytes(h[:4], byteorder="big") / 2**32  # [0,1)
+        # Use zlib.crc32 for speed - deterministic and fast (~20x faster than SHA256)
+        seed_bytes = f"{image_id}|epoch{self._current_epoch}".encode("utf-8")
+        h = zlib.crc32(seed_bytes) & 0xFFFFFFFF  # Ensure unsigned 32-bit
+        v = h / 0xFFFFFFFF  # [0,1]
         return v < float(self.random_flip_prob)
 
     def _decide_flip_mode(self, image_id: str, tags: List[str]) -> str:
@@ -1790,6 +2318,85 @@ class SidecarJsonDataset(Dataset):
                 pass
         return "random" if self._deterministic_coin(image_id) else "none"
 
+    def _track_flip_mismatch(
+        self,
+        image_id: str,
+        mode: str,
+        unmapped_tags: List[str]
+    ) -> None:
+        """Track and optionally warn about tag-image flip mismatches.
+
+        Called when a flip is applied but some orientation-sensitive tags
+        couldn't be swapped, creating a potential tag-image mismatch.
+
+        Args:
+            image_id: Image identifier for debugging
+            mode: Flip mode ("force" or "random")
+            unmapped_tags: Tags that needed mapping but had none
+        """
+        if mode == "force":
+            self._mismatch_stats['force_flip_mismatches'] += 1
+        else:
+            self._mismatch_stats['random_flip_mismatches'] += 1
+
+        # Store sample info for debugging (bounded list)
+        if len(self._mismatch_stats['mismatch_samples']) < 50:
+            self._mismatch_stats['mismatch_samples'].append({
+                'image_id': image_id,
+                'mode': mode,
+                'unmapped_tags': unmapped_tags[:5],  # Limit stored tags
+            })
+
+        # Warn once when threshold exceeded
+        total_mismatches = (
+            self._mismatch_stats['force_flip_mismatches'] +
+            self._mismatch_stats['random_flip_mismatches']
+        )
+        if not self._mismatch_warned and total_mismatches >= self._mismatch_warning_threshold:
+            self._mismatch_warned = True
+            sample_tags = [s['unmapped_tags'] for s in self._mismatch_stats['mismatch_samples'][:3]]
+            self.logger.warning(
+                f"Detected {total_mismatches} tag-image flip mismatches. "
+                f"Force mode: {self._mismatch_stats['force_flip_mismatches']}, "
+                f"Random mode: {self._mismatch_stats['random_flip_mismatches']}. "
+                f"Sample unmapped tags: {sample_tags}. "
+                f"Consider adding mappings to orientation_map.json"
+            )
+
+    def get_flip_mismatch_statistics(self) -> Dict[str, Any]:
+        """Return statistics about flip-related tag mismatches.
+
+        Useful for monitoring training quality and identifying tags
+        that need orientation mappings.
+
+        Returns:
+            Dictionary with mismatch statistics including:
+                - force_flip_mismatches: Count of force mode mismatches
+                - random_flip_mismatches: Count of random mode mismatches
+                - mismatch_samples: Sample of affected images/tags
+                - total_mismatches: Total mismatch count
+                - mismatch_rate: Ratio of mismatches to total flips (if available)
+        """
+        total_mismatches = (
+            self._mismatch_stats['force_flip_mismatches'] +
+            self._mismatch_stats['random_flip_mismatches']
+        )
+
+        # Calculate mismatch rate if orientation handler has flip stats
+        total_flips = 0
+        if self.orientation_handler is not None:
+            stats = self.orientation_handler.stats
+            total_flips = stats.get('total_flips', 0)
+
+        mismatch_rate = total_mismatches / max(1, total_flips) if total_flips > 0 else 0.0
+
+        return {
+            **self._mismatch_stats,
+            'total_mismatches': total_mismatches,
+            'total_flips': total_flips,
+            'mismatch_rate': mismatch_rate,
+        }
+
     def _build_sample_dict(
         self,
         image: torch.Tensor,
@@ -1798,6 +2405,9 @@ class SidecarJsonDataset(Dataset):
         rating: Any,
         image_id: str,
         cached: bool = False,
+        flip_applied: bool = False,
+        flip_mode: str = "none",
+        has_tag_mismatch: bool = False,
     ) -> Dict[str, Any]:
         """Build the sample dictionary returned by __getitem__.
 
@@ -1808,11 +2418,22 @@ class SidecarJsonDataset(Dataset):
             rating: Rating value (to be mapped)
             image_id: Image identifier
             cached: Whether data came from cache
+            flip_applied: Whether horizontal flip was applied
+            flip_mode: Flip mode used ("none", "force", "random")
+            has_tag_mismatch: Whether unmapped orientation tags exist (tag-image mismatch)
 
         Returns:
             Sample dict for training
         """
         rating_idx = _map_rating(rating)
+
+        # Ensure tensors are contiguous before returning for efficient pin_memory
+        # torch.flip() returns a view (non-contiguous), which forces implicit copies during
+        # DataLoader collation/pinning. Making them contiguous here (in workers) is cheaper.
+        if not image.is_contiguous():
+            image = image.contiguous()
+        if not padding_mask.is_contiguous():
+            padding_mask = padding_mask.contiguous()
 
         return {
             "images": image,
@@ -1821,15 +2442,43 @@ class SidecarJsonDataset(Dataset):
             "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
             "image_id": image_id,
             "cached": cached,
+            "flip_applied": flip_applied,
+            "flip_mode": flip_mode,
+            "has_tag_mismatch": has_tag_mismatch,
             "error": False,
             "error_reason": "",
         }
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        # Periodically reload exclusions to pick up failures from other workers
+        # This runs every ~120 seconds (configurable via _EXCLUSION_RELOAD_INTERVAL)
+        if self._exclusion_manager:
+            if self._exclusion_manager.reload_if_stale():
+                # Update local reference if new exclusions were found
+                new_exclusions = self._exclusion_manager.get_excluded_ids()
+                if len(new_exclusions) > len(self.excluded_image_ids):
+                    self.excluded_image_ids = new_exclusions
+
         if idx in self.failed_samples:
             return self._error_sample(idx, "Previously failed sample")
 
+        # Check if this sample was excluded by another worker (cross-worker sync)
+        if idx < len(self.items):
+            item_image_id = self.items[idx].get("image_id")
+            if item_image_id and item_image_id in self.excluded_image_ids:
+                # Mark as failed in memory too to speed up subsequent checks
+                if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
+                    self.failed_samples.add(idx)
+                return self._error_sample(idx, f"Excluded by other worker: {item_image_id}")
+
+        # Track retries with memory bounds to prevent unbounded growth
         if idx not in self.retry_counts:
+            # Evict oldest entries if at capacity (simple FIFO-like eviction)
+            if len(self.retry_counts) >= _MAX_RETRY_COUNTS:
+                # Remove ~10% of entries to amortize eviction cost
+                keys_to_remove = list(self.retry_counts.keys())[:_MAX_RETRY_COUNTS // 10]
+                for k in keys_to_remove:
+                    del self.retry_counts[k]
             self.retry_counts[idx] = 0
 
         try:
@@ -1841,27 +2490,34 @@ class SidecarJsonDataset(Dataset):
             # Decide whether to flip and adjust tags accordingly
             mode = self._decide_flip_mode(image_id, original_tags)
             flip_bit = False
+            has_tag_mismatch = False
             if mode != "none" and self.orientation_handler is not None:
-                if mode == "force":
-                    tags_now = [self.orientation_handler.swap_tag(t) for t in original_tags]
-                    flip_bit = True
-                else:
-                    # Avoid double safety checks here; decision already made by _decide_flip_mode
-                    tags_now, flipped = self.orientation_handler.swap_tags(original_tags, skip_safety_check=True)
-                    flip_bit = bool(flipped)
+                # Use swap_tags_with_info() to detect potential tag-image mismatches
+                swap_result = self.orientation_handler.swap_tags_with_info(
+                    original_tags,
+                    skip_safety_check=True,  # Safety already checked in _decide_flip_mode
+                    record_stats=True
+                )
+                tags_now = swap_result.swapped_tags
+                flip_bit = swap_result.flip_applied if mode == "random" else True
+                has_tag_mismatch = swap_result.has_mismatch
+
+                # Track mismatches for monitoring and debugging
+                if has_tag_mismatch:
+                    self._track_flip_mismatch(image_id, mode, swap_result.unmapped_orientation_tags)
 
             # Resolve image path first (needed for both cache lookup and loading)
             img_root = ann.get("dir", self.root)
             img_path = validate_image_path(Path(img_root), image_id)
 
-            # Get source file mtime for cache invalidation when source is modified
-            try:
-                source_mtime = os.path.getmtime(img_path)
-            except OSError:
-                source_mtime = None  # File might not exist yet, will fail later
-
             # Try sidecar cache first
             if self._sidecar_enabled:
+                # Get source file mtime for cache invalidation when source is modified
+                # Only fetch when sidecar cache is enabled to avoid unnecessary syscalls
+                try:
+                    source_mtime = os.path.getmtime(img_path)
+                except OSError:
+                    source_mtime = None  # File might not exist yet, will fail later
                 sidecar_path = get_sidecar_path(str(img_path), self._sidecar_extension)
                 cache_result = load_sidecar(
                     sidecar_path,
@@ -1885,55 +2541,61 @@ class SidecarJsonDataset(Dataset):
                         tag_vec = self.vocab.encode_tags(tags_now)
                         monitor.l2_hit()  # Sidecar cache hit
                         return self._build_sample_dict(
-                            img_t, pmask, tag_vec, ann.get("rating", "unknown"), image_id, cached=True
+                            img_t, pmask, tag_vec, ann.get("rating", "unknown"), image_id,
+                            cached=True,
+                            flip_applied=flip_bit,
+                            flip_mode=mode,
+                            has_tag_mismatch=has_tag_mismatch,
                         )
                     else:
                         # Cache file loaded but validation failed - this is a stale entry, not a miss
-                        if not shape_ok:
-                            self.logger.debug(f"Sidecar shape mismatch for {image_id}, reloading")
-                        elif not dtype_ok:
-                            self.logger.debug(f"Sidecar dtype mismatch for {image_id}: {img_t.dtype} != {self._sidecar_dtype}")
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            if not shape_ok:
+                                self.logger.debug(f"Sidecar shape mismatch for {image_id}, reloading")
+                            elif not dtype_ok:
+                                self.logger.debug(f"Sidecar dtype mismatch for {image_id}: {img_t.dtype} != {self._sidecar_dtype}")
                         monitor.l2_stale()  # Stale cache entry (loaded but invalid)
                 else:
                     monitor.l2_miss()  # True cache miss (file not found or couldn't load)
 
             # Cache miss: load from disk
-            # Fully decode and correct EXIF while file is open
-            with Image.open(img_path) as pil_img:
-                pil_img.load()
-                pil_img = ImageOps.exif_transpose(pil_img)
-                if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
-                    rgba = pil_img.convert("RGBA")
-                    bg = Image.new("RGB", rgba.size, tuple(self.pad_color))
-                    alpha = rgba.getchannel("A")
-                    bg.paste(rgba, mask=alpha)
-                    pil = bg
-                else:
-                    pil = pil_img.convert("RGB")
-            # 2) Letterbox to square and padding mask
-            target = int(self.image_size)
-            w, h = pil.size
-            # Downscale-only letterbox: preserve aspect, never upscale
-            ratio = min(target / float(w), target / float(h)) if (w > 0 and h > 0) else 1.0
-            scale = min(1.0, ratio)
-            nw, nh = int(round(w * scale)), int(round(h * scale))
-            resized = pil.resize((max(1, nw), max(1, nh)), RESAMPLE_BILINEAR)
-            canvas = Image.new("RGB", (target, target), tuple(self.pad_color))
-            left = (target - resized.size[0]) // 2
-            top = (target - resized.size[1]) // 2
-            canvas.paste(resized, (left, top))
-            pmask = torch.ones(target, target, dtype=torch.bool)
-            pmask[top:top + resized.size[1], left:left + resized.size[0]] = False
-            # Apply horizontal flip based on the pre-decided flip_bit
-            if flip_bit:
-                canvas = ImageOps.mirror(canvas)
-                pmask = torch.flip(pmask, dims=[1])
+            # Try to use pre-fetched image first (reduces I/O latency by ~20-40%)
+            self._ensure_prefetcher()
+            prefetch_result = None
+            if self._prefetcher is not None:
+                prefetch_result = self._prefetcher.get(idx)
+                # Trigger lookahead for next images
+                self._prefetcher.trigger_lookahead(
+                    idx, len(self), self._get_image_path_for_idx
+                )
+
+            # If not pre-fetched, load synchronously
+            if prefetch_result is None:
+                # Fully decode and correct EXIF while file is open
+                with Image.open(img_path) as pil_img:
+                    pil_img.load()
+                    pil_img = ImageOps.exif_transpose(pil_img)
+                    if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
+                        rgba = pil_img.convert("RGBA")
+                        bg = Image.new("RGB", rgba.size, self.pad_color)
+                        alpha = rgba.getchannel("A")
+                        bg.paste(rgba, mask=alpha)
+                        pil = bg
+                    else:
+                        pil = pil_img.convert("RGB")
+                
+                canvas, pmask = process_image_cpu(pil, self.image_size, self.pad_color)
+            else:
+                canvas, pmask = prefetch_result
+
+            # NOTE: Flip is applied AFTER joint_transforms to ensure correct ordering
+            # (transforms operate on canonical unflipped images, flip is applied last)
             # Joint v2 transforms keep geometry aligned with mask when used
             if self.joint_transforms is not None and T is not None and tv_tensors is not None:
                 img_tv = tv_tensors.Image(canvas)
                 mask_tv = tv_tensors.Mask(pmask.to(torch.uint8))
                 img_tv, mask_tv = self.joint_transforms(img_tv, mask_tv)
-                img = T.ToTensor()(img_tv)
+                img = self._to_tensor_v2(img_tv)
                 if self._cpu_bf16_cache:
                     img = img.to(torch.bfloat16)
                 img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
@@ -1943,23 +2605,25 @@ class SidecarJsonDataset(Dataset):
                 if self.transform:
                     try:
                         transformed = self.transform(canvas)
-                        if transforms is None:
+                        if self._to_tensor is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                        img = transformed if isinstance(transformed, torch.Tensor) else transforms.ToTensor()(transformed)
+                        img = transformed if isinstance(transformed, torch.Tensor) else self._to_tensor(transformed)
                         if self._cpu_bf16_cache:
                             img = img.to(torch.bfloat16)
                         img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
-                    except Exception:
-                        if transforms is None:
+                    except Exception as e:
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            self.logger.debug(f"Transform failed, using fallback: {e}")
+                        if self._to_tensor is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                        img = transforms.ToTensor()(canvas)
+                        img = self._to_tensor(canvas)
                         if self._cpu_bf16_cache:
                             img = img.to(torch.bfloat16)
                         img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
                 else:
-                    if transforms is None:
+                    if self._to_tensor is None:
                         raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
-                    img = transforms.ToTensor()(canvas)
+                    img = self._to_tensor(canvas)
                     if self._cpu_bf16_cache:
                         img = img.to(torch.bfloat16)
                     img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
@@ -1967,37 +2631,33 @@ class SidecarJsonDataset(Dataset):
             # Encode labels (tags already account for flipping)
             tag_vec = self.vocab.encode_tags(tags_now)  # (V,)
 
-            # Save sidecar cache file (stores unflipped version for reuse across epochs)
+            # Save sidecar cache file BEFORE applying flip (stores canonical unflipped version)
             if self._sidecar_enabled:
-                # Store the UNFLIPPED version (flip is applied on load)
-                # If flip_bit was True, we need to unflip before saving
+                # Store the UNFLIPPED version directly - flip will be applied after caching
                 img_to_cache = img
                 mask_to_cache = pmask
-                if flip_bit:
-                    # Undo the flip for caching (cache stores canonical unflipped version)
-                    img_to_cache = torch.flip(img, dims=[2])
-                    mask_to_cache = torch.flip(pmask, dims=[1])
 
-                # Use file locking to coordinate concurrent writes to same sidecar
-                # This prevents multiple workers from competing on the same file
+                # Use file locking to reduce redundant I/O from concurrent writes
                 # Skip locking for very long paths to avoid filesystem limits (Windows: 260 chars)
+                # Note: save_sidecar() uses atomic writes (UUID temp + os.replace), so multiple
+                # writes are safe even without locking - locking just reduces wasted work
                 use_locking = HAS_FILELOCK and len(sidecar_path) <= 240  # Leave room for .lock extension
                 if use_locking:
                     lock_path = sidecar_path + ".lock"
                     try:
-                        with filelock.FileLock(lock_path, timeout=5):  # Short timeout for cache writes
-                            # Check again inside lock in case another worker wrote it
-                            if not os.path.exists(sidecar_path):
-                                save_sidecar(
-                                    sidecar_path,
-                                    img_to_cache.to(self._sidecar_dtype),
-                                    mask_to_cache,
-                                    self._config_hash,
-                                    image_size=self.image_size,
-                                    source_mtime=source_mtime,
-                                )
+                        with filelock.FileLock(lock_path, timeout=0.1):  # Non-blocking attempt
+                            # Got lock - write the cache file
+                            # Skip existence check to avoid TOCTOU race; atomic write handles conflicts
+                            save_sidecar(
+                                sidecar_path,
+                                img_to_cache.to(self._sidecar_dtype),
+                                mask_to_cache,
+                                self._config_hash,
+                                image_size=self.image_size,
+                                source_mtime=source_mtime,
+                            )
                     except filelock.Timeout:
-                        pass  # Another worker is writing, skip this cache write
+                        pass  # Another worker is writing, skip to avoid redundant work
                 else:
                     # Without locking, still safe due to UUID-based temp files in save_sidecar
                     save_sidecar(
@@ -2009,16 +2669,48 @@ class SidecarJsonDataset(Dataset):
                         source_mtime=source_mtime,
                     )
 
+            # Apply horizontal flip AFTER caching (ensures correct transform ordering)
+            # Flip is applied at tensor level after all other transforms complete
+            if flip_bit:
+                img = torch.flip(img, dims=[2])  # Flip width dimension (CHW format)
+                pmask = torch.flip(pmask, dims=[1])  # Flip width dimension (HW format)
+
             self.retry_counts[idx] = 0
             return self._build_sample_dict(
-                img, pmask, tag_vec, ann.get("rating", "unknown"), image_id, cached=False
+                img, pmask, tag_vec, ann.get("rating", "unknown"), image_id,
+                cached=False,
+                flip_applied=flip_bit,
+                flip_mode=mode,
+                has_tag_mismatch=has_tag_mismatch,
             )
 
         except Exception as e:
             self.retry_counts[idx] += 1
-            self.logger.warning(f"Failed to load sample {idx}: {e}")
+            self._sample_error_log_count += 1
+            # Rate-limit warning logs: log first, then every 100th
+            if self._sample_error_log_count == 1 or self._sample_error_log_count % 100 == 0:
+                self.logger.warning(f"Failed to load sample {idx}: {e} (total errors: {self._sample_error_log_count})")
             if self.retry_counts[idx] >= self.max_retries:
-                self.failed_samples.add(idx)
+                # Add to failed set with memory bounds
+                if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
+                    self.failed_samples.add(idx)
+
+                # Persist failed sample to exclusion file immediately
+                # This ensures the sample is skipped in future epochs/runs
+                try:
+                    failed_image_id = self.items[idx].get("image_id") if idx < len(self.items) else None
+                    if failed_image_id and self._exclusion_manager:
+                        was_new = self._exclusion_manager.add_exclusion(failed_image_id, immediate=True)
+                        if was_new:
+                            self.excluded_image_ids.add(failed_image_id)
+                            self.logger.info(
+                                f"Persisted exclusion for {failed_image_id} (sample {idx}) - "
+                                f"will be skipped in future runs"
+                            )
+                except Exception as persist_err:
+                    self.logger.warning(f"Could not persist exclusion for sample {idx}: {persist_err}")
+
+                # Always log when sample permanently fails (rate-limited by max_retries)
                 self.logger.error(f"Sample {idx} exceeded max retries, marking as failed")
                 return self._error_sample(idx, str(e))
             return self._error_sample(idx, f"Temporary failure: {e}")
@@ -2043,14 +2735,20 @@ class SidecarJsonDataset(Dataset):
     def _error_sample(self, idx: int, reason: str) -> Dict[str, Any]:
         # Always use self.image_size for consistency with actual samples
         # This ensures error samples have the same shape as valid samples for batching
-        sz = int(self.image_size)
+        sz = self.image_size  # Already int from __init__
+        # Match image dtype to what cached/non-cached samples use to avoid batch collation issues
+        # Use _sidecar_dtype directly since that's what both paths now produce
+        img_dtype = self._sidecar_dtype
         return {
-            "images": torch.zeros((3, sz, sz)),
+            "images": torch.zeros((3, sz, sz), dtype=img_dtype),
             "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
             "tag_labels": torch.zeros(len(self.vocab.tag_to_index), dtype=self._tag_vector_dtype),
             "rating_labels": torch.tensor(4, dtype=torch.long),
             "image_id": f"error_{idx}",
             "cached": False,
+            "flip_applied": False,
+            "flip_mode": "none",
+            "has_tag_mismatch": False,
             "error": True,
             "error_reason": reason,
         }
@@ -2117,7 +2815,7 @@ def create_dataloaders(
         'preload_files': int(getattr(data_config, "preload_files", 0)),
         'cpu_bf16_cache_pipeline': getattr(data_config, "cpu_bf16_cache_pipeline", None),
         # Image processing configuration
-        'image_size': int(getattr(data_config, "image_size", 640)),
+        'image_size': int(getattr(data_config, "image_size", 512)),
         'normalize_mean': tuple(getattr(data_config, "normalize_mean", [0.5, 0.5, 0.5])),
         'normalize_std': tuple(getattr(data_config, "normalize_std", [0.5, 0.5, 0.5])),
         'pad_color': tuple(getattr(data_config, "pad_color", [114, 114, 114])),
@@ -2136,6 +2834,8 @@ def create_dataloaders(
         'metadata_cache_workers': int(getattr(data_config, "metadata_cache_workers", 16)),
         'force_rebuild_metadata_cache': bool(getattr(data_config, "force_rebuild_metadata_cache", False)),
         'metadata_cache_staleness_check_samples': int(getattr(data_config, "metadata_cache_staleness_check_samples", 100)),
+        # Validation split limiting
+        'max_val_samples': getattr(data_config, "max_val_samples", None),
     }
 
     if config_cache['sidecar_cache_enabled']:
@@ -2277,9 +2977,47 @@ def create_dataloaders(
             rng.shuffle(all_jsons)
             split_ratio = 0.95
             n_train = max(1, int(len(all_jsons) * split_ratio))
+            # Ensure validation set doesn't overlap with training set
+            # If we only have 1 sample, train on it and validation will be empty
+            # (downstream code should handle empty validation gracefully)
+            if n_train >= len(all_jsons) and len(all_jsons) > 1:
+                # Keep at least 1 sample for validation when possible
+                n_train = len(all_jsons) - 1
             train_list = all_jsons[:n_train]
-            val_list = all_jsons[n_train:] if n_train < len(all_jsons) else all_jsons[-max(1, len(all_jsons)//20):]
+            val_list = all_jsons[n_train:]
             _write_cached_split(root, train_list, val_list, seed=int(seed))
+
+        # Limit validation samples at split time if configured
+        # Excess validation samples are moved to training (not discarded)
+        max_val_samples = config_cache['max_val_samples']
+        if max_val_samples and len(val_list) > max_val_samples:
+            original_val_size = len(val_list)
+            excess_val = val_list[max_val_samples:]
+            val_list = val_list[:max_val_samples]
+            train_list = train_list + excess_val  # Move excess to training
+            logger.info(
+                f"Validation limited to {max_val_samples:,} samples at split time "
+                f"(was {original_val_size:,}, moved {len(excess_val):,} to training)"
+            )
+
+        # Build Arrow metadata cache ONCE from ALL files (train + val combined)
+        # This ensures warmup and training share the same complete cache.
+        # Individual datasets will filter to their subset.
+        prebuilt_arrow_table = None
+        if config_cache['metadata_cache_enabled']:
+            all_jsons_combined = train_list + val_list  # Full dataset
+            from utils.metadata_cache import try_load_arrow_cache
+            logger.info(f"Building/loading Arrow cache from {len(all_jsons_combined):,} total files...")
+            prebuilt_arrow_table = try_load_arrow_cache(
+                root_dir=root,
+                json_files=all_jsons_combined,
+                force_rebuild=config_cache['force_rebuild_metadata_cache'],
+                num_workers=config_cache['metadata_cache_workers'],
+                staleness_check_samples=config_cache['metadata_cache_staleness_check_samples'],
+                logger=logger,
+            )
+            if prebuilt_arrow_table is not None:
+                logger.info(f"Arrow cache ready: {len(prebuilt_arrow_table):,} rows")
 
         train_ds = SidecarJsonDataset(
             root_dir=root,
@@ -2300,8 +3038,9 @@ def create_dataloaders(
             stats_queue=config_cache['stats_queue'],
             metadata_cache_enabled=config_cache['metadata_cache_enabled'],
             metadata_cache_workers=config_cache['metadata_cache_workers'],
-            force_rebuild_metadata_cache=config_cache['force_rebuild_metadata_cache'],
+            force_rebuild_metadata_cache=False,  # Already built above
             metadata_cache_staleness_check_samples=config_cache['metadata_cache_staleness_check_samples'],
+            prebuilt_arrow_table=prebuilt_arrow_table,
         )
 
         val_ds = SidecarJsonDataset(
@@ -2321,27 +3060,32 @@ def create_dataloaders(
             orientation_handler=_handler,  # still needed to encode swapped tags if you ever TTA
             flip_overrides_path=None,
             stats_queue=config_cache['stats_queue'],
-            # Disable metadata cache for validation - it's small enough that parsing
-            # is fast, and sharing cache with train causes file count mismatch errors
-            metadata_cache_enabled=False,
+            # Now sharing prebuilt cache properly - no file count mismatch
+            metadata_cache_enabled=config_cache['metadata_cache_enabled'],
             metadata_cache_workers=config_cache['metadata_cache_workers'],
-            force_rebuild_metadata_cache=False,
+            force_rebuild_metadata_cache=False,  # Already built above
             metadata_cache_staleness_check_samples=config_cache['metadata_cache_staleness_check_samples'],
+            prebuilt_arrow_table=prebuilt_arrow_table,
         )
 
     # Samplers for distributed training
-    train_sampler = None
+    # Always use DistributedSampler (with world_size=1 if not distributed)
+    # This ensures deterministic shuffling per epoch that is independent of global RNG state,
+    # which is critical for correct mid-epoch resumption.
+    #
+    # ResumableSampler extends DistributedSampler with O(1) mid-epoch resume support
+    # by allowing direct offset into the shuffled indices instead of iterating through.
+    train_sampler = ResumableSampler(
+        train_ds,
+        num_replicas=int(world_size) if distributed else 1,
+        rank=int(rank) if distributed else 0,
+        shuffle=True,
+        drop_last=config_cache['drop_last'],
+        seed=int(seed) if seed is not None else 0,
+    )
+    
     val_sampler = None
     if distributed:
-        # NOTE: when sampler is set, DataLoader.shuffle must be False.
-        train_sampler = DistributedSampler(
-            train_ds,
-            num_replicas=int(world_size),
-            rank=int(rank),
-            shuffle=True,
-            drop_last=config_cache['drop_last'],
-            seed=int(seed) if seed is not None else 0,
-        )
         val_sampler = DistributedSampler(
             val_ds,
             num_replicas=int(world_size),
@@ -2392,6 +3136,16 @@ def create_dataloaders(
     _val_kw["worker_init_fn"] = WorkerInitializer(log_queue, shared_vocab_info)
     val_loader = DataLoader(val_ds, **_val_kw)
 
+    # Verify pin_memory is enabled for GPU training (Critical for non_blocking transfers)
+    # Without pin_memory, non_blocking=True in .to(device) has no effect
+    if train_loader.pin_memory:
+        logger.info("DataLoader pin_memory enabled - async H2D transfers active")
+    else:
+        logger.warning(
+            "DataLoader pin_memory is DISABLED. This significantly degrades GPU utilization. "
+            "Set data.pin_memory=true in config for optimal performance with non_blocking transfers."
+        )
+
     # Validate datasets have samples (first-time startup safety check)
     if len(train_ds) == 0:
         raise ValueError(
@@ -2402,7 +3156,12 @@ def create_dataloaders(
         )
     if len(val_ds) == 0:
         logger.warning(
-            "Validation dataset has 0 samples. Validation metrics will be unavailable."
+            "Validation dataset has 0 samples. Validation will be skipped. "
+            "This typically happens with very small datasets (1-2 samples) where "
+            "all samples are allocated to training. To enable validation, add more samples."
         )
+        # Return None for val_loader to signal callers to skip validation
+        # This prevents downstream errors like division by zero in metrics
+        val_loader = None
 
     return train_loader, val_loader, vocab

@@ -17,12 +17,10 @@ import logging
 from typing import Optional, Tuple, Any
 from dataclasses import dataclass
 
-from optimizer_config import (
+from training_config import (
     get_adamw8bit_config,
     get_recommended_batch_size,
-    AdamW8bitConfig
-)
-from scheduler_config import (
+    AdamW8bitConfig,
     get_scheduler_config,
     create_scheduler_from_config,
     recommend_scheduler,
@@ -270,7 +268,6 @@ def create_optimizer_and_scheduler(
     )
 
     # Create scheduler
-    from scheduler_config import SchedulerConfig
     sched_config = SchedulerConfig(
         scheduler_type=config.scheduler_type,
         warmup_steps=config.warmup_steps,

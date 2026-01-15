@@ -31,17 +31,17 @@ def get_gpu_memory_info():
         used = info.used / 1024**3  # GB
         total = info.total / 1024**3  # GB
         return used, total
-    except:
+    except (ImportError, OSError, RuntimeError):
         # Fallback: parse nvidia-smi output
         import subprocess
         try:
-            result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total', 
-                                   '--format=csv,nounits,noheader'], 
+            result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total',
+                                   '--format=csv,nounits,noheader'],
                                   capture_output=True, text=True)
             if result.returncode == 0:
                 used, total = map(float, result.stdout.strip().split(','))
                 return used/1024, total/1024  # Convert MB to GB
-        except:
+        except (FileNotFoundError, subprocess.SubprocessError, ValueError):
             pass
         return 0, 0
 
@@ -54,7 +54,7 @@ def load_tag_names(config_path):
         return names, norm
     return None, None
 
-def letterbox_resize_numpy(image, target_size=640, pad_color=(114, 114, 114), patch_size=16):
+def letterbox_resize_numpy(image, target_size=512, pad_color=(114, 114, 114), patch_size=16):
     """
     Letterbox resize for numpy arrays with padding info tracking.
     Matches the training letterbox_resize but works with PIL/numpy.
@@ -141,7 +141,7 @@ def downsample_mask_to_patches(pixel_mask, patch_size=16, threshold=0.9):
     token_mask = pooled >= threshold
     return token_mask
 
-def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5),
+def preprocess_batch(image_paths, image_size=512, mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5),
                     gray_background=(114, 114, 114)):
     """Preprocess multiple images into a batch with proper transparency handling and padding"""
     batch = []
@@ -187,8 +187,17 @@ def preprocess_batch(image_paths, image_size=640, mean=(0.5,0.5,0.5), std=(0.5,0
         return np.stack(batch, axis=0).astype(np.float32), valid_indices, batch_infos
     return None, [], []
 
-def get_predictions_from_scores(scores, tag_names, threshold=0.5, vocabulary=None):
-    """Get predicted tags above threshold for batch or single image"""
+def get_predictions_from_scores(scores, tag_names, threshold=0.5, vocabulary=None, skip_indices=None):
+    """Get predicted tags above threshold for batch or single image.
+
+    Args:
+        scores: Prediction scores array (1D or 2D).
+        tag_names: List of tag names corresponding to score indices.
+        threshold: Minimum score to consider a tag predicted.
+        vocabulary: Optional vocabulary object for proper tag validation.
+        skip_indices: Set of indices to skip (e.g., {0, 1} for PAD and UNK).
+                      Defaults to {0, 1} to skip special tokens.
+    """
     if scores.ndim == 1:
         scores = scores[np.newaxis, :]  # Add batch dimension if missing
 
@@ -196,10 +205,17 @@ def get_predictions_from_scores(scores, tag_names, threshold=0.5, vocabulary=Non
     if not tag_names:
         raise ValueError("No tag names available for decoding predictions")
 
+    # Default to skipping PAD (0) and UNK (1) special tokens
+    if skip_indices is None:
+        skip_indices = {0, 1}
+
     batch_predictions = []
     for score_vec in scores:
         predicted_tags = set()
         for i, score in enumerate(score_vec):
+            # Skip special token indices
+            if i in skip_indices:
+                continue
             if score >= threshold:
                 if i < len(tag_names):
                     # Use vocabulary if available for proper validation
@@ -326,7 +342,7 @@ def create_gpu_session(model_path, max_memory_gb=25):
 
     # Warmup run to initialize GPU memory pools
     try:
-        dummy_input = np.random.randn(1, 3, 640, 640).astype(np.float32)
+        dummy_input = np.random.randn(1, 3, 512, 512).astype(np.float32)
         _ = session.run(None, {session.get_inputs()[0].name: dummy_input})
         print("Warmup run completed")
     except Exception as e:
@@ -393,7 +409,7 @@ def create_pytorch_session(model_path, device='cuda', compile_model=False):
     return model
 
 def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0.5,
-                         image_size=640, output_file="evaluation_results_torch.json",
+                         image_size=512, output_file="evaluation_results_torch.json",
                          results_file=None, batch_size=32, limit=None, compile_model=False):
     """Process images using PyTorch with full GPU optimizations.
 
@@ -602,7 +618,7 @@ def process_batch_pytorch(data_folder, model_path, config_path=None, threshold=0
     print(f"Detailed results saved to: {results_file}")
 
 def process_batch_gpu(data_folder, model_path, config_path=None, threshold=0.5,
-                     image_size=640, output_file="evaluation_results.json",
+                     image_size=512, output_file="evaluation_results.json",
                      results_file=None, batch_size=32, limit=None, max_memory_gb=25):
     """Process images in batches on GPU for efficient inference.
 
@@ -952,7 +968,7 @@ def main():
             model_path=model_path,
             config_path=None,
             threshold=0.5,
-            image_size=640,
+            image_size=512,
             output_file=output_file.replace('.json', '_pytorch.json'),
             batch_size=BATCH_SIZE,
             compile_model=True  # Enable torch.compile for extra speed
@@ -964,7 +980,7 @@ def main():
             model_path=model_path,
             config_path=None,
             threshold=0.5,
-            image_size=640,
+            image_size=512,
             output_file=output_file,
             batch_size=BATCH_SIZE,
             limit=None,  # Set to a number for testing (e.g., 100)

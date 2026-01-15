@@ -33,6 +33,25 @@ class LitOppai(pl.LightningModule):
     normalizes incoming batches from dict or tuple into (images, targets).
     """
 
+    @staticmethod
+    def _get_config_value(config: Any, *keys: str, default: Any = None) -> Any:
+        """Extract a nested config value with fallback to default.
+
+        Handles both object attributes and dict keys transparently.
+        Example: _get_config_value(cfg, "training", "lr", default=1e-4)
+        """
+        obj = config
+        for key in keys:
+            if obj is None:
+                return default
+            if hasattr(obj, key):
+                obj = getattr(obj, key)
+            elif isinstance(obj, dict):
+                obj = obj.get(key)
+            else:
+                return default
+        return obj if obj is not None else default
+
     def __init__(self, config: Any, vocab_size: int, *, drop_shape_mismatches: bool = True, dataset_size: int = None):
         super().__init__()
         self.config = config
@@ -53,16 +72,7 @@ class LitOppai(pl.LightningModule):
         self.criterion = MultiTaskLoss(tag_loss_fn=AsymmetricFocalLoss())
 
         # Torchmetrics collections for training and validation
-        threshold_cfg = getattr(config, "threshold_calibration", None)
-        if threshold_cfg is not None:
-            if hasattr(threshold_cfg, "default_threshold"):
-                threshold = threshold_cfg.default_threshold
-            elif isinstance(threshold_cfg, dict):
-                threshold = threshold_cfg.get("default_threshold", 0.5)
-            else:
-                threshold = 0.5
-        else:
-            threshold = 0.5
+        threshold = self._get_config_value(config, "threshold_calibration", "default_threshold", default=0.5)
         self.train_metrics = MetricCollection(
             {
                 "f1_macro": MultilabelF1Score(num_labels=vocab_size, average="macro", threshold=threshold),
@@ -108,21 +118,31 @@ class LitOppai(pl.LightningModule):
             return self.model(images, padding_mask=padding_mask)
         return self.model(images)
 
-    def training_step(self, batch: Tuple[torch.Tensor, Dict[str, torch.Tensor]] | Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def _shared_step(self, batch: Any, stage: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Shared logic for training and validation steps.
+
+        Args:
+            batch: Input batch (dict or tuple format)
+            stage: Either 'train' or 'val' for logging prefix
+
+        Returns:
+            Tuple of (loss, predictions, targets)
+        """
         images, targets = self._unpack_batch(batch)
         padding = targets.get("padding_mask")
         outputs = self(images, padding_mask=padding)
-        # Align with model outputs
+
+        # Extract logits and targets
         tag_logits = outputs.get("tag_logits") or outputs.get("tag")
         rating_logits = outputs.get("rating_logits") or outputs.get("rating")
         tag_targets = targets.get("tag")
         rating_targets = targets.get("rating")
 
-        # Validate we have at least tag predictions (required)
+        # Validate required outputs
         if tag_logits is None:
             available_keys = list(outputs.keys())
             raise RuntimeError(
-                f"Model outputs missing tag predictions. "
+                f"{stage.capitalize()}: Model outputs missing tag predictions. "
                 f"Expected 'tag_logits' or 'tag', but got keys: {available_keys}. "
                 f"This usually indicates a model architecture mismatch."
             )
@@ -130,65 +150,49 @@ class LitOppai(pl.LightningModule):
         if tag_targets is None:
             available_keys = list(targets.keys())
             raise RuntimeError(
-                f"Batch targets missing tag labels. "
+                f"{stage.capitalize()}: Batch targets missing tag labels. "
                 f"Expected 'tag' key, but got keys: {available_keys}. "
                 f"This indicates a dataloader issue."
             )
 
         # Compute loss - handle optional ratings
+        is_training = (stage == "train")
         if rating_logits is not None and rating_targets is not None:
-            loss, _ = self.criterion(tag_logits, rating_logits, tag_targets, rating_targets)
+            loss, loss_dict = self.criterion(tag_logits, rating_logits, tag_targets, rating_targets)
+            # Log individual loss components
+            self.log(f"{stage}/tag_loss", loss_dict['tag_loss'],
+                     on_step=is_training, on_epoch=True, sync_dist=True)
+            self.log(f"{stage}/rating_loss", loss_dict['rating_loss'],
+                     on_step=is_training, on_epoch=True, sync_dist=True)
         else:
-            # Compute tag loss only when ratings are absent
             loss = self.criterion.tag_loss_fn(tag_logits, tag_targets)
 
-        # Update training metrics
+        # Compute predictions for metrics
         preds = torch.sigmoid(tag_logits)
-        targs = tag_targets.to(dtype=preds.dtype)
-        metrics_dict = self.train_metrics(preds, targs)
-        self.log_dict(metrics_dict, prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
+        # Ensure both device and dtype match to avoid RuntimeError in distributed training
+        targs = tag_targets.to(device=preds.device, dtype=preds.dtype)
 
+        return loss, preds, targs
+
+    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        """Training step with metric logging."""
+        loss, preds, targs = self._shared_step(batch, stage="train")
+
+        # Accumulate training metrics (computed in on_train_epoch_end to avoid double-counting)
+        # Use .update() to accumulate, not __call__() which would compute AND update
+        self.train_metrics.update(preds, targs)
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+
         return loss
 
-    def validation_step(self, batch: Tuple[torch.Tensor, Dict[str, torch.Tensor]] | Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, Any]:
-        images, targets = self._unpack_batch(batch)
-        padding = targets.get("padding_mask")
-        outputs = self(images, padding_mask=padding)
+    def validation_step(self, batch: Any, batch_idx: int) -> Dict[str, Any]:
+        """Validation step with metric accumulation."""
+        loss, preds, targs = self._shared_step(batch, stage="val")
 
-        tag_logits = outputs.get("tag_logits") or outputs.get("tag")
-        rating_logits = outputs.get("rating_logits") or outputs.get("rating")
-        tag_targets = targets.get("tag")
-        rating_targets = targets.get("rating")
-
-        # Validate we have at least tag predictions (required)
-        if tag_logits is None:
-            available_keys = list(outputs.keys())
-            raise RuntimeError(
-                f"Validation: Model outputs missing tag predictions. "
-                f"Expected 'tag_logits' or 'tag', but got keys: {available_keys}"
-            )
-
-        if tag_targets is None:
-            available_keys = list(targets.keys())
-            raise RuntimeError(
-                f"Validation: Batch targets missing tag labels. "
-                f"Expected 'tag' key, but got keys: {available_keys}"
-            )
-
-        # Compute loss - handle optional ratings
-        if rating_logits is not None and rating_targets is not None:
-            loss, _ = self.criterion(tag_logits, rating_logits, tag_targets, rating_targets)
-        else:
-            # Compute tag loss only when ratings are absent
-            loss = self.criterion.tag_loss_fn(tag_logits, tag_targets)
-
-        # Update metrics (logged in on_validation_epoch_end)
-        preds = torch.sigmoid(tag_logits)
-        targs = tag_targets.to(dtype=preds.dtype)
+        # Accumulate validation metrics (logged in on_validation_epoch_end)
         self.val_metrics.update(preds, targs)
-
         self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+
         return {"val_loss": loss}
 
     def on_validation_epoch_end(self) -> None:
@@ -197,18 +201,49 @@ class LitOppai(pl.LightningModule):
         self.val_metrics.reset()
 
     def on_train_epoch_end(self) -> None:
-        # Compute and log epoch-level training metrics before reset
+        # Compute and log epoch-level training metrics, then reset for next epoch
         metrics = self.train_metrics.compute()
-        self.log_dict(metrics, on_epoch=True, sync_dist=True)
+        self.log_dict(metrics, prog_bar=True, on_epoch=True, sync_dist=True)
         self.train_metrics.reset()
 
-    def configure_optimizers(self):
-        if bnb is None:
-            raise ImportError(
-                "bitsandbytes is required for AdamW8bit optimizer. "
-                "Install it with: pip install bitsandbytes"
+    def _get_world_size(self) -> int:
+        """Get the total number of processes for distributed training."""
+        # Try to get world size from Lightning trainer first (most accurate)
+        if self.trainer is not None:
+            return self.trainer.world_size
+        # Fallback to torch distributed if initialized
+        if torch.distributed.is_initialized():
+            return torch.distributed.get_world_size()
+        # Single GPU or CPU fallback
+        return max(1, torch.cuda.device_count()) if torch.cuda.is_available() else 1
+
+    def _create_optimizer(self, lr: float, weight_decay: float = 0.01,
+                          betas: tuple = (0.9, 0.999), eps: float = 1e-8):
+        """Create optimizer with fallback from AdamW8bit to standard AdamW."""
+        if bnb is not None:
+            logger.info(f"Using AdamW8bit optimizer (lr={lr:.6f})")
+            return bnb.optim.AdamW8bit(
+                self.parameters(),
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay
+            )
+        else:
+            logger.warning(
+                "bitsandbytes not available, using standard AdamW. "
+                "Install bitsandbytes for 8-bit optimizer: pip install bitsandbytes"
+            )
+            return torch.optim.AdamW(
+                self.parameters(),
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay
             )
 
+    def configure_optimizers(self):
+        """Configure optimizer and learning rate scheduler."""
         # Get training config
         training_cfg = getattr(self.config, "training", None)
         data_cfg = getattr(self.config, "data", None)
@@ -218,44 +253,55 @@ class LitOppai(pl.LightningModule):
         num_epochs = getattr(training_cfg, "num_epochs", 50)
         grad_accum = getattr(training_cfg, "gradient_accumulation_steps", 1)
 
+        # Default optimizer hyperparameters from config
+        default_lr = getattr(training_cfg, "learning_rate", 1e-4)
+        weight_decay = getattr(training_cfg, "weight_decay", 0.01)
+        beta1 = getattr(training_cfg, "adam_beta1", 0.9)
+        beta2 = getattr(training_cfg, "adam_beta2", 0.999)
+        eps = getattr(training_cfg, "adam_epsilon", 1e-8)
+
         warmup_steps = 0
+        lr = default_lr
 
         # Use adaptive optimizer configuration if dataset_size is available
         if self.dataset_size is not None and self.dataset_size > 0:
             try:
-                from optimizer_config import get_adamw8bit_config
+                from training_config import get_adamw8bit_config
+
+                # Use world_size for correct LR scaling in distributed training
+                world_size = self._get_world_size()
+                num_gpus = world_size if world_size > 1 else (
+                    torch.cuda.device_count() if torch.cuda.is_available() else 1
+                )
 
                 lr, optim_kwargs, warmup_steps = get_adamw8bit_config(
                     dataset_size=self.dataset_size,
                     batch_size=batch_size,
                     num_epochs=num_epochs,
                     gradient_accumulation_steps=grad_accum,
-                    num_gpus=torch.cuda.device_count() if torch.cuda.is_available() else 1,
+                    num_gpus=num_gpus,
                 )
 
-                logger.info(f"Using adaptive AdamW8bit config: lr={lr:.6f}, warmup={warmup_steps}")
-                optimizer = bnb.optim.AdamW8bit(self.parameters(), lr=lr, **optim_kwargs)
+                logger.info(
+                    f"Using adaptive optimizer config: lr={lr:.6f}, "
+                    f"warmup={warmup_steps}, world_size={world_size}"
+                )
+                optimizer = self._create_optimizer(
+                    lr=lr,
+                    weight_decay=optim_kwargs.get('weight_decay', weight_decay),
+                    betas=optim_kwargs.get('betas', (beta1, beta2)),
+                    eps=optim_kwargs.get('eps', eps)
+                )
 
             except ImportError as e:
-                logger.warning(f"Could not import optimizer_config: {e}. Using fallback configuration.")
-                lr = getattr(training_cfg, "learning_rate", 1e-4)
-                optimizer = bnb.optim.AdamW8bit(self.parameters(), lr=lr)
+                logger.warning(f"Could not import training_config: {e}. Using fallback configuration.")
+                optimizer = self._create_optimizer(lr=lr, weight_decay=weight_decay,
+                                                   betas=(beta1, beta2), eps=eps)
         else:
             # Fallback to config-based learning rate
             logger.info("Dataset size not provided, using config learning rate")
-            lr = getattr(training_cfg, "learning_rate", 1e-4)
-            weight_decay = getattr(training_cfg, "weight_decay", 0.01)
-            beta1 = getattr(training_cfg, "adam_beta1", 0.9)
-            beta2 = getattr(training_cfg, "adam_beta2", 0.999)
-            eps = getattr(training_cfg, "adam_epsilon", 1e-8)
-
-            optimizer = bnb.optim.AdamW8bit(
-                self.parameters(),
-                lr=lr,
-                betas=(beta1, beta2),
-                eps=eps,
-                weight_decay=weight_decay
-            )
+            optimizer = self._create_optimizer(lr=lr, weight_decay=weight_decay,
+                                               betas=(beta1, beta2), eps=eps)
 
         # Create warmup scheduler if warmup_steps > 0
         if warmup_steps > 0:

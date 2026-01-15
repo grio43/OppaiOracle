@@ -9,7 +9,7 @@ missing the padding index, which is not a valid output class.
 """
 
 from __future__ import annotations
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, ClassVar, Union
 import logging
 import torch
 import torch.nn as nn
@@ -29,6 +29,10 @@ class AsymmetricFocalLoss(nn.Module):
     ``none`` returns the unreduced tensor.
     """
 
+    # Class-level cache for ignore_indices masks to avoid creating new tensors per forward pass
+    # Key: (num_classes, device_index, tuple(sorted_ignore_indices)) -> mask tensor
+    _keep_mask_cache: Dict[Tuple[int, int, Tuple[int, ...]], torch.Tensor] = {}
+
     def __init__(
         self,
         gamma_pos: float = 1.0,
@@ -37,9 +41,23 @@ class AsymmetricFocalLoss(nn.Module):
         clip: float = 0.05,
         reduction: str = 'mean',
         label_smoothing: float = 0.05,
-        ignore_index: Optional[int] = 0,
+        ignore_indices: Optional[Union[int, List[int]]] = 0,
     ):
         super().__init__()
+
+        # Validate reduction parameter
+        valid_reductions = ('mean', 'sum', 'none')
+        if reduction not in valid_reductions:
+            raise ValueError(
+                f"Invalid reduction '{reduction}'. Must be one of {valid_reductions}"
+            )
+
+        # Validate clip parameter (must be in [0, 1))
+        if clip < 0 or clip >= 1:
+            raise ValueError(
+                f"clip must be in range [0, 1), got {clip}. "
+                f"Typical values are 0.0 (disabled) or 0.05."
+            )
 
         # Validate gamma values (must be non-negative, reasonable range)
         if gamma_pos < 0:
@@ -57,10 +75,17 @@ class AsymmetricFocalLoss(nn.Module):
         self.clip = clip
         self.reduction = reduction
         self.label_smoothing = label_smoothing
-        # If not None, drop this class index from both logits and targets.
+        # If not None/empty, drop these class indices from both logits and targets.
         # By default we ignore index 0 for TAGS to avoid penalising the <PAD> token.
-        # For single-label ratings, pass ignore_index=None to keep all classes.
-        self.ignore_index = ignore_index
+        # For tags, pass [0, 1] to ignore both <PAD> and <UNK>.
+        # For single-label ratings, pass None or [] to keep all classes.
+        # Normalize to list for consistent handling
+        if ignore_indices is None:
+            self.ignore_indices: List[int] = []
+        elif isinstance(ignore_indices, int):
+            self.ignore_indices = [ignore_indices]
+        else:
+            self.ignore_indices = list(ignore_indices)
 
     def forward(
         self,
@@ -146,12 +171,24 @@ class AsymmetricFocalLoss(nn.Module):
                     f"got shape {sample_weights.shape}"
                 )
 
-        # Optionally ignore one class (e.g., pad index for tags)
-        if self.ignore_index is not None:
+        # Optionally ignore specified classes (e.g., PAD at index 0, UNK at index 1)
+        if self.ignore_indices:
             c = logits.size(1)
-            if 0 <= self.ignore_index < c:
-                keep = torch.ones(c, dtype=torch.bool, device=logits.device)
-                keep[self.ignore_index] = False
+            # Filter to valid indices only
+            valid_ignore = tuple(sorted(idx for idx in self.ignore_indices if 0 <= idx < c))
+            if valid_ignore:
+                # Use cached mask to avoid creating new tensors per forward pass
+                # Key: (num_classes, device_index, tuple(sorted_ignore_indices))
+                device_idx = logits.device.index if logits.device.type == 'cuda' else -1
+                cache_key = (c, device_idx, valid_ignore)
+
+                if cache_key not in AsymmetricFocalLoss._keep_mask_cache:
+                    keep = torch.ones(c, dtype=torch.bool, device=logits.device)
+                    for idx in valid_ignore:
+                        keep[idx] = False
+                    AsymmetricFocalLoss._keep_mask_cache[cache_key] = keep
+
+                keep = AsymmetricFocalLoss._keep_mask_cache[cache_key]
                 logits = logits[:, keep]
                 targets = targets[:, keep]
 
@@ -164,18 +201,34 @@ class AsymmetricFocalLoss(nn.Module):
         # Use BCEWithLogitsLoss for numerical stability.
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
 
+        # Calculate probabilities for focal weighting
+        probs = torch.sigmoid(logits)
+
+        # Apply probability clipping for asymmetric focusing on negatives.
+        # This shifts negative probabilities, reducing the contribution of easy negatives.
+        # For negatives, we compute (p + clip).clamp(max=1) which makes the model
+        # "think" it's less confident, reducing the focal weight for easy negatives.
+        if self.clip > 0:
+            probs_neg = (probs + self.clip).clamp(max=1.0)
+        else:
+            probs_neg = probs
+
         # Calculate focal weights using log-space math for numerical stability and
         # gradient preservation (CR-008 fix)
-        # log_sigmoid(x) = -softplus(-x), where softplus(x) = log(1 + exp(x))
-        log_probs = -F.softplus(-logits)  # log(p) = log(sigmoid(logits))
-        log_one_minus_probs = -F.softplus(logits)  # log(1-p) = log(1 - sigmoid(logits))
-
-        # Calculate focal weights using exp(gamma * log_prob) = prob^gamma
+        # For positives: use (1-p)^gamma_pos - down-weight easy positives
+        # For negatives: use p_clipped^gamma_neg - down-weight easy negatives (with clipping)
+        # Using log-space: exp(gamma * log(x)) = x^gamma
         # This avoids pow(0, gamma) numerically while maintaining gradients everywhere
+
+        # log(1-p) for positive focal weight
+        log_one_minus_probs = torch.log((1 - probs).clamp(min=1e-8))
+        # log(p_clipped) for negative focal weight
+        log_probs_neg = torch.log(probs_neg.clamp(min=1e-8))
+
         # Clamp the exponent to prevent overflow: exp(88) ≈ 2e38 (near float32 max)
         MAX_EXP = 88.0
         pos_exp = torch.clamp(self.gamma_pos * log_one_minus_probs, min=-MAX_EXP, max=MAX_EXP)
-        neg_exp = torch.clamp(self.gamma_neg * log_probs, min=-MAX_EXP, max=MAX_EXP)
+        neg_exp = torch.clamp(self.gamma_neg * log_probs_neg, min=-MAX_EXP, max=MAX_EXP)
         pos_weights = targets * torch.exp(pos_exp)
         neg_weights = (1 - targets) * torch.exp(neg_exp)
 

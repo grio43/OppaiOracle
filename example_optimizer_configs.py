@@ -4,7 +4,7 @@ Example configurations for AdamW8bit optimizer across different dataset sizes.
 Run this script to see how the optimizer parameters scale for your specific use case.
 """
 
-from optimizer_config import (
+from training_config import (
     get_adamw8bit_config,
     get_recommended_batch_size,
     AdamW8bitConfig

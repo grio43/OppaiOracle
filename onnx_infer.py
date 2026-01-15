@@ -80,8 +80,8 @@ def _load_metadata(session: ort.InferenceSession):
 
     mean = json.loads(meta.get('normalize_mean', '[0.5, 0.5, 0.5]'))
     std = json.loads(meta.get('normalize_std', '[0.5, 0.5, 0.5]'))
-    image_size = int(meta.get('image_size', 448))
-    patch_size = int(meta.get('patch_size', 32))
+    image_size = int(meta.get('image_size', 512))
+    patch_size = int(meta.get('patch_size', 16))
     return vocab, mean, std, image_size, patch_size, meta
 
 
@@ -206,10 +206,11 @@ def main():
                 # Resolve special-token indices once
                 try:
                     pad_idx = vocab.tag_to_index.get(getattr(vocab, "pad_token", "<PAD>"), 0)
+                    unk_idx = getattr(vocab, "unk_index",
+                                      vocab.tag_to_index.get(getattr(vocab, "unk_token", "<UNK>"), 1))
                 except Exception:
                     pad_idx = 0
-                unk_idx = getattr(vocab, "unk_index",
-                                  vocab.tag_to_index.get(getattr(vocab, "unk_token", "<UNK>"), 1))
+                    unk_idx = 1
 
                 tags = []
                 for idx in idxs:

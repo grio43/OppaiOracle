@@ -187,21 +187,19 @@ def get_sidecar_path(image_path: str, extension: str = ".safetensor") -> str:
         extension: Sidecar file extension (default: .safetensor)
 
     Returns:
-        Path with image extension replaced by sidecar extension
+        Path with sidecar extension appended to the original filename.
+        Using the full filename (e.g., image.jpg.safetensor) avoids collisions 
+        between different formats of the same image (e.g., image.jpg and image.png).
 
     Raises:
         ValueError: If path contains suspicious patterns like '..'
-
-    Example:
-        get_sidecar_path("/data/12345.png") -> "/data/12345.safetensor"
     """
     # Validate path doesn't contain path traversal attempts
-    # This prevents writing sidecars outside the intended directory
     if ".." in image_path:
         raise ValueError(f"Path traversal detected in image path: {image_path}")
 
-    base = os.path.splitext(image_path)[0]
-    return base + extension
+    # Append extension to full path to avoid stem-based collisions
+    return image_path + extension
 
 
 def save_sidecar(
@@ -376,8 +374,12 @@ def load_sidecar(
                 return None
 
             # Load tensors
-            image = f.get_tensor("image")
-            mask = f.get_tensor("mask")
+            # CLONE tensors to ensure they don't hold a reference to the memory-mapped file.
+            # This is CRITICAL on Windows to allow the file to be replaced/deleted by other
+            # workers while training is running. Without clone(), the mmap remains active
+            # as long as the tensor is in memory, locking the file.
+            image = f.get_tensor("image").clone()
+            mask = f.get_tensor("mask").clone()
 
         # Validate image is 3D (C, H, W)
         if image.dim() != 3:

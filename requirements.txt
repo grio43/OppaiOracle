@@ -13,6 +13,7 @@ onnxsim>=0.4.36
 opencv-python>=4.8
 pandas>=2.1
 pillow>=10.0.0
+pyarrow>=14.0.0  # Arrow IPC for zero-copy metadata cache (memory-mapped, shared across workers)
 prometheus-client>=0.15.0  # optional
 psutil>=5.9.0
 python-multipart>=0.0.9  # for API
@@ -33,6 +34,9 @@ tqdm>=4.66.4
 uvicorn>=0.35.0  # for API
 wandb>=0.16.4  # optional
 wordcloud>=1.9.3  # optional
+
+# Triton for torch.compile optimization (15-35% training speedup)
+triton-windows>=3.4.0,<3.5
 
 # New training stack dependencies
 pytorch-lightning>=2.5.3

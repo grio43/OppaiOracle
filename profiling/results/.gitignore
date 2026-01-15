@@ -1,0 +1,5 @@
+# Ignore all profiling results (CSV files can be large and are machine-specific)
+*.csv
+
+# Keep this .gitignore
+!.gitignore
