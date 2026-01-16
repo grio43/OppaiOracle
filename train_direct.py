@@ -37,6 +37,25 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader, Subset
 from torchmetrics.classification import MultilabelF1Score, MultilabelAveragePrecision
 import numpy as np
+from typing import TYPE_CHECKING
+
+
+def _shutdown_dataloader_workers(loader: "Optional[DataLoader]") -> None:
+    """Safely shutdown DataLoader workers to prevent orphaned processes.
+
+    Call this before reassigning a DataLoader variable to ensure the old
+    loader's worker processes are properly terminated.
+    """
+    if loader is None:
+        return
+    try:
+        # Access internal iterator which holds worker references
+        if hasattr(loader, '_iterator') and loader._iterator is not None:
+            loader._iterator._shutdown_workers()
+    except Exception:
+        pass  # Best effort - may fail if already cleaned up
+
+
 from Monitor_log import MonitorConfig, TrainingMonitor
 from utils.cache_monitor import monitor as cache_monitor
 from evaluation_metrics import MetricComputer
@@ -628,6 +647,9 @@ def train_with_orientation_tracking(config: FullConfig):
         val_persistent = getattr(val_dl_cfg, "persistent_workers", None)
         if val_persistent is None:
             val_persistent = getattr(config.data, "persistent_workers", False)
+
+        # Shutdown old loader's workers before creating new one to prevent orphaned processes
+        _shutdown_dataloader_workers(val_loader)
 
         # Rebuild val_loader with the subset, preserving ALL config settings
         val_loader_kwargs = dict(
@@ -1367,20 +1389,45 @@ def train_with_orientation_tracking(config: FullConfig):
             # Reuse warmup iterator for first epoch to avoid redundant worker spawn
             if epoch == start_epoch and not is_mid_epoch:
                 join_start = time.perf_counter()
-                warmup_thread.join(timeout=120)  # Ensure warmup complete
+                
+                # Wait for warmup with progress logging instead of hard timeout
+                # Hard timeout caused double-spawning of workers (20+ processes) when startup was slow
+                wait_interval = 10.0
+                while warmup_thread.is_alive():
+                    warmup_thread.join(timeout=wait_interval)
+                    if warmup_thread.is_alive():
+                        elapsed = time.perf_counter() - join_start
+                        logger.info(f"Waiting for worker warmup... ({elapsed:.1f}s elapsed)")
+
                 join_wait = time.perf_counter() - join_start
                 warmup_duration = _warmup_result.get("duration", "N/A")
                 if isinstance(warmup_duration, (int, float)):
                     logger.info(f"Warmup join waited {join_wait:.1f}s (warmup total: {warmup_duration:.1f}s)")
                 else:
                     logger.info(f"Warmup join waited {join_wait:.1f}s (warmup duration unknown)")
+
                 if _warmup_result["error"]:
                     logger.warning(f"Worker warmup failed, creating fresh iterator: {_warmup_result['error']}")
+                    # Clean up any partially-initialized warmup iterator to prevent orphaned workers
+                    if _warmup_result["iter"] is not None:
+                        try:
+                            _warmup_result["iter"]._shutdown_workers()
+                        except Exception:
+                            pass
+                        _warmup_result["iter"] = None
                     train_iter = iter(train_loader)
                 elif _warmup_result["iter"] is not None:
                     train_iter = _warmup_result["iter"]
                     _warmup_result["iter"] = None  # Clear to prevent reuse
                     logger.info("Reusing warmed-up iterator (workers already spawned)")
+                    
+                    # Fix for lost batch: inject the warmup batch back into the stream
+                    # The warmup thread consumed one batch to trigger worker spawn; we must not lose it.
+                    if _warmup_result["batch"] is not None:
+                        import itertools
+                        train_iter = itertools.chain([_warmup_result["batch"]], train_iter)
+                        _warmup_result["batch"] = None
+                        logger.debug("Injected warmup batch back into training stream")
                 else:
                     train_iter = iter(train_loader)
             else:
