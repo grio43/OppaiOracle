@@ -28,6 +28,22 @@ import torch.distributed as dist
 from torch.amp import autocast
 from tqdm import tqdm
 
+
+def _shutdown_dataloader_workers(loader: Optional[DataLoader]) -> None:
+    """Safely shutdown DataLoader workers to prevent orphaned processes.
+
+    Call this before reassigning a DataLoader variable to ensure the old
+    loader's worker processes are properly terminated.
+    """
+    if loader is None:
+        return
+    try:
+        # Access internal iterator which holds worker references
+        if hasattr(loader, '_iterator') and loader._iterator is not None:
+            loader._iterator._shutdown_workers()
+    except Exception:
+        pass  # Best effort - may fail if already cleaned up
+
 # Scientific computing imports
 from sklearn.metrics import (
     average_precision_score,
@@ -598,6 +614,8 @@ class ValidationRunner:
         if self.config.max_samples and self.config.max_samples < len(val_loader.dataset):
             indices = np.random.choice(len(val_loader.dataset), self.config.max_samples, replace=False)
             subset = Subset(val_loader.dataset, indices)
+            # Shutdown old loader's workers before creating new one to prevent orphaned processes
+            _shutdown_dataloader_workers(val_loader)
             val_loader = DataLoader(
                 subset,
                 batch_size=self.config.batch_size,
