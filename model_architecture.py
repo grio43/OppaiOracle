@@ -90,6 +90,8 @@ class VisionTransformerConfig:
     token_ignore_threshold: float = 0.9
     # Enable gradient checkpointing by default to reduce memory usage
     gradient_checkpointing: bool = True
+    # Checkpoint every N-th layer (1=all layers, 2=every 2nd, 4=every 4th, etc.)
+    checkpoint_every_n_layers: int = 1
     drop_path_rate: float = 0.0
     # Enable numerical stability checking (for debugging only)
     check_numerical_stability: bool = False
@@ -436,9 +438,16 @@ class SimplifiedTagger(nn.Module):
         if attn_kpm is not None and attn_kpm.any():
             block_mask = self._create_block_mask(attn_kpm, x.size(1))
 
-        # Transformer blocks with optional gradient checkpointing
-        for block in self.blocks:
-            if self.config.gradient_checkpointing and self.training:
+        # Transformer blocks with optional selective gradient checkpointing
+        # checkpoint_every_n_layers controls granularity: 1=all, 2=every 2nd, 4=every 4th
+        checkpoint_interval = getattr(self.config, 'checkpoint_every_n_layers', 1)
+        for idx, block in enumerate(self.blocks):
+            should_checkpoint = (
+                self.config.gradient_checkpointing
+                and self.training
+                and (idx % checkpoint_interval == 0)
+            )
+            if should_checkpoint:
                 # use_reentrant=False is recommended for PyTorch 2.x and works better with
                 # complex inputs like attention masks. It's also more memory efficient.
                 # See: https://pytorch.org/docs/stable/checkpoint.html

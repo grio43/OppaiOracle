@@ -732,7 +732,7 @@ class ValidationRunner:
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validating")):
                 total_batches += 1
-                images = batch['images'].to(self.device)
+                images = batch['images'].to(self.device, non_blocking=True)
                 tag_labels = batch['tag_labels']
                 # Validate tag_labels is on CPU (expected from dataloader for later cat())
                 if tag_labels is not None and tag_labels.device.type != 'cpu':
@@ -747,7 +747,7 @@ class ValidationRunner:
                 # Forward pass (propagate padding masks when available)
                 pmask = batch.get('padding_mask', None)
                 if pmask is not None:
-                    pmask = pmask.to(self.device)
+                    pmask = pmask.to(self.device, non_blocking=True)
                 with autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.amp_enabled):
                     outputs = self.model(images, padding_mask=pmask)
                     logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs

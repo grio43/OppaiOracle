@@ -51,6 +51,22 @@ class ImageReviewApp {
         this.modal = document.getElementById('image-modal');
         this.modalImage = document.getElementById('modal-image');
         this.modalClose = document.getElementById('modal-close');
+
+        // Mobile elements
+        this.hamburgerBtn = document.getElementById('hamburger-btn');
+        this.sidebar = document.getElementById('sidebar');
+        this.sidebarOverlay = document.getElementById('sidebar-overlay');
+        this.mobileBtnPrev = document.getElementById('mobile-btn-prev');
+        this.mobileBtnNext = document.getElementById('mobile-btn-next');
+        this.mobileCurrentNum = document.getElementById('mobile-current-num');
+        this.mobileTotalNum = document.getElementById('mobile-total-num');
+        this.swipeHint = document.getElementById('swipe-hint');
+
+        // Touch state
+        this.touchStartX = 0;
+        this.touchStartY = 0;
+        this.touchEndX = 0;
+        this.isSwiping = false;
     }
 
     bindEvents() {
@@ -73,6 +89,120 @@ class ImageReviewApp {
 
         // Keyboard shortcuts
         document.addEventListener('keydown', (e) => this.handleKeyboard(e));
+
+        // Mobile: Hamburger menu
+        if (this.hamburgerBtn) {
+            this.hamburgerBtn.addEventListener('click', () => this.toggleSidebar());
+        }
+        if (this.sidebarOverlay) {
+            this.sidebarOverlay.addEventListener('click', () => this.closeSidebar());
+        }
+
+        // Mobile: Navigation buttons
+        if (this.mobileBtnPrev) {
+            this.mobileBtnPrev.addEventListener('click', () => this.navigate('prev'));
+        }
+        if (this.mobileBtnNext) {
+            this.mobileBtnNext.addEventListener('click', () => this.navigate('next'));
+        }
+
+        // Touch/Swipe gestures
+        this.bindTouchEvents();
+    }
+
+    bindTouchEvents() {
+        const mainContent = document.querySelector('.main-content');
+        if (!mainContent) return;
+
+        mainContent.addEventListener('touchstart', (e) => {
+            this.touchStartX = e.changedTouches[0].screenX;
+            this.touchStartY = e.changedTouches[0].screenY;
+            this.isSwiping = false;
+        }, { passive: true });
+
+        mainContent.addEventListener('touchmove', (e) => {
+            const deltaX = Math.abs(e.changedTouches[0].screenX - this.touchStartX);
+            const deltaY = Math.abs(e.changedTouches[0].screenY - this.touchStartY);
+            // Consider horizontal swipe if X movement is greater than Y
+            if (deltaX > deltaY && deltaX > 30) {
+                this.isSwiping = true;
+            }
+        }, { passive: true });
+
+        mainContent.addEventListener('touchend', (e) => {
+            this.touchEndX = e.changedTouches[0].screenX;
+            this.handleSwipe();
+        }, { passive: true });
+
+        // Modal swipe support
+        this.modal.addEventListener('touchstart', (e) => {
+            this.touchStartX = e.changedTouches[0].screenX;
+        }, { passive: true });
+
+        this.modal.addEventListener('touchend', (e) => {
+            this.touchEndX = e.changedTouches[0].screenX;
+            this.handleSwipe();
+        }, { passive: true });
+    }
+
+    handleSwipe() {
+        const swipeThreshold = 50;
+        const diff = this.touchStartX - this.touchEndX;
+
+        if (Math.abs(diff) < swipeThreshold) return;
+        if (!this.isSwiping && !this.modal.classList.contains('visible')) return;
+
+        if (diff > 0) {
+            // Swipe left -> next
+            if (!this.btnNext.disabled) {
+                this.navigate('next');
+                if (this.modal.classList.contains('visible')) {
+                    setTimeout(() => {
+                        this.modalImage.src = this.sampleImage.src;
+                    }, 100);
+                }
+                this.hideSwipeHint();
+            }
+        } else {
+            // Swipe right -> prev
+            if (!this.btnPrev.disabled) {
+                this.navigate('prev');
+                if (this.modal.classList.contains('visible')) {
+                    setTimeout(() => {
+                        this.modalImage.src = this.sampleImage.src;
+                    }, 100);
+                }
+                this.hideSwipeHint();
+            }
+        }
+    }
+
+    toggleSidebar() {
+        if (this.sidebar) {
+            this.sidebar.classList.toggle('open');
+        }
+        if (this.sidebarOverlay) {
+            this.sidebarOverlay.classList.toggle('visible');
+        }
+    }
+
+    closeSidebar() {
+        if (this.sidebar) {
+            this.sidebar.classList.remove('open');
+        }
+        if (this.sidebarOverlay) {
+            this.sidebarOverlay.classList.remove('visible');
+        }
+    }
+
+    hideSwipeHint() {
+        if (this.swipeHint && !this.swipeHintHidden) {
+            this.swipeHint.style.opacity = '0';
+            setTimeout(() => {
+                this.swipeHint.style.display = 'none';
+            }, 300);
+            this.swipeHintHidden = true;
+        }
     }
 
     async loadRuns() {
@@ -104,6 +234,9 @@ class ImageReviewApp {
             return;
         }
 
+        // Close sidebar on mobile after selection
+        this.closeSidebar();
+
         this.runInfo.textContent = 'Loading...';
 
         try {
@@ -129,6 +262,9 @@ class ImageReviewApp {
             });
 
             this.totalNum.textContent = data.total_samples;
+            if (this.mobileTotalNum) {
+                this.mobileTotalNum.textContent = data.total_samples;
+            }
 
             // Load samples
             if (data.total_samples > 0) {
@@ -160,6 +296,9 @@ class ImageReviewApp {
             this.allSamples = data.samples;
             this.currentIndex = 0;
             this.totalNum.textContent = this.allSamples.length;
+            if (this.mobileTotalNum) {
+                this.mobileTotalNum.textContent = this.allSamples.length;
+            }
 
             if (this.allSamples.length > 0) {
                 await this.loadSampleByIndex(0);
@@ -266,9 +405,29 @@ class ImageReviewApp {
     }
 
     updateNavigation() {
-        this.currentNum.textContent = this.currentIndex + 1;
-        this.btnPrev.disabled = this.currentIndex <= 0;
-        this.btnNext.disabled = this.currentIndex >= this.allSamples.length - 1;
+        const currentDisplay = this.currentIndex + 1;
+        const totalDisplay = this.allSamples.length;
+        const atStart = this.currentIndex <= 0;
+        const atEnd = this.currentIndex >= this.allSamples.length - 1;
+
+        // Desktop navigation
+        this.currentNum.textContent = currentDisplay;
+        this.btnPrev.disabled = atStart;
+        this.btnNext.disabled = atEnd;
+
+        // Mobile navigation
+        if (this.mobileCurrentNum) {
+            this.mobileCurrentNum.textContent = currentDisplay;
+        }
+        if (this.mobileTotalNum) {
+            this.mobileTotalNum.textContent = totalDisplay;
+        }
+        if (this.mobileBtnPrev) {
+            this.mobileBtnPrev.disabled = atStart;
+        }
+        if (this.mobileBtnNext) {
+            this.mobileBtnNext.disabled = atEnd;
+        }
     }
 
     async navigate(direction) {
