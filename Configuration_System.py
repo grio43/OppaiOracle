@@ -794,7 +794,8 @@ class ModelConfig(BaseConfig):
     
     # Efficiency
     gradient_checkpointing: bool = False
-    
+    checkpoint_every_n_layers: int = 1  # 1=all layers, 2=every 2nd, 4=every 4th, etc.
+
     def validate(self):
         """Validate model configuration"""
         errors = []
@@ -895,6 +896,9 @@ class DataConfig(BaseConfig):
     prefetch_factor: int = 2
     persistent_workers: bool = True
     drop_last: bool = False
+
+    # Worker logging (WARNING allows debugging, CRITICAL minimizes queue overhead)
+    worker_log_level: str = field(default="WARNING", metadata={"help": "Log level for DataLoader workers (DEBUG, INFO, WARNING, ERROR, CRITICAL)"})
 
     # Validation split limiting
     max_val_samples: Optional[int] = field(default=None, metadata={"help": "Limit validation set size at split time (before Arrow cache loading)"})

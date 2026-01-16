@@ -895,7 +895,7 @@ class AsyncCheckpointWriter:
                         os.close(fd)
 
                         with lock_context:
-                            torch.save(checkpoint, temp_path)
+                            torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=True)
                             os.replace(temp_path, path)
                             temp_path = None  # Mark as consumed
 
@@ -958,12 +958,32 @@ class AsyncCheckpointWriter:
             # Queue is full, caller should save synchronously
             return False
 
-    def wait_pending(self, timeout: float = 300.0):
-        """Wait for all pending saves to complete (timeout is advisory, join blocks)."""
-        # Note: Queue.join() doesn't support timeout, but we use it for API consistency
-        # In practice, checkpoint saves complete quickly enough that timeout isn't needed
-        _ = timeout  # Suppress unused warning; kept for API compatibility
-        self._queue.join()
+    def wait_pending(self, timeout: float = 300.0) -> bool:
+        """Wait for all pending saves to complete with timeout support.
+
+        Args:
+            timeout: Maximum seconds to wait (default 300s = 5 minutes)
+
+        Returns:
+            True if all saves completed, False if timeout was reached
+        """
+        deadline = time.time() + timeout
+        poll_interval = 0.1  # 100ms polling
+
+        while True:
+            with self._lock:
+                if self._pending_count == 0:
+                    return True
+
+            if time.time() > deadline:
+                with self._lock:
+                    pending = self._pending_count
+                logger.warning(
+                    f"Timeout waiting for {pending} pending checkpoint save(s) after {timeout:.0f}s"
+                )
+                return False
+
+            time.sleep(poll_interval)
 
     def shutdown(self, wait: bool = True, timeout: float = 300.0):
         """

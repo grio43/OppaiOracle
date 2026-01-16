@@ -83,10 +83,12 @@ except ImportError:
 try:
     import pyarrow as pa
     import pyarrow.ipc as pa_ipc
+    import pyarrow.compute as pc  # Vectorized filtering operations
     HAS_PYARROW = True
 except ImportError:
     pa = None
     pa_ipc = None
+    pc = None
     HAS_PYARROW = False
 
 import logging.handlers
@@ -167,7 +169,8 @@ _MAX_ERROR_STATS_TAGS = 5000    # Max unique tags to track error stats for
 
 # Exclusion file reload interval (seconds) - how often to check for new exclusions
 # from other workers. Lower = faster sync, Higher = less I/O overhead
-_EXCLUSION_RELOAD_INTERVAL = 120.0
+# Set to 300s to reduce lock contention during training (exclusions change rarely)
+_EXCLUSION_RELOAD_INTERVAL = 300.0
 
 # Minimal dtype mapping for cache plumbing
 _DTYPE_MAP = {
@@ -251,7 +254,6 @@ def process_image_cpu(
 ) -> Tuple[Image.Image, torch.Tensor]:
     """
     Process PIL image on CPU: resizing, letterboxing, and padding mask generation.
-    Moves heavy PIL operations to background threads when used with ImagePreFetcher.
 
     Args:
         img: Source PIL Image (RGB)
@@ -713,6 +715,26 @@ class ArrowMetadataAccessor:
     def __len__(self) -> int:
         return self._len
 
+    def _ensure_table(self) -> None:
+        """Lazy-load the Arrow table on first access.
+
+        This defers the memory-map open until the worker actually needs data,
+        allowing all workers to spawn in parallel without blocking on I/O.
+        The memory-map operation itself is fast (~10ms), but doing it during
+        __setstate__ serializes worker startup on Windows (spawn context).
+        """
+        if self._table is None:
+            from utils.metadata_cache import _load_arrow_cache
+            import logging
+            logger = logging.getLogger(__name__)
+            self._table = _load_arrow_cache(self._cache_path, logger)
+            if self._table is None:
+                raise RuntimeError(
+                    f"Failed to load Arrow metadata cache: {self._cache_path}. "
+                    "The cache file may be missing, corrupted, or locked. "
+                    "Try deleting the cache file and restarting training."
+                )
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get metadata for a single sample.
 
@@ -720,6 +742,8 @@ class ArrowMetadataAccessor:
         {"image_id": str, "tags": List[str], "rating": str, "dir": Path}
         Plus "json_stem" if available (v2.0+ cache format).
         """
+        # Lazy-load table on first access (enables parallel worker spawn)
+        self._ensure_table()
         # Slice single row - Arrow handles this efficiently
         row = self._table.slice(idx, 1)
         result = {
@@ -741,212 +765,19 @@ class ArrowMetadataAccessor:
         }
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
-        """Restore from pickle in worker process - re-open the mmap."""
+        """Restore from pickle in worker process - defer mmap until first access.
+
+        IMPORTANT: We do NOT load the Arrow table here. Loading during unpickle
+        blocks each worker sequentially on Windows (spawn context), causing
+        ~3.3s delay per worker (50+ seconds for 16 workers).
+
+        Instead, we set _table = None and lazy-load on first __getitem__ call.
+        This allows all workers to spawn in parallel, then each opens the
+        memory-mapped file when it actually needs data.
+        """
         self._cache_path = state["_cache_path"]
         self._len = state["_len"]
-        # Re-open memory-mapped file in worker
-        # Import here to avoid issues if pyarrow not installed
-        from utils.metadata_cache import _load_arrow_cache
-        import logging
-        logger = logging.getLogger(__name__)
-        self._table = _load_arrow_cache(self._cache_path, logger)
-        if self._table is None:
-            raise RuntimeError(
-                f"Failed to reload Arrow metadata cache in worker process: {self._cache_path}. "
-                "The cache file may be missing, corrupted, or locked. "
-                "Try deleting the cache file and restarting training."
-            )
-
-
-class ImagePreFetcher:
-    """Background thread pool for pre-fetching image files.
-
-    Reduces I/O latency by loading the next N images in the background while
-    the current batch is being processed. Uses a small thread pool and LRU
-    cache to avoid memory bloat.
-
-    Performance gains:
-      - ~20-40% faster dataset iteration when cache misses are common
-      - Hides disk I/O latency behind computation
-      - Moves resizing/padding to background threads (new in this version)
-      - Minimal memory overhead (< 100MB for typical settings)
-    """
-
-    def __init__(self, max_workers: int = 2, cache_size: int = 8, target_size: int = 512, pad_color: tuple = (114, 114, 114)):
-        """Initialize pre-fetcher.
-
-        Args:
-            max_workers: Number of background threads (default 2)
-            cache_size: Maximum number of pre-fetched images to cache
-            target_size: Target image size for resizing/padding
-            pad_color: RGB tuple for padding
-        """
-        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="prefetch")
-        self.cache: Dict[int, Any] = {}  # idx -> (pil_img, padding_mask)
-        self.cache_size = cache_size
-        self.futures: Dict[int, Any] = {}  # idx -> Future
-        self._lock = threading.Lock()
-        self._last_idx = -1
-        self.target_size = target_size
-        self.pad_color = pad_color
-
-    def _load_image(self, img_path: Path) -> Optional[Tuple[Image.Image, torch.Tensor]]:
-        """Load, decode, and process image in background thread.
-
-        Returns a fully-loaded and processed (resized/padded) image + mask.
-        """
-        try:
-            with Image.open(img_path) as pil_img:
-                pil_img.load()
-                pil_img = ImageOps.exif_transpose(pil_img)
-
-                # Handle transparency
-                if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
-                    rgba = pil_img.convert("RGBA")
-                    bg = Image.new("RGB", rgba.size, self.pad_color)
-                    alpha = rgba.getchannel("A")
-                    bg.paste(rgba, mask=alpha)
-                    img = bg
-                else:
-                    img = pil_img.convert("RGB")
-                
-                # Perform resizing and padding in background thread
-                return process_image_cpu(img, self.target_size, self.pad_color)
-        except Exception:
-            # Silent failure - will be retried in main thread
-            return None
-
-    def prefetch(self, idx: int, img_path: Path) -> None:
-        """Start pre-fetching an image in the background.
-
-        Args:
-            idx: Dataset index for this image
-            img_path: Path to image file
-        """
-        with self._lock:
-            # Only prefetch if not already cached or in-flight
-            if idx not in self.cache and idx not in self.futures:
-                future = self.executor.submit(self._load_image, img_path)
-                self.futures[idx] = (future, img_path)
-
-    def get(self, idx: int, wait_timeout: Optional[float] = 0.05) -> Optional[Tuple[Image.Image, torch.Tensor]]:
-        """Get pre-fetched image, optionally waiting for completion.
-
-        Args:
-            idx: Dataset index to retrieve
-            wait_timeout: Max seconds to wait for prefetch (default 0.05s = 50ms).
-                         Set to 0 for non-blocking, None for unlimited wait.
-
-        Returns:
-            (PIL Image, padding_mask) if pre-fetched, None otherwise
-        """
-        future_to_wait = None
-
-        with self._lock:
-            # Check cache first
-            if idx in self.cache:
-                return self.cache.pop(idx)
-
-            # Check if future exists
-            if idx in self.futures:
-                future, img_path = self.futures[idx]
-
-                if future.done():
-                    # Future completed - pop and return
-                    self.futures.pop(idx)
-                    try:
-                        result = future.result(timeout=0)
-                        return result
-                    except Exception:
-                        return None
-
-                # Future not done - optionally wait outside lock to avoid blocking
-                # wait_timeout: None=unlimited, >0=wait with timeout, 0=non-blocking
-                if wait_timeout is None or wait_timeout > 0:
-                    # Pop from futures while holding lock (safe), wait outside lock
-                    self.futures.pop(idx)
-                    future_to_wait = future
-
-        # Wait for future OUTSIDE of lock (no race condition since we already popped it)
-        if future_to_wait is not None:
-            try:
-                # None means unlimited wait, positive means timeout in seconds
-                return future_to_wait.result(timeout=wait_timeout)
-            except Exception:
-                return None
-
-        return None
-
-    def trigger_lookahead(self, current_idx: int, dataset_len: int,
-                         get_path_func, lookahead: int = 4) -> None:
-        """Trigger pre-fetching for upcoming indices.
-
-        Args:
-            current_idx: Current dataset index being accessed
-            dataset_len: Total dataset length
-            get_path_func: Function to get image path for an index (idx -> Path)
-            lookahead: Number of indices to pre-fetch ahead (default 4)
-        """
-        # Detect sequential access pattern (thread-safe read of _last_idx)
-        with self._lock:
-            last_idx = self._last_idx
-            self._last_idx = current_idx
-
-        if current_idx == last_idx + 1 or last_idx < 0:
-            # Pre-fetch next N images
-            for offset in range(1, lookahead + 1):
-                next_idx = current_idx + offset
-                if next_idx < dataset_len:
-                    try:
-                        img_path = get_path_func(next_idx)
-                        self.prefetch(next_idx, img_path)
-                    except Exception:
-                        pass  # Invalid path, skip
-
-        # Cleanup: remove stale futures and enforce cache size
-        with self._lock:
-            # Check for completed futures
-            # We must process ALL completed futures to prevent memory leaks in self.futures
-            # If cache is full, we still need to remove them from self.futures (discarding the result)
-            idxs_to_remove = []
-            
-            for idx, (future, _) in list(self.futures.items()):  # List copy for safe iteration
-                if future.done():
-                    idxs_to_remove.append(idx)
-                    
-            for idx in idxs_to_remove:
-                future, img_path = self.futures.pop(idx)
-                # Only add to cache if we have space
-                if len(self.cache) < self.cache_size:
-                    try:
-                        result = future.result(timeout=0)
-                        if result is not None:
-                            self.cache[idx] = result
-                    except Exception:
-                        pass
-                # else: implicit discard (future removed from futures, result ignored)
-
-            # Evict old cache entries if we exceed size
-            while len(self.cache) > self.cache_size:
-                # Remove oldest (arbitrary key)
-                self.cache.pop(next(iter(self.cache)))
-
-    def shutdown(self) -> None:
-        """Shutdown background threads and cleanup resources."""
-        self.executor.shutdown(wait=True)
-        # Close any cached PIL Images to release file handles
-        for item in self.cache.values():
-            if isinstance(item, tuple):
-                 img = item[0]
-            else:
-                 img = item
-            if hasattr(img, 'close'):
-                try:
-                    img.close()
-                except Exception:
-                    pass
-        self.cache.clear()
-        self.futures.clear()
+        self._table = None  # Lazy load on first access via _ensure_table()
 
 
 class WorkerInitializer:
@@ -956,14 +787,17 @@ class WorkerInitializer:
     Unlike closures, class instances are picklable by default.
     """
 
-    def __init__(self, log_queue=None, shared_vocab_info=None):
+    def __init__(self, log_queue=None, shared_vocab_info=None, worker_log_level="WARNING"):
         """
         Args:
             log_queue: Queue for logging (optional)
             shared_vocab_info: Tuple of (shm_name, vocab_size) for shared vocabulary (optional)
+            worker_log_level: Log level for workers (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+                             WARNING allows debugging issues, CRITICAL minimizes queue overhead
         """
         self.log_queue = log_queue
         self.shared_vocab_info = shared_vocab_info
+        self.worker_log_level = worker_log_level
 
     def __call__(self, worker_id: int):
         """Worker initialization function called by DataLoader.
@@ -987,10 +821,11 @@ class WorkerInitializer:
             try:
                 from logging.handlers import QueueHandler
                 logger.addHandler(QueueHandler(self.log_queue))
-                # Set worker log level to CRITICAL to minimize queue traffic from workers
-                # WARNING-level logs still have overhead (queue serialization, main process dequeue)
-                # With 8+ workers, even infrequent warnings add measurable latency (~1-2ms/batch)
-                logger.setLevel(logging.CRITICAL)
+                # Set worker log level from config (default: WARNING for debuggability)
+                # CRITICAL minimizes queue overhead but hides worker errors
+                # WARNING allows debugging issues with ~1-2ms/batch overhead
+                level = getattr(logging, self.worker_log_level.upper(), logging.WARNING)
+                logger.setLevel(level)
             except Exception:
                 pass
 
@@ -1118,10 +953,6 @@ class DatasetLoader(Dataset):
 
         self._preload_n = int(preload_files or 0)
 
-        # --- Image pre-fetching (per-worker; created lazily) ---
-        self._prefetcher: Optional[ImagePreFetcher] = None
-        self._enable_prefetch = os.getenv("DATASET_PREFETCH", "1") != "0"
-
         # --- Shared vocabulary flag (for worker_init_fn) ---
         self._shared_vocab_loaded = False
 
@@ -1137,43 +968,21 @@ class DatasetLoader(Dataset):
             self._to_tensor_v2 = None
             self._to_tensor = None
 
-    # ---------- Pre-fetcher ----------
-    def _ensure_prefetcher(self):
-        """Create image pre-fetcher lazily (per-worker)."""
-        if not self._enable_prefetch or self._prefetcher is not None:
-            return
-        # Configurable prefetch settings (increased defaults to hide I/O latency)
-        # DATASET_PREFETCH_SIZE: Number of images to prefetch (default 32, was 8)
-        # DATASET_PREFETCH_WORKERS: Number of background threads (default 2)
-        # Reduced from 4 to avoid thread oversubscription with num_workers=6 (would be 24+6=30 threads)
-        # Memory overhead: ~3MB per cached image, so 32 images = ~96MB per worker
-        cache_size = int(os.getenv("DATASET_PREFETCH_SIZE", "32"))
-        max_workers = int(os.getenv("DATASET_PREFETCH_WORKERS", "2"))
-        self._prefetcher = ImagePreFetcher(
-            max_workers=max_workers, 
-            cache_size=cache_size,
-            target_size=self.image_size,
-            pad_color=self.pad_color
-        )
-
     # ---------- Pickling support for multiprocessing ----------
     def __getstate__(self):
         """Prepare for pickling - exclude unpicklable objects."""
         state = self.__dict__.copy()
         # Remove unpicklable objects before sending to worker
         state['validator'] = None           # BackgroundValidator thread
-        state['_prefetcher'] = None        # ImagePreFetcher thread pool
         return state
 
     def __setstate__(self, state):
         """Restore from pickle in worker process."""
         self.__dict__.update(state)
-        # These will be lazily recreated when needed:
-        # - _prefetcher via _ensure_prefetcher()
-        # - validator stays None in workers
+        # validator stays None in workers
 
     def _get_image_path_for_idx(self, idx: int) -> Path:
-        """Get image path for a given index (for prefetching).
+        """Get image path for a given index.
 
         Returns:
             Path to image file
@@ -1443,36 +1252,23 @@ class DatasetLoader(Dataset):
                 allowed_external_roots=([Path(self.dataset_root)] if self.dataset_root else None),
             )
 
-            # Try to use pre-fetched image first (reduces I/O latency by ~20-40%)
-            self._ensure_prefetcher()
-            prefetch_result = None
-            if self._prefetcher is not None:
-                prefetch_result = self._prefetcher.get(idx)
-                # Trigger lookahead for next images
-                self._prefetcher.trigger_lookahead(
-                    idx, len(self), self._get_image_path_for_idx
-                )
+            # Load image from disk
+            # Fully decode while file is open; fix EXIF rotations.
+            with Image.open(img_path) as pil_img:
+                pil_img.load()
+                pil_img = ImageOps.exif_transpose(pil_img)
 
-            # If not pre-fetched, load synchronously
-            if prefetch_result is None:
-                # Fully decode while file is open; fix EXIF rotations.
-                with Image.open(img_path) as pil_img:
-                    pil_img.load()
-                    pil_img = ImageOps.exif_transpose(pil_img)
+                if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
+                    rgba = pil_img.convert("RGBA")
+                    bg = Image.new("RGB", rgba.size, self.pad_color)
+                    alpha = rgba.getchannel("A")
+                    bg.paste(rgba, mask=alpha)
+                    img = bg
+                else:
+                    img = pil_img.convert("RGB")
 
-                    if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
-                        rgba = pil_img.convert("RGBA")
-                        bg = Image.new("RGB", rgba.size, self.pad_color)
-                        alpha = rgba.getchannel("A")
-                        bg.paste(rgba, mask=alpha)
-                        img = bg
-                    else:
-                        img = pil_img.convert("RGB")
-                
                 # Process on CPU (resize/pad)
                 canvas, pmask = process_image_cpu(img, self.image_size, self.pad_color)
-            else:
-                canvas, pmask = prefetch_result
 
             # If provided, run joint v2 transforms to keep image & mask aligned
             if self.joint_transforms is not None and T is not None and tv_tensors is not None:
@@ -2057,11 +1853,6 @@ class SidecarJsonDataset(Dataset):
             self._to_tensor_v2 = None
             self._to_tensor = None
 
-        # --- Image pre-fetching (per-worker; created lazily) ---
-        # Provides 20-40% speedup by loading next images in background threads
-        self._prefetcher: Optional[ImagePreFetcher] = None
-        self._enable_prefetch = os.getenv("DATASET_PREFETCH", "1") != "0"
-
         # Pre-parse minimal fields for speed
         # items can be List[Dict] (legacy) or ArrowMetadataAccessor (zero-copy)
         self.items: Any = []
@@ -2093,35 +1884,43 @@ class SidecarJsonDataset(Dataset):
 
                 # If using prebuilt table (contains ALL files), filter to this dataset's files
                 if prebuilt_arrow_table is not None and "json_stem" in arrow_table.column_names:
-                    # Build lookup set of (dir, stem) from our json_files
-                    our_files = {(str(jp.parent), jp.stem) for jp in self.json_files}
-                    dirs = arrow_table.column("dir").to_pylist()
-                    stems = arrow_table.column("json_stem").to_pylist()
-                    # Create boolean mask for filtering
-                    mask = [(d, s) in our_files for d, s in zip(dirs, stems)]
+                    # Build lookup set of combined keys from our json_files
+                    # Using vectorized PyArrow filtering (10-100x faster than Python loop)
+                    our_keys = {f"{str(jp.parent)}/{jp.stem}" for jp in self.json_files}
+                    our_keys_array = pa.array(list(our_keys))
+
+                    # Create combined key column in Arrow table for vectorized matching
+                    dir_col = arrow_table.column("dir")
+                    stem_col = arrow_table.column("json_stem")
+                    combined_keys = pc.binary_join_element_wise(dir_col, stem_col, "/")
+
+                    # Vectorized membership test (much faster than Python loop)
+                    mask = pc.is_in(combined_keys, value_set=our_keys_array)
                     arrow_table = arrow_table.filter(mask)
-                    self.logger.info(f"Filtered Arrow table to {len(arrow_table):,} rows for this split")
+                    self.logger.info(f"Filtered Arrow table to {len(arrow_table):,} rows for this split (vectorized)")
 
                 if self.excluded_image_ids:
-                    # If there are exclusions, we need to filter them out
-                    # Build a filtered list (loses zero-copy but handles exclusions correctly)
-                    # This is rare - exclusions are only for bad/corrupted images
+                    # Filter exclusions using vectorized PyArrow operations (much faster)
+                    # This preserves zero-copy semantics by filtering the Arrow table directly
                     self.logger.info(
                         f"Filtering {len(self.excluded_image_ids)} exclusions from Arrow cache..."
                     )
-                    accessor = ArrowMetadataAccessor(arrow_table, self._arrow_cache_path)
-                    original_count = len(accessor)
-                    filtered_items = []
-                    for i in range(original_count):
-                        item = accessor[i]
-                        if item['image_id'] not in self.excluded_image_ids:
-                            filtered_items.append(item)
-                    self.items = filtered_items
-                    excluded_count = original_count - len(self.items)
-                    self._using_arrow = False  # Using list, not Arrow accessor
+                    original_count = len(arrow_table)
+
+                    # Vectorized exclusion filtering (O(n) Arrow ops vs O(n*m) Python)
+                    exclusion_array = pa.array(list(self.excluded_image_ids))
+                    image_id_col = arrow_table.column("image_id")
+                    is_excluded = pc.is_in(image_id_col, value_set=exclusion_array)
+                    keep_mask = pc.invert(is_excluded)  # Keep items NOT in exclusion set
+                    arrow_table = arrow_table.filter(keep_mask)
+
+                    excluded_count = original_count - len(arrow_table)
+                    # Use zero-copy Arrow accessor on filtered table
+                    self.items = ArrowMetadataAccessor(arrow_table, self._arrow_cache_path)
+                    self._using_arrow = True  # Still using Arrow (zero-copy preserved!)
                     self.logger.info(
                         f"Filtered {excluded_count} excluded images, {len(self.items):,} items remaining "
-                        "(note: zero-copy disabled due to exclusions)"
+                        "(zero-copy preserved via vectorized filtering)"
                     )
                 else:
                     # No exclusions - use zero-copy Arrow accessor
@@ -2181,10 +1980,15 @@ class SidecarJsonDataset(Dataset):
         """
         state = self.__dict__.copy()
         # Remove unpicklable objects before sending to worker
-        state['_prefetcher'] = None          # ImagePreFetcher thread pool (if any)
         state['orientation_handler'] = None  # May contain unpicklable state
         state['_stats_queue'] = None         # multiprocessing.Queue (cannot be pickled on Windows spawn)
         state['_exclusion_manager'] = None   # Contains threading lock (will be recreated)
+        # Snapshot exclusions for lock-free worker startup
+        # Workers restore from snapshot instead of blocking on file lock
+        if hasattr(self, 'excluded_image_ids'):
+            state['_excluded_ids_snapshot'] = set(self.excluded_image_ids)
+        else:
+            state['_excluded_ids_snapshot'] = set()
         # ArrowMetadataAccessor handles its own __getstate__/__setstate__
         # It only pickles the path, then re-opens the mmap in worker
         return state
@@ -2193,7 +1997,7 @@ class SidecarJsonDataset(Dataset):
         """Restore from pickle in worker process."""
         self.__dict__.update(state)
         # These will be lazily recreated when needed:
-        # - _prefetcher and _orientation_handler if needed
+        # - orientation_handler if needed
         # - _stats_queue stays None in workers (telemetry only from main process)
         # - ArrowMetadataAccessor re-opens the memory-mapped file automatically
 
@@ -2204,32 +2008,28 @@ class SidecarJsonDataset(Dataset):
             exclusion_path,
             reload_interval_seconds=_EXCLUSION_RELOAD_INTERVAL
         )
-        # Load current exclusions (may have been updated by other workers)
-        self.excluded_image_ids = self._exclusion_manager.load()
+        # Lock-free restore from snapshot (avoids file lock contention at startup)
+        # Workers spawn serially on Windows; blocking on file lock here causes
+        # sequential initialization (RAM fills one worker at a time)
+        snapshot = state.get('_excluded_ids_snapshot', set())
+        self.excluded_image_ids = snapshot
+        self._exclusion_manager._excluded_ids = snapshot.copy()
+        self._exclusion_manager._last_load_time = time.time()  # Treat snapshot as fresh
+        # CRITICAL: Set _last_mtime to current file mtime to prevent reload_if_stale()
+        # from triggering _load_internal() on first __getitem__ call (causes lock contention)
+        try:
+            if self._exclusion_manager.exclusion_path.exists():
+                self._exclusion_manager._last_mtime = self._exclusion_manager.exclusion_path.stat().st_mtime
+        except OSError:
+            pass  # File doesn't exist yet, that's fine
+        # Periodic reload_if_stale() (every 30s) will catch new exclusions during training
+        self._needs_initial_exclusion_refresh = False
 
     def __len__(self) -> int:
         return len(self.items)
 
-    # ---------- Pre-fetcher ----------
-    def _ensure_prefetcher(self):
-        """Create image pre-fetcher lazily (per-worker)."""
-        if not self._enable_prefetch or self._prefetcher is not None:
-            return
-        # Configurable prefetch settings (increased defaults to hide I/O latency)
-        # DATASET_PREFETCH_SIZE: Number of images to prefetch (default 32)
-        # DATASET_PREFETCH_WORKERS: Number of background threads (default 4)
-        # Memory overhead: ~3MB per cached image, so 32 images = ~96MB per worker
-        cache_size = int(os.getenv("DATASET_PREFETCH_SIZE", "32"))
-        max_workers = int(os.getenv("DATASET_PREFETCH_WORKERS", "4"))
-        self._prefetcher = ImagePreFetcher(
-            max_workers=max_workers, 
-            cache_size=cache_size,
-            target_size=self.image_size,
-            pad_color=self.pad_color
-        )
-
     def _get_image_path_for_idx(self, idx: int) -> Path:
-        """Get image path for a given index (for prefetching).
+        """Get image path for a given index.
 
         Returns:
             Path to image file
@@ -2451,7 +2251,7 @@ class SidecarJsonDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         # Periodically reload exclusions to pick up failures from other workers
-        # This runs every ~120 seconds (configurable via _EXCLUSION_RELOAD_INTERVAL)
+        # This runs every ~30 seconds (configurable via _EXCLUSION_RELOAD_INTERVAL)
         if self._exclusion_manager:
             if self._exclusion_manager.reload_if_stale():
                 # Update local reference if new exclusions were found
@@ -2484,21 +2284,22 @@ class SidecarJsonDataset(Dataset):
         try:
             ann = self.items[idx]
             image_id = ann["image_id"]
-            # Work on a copy of the tag list so we can safely modify it
-            original_tags: List[str] = list(ann["tags"])
-            tags_now: List[str] = original_tags
+            # Use original tags directly for read-only operations (avoid unnecessary copy)
+            original_tags = ann["tags"]  # No copy - read-only reference
             # Decide whether to flip and adjust tags accordingly
             mode = self._decide_flip_mode(image_id, original_tags)
             flip_bit = False
             has_tag_mismatch = False
+            tags_now = original_tags  # Default: use original (no copy needed)
             if mode != "none" and self.orientation_handler is not None:
                 # Use swap_tags_with_info() to detect potential tag-image mismatches
+                # This creates a NEW list for swapped_tags, so no need to copy original
                 swap_result = self.orientation_handler.swap_tags_with_info(
                     original_tags,
                     skip_safety_check=True,  # Safety already checked in _decide_flip_mode
                     record_stats=True
                 )
-                tags_now = swap_result.swapped_tags
+                tags_now = swap_result.swapped_tags  # New list from swap operation
                 flip_bit = swap_result.flip_applied if mode == "random" else True
                 has_tag_mismatch = swap_result.has_mismatch
 
@@ -2527,10 +2328,11 @@ class SidecarJsonDataset(Dataset):
                 if cache_result is not None:
                     img_t, pmask = cache_result
                     # Verify cached shape and dtype match expected values
+                    # (self.image_size is already int from __init__)
                     shape_ok = (img_t.dim() == 3 and
                                 img_t.shape[0] == 3 and
-                                img_t.shape[1] == int(self.image_size) and
-                                img_t.shape[2] == int(self.image_size))
+                                img_t.shape[1] == self.image_size and
+                                img_t.shape[2] == self.image_size)
                     dtype_ok = (img_t.dtype == self._sidecar_dtype)
                     if shape_ok and dtype_ok:
                         # Apply flip transformation to cached data if needed
@@ -2559,34 +2361,20 @@ class SidecarJsonDataset(Dataset):
                     monitor.l2_miss()  # True cache miss (file not found or couldn't load)
 
             # Cache miss: load from disk
-            # Try to use pre-fetched image first (reduces I/O latency by ~20-40%)
-            self._ensure_prefetcher()
-            prefetch_result = None
-            if self._prefetcher is not None:
-                prefetch_result = self._prefetcher.get(idx)
-                # Trigger lookahead for next images
-                self._prefetcher.trigger_lookahead(
-                    idx, len(self), self._get_image_path_for_idx
-                )
+            # Fully decode and correct EXIF while file is open
+            with Image.open(img_path) as pil_img:
+                pil_img.load()
+                pil_img = ImageOps.exif_transpose(pil_img)
+                if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
+                    rgba = pil_img.convert("RGBA")
+                    bg = Image.new("RGB", rgba.size, self.pad_color)
+                    alpha = rgba.getchannel("A")
+                    bg.paste(rgba, mask=alpha)
+                    pil = bg
+                else:
+                    pil = pil_img.convert("RGB")
 
-            # If not pre-fetched, load synchronously
-            if prefetch_result is None:
-                # Fully decode and correct EXIF while file is open
-                with Image.open(img_path) as pil_img:
-                    pil_img.load()
-                    pil_img = ImageOps.exif_transpose(pil_img)
-                    if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
-                        rgba = pil_img.convert("RGBA")
-                        bg = Image.new("RGB", rgba.size, self.pad_color)
-                        alpha = rgba.getchannel("A")
-                        bg.paste(rgba, mask=alpha)
-                        pil = bg
-                    else:
-                        pil = pil_img.convert("RGB")
-                
                 canvas, pmask = process_image_cpu(pil, self.image_size, self.pad_color)
-            else:
-                canvas, pmask = prefetch_result
 
             # NOTE: Flip is applied AFTER joint_transforms to ensure correct ordering
             # (transforms operate on canonical unflipped images, flip is applied last)
@@ -3096,19 +2884,36 @@ def create_dataloaders(
     # --------------------------------------------------------------------
 
     # DataLoaders
-    def _dl_kwargs(cfg, *, shuffle: bool, drop_last: bool):
+    def _dl_kwargs(cfg, *, shuffle: bool, drop_last: bool, override_cfg=None):
+        """Build DataLoader kwargs from config.
+
+        Args:
+            cfg: Primary config (data_config)
+            shuffle: Whether to shuffle
+            drop_last: Whether to drop last incomplete batch
+            override_cfg: Optional override config (e.g., validation_config.dataloader)
+                         Values from override_cfg take precedence over cfg.
+        """
+        # Use override values if provided, else fall back to primary config
+        def get_val(attr, default=None):
+            if override_cfg is not None and hasattr(override_cfg, attr):
+                return getattr(override_cfg, attr)
+            return getattr(cfg, attr, default)
+
         kw = dict(
-            batch_size=cfg.batch_size,
-            num_workers=cfg.num_workers,
-            pin_memory=getattr(cfg, "pin_memory", False),
+            batch_size=get_val("batch_size"),
+            num_workers=get_val("num_workers"),
+            pin_memory=get_val("pin_memory", True),
             drop_last=drop_last,
             shuffle=shuffle,
         )
         # Only use multiprocessing knobs when workers > 0
-        if int(getattr(cfg, "num_workers", 0) or 0) > 0:
-            if getattr(cfg, "prefetch_factor", None) is not None:
-                kw["prefetch_factor"] = cfg.prefetch_factor
-            kw["persistent_workers"] = bool(getattr(cfg, "persistent_workers", False))
+        num_workers = int(kw.get("num_workers", 0) or 0)
+        if num_workers > 0:
+            prefetch = get_val("prefetch_factor", None)
+            if prefetch is not None:
+                kw["prefetch_factor"] = prefetch
+            kw["persistent_workers"] = bool(get_val("persistent_workers", False))
         return kw
 
     _train_kw = _dl_kwargs(
@@ -3120,21 +2925,25 @@ def create_dataloaders(
         _train_kw["sampler"] = train_sampler
     # Attach logging QueueHandler in workers if a queue is provided
     log_queue = kwargs.get("log_queue")
-    _train_kw["worker_init_fn"] = WorkerInitializer(log_queue, shared_vocab_info)
+    worker_log_level = getattr(data_config, "worker_log_level", "WARNING")
+    _train_kw["worker_init_fn"] = WorkerInitializer(log_queue, shared_vocab_info, worker_log_level)
     train_loader = DataLoader(train_ds, **_train_kw)
 
-    val_batch = (
-        validation_config.dataloader.batch_size
-        if hasattr(validation_config, "dataloader")
-        else data_config.batch_size
-    )
-    # Build kwargs for val loader separately to honor val batch size
-    _val_kw = _dl_kwargs(data_config, shuffle=False, drop_last=False)
-    _val_kw["batch_size"] = val_batch
+    # Build validation loader kwargs using validation-specific config if available
+    val_override_cfg = validation_config.dataloader if hasattr(validation_config, "dataloader") else None
+    _val_kw = _dl_kwargs(data_config, shuffle=False, drop_last=False, override_cfg=val_override_cfg)
     if val_sampler is not None:
         _val_kw["sampler"] = val_sampler
-    _val_kw["worker_init_fn"] = WorkerInitializer(log_queue, shared_vocab_info)
+    _val_kw["worker_init_fn"] = WorkerInitializer(log_queue, shared_vocab_info, worker_log_level)
     val_loader = DataLoader(val_ds, **_val_kw)
+
+    # Log validation dataloader settings for visibility
+    if val_override_cfg is not None:
+        logger.info(
+            f"Validation DataLoader: batch_size={_val_kw['batch_size']}, "
+            f"num_workers={_val_kw['num_workers']}, "
+            f"prefetch_factor={_val_kw.get('prefetch_factor', 'default')}"
+        )
 
     # Verify pin_memory is enabled for GPU training (Critical for non_blocking transfers)
     # Without pin_memory, non_blocking=True in .to(device) has no effect

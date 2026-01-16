@@ -622,18 +622,29 @@ class TagVocabulary:
         return self.ignored_tag_indices.copy()
     
     def encode_tags(self, tags: Iterable[str]) -> torch.Tensor:
-        """Encode tag strings into a multi-hot tensor of shape (vocab_size,)."""
-        vocab_size = len(self.tag_to_index)
-        vector = torch.zeros(vocab_size, dtype=self._tag_vector_dtype)
+        """Encode tag strings into a multi-hot tensor of shape (vocab_size,).
+
+        Optimized for high throughput: caches local references and uses
+        batch tensor indexing instead of per-tag assignment.
+        """
+        # Cache local references to avoid repeated attribute lookups (significant speedup)
+        tag_to_index = self.tag_to_index
+        ignored_tags = self.ignored_tags
+        vocab_size = len(tag_to_index)
+
+        # Build list of valid indices first (faster than repeated tensor indexing)
+        indices = []
         for tag in tags:
-            if tag in self.ignored_tags:
-                continue
-            idx = self.tag_to_index.get(tag, self.tag_to_index.get(self.unk_token, self.unk_index))
-            # Bounds check to prevent IndexError with corrupted vocabularies
-            if idx < 0 or idx >= vocab_size:
-                logger.warning(f"Tag '{tag}' has out-of-bounds index {idx} (vocab_size={vocab_size}), skipping")
-                continue
-            vector[idx] = 1.0
+            if tag not in ignored_tags:
+                idx = tag_to_index.get(tag)
+                # Combined None and bounds check (bounds check rarely triggers)
+                if idx is not None and 0 <= idx < vocab_size:
+                    indices.append(idx)
+
+        # Create vector and batch-assign all indices at once
+        vector = torch.zeros(vocab_size, dtype=self._tag_vector_dtype)
+        if indices:
+            vector[indices] = 1.0
         return vector
     
     def get_tag_index(self, tag: str) -> int:

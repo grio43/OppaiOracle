@@ -221,7 +221,10 @@ class VRAMProfiler:
 
             # Detect overflow to system RAM
             # If reserved >> allocated, it suggests fragmentation or unified memory spillover
-            overflow = (peak_reserved - peak_alloc) > 2.0
+            # Make threshold proportional to GPU memory (15% or 2GB, whichever smaller)
+            total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+            threshold = min(2.0, total_vram * 0.15)
+            overflow = (peak_reserved - peak_alloc) > threshold
 
             avg_forward = sum(forward_times) / len(forward_times)
             avg_backward = sum(backward_times) / len(backward_times)

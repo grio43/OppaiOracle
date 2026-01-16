@@ -21,11 +21,11 @@ default_output_dir: "./outputs"
 
 # Model Configuration
 model:
-    architecture_type: "vit_large_extended"
-    hidden_size: 1344
-    num_hidden_layers: 28
-    num_attention_heads: 21
-    intermediate_size: 5376
+    architecture_type: "vit_wide_shallow"
+    hidden_size: 1152
+    num_hidden_layers: 16
+    num_attention_heads: 18
+    intermediate_size: 4608
     image_size: 512
     patch_size: 16
     num_channels: 3
@@ -34,9 +34,9 @@ model:
     use_line_token: true
     use_color_token: true
     num_special_tokens: 4
-    hidden_dropout_prob: 0.1
-    attention_probs_dropout_prob: 0.1
-    drop_path_rate: 0.1   # recommended range 0.08–0.3 (must be < 1.0)
+    hidden_dropout_prob: 0.18
+    attention_probs_dropout_prob: 0.18
+    drop_path_rate: 0.15   # recommended range 0.08–0.3 (must be < 1.0)
     initializer_range: 0.02
     layer_norm_eps: 1.0e-6
     use_flex_attention: true  # Enables Flex Attention (PyTorch 2.5+)
@@ -46,7 +46,8 @@ model:
     num_labels: 0  # Auto-detect from vocabulary
     num_groups: 20
     tags_per_group: 10000
-    gradient_checkpointing: true  # Trades ~30% compute time for ~40% VRAM savings
+    gradient_checkpointing: false
+    # checkpoint_every_n_layers: 4   # Checkpoint every 4th layer (layers 0,4,8,12 of 16)
 
 # Data Configuration (consolidates dataloader.yaml, train_config.yaml, augmentation.yaml)
 data:
@@ -82,12 +83,13 @@ data:
   pad_color: [114, 114, 114]
 
   # Data loading (from dataloader.yaml)
-  batch_size: 96  # Optimized for Tensor Core alignment (multiple of 8)
-  num_workers: 8  # Arrow mmap shares metadata (~500MB/worker overhead), provides deeper queue
+  batch_size: 32
+  num_workers: 10  # Arrow mmap shares metadata (~500MB/worker overhead), 32-core system
   pin_memory: true   # Enables async DMA transfer for PCIe 4.0/5.0
-  prefetch_factor: 4   # 8 workers × 4 = 32 batches queued (~6.7GB runway)
+  prefetch_factor:  4 
   persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   drop_last: false
+  worker_log_level: WARNING  # Worker log level: WARNING allows debugging, CRITICAL minimizes overhead
 
   # Validation split limiting
   # Limits validation set size at split time (before Arrow cache loading).
@@ -99,6 +101,8 @@ data:
   # Sidecar Tensor Cache (replaces L2 LMDB cache)
   # Preprocessed images are stored as .safetensor files alongside original images.
   # No virtual memory issues, pooled SSD-friendly, unlimited parallel reads.
+  # NOTE: Provides no benefit if the system has CPU to spare - only helps when
+  # CPU preprocessing (decode/resize) is the bottleneck starving the GPU.
   sidecar_cache_enabled: false
   sidecar_extension: ".safetensor"  # File extension for cached tensors
   sidecar_storage_dtype: "bfloat16"  # Storage dtype for cached tensors
@@ -159,10 +163,10 @@ data:
 # Training Configuration (from training_config.yaml)
 training:
     memory_format: "channels_last"
-    num_epochs: 30
+    num_epochs: 25
     learning_rate: 1.0e-4
-    weight_decay: 0.01
-    gradient_accumulation_steps: 1  # Effective batch size of 108 (36 × 3)
+    weight_decay: 0.03
+    gradient_accumulation_steps: 4  # Effective batch size: 32 × 4 = 128
 
     # Optimizer
     # NOTE: Using "adamw8bit" for memory-efficient 8-bit quantized optimizer states
@@ -221,13 +225,13 @@ training:
       alpha: 0.5            # Balancing factor between positive/negative examples
       gamma_neg: 1.0        # Focusing parameter for negatives
       gamma_pos: 1.0        # Focusing parameter for positives
-      label_smoothing: 0.0  # Smoothing for tag targets
+      label_smoothing: 0.1  # Smoothing for tag targets (regularization boost)
       clip: 0.05            # Prevent extreme logits
     rating_loss:
       alpha: 0.5
       gamma_neg: 1.0
       gamma_pos: 1.0
-      label_smoothing: 0.0
+      label_smoothing: 0.1  # Smoothing for rating targets
       clip: 0.05
     use_class_weights: true
   
@@ -250,7 +254,7 @@ training:
     use_compile: true
     compile_mode: "max-autotune-no-cudagraphs"  # Triton autotuning without CUDA graph VRAM overhead
     compile_fullgraph: false  # Allow graph breaks for dynamic shapes (padding masks)
-    compile_dynamic: false  # Disabled - fixed 512x512 images don't need dynamic kernels
+    compile_dynamic: true  # Enabled - prevents recompilation when batch size varies (e.g., corrupt images)
     # First compilation takes 2-5 minutes but is negligible over 60 epochs
 
     # Tracking
@@ -266,7 +270,7 @@ training:
     benchmark: true
 
     # Early stopping
-    early_stopping_patience: 8
+    early_stopping_patience: 6
     early_stopping_threshold: 0.0001
     # Ignore first N epochs for early-stopping to avoid initial instability
     early_stopping_burn_in_epochs: 2

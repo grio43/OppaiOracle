@@ -4,8 +4,15 @@ Enhanced training script with comprehensive orientation handling for anime image
 Demonstrates integration of the orientation handler with fail-fast behavior and statistics tracking.
 """
 
+import gc
 import logging
 import os
+
+# Set CUDA allocator config to reduce memory fragmentation
+# Must be set BEFORE any torch/CUDA imports
+if 'PYTORCH_CUDA_ALLOC_CONF' not in os.environ:
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import hashlib
 import json
 import time
@@ -609,28 +616,36 @@ def train_with_orientation_tracking(config: FullConfig):
         original_val_size = len(val_loader.dataset)
         indices = np.random.choice(original_val_size, val_max_samples, replace=False)
         val_subset = Subset(val_loader.dataset, indices.tolist())
-        # Rebuild val_loader with the subset, preserving original settings
-        val_batch = (
-            config.validation.dataloader.batch_size
-            if hasattr(config.validation, "dataloader")
-            else config.data.batch_size
-        )
-        val_num_workers = (
-            config.validation.dataloader.num_workers
-            if hasattr(config.validation, "dataloader")
-            else config.data.num_workers
-        )
-        val_loader = DataLoader(
-            val_subset,
+
+        # Extract validation dataloader config (fall back to training config)
+        val_dl_cfg = getattr(config.validation, "dataloader", None)
+        val_batch = getattr(val_dl_cfg, "batch_size", None) or config.data.batch_size
+        val_num_workers = getattr(val_dl_cfg, "num_workers", None) or config.data.num_workers
+        val_prefetch = getattr(val_dl_cfg, "prefetch_factor", None) or getattr(config.data, "prefetch_factor", 2)
+        val_pin_memory = getattr(val_dl_cfg, "pin_memory", None)
+        if val_pin_memory is None:
+            val_pin_memory = getattr(config.data, "pin_memory", True)
+        val_persistent = getattr(val_dl_cfg, "persistent_workers", None)
+        if val_persistent is None:
+            val_persistent = getattr(config.data, "persistent_workers", False)
+
+        # Rebuild val_loader with the subset, preserving ALL config settings
+        val_loader_kwargs = dict(
             batch_size=val_batch,
             shuffle=False,
             num_workers=val_num_workers,
-            pin_memory=True,
-            persistent_workers=val_num_workers > 0,
+            pin_memory=val_pin_memory,
         )
+        # Only add multiprocessing-specific kwargs when workers > 0
+        if val_num_workers > 0:
+            val_loader_kwargs["prefetch_factor"] = val_prefetch
+            val_loader_kwargs["persistent_workers"] = val_persistent
+
+        val_loader = DataLoader(val_subset, **val_loader_kwargs)
         logger.info(
             f"Validation subsampled: {val_max_samples:,} of {original_val_size:,} samples "
-            f"({100 * val_max_samples / original_val_size:.1f}%)"
+            f"({100 * val_max_samples / original_val_size:.1f}%) "
+            f"[workers={val_num_workers}, prefetch={val_prefetch}]"
         )
 
     # Set initial epoch before any DataLoader access (prevents worker spawn warnings)
@@ -638,6 +653,32 @@ def train_with_orientation_tracking(config: FullConfig):
         train_loader.dataset.set_epoch(0)
     if val_loader is not None and hasattr(val_loader.dataset, 'set_epoch'):
         val_loader.dataset.set_epoch(0)
+
+    # --- Background Worker Warmup (Windows optimization) ---
+    # On Windows, DataLoader workers spawn sequentially (~3.3s each) due to 'spawn' context.
+    # Start worker spawning in background while model setup continues (parallel with torch.compile).
+    # This hides the ~50s worker startup time behind model compilation/setup.
+    _warmup_result = {"iter": None, "batch": None, "error": None, "complete": False, "duration": None}
+    _warmup_start_time = time.perf_counter()
+
+    def _warmup_workers():
+        try:
+            warmup_iter = iter(train_loader)
+            warmup_batch = next(warmup_iter)  # Forces all workers to fully initialize
+            _warmup_result["iter"] = warmup_iter
+            _warmup_result["batch"] = warmup_batch
+            _warmup_result["complete"] = True
+            _warmup_result["duration"] = time.perf_counter() - _warmup_start_time
+            logger.info(f"Worker warmup complete in {_warmup_result['duration']:.1f}s - all workers spawned in background")
+        except Exception as e:
+            _warmup_result["error"] = e
+            _warmup_result["complete"] = True
+            _warmup_result["duration"] = time.perf_counter() - _warmup_start_time
+            logger.warning(f"Worker warmup failed after {_warmup_result['duration']:.1f}s: {e}")
+
+    warmup_thread = threading.Thread(target=_warmup_workers, daemon=True, name="WorkerWarmup")
+    warmup_thread.start()
+    logger.info("Started background worker warmup (parallel with model setup)")
 
     # --- Orientation diagnostics (enabled by default) -----------------------
     # Create an OrientationMonitor to write/update unmapped_orientation_tags.txt
@@ -1185,11 +1226,51 @@ def train_with_orientation_tracking(config: FullConfig):
 
         logger.info("=" * 70)
 
+        # --- Force compilation during worker warmup (Windows optimization) ---
+        # torch.compile() only wraps the model - actual compilation happens on first forward pass.
+        # By triggering compilation NOW with a dummy input, we overlap it with worker warmup
+        # (which is spawning workers in background thread), reducing total startup time.
+        # Without this, worker spawn (~50s) and compilation (2-5min) would be sequential.
+        try:
+            logger.info("Triggering torch.compile graph compilation (overlapping with worker warmup)...")
+            compile_start = time.time()
+
+            # Create dummy input matching expected batch shape
+            dummy_batch_size = config.data.batch_size
+            dummy_images = torch.randn(
+                dummy_batch_size, 3, config.data.image_size, config.data.image_size,
+                device=device, dtype=dtype
+            )
+            if use_channels_last:
+                dummy_images = dummy_images.contiguous(memory_format=torch.channels_last)
+
+            # Trigger actual compilation (this takes 2-5 minutes on first run)
+            with torch.no_grad():
+                _ = model(dummy_images)
+
+            compile_time = time.time() - compile_start
+            logger.info(f"Graph compilation complete in {compile_time:.1f}s (workers spawned in parallel)")
+
+            # Clear dummy tensors
+            del dummy_images
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        except Exception as e:
+            logger.warning(f"Forced compilation failed: {e}")
+            logger.warning("Compilation will happen on first real training batch instead")
+
     # Log TensorBoard model graph - skip when model is compiled because FX trace
     # is incompatible with torch.compile (causes "FX to torch.jit.trace a dynamo-optimized function" error)
     if config.training.use_tensorboard and not use_compile:
         try:
-            sample_batch = next(iter(train_loader))
+            # Reuse warmup batch if available (avoids redundant worker spawn)
+            warmup_thread.join(timeout=120)  # Wait for warmup to complete
+            if _warmup_result["batch"] is not None:
+                sample_batch = _warmup_result["batch"]
+                logger.debug("Reusing warmup batch for TensorBoard graph logging")
+            else:
+                sample_batch = next(iter(train_loader))
             images = sample_batch['images'].to(device)
             if use_channels_last:
                 images = images.contiguous(memory_format=torch.channels_last)
@@ -1283,7 +1364,29 @@ def train_with_orientation_tracking(config: FullConfig):
                     logger.info(f"Resuming mid-epoch at batch {resume_batch_idx} (sample offset {sample_offset}, instant via sampler)")
 
             # Create iterator (sampler start_index already set if mid-epoch resume)
-            train_iter = iter(train_loader)
+            # Reuse warmup iterator for first epoch to avoid redundant worker spawn
+            if epoch == start_epoch and not is_mid_epoch:
+                join_start = time.perf_counter()
+                warmup_thread.join(timeout=120)  # Ensure warmup complete
+                join_wait = time.perf_counter() - join_start
+                warmup_duration = _warmup_result.get("duration", "N/A")
+                if isinstance(warmup_duration, (int, float)):
+                    logger.info(f"Warmup join waited {join_wait:.1f}s (warmup total: {warmup_duration:.1f}s)")
+                else:
+                    logger.info(f"Warmup join waited {join_wait:.1f}s (warmup duration unknown)")
+                if _warmup_result["error"]:
+                    logger.warning(f"Worker warmup failed, creating fresh iterator: {_warmup_result['error']}")
+                    train_iter = iter(train_loader)
+                elif _warmup_result["iter"] is not None:
+                    train_iter = _warmup_result["iter"]
+                    _warmup_result["iter"] = None  # Clear to prevent reuse
+                    logger.info("Reusing warmed-up iterator (workers already spawned)")
+                else:
+                    train_iter = iter(train_loader)
+            else:
+                # Subsequent epochs or mid-epoch resume: create fresh iterator
+                # (persistent_workers=True keeps workers alive, so spawn is instant)
+                train_iter = iter(train_loader)
 
             # Fallback path for mid-epoch resume without ResumableSampler
             if epoch == start_epoch and is_mid_epoch and resume_batch_idx > 0 and start_step == 0:
@@ -1304,6 +1407,12 @@ def train_with_orientation_tracking(config: FullConfig):
                 start_step = resume_batch_idx
 
             for step, batch in enumerate(train_iter, start=start_step):
+                # Periodic memory cleanup to prevent fragmentation (every 5000 steps)
+                if global_step > 0 and global_step % 5000 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
                 # Filter out error samples that failed to load (zero-valued samples corrupt gradients)
                 error_flags = batch.get('error')
                 if error_flags is not None and isinstance(error_flags, torch.Tensor) and error_flags.any():
@@ -1358,11 +1467,10 @@ def train_with_orientation_tracking(config: FullConfig):
                     assert_finite(images, tag_labels, names=['images', 'tag_labels'], batch=batch, config=config)
 
                 if getattr(config.debug, 'log_input_stats', False) and (global_step % config.training.logging_steps == 0):
-                    # OPTIMIZED: Batch stats computation to minimize GPU syncs
-                    # Compute all stats in one tensor, transfer once, then extract
+                    # OPTIMIZED: Single GPU sync via .tolist() instead of multiple .item() calls
                     with torch.no_grad():
-                        img_stats = torch.stack([images.min(), images.max(), images.mean()]).cpu()
-                    img_min, img_max, img_mean = img_stats[0].item(), img_stats[1].item(), img_stats[2].item()
+                        img_stats = torch.stack([images.min(), images.max(), images.mean()]).cpu().tolist()
+                    img_min, img_max, img_mean = img_stats
                     monitor.log_scalar('train/image_min', img_min, global_step)
                     monitor.log_scalar('train/image_max', img_max, global_step)
                     monitor.log_scalar('train/image_mean', img_mean, global_step)
@@ -1372,20 +1480,18 @@ def train_with_orientation_tracking(config: FullConfig):
                     outputs = model(images, padding_mask=pmask)
 
                     if getattr(config.debug, 'log_activation_stats', False) and (global_step % config.training.logging_steps == 0):
-                        # OPTIMIZED: Batch stats computation to minimize GPU syncs
+                        # OPTIMIZED: Single GPU sync via .tolist() instead of multiple .item() calls
                         tag_logits = outputs.get('tag_logits')
                         rating_logits = outputs.get('rating_logits')
                         with torch.no_grad():
                             if tag_logits is not None:
-                                tag_stats = torch.stack([tag_logits.min(), tag_logits.max(), tag_logits.mean()]).cpu()
-                                t_min, t_max, t_mean = tag_stats[0].item(), tag_stats[1].item(), tag_stats[2].item()
+                                t_min, t_max, t_mean = torch.stack([tag_logits.min(), tag_logits.max(), tag_logits.mean()]).cpu().tolist()
                                 monitor.log_scalar('train/tag_logits_min', t_min, global_step)
                                 monitor.log_scalar('train/tag_logits_max', t_max, global_step)
                                 monitor.log_scalar('train/tag_logits_mean', t_mean, global_step)
                                 logger.debug(f"Tag logits stats - min: {t_min:.6f}, mean: {t_mean:.6f}, max: {t_max:.6f}")
                             if rating_logits is not None:
-                                rating_stats = torch.stack([rating_logits.min(), rating_logits.max(), rating_logits.mean()]).cpu()
-                                r_min, r_max, r_mean = rating_stats[0].item(), rating_stats[1].item(), rating_stats[2].item()
+                                r_min, r_max, r_mean = torch.stack([rating_logits.min(), rating_logits.max(), rating_logits.mean()]).cpu().tolist()
                                 monitor.log_scalar('train/rating_logits_min', r_min, global_step)
                                 monitor.log_scalar('train/rating_logits_max', r_max, global_step)
                                 monitor.log_scalar('train/rating_logits_mean', r_mean, global_step)
@@ -1448,10 +1554,12 @@ def train_with_orientation_tracking(config: FullConfig):
                     scaler.unscale_(optimizer)
 
                     if getattr(config.debug, 'log_gradient_norm', False) and (global_step % config.training.logging_steps == 0):
-                        # Compute gradient norm efficiently in single pass (avoids per-parameter GPU syncs)
-                        grads = [p.grad.flatten() for p in model.parameters() if p.grad is not None]
+                        # Compute gradient norm using foreach operations (avoids memory spike from concatenation)
+                        grads = [p.grad for p in model.parameters() if p.grad is not None]
                         if grads:
-                            total_norm = torch.cat(grads).norm(2).item()
+                            # Use _foreach_norm for efficient per-tensor norms, then combine
+                            norms = torch._foreach_norm(grads, ord=2)
+                            total_norm = torch.stack(norms).norm(2).item()
                         else:
                             total_norm = 0.0
                         monitor.log_scalar('train/grad_norm', total_norm, global_step)
@@ -1838,14 +1946,14 @@ def train_with_orientation_tracking(config: FullConfig):
                 logger.warning(f"Failed to reset validation metrics, recreating: {e}")
                 # CRITICAL: Clean up old metrics before recreating to prevent GPU memory leak
                 # Move old metrics to CPU and delete to free GPU memory
+                # Note: Avoid torch.cuda.empty_cache() here as it causes expensive global GPU sync.
+                # Moving to CPU + del is sufficient; the garbage collector handles cleanup.
                 for name, metric in list(val_metrics.items()):
                     try:
                         metric.cpu()  # Move to CPU to free GPU memory
                     except Exception:
                         pass
                 del val_metrics
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
                 # Recreate metrics on failure to ensure clean state
                 val_metrics = {
                     'f1_macro': MultilabelF1Score(num_labels=num_tags, average="macro", threshold=threshold).to(device),

@@ -96,7 +96,11 @@ class ExclusionManager:
             return self._load_internal()
 
     def _load_internal(self) -> Set[str]:
-        """Internal load (assumes lock is held)."""
+        """Internal load (assumes threading lock is held).
+
+        Uses non-blocking file lock to avoid contention during worker startup.
+        If lock is held by another process, returns cached snapshot instead of blocking.
+        """
         if not self.exclusion_path.exists():
             self._excluded_ids = set()
             self._last_load_time = time.time()
@@ -104,8 +108,18 @@ class ExclusionManager:
 
         try:
             with open(self.exclusion_path, 'r', encoding='utf-8') as f:
-                # Acquire shared lock for reading
-                self._acquire_lock(f, exclusive=False)
+                # Try non-blocking lock first (fast path for parallel workers)
+                # If lock is held, return cached snapshot to avoid blocking during startup
+                if not self._try_lock_nonblocking(f, exclusive=False):
+                    # Lock held by another process - return cached snapshot
+                    # This avoids blocking during worker startup when multiple workers
+                    # try to reload simultaneously
+                    self._last_load_time = time.time()  # Reset timer to prevent immediate retry
+                    logger.debug(
+                        f"Exclusion file locked, using cached snapshot ({len(self._excluded_ids)} ids)"
+                    )
+                    return self._excluded_ids.copy()
+
                 try:
                     self._excluded_ids = set()
                     for line in f:
@@ -332,6 +346,36 @@ class ExclusionManager:
             return self._acquire_lock_windows(f, exclusive)
         else:
             return self._acquire_lock_unix(f, exclusive)
+
+    def _try_lock_nonblocking(self, f, exclusive: bool = False) -> bool:
+        """
+        Try to acquire file lock without blocking (single attempt, no retry).
+
+        Used during worker startup to avoid lock contention - if lock is held,
+        return cached snapshot instead of blocking.
+
+        Args:
+            f: Open file handle
+            exclusive: True for exclusive (write) lock, False for shared (read) lock
+
+        Returns:
+            True if lock acquired, False if lock is held by another process
+        """
+        if platform.system() == 'Windows':
+            lock_size = max(1, f.seek(0, 2))
+            f.seek(0)
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, lock_size)
+                return True
+            except (OSError, IOError):
+                return False  # Lock held by another process
+        else:
+            try:
+                lock_type = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
+                fcntl.flock(f, lock_type)
+                return True
+            except (OSError, IOError):
+                return False  # Lock held by another process
 
     def _acquire_lock_windows(self, f, exclusive: bool) -> bool:
         """Windows-specific file locking with retry."""

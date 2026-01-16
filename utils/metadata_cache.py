@@ -385,15 +385,29 @@ def _build_arrow_cache(
 
         # Use file locking if available (prevents concurrent write corruption)
         if HAS_FILELOCK:
+            lock = filelock.FileLock(lock_path)
             try:
-                with filelock.FileLock(lock_path, timeout=600):  # 10 min timeout for large caches
-                    _do_arrow_write()
+                # Fast path: try non-blocking first (timeout=0)
+                # If another process is building, we'll wait on the slow path
+                lock.acquire(timeout=0)
+                logger.debug("Acquired cache lock immediately (non-blocking)")
             except filelock.Timeout:
-                logger.error(
-                    f"Timeout acquiring cache lock after 600s - another process may be building. "
-                    f"Lock file: {lock_path}"
-                )
-                return False
+                # Slow path: another process is building, wait with reduced timeout
+                # 30s is sufficient for most cache writes; 600s was excessive
+                logger.info("Cache lock held by another process, waiting up to 30s...")
+                try:
+                    lock.acquire(timeout=30)
+                except filelock.Timeout:
+                    logger.error(
+                        f"Timeout acquiring cache lock after 30s - another process may be stuck. "
+                        f"Lock file: {lock_path}"
+                    )
+                    return False
+
+            try:
+                _do_arrow_write()
+            finally:
+                lock.release()
         else:
             _do_arrow_write()
 

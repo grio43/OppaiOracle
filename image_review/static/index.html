@@ -7,9 +7,18 @@
     <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+    <!-- Mobile Header -->
+    <header class="mobile-header">
+        <h1>Image Review</h1>
+        <button class="hamburger-btn" id="hamburger-btn" aria-label="Open menu">&#9776;</button>
+    </header>
+
+    <!-- Sidebar Overlay (for mobile) -->
+    <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
     <div class="app-container">
         <!-- Sidebar: Run Selection & Navigation -->
-        <aside class="sidebar">
+        <aside class="sidebar" id="sidebar">
             <h1>Image Review</h1>
 
             <!-- Run Selection -->
@@ -107,8 +116,24 @@
                     <div class="prediction-list" id="predictions"></div>
                 </section>
             </div>
+
+            <!-- Swipe Hint (mobile only) -->
+            <div class="swipe-hint" id="swipe-hint">
+                <span>&larr;</span>
+                <span>Swipe to navigate</span>
+                <span>&rarr;</span>
+            </div>
         </main>
     </div>
+
+    <!-- Mobile Navigation Bar -->
+    <nav class="mobile-nav-bar">
+        <button id="mobile-btn-prev" class="nav-btn" disabled>&larr; Prev</button>
+        <div class="nav-info">
+            <span id="mobile-current-num">-</span>/<span id="mobile-total-num">-</span>
+        </div>
+        <button id="mobile-btn-next" class="nav-btn" disabled>Next &rarr;</button>
+    </nav>
 
     <!-- Full-size Image Modal -->
     <div class="modal-overlay" id="image-modal">
