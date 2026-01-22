@@ -10,8 +10,8 @@ import os
 
 # Set CUDA allocator config to reduce memory fragmentation
 # Must be set BEFORE any torch/CUDA imports
-if 'PYTORCH_CUDA_ALLOC_CONF' not in os.environ:
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+if 'PYTORCH_ALLOC_CONF' not in os.environ:
+    os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 
 import hashlib
 import json
@@ -52,8 +52,10 @@ def _shutdown_dataloader_workers(loader: "Optional[DataLoader]") -> None:
         # Access internal iterator which holds worker references
         if hasattr(loader, '_iterator') and loader._iterator is not None:
             loader._iterator._shutdown_workers()
-    except Exception:
-        pass  # Best effort - may fail if already cleaned up
+            logger.debug("Successfully shut down dataloader workers")
+    except Exception as e:
+        # Best effort - may fail if already cleaned up or workers not started
+        logger.debug(f"DataLoader worker cleanup (expected if already clean): {type(e).__name__}")
 
 
 from Monitor_log import MonitorConfig, TrainingMonitor
@@ -75,6 +77,12 @@ from orientation_handler import OrientationHandler, OrientationMonitor
 # Cache monitor interval (steps). Configurable via CACHE_MONITOR_INTERVAL_STEPS env var.
 # Default: 3000 steps (~50 minutes at 1 step/sec, ~96k images with batch_size=32)
 CACHE_MONITOR_EVERY_STEPS = int(os.getenv('CACHE_MONITOR_INTERVAL_STEPS', '3000'))
+
+# Rating index for "unknown" rating class to ignore during loss computation.
+# This must match the vocabulary definition in vocabulary.py:
+#   rating_to_index = {"general": 0, "sensitive": 1, "questionable": 2, "explicit": 3, "unknown": 4}
+# If the vocabulary changes, update this constant accordingly.
+RATING_UNKNOWN_INDEX = 4
 
 # Import base modules with error handling
 try:
@@ -485,6 +493,8 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # Ensure log_dir exists early for sentinel files and diagnostics
     Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+    # Ensure output_root exists for tensorboard and checkpoints
+    Path(config.output_root).mkdir(parents=True, exist_ok=True)
 
     # Find the active data path from storage_locations
     active_location = next((loc for loc in config.data.storage_locations if loc.get('enabled')), None)
@@ -630,10 +640,14 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # Apply validation max_samples subsampling if configured
     # This significantly speeds up validation by using a random subset
+    # Use seeded RNG for deterministic subset selection across runs
     val_max_samples = getattr(config.validation, 'max_samples', None)
     if val_loader is not None and val_max_samples and val_max_samples < len(val_loader.dataset):
         original_val_size = len(val_loader.dataset)
-        indices = np.random.choice(original_val_size, val_max_samples, replace=False)
+        val_subset_seed = getattr(config.training, 'seed', 42)
+        val_rng = np.random.RandomState(val_subset_seed)
+        indices = val_rng.choice(original_val_size, val_max_samples, replace=False)
+        indices = np.sort(indices)  # Sort to maintain consistent dataset ordering
         val_subset = Subset(val_loader.dataset, indices.tolist())
 
         # Extract validation dataloader config (fall back to training config)
@@ -675,32 +689,6 @@ def train_with_orientation_tracking(config: FullConfig):
         train_loader.dataset.set_epoch(0)
     if val_loader is not None and hasattr(val_loader.dataset, 'set_epoch'):
         val_loader.dataset.set_epoch(0)
-
-    # --- Background Worker Warmup (Windows optimization) ---
-    # On Windows, DataLoader workers spawn sequentially (~3.3s each) due to 'spawn' context.
-    # Start worker spawning in background while model setup continues (parallel with torch.compile).
-    # This hides the ~50s worker startup time behind model compilation/setup.
-    _warmup_result = {"iter": None, "batch": None, "error": None, "complete": False, "duration": None}
-    _warmup_start_time = time.perf_counter()
-
-    def _warmup_workers():
-        try:
-            warmup_iter = iter(train_loader)
-            warmup_batch = next(warmup_iter)  # Forces all workers to fully initialize
-            _warmup_result["iter"] = warmup_iter
-            _warmup_result["batch"] = warmup_batch
-            _warmup_result["complete"] = True
-            _warmup_result["duration"] = time.perf_counter() - _warmup_start_time
-            logger.info(f"Worker warmup complete in {_warmup_result['duration']:.1f}s - all workers spawned in background")
-        except Exception as e:
-            _warmup_result["error"] = e
-            _warmup_result["complete"] = True
-            _warmup_result["duration"] = time.perf_counter() - _warmup_start_time
-            logger.warning(f"Worker warmup failed after {_warmup_result['duration']:.1f}s: {e}")
-
-    warmup_thread = threading.Thread(target=_warmup_workers, daemon=True, name="WorkerWarmup")
-    warmup_thread.start()
-    logger.info("Started background worker warmup (parallel with model setup)")
 
     # --- Orientation diagnostics (enabled by default) -----------------------
     # Create an OrientationMonitor to write/update unmapped_orientation_tags.txt
@@ -752,21 +740,47 @@ def train_with_orientation_tracking(config: FullConfig):
     )
     logger.info(f"Rating validator created with action='{rating_validation_action}'")
 
-    model_config = config.model.to_dict()
-    model_config["num_tags"] = num_tags
-    model_config["num_ratings"] = num_ratings
+    # Determine architecture type
+    architecture_type = getattr(config.model, 'architecture_type', 'vit')
+    logger.info(f"Creating model with architecture: {architecture_type}")
 
-    # Filter out config keys that are in unified_config.yaml but not used by VisionTransformerConfig
-    # These are legacy/alternate config fields that don't map to the current model architecture
-    _unused_config_keys = {
-        'architecture_type', 'attention_probs_dropout_prob',
-        'hidden_dropout_prob', 'initializer_range', 'num_groups', 'num_labels',
-        'num_special_tokens', 'tags_per_group', 'use_cls_token', 'use_color_token',
-        'use_line_token', 'use_style_token'
-    }
-    model_config = {k: v for k, v in model_config.items() if k not in _unused_config_keys}
+    # Warn if gradient_checkpointing is set for SwinV2 (it's ignored, use swin_config.use_checkpoint instead)
+    if architecture_type == 'swinv2' and getattr(config.model, 'gradient_checkpointing', False):
+        logger.warning(
+            "gradient_checkpointing is set but ignored for SwinV2. "
+            "Use swin_config.use_checkpoint instead for SwinV2 gradient checkpointing."
+        )
 
-    model = create_model(**model_config)
+    if architecture_type == 'swinv2':
+        # Get SwinV2-specific config
+        swin_config = getattr(config.model, 'swin_config', None)
+
+        model = create_model(
+            architecture_type='swinv2',
+            swin_config=swin_config,
+            image_size=config.model.image_size,
+            num_tags=num_tags,
+            num_ratings=num_ratings,
+            logit_clamp_value=getattr(config.model, 'logit_clamp_value', 15.0),
+        )
+        logger.info(f"Created SwinV2 model with {sum(p.numel() for p in model.parameters()):,} parameters")
+    else:
+        # Existing ViT model creation
+        model_config = config.model.to_dict()
+        model_config["num_tags"] = num_tags
+        model_config["num_ratings"] = num_ratings
+
+        # Filter out config keys that are in unified_config.yaml but not used by VisionTransformerConfig
+        # These are legacy/alternate config fields that don't map to the current model architecture
+        _unused_config_keys = {
+            'architecture_type', 'attention_probs_dropout_prob',
+            'hidden_dropout_prob', 'initializer_range', 'num_groups', 'num_labels',
+            'num_special_tokens', 'tags_per_group', 'use_cls_token', 'use_color_token',
+            'use_line_token', 'use_style_token', 'swin_config'
+        }
+        model_config = {k: v for k, v in model_config.items() if k not in _unused_config_keys}
+
+        model = create_model(**model_config)
     # Move model to device first, then apply dtype conversion
     # NOTE: channels_last memory format is applied LATER (after checkpoint loading and dtype conversion)
     # to ensure it's not lost during transformations. See the channels_last application block below.
@@ -790,6 +804,8 @@ def train_with_orientation_tracking(config: FullConfig):
     # Only set a default if not provided in config
     if not getattr(config.monitor, "tensorboard_dir", None):
         config.monitor.tensorboard_dir = str(Path(config.output_root) / config.experiment_name)
+    # Ensure tensorboard directory exists before initializing monitor
+    Path(config.monitor.tensorboard_dir).mkdir(parents=True, exist_ok=True)
     config.monitor.use_wandb = config.training.use_wandb
 
     monitor = TrainingMonitor(config.monitor)
@@ -820,8 +836,13 @@ def train_with_orientation_tracking(config: FullConfig):
     # NOTE: TensorBoard model graph logging is deferred until AFTER torch.compile()
     # to avoid stride mismatch issues. See the model graph logging block below.
 
-    # Detect and log Flex Attention configuration
-    if config.model.use_flex_attention:
+    # Detect and log Flex Attention configuration (only for custom ViT, SwinV2 uses timm's attention)
+    if config.model.use_flex_attention and architecture_type == 'swinv2':
+        logger.info(
+            "use_flex_attention is set but SwinV2 uses shifted window attention (built into timm). "
+            "Flex Attention setting is ignored for SwinV2."
+        )
+    elif config.model.use_flex_attention and architecture_type != 'swinv2':
         logger.info("=" * 70)
         logger.info("Flex Attention Configuration:")
         logger.info(f"  PyTorch version: {torch.__version__}")
@@ -883,13 +904,12 @@ def train_with_orientation_tracking(config: FullConfig):
             label_smoothing=tag_loss_cfg.label_smoothing,
             ignore_indices=[0, 1],  # Ignore <PAD> (0) and <UNK> (1) for tags
         ),
-        rating_loss_fn=AsymmetricFocalLoss(
-            alpha=rating_loss_cfg.alpha,
-            clip=rating_loss_cfg.clip,
-            gamma_neg=rating_loss_cfg.gamma_neg,
-            gamma_pos=rating_loss_cfg.gamma_pos,
+        # For ratings (single-label classification), use CrossEntropyLoss instead of
+        # AsymmetricFocalLoss which is designed for multi-label classification.
+        rating_loss_fn=torch.nn.CrossEntropyLoss(
+            weight=torch.tensor(rating_loss_cfg.class_weights, dtype=amp_dtype) if rating_loss_cfg.class_weights else None,
+            ignore_index=RATING_UNKNOWN_INDEX,  # Ignore "unknown" rating (see vocabulary.py)
             label_smoothing=rating_loss_cfg.label_smoothing,
-            ignore_indices=[4],  # Ignore "unknown" rating (index 4)
         ),
     )
     from training_utils import TrainingUtils
@@ -1009,6 +1029,9 @@ def train_with_orientation_tracking(config: FullConfig):
                 yield
 
     # GradScaler is only needed for float16 AMP on Volta+ GPUs (compute capability >= 7)
+    # Note: bfloat16 does NOT require GradScaler because it has a much larger dynamic range
+    # (8 exponent bits vs float16's 5), which naturally avoids the underflow/overflow issues
+    # that GradScaler addresses for float16. When using bfloat16, enabled=False is intentional.
     use_scaler = False
     if amp_enabled and amp_dtype == torch.float16:
         if torch.cuda.is_available():
@@ -1063,6 +1086,7 @@ def train_with_orientation_tracking(config: FullConfig):
     # Track mid-epoch resume info (for resuming from exact batch position)
     resume_batch_idx = 0
     is_mid_epoch = False
+    ckpt_original_batch_size = None  # For batch-size agnostic resume from legacy checkpoints
     # Soft-stop sentinel files (located in log_dir)
     stop_sentinel = Path(config.log_dir) / "STOP_TRAINING"
     save_sentinel = Path(config.log_dir) / "SAVE_CHECKPOINT"
@@ -1097,6 +1121,21 @@ def train_with_orientation_tracking(config: FullConfig):
 
     if ckpt_path:
         try:
+            # --- Pre-load architecture validation (fail-fast before loading weights) ---
+            # Peek at checkpoint config to detect architecture mismatch BEFORE
+            # attempting to load state_dict, which would fail with a cryptic error.
+            ckpt_config_preview = checkpoint_manager.peek_checkpoint_config(ckpt_path)
+            if ckpt_config_preview:
+                is_compatible, messages = validate_config_compatibility(
+                    checkpoint_config=ckpt_config_preview,
+                    current_config=config,
+                    strict=True  # Fail on critical mismatches (architecture_type, num_labels, etc.)
+                )
+                if messages:
+                    for msg in messages:
+                        logger.info("Pre-load validation: %s", msg)
+            # --- End pre-load validation ---
+
             ckpt = checkpoint_manager.load_checkpoint(
                 checkpoint_path=ckpt_path,
                 model=model,
@@ -1107,7 +1146,6 @@ def train_with_orientation_tracking(config: FullConfig):
             if not ckpt:
                 raise RuntimeError(f"Checkpoint returned empty data from {ckpt_path}")
             training_state = TrainingState.from_dict(ckpt.get('training_state', {}))
-            start_epoch = ckpt.get('epoch', 0)
             global_step = ckpt.get('step', 0)
             # Preserve historical best; only reconcile when explicitly marked as best
             if ckpt.get('is_best', False):
@@ -1118,38 +1156,46 @@ def train_with_orientation_tracking(config: FullConfig):
                     logger.warning(f"Could not parse best metric from checkpoint: {e}")
             # Extract mid-epoch resume info if available
             resume_batch_idx = getattr(training_state, 'batch_in_epoch', 0)
+            resume_sample_idx = getattr(training_state, 'sample_in_epoch', 0)  # Batch-size agnostic
             is_mid_epoch = not getattr(training_state, 'is_epoch_boundary', True)
 
-            # Fix: Convert 1-based checkpoint epoch back to 0-based for mid-epoch resume
+            # Convert from 1-based checkpoint epoch to 0-based loop index
             # Checkpoints store epoch+1, but the training loop uses 0-based indexing
-            if is_mid_epoch and start_epoch > 0:
-                start_epoch = start_epoch - 1
-                logger.info(f"Mid-epoch resume: adjusted start_epoch to {start_epoch} (0-based)")
+            start_epoch = ckpt.get('epoch', 1) - 1
+            if start_epoch < 0:
+                start_epoch = 0
+            # For mid-epoch resume, we continue the same epoch; for completed epochs,
+            # the checkpoint's epoch+1 means we start the NEXT epoch (which after -1 is correct)
+            if is_mid_epoch:
+                logger.info(f"Mid-epoch resume: continuing epoch {start_epoch} (0-based)")
 
             if is_mid_epoch and resume_batch_idx > 0:
                 logger.info("Resumed from %s (epoch=%s, step=%s, batch_in_epoch=%s) - mid-epoch resume",
                            ckpt_path, start_epoch, global_step, resume_batch_idx)
                 # Warn about persistent_workers limitation with mid-epoch resume
-                # Workers maintain RNG state that we can't restore - data order may differ slightly
+                # Workers maintain RNG state that cannot be serialized - augmentations will differ
                 if getattr(config.data, 'persistent_workers', False):
                     logger.warning(
-                        "persistent_workers=true with mid-epoch resume: worker RNG states cannot be restored. "
-                        "Data order will be correct (via ResumableSampler), but per-worker augmentation RNG "
-                        "may differ from original run. This is usually acceptable for training."
+                        "Resuming mid-epoch with persistent_workers=True: per-worker RNG state "
+                        "cannot be serialized. Augmentations may differ from original run. "
+                        "Set persistent_workers=False for fully reproducible mid-epoch resume."
                     )
             else:
                 logger.info("Resumed from %s (epoch=%s, step=%s)", ckpt_path, start_epoch, global_step)
 
-            # Validate config compatibility between checkpoint and current config
+            # Extract original batch_size for legacy checkpoint resume (batch-size agnostic)
+            # Note: Critical config validation (architecture_type, num_labels, etc.) was already
+            # performed BEFORE load_checkpoint() via peek_checkpoint_config() to fail fast.
             ckpt_config = ckpt.get('config', {})
             if ckpt_config:
-                is_compatible, messages = validate_config_compatibility(
-                    checkpoint_config=ckpt_config,
-                    current_config=config,
-                    strict=True  # Fail on critical mismatches
-                )
-                if messages:
-                    logger.info("Config validation completed with %d messages", len(messages))
+                ckpt_original_batch_size = ckpt_config.get('data', {}).get('batch_size')
+                if ckpt_original_batch_size and ckpt_original_batch_size != config.data.batch_size:
+                    logger.info(f"Checkpoint was trained with batch_size={ckpt_original_batch_size}, "
+                               f"current batch_size={config.data.batch_size} - will use original for resume offset")
+
+            # Release checkpoint memory after extraction - model/optimizer states already loaded
+            del ckpt
+            gc.collect()
         except Exception as e:
             # CRITICAL: Don't silently continue with uninitialized state
             # This could overwrite existing checkpoints with bad data
@@ -1261,7 +1307,7 @@ def train_with_orientation_tracking(config: FullConfig):
             dummy_batch_size = config.data.batch_size
             dummy_images = torch.randn(
                 dummy_batch_size, 3, config.data.image_size, config.data.image_size,
-                device=device, dtype=dtype
+                device=device, dtype=amp_dtype
             )
             if use_channels_last:
                 dummy_images = dummy_images.contiguous(memory_format=torch.channels_last)
@@ -1286,13 +1332,7 @@ def train_with_orientation_tracking(config: FullConfig):
     # is incompatible with torch.compile (causes "FX to torch.jit.trace a dynamo-optimized function" error)
     if config.training.use_tensorboard and not use_compile:
         try:
-            # Reuse warmup batch if available (avoids redundant worker spawn)
-            warmup_thread.join(timeout=120)  # Wait for warmup to complete
-            if _warmup_result["batch"] is not None:
-                sample_batch = _warmup_result["batch"]
-                logger.debug("Reusing warmup batch for TensorBoard graph logging")
-            else:
-                sample_batch = next(iter(train_loader))
+            sample_batch = next(iter(train_loader))
             images = sample_batch['images'].to(device)
             if use_channels_last:
                 images = images.contiguous(memory_format=torch.channels_last)
@@ -1364,7 +1404,7 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.debug(f"Dataset set_epoch skipped: {e}")
 
         model.train()
-        running_loss = torch.tensor(0.0, device=device)  # Keep on GPU to avoid per-batch sync
+        running_loss = 0.0  # Use CPU scalar to avoid VRAM accumulation over epoch
         optimizer.zero_grad(set_to_none=True)  # Use set_to_none for memory efficiency
         accum_count = 0  # Tracks accumulated batches (handles skipped batches)
         processed_batches = 0  # Excludes skipped batches for accurate loss averaging
@@ -1374,66 +1414,27 @@ def train_with_orientation_tracking(config: FullConfig):
         with anomaly_ctx:
             # Mid-epoch resume setup (before creating iterator to avoid double-init)
             start_step = 0
-            if epoch == start_epoch and is_mid_epoch and resume_batch_idx > 0:
+            if epoch == start_epoch and is_mid_epoch and (resume_batch_idx > 0 or resume_sample_idx > 0):
                 # Try instant resume via ResumableSampler (O(1) instead of O(n) batch iteration)
                 sampler = getattr(train_loader, 'sampler', None)
                 if hasattr(sampler, 'set_start_index'):
                     # Set sampler offset BEFORE creating iterator
                     # Note: set_start_index expects SAMPLE index, not batch index
-                    sample_offset = resume_batch_idx * train_loader.batch_size
+                    # Use sample_in_epoch if available (batch-size agnostic), otherwise calculate
+                    if resume_sample_idx > 0:
+                        sample_offset = resume_sample_idx
+                        start_step = sample_offset // train_loader.batch_size
+                    else:
+                        # Use original batch_size from checkpoint for legacy checkpoints (batch-size agnostic)
+                        effective_batch_size = ckpt_original_batch_size or train_loader.batch_size
+                        sample_offset = resume_batch_idx * effective_batch_size
+                        start_step = sample_offset // train_loader.batch_size
                     sampler.set_start_index(sample_offset)
-                    start_step = resume_batch_idx
-                    logger.info(f"Resuming mid-epoch at batch {resume_batch_idx} (sample offset {sample_offset}, instant via sampler)")
+                    logger.info(f"Resuming mid-epoch at batch {start_step} (sample offset {sample_offset}, instant via sampler)")
 
             # Create iterator (sampler start_index already set if mid-epoch resume)
-            # Reuse warmup iterator for first epoch to avoid redundant worker spawn
-            if epoch == start_epoch and not is_mid_epoch:
-                join_start = time.perf_counter()
-                
-                # Wait for warmup with progress logging instead of hard timeout
-                # Hard timeout caused double-spawning of workers (20+ processes) when startup was slow
-                wait_interval = 10.0
-                while warmup_thread.is_alive():
-                    warmup_thread.join(timeout=wait_interval)
-                    if warmup_thread.is_alive():
-                        elapsed = time.perf_counter() - join_start
-                        logger.info(f"Waiting for worker warmup... ({elapsed:.1f}s elapsed)")
-
-                join_wait = time.perf_counter() - join_start
-                warmup_duration = _warmup_result.get("duration", "N/A")
-                if isinstance(warmup_duration, (int, float)):
-                    logger.info(f"Warmup join waited {join_wait:.1f}s (warmup total: {warmup_duration:.1f}s)")
-                else:
-                    logger.info(f"Warmup join waited {join_wait:.1f}s (warmup duration unknown)")
-
-                if _warmup_result["error"]:
-                    logger.warning(f"Worker warmup failed, creating fresh iterator: {_warmup_result['error']}")
-                    # Clean up any partially-initialized warmup iterator to prevent orphaned workers
-                    if _warmup_result["iter"] is not None:
-                        try:
-                            _warmup_result["iter"]._shutdown_workers()
-                        except Exception:
-                            pass
-                        _warmup_result["iter"] = None
-                    train_iter = iter(train_loader)
-                elif _warmup_result["iter"] is not None:
-                    train_iter = _warmup_result["iter"]
-                    _warmup_result["iter"] = None  # Clear to prevent reuse
-                    logger.info("Reusing warmed-up iterator (workers already spawned)")
-                    
-                    # Fix for lost batch: inject the warmup batch back into the stream
-                    # The warmup thread consumed one batch to trigger worker spawn; we must not lose it.
-                    if _warmup_result["batch"] is not None:
-                        import itertools
-                        train_iter = itertools.chain([_warmup_result["batch"]], train_iter)
-                        _warmup_result["batch"] = None
-                        logger.debug("Injected warmup batch back into training stream")
-                else:
-                    train_iter = iter(train_loader)
-            else:
-                # Subsequent epochs or mid-epoch resume: create fresh iterator
-                # (persistent_workers=True keeps workers alive, so spawn is instant)
-                train_iter = iter(train_loader)
+            # Workers spawn synchronously here; persistent_workers=True keeps them alive for subsequent epochs
+            train_iter = iter(train_loader)
 
             # Fallback path for mid-epoch resume without ResumableSampler
             if epoch == start_epoch and is_mid_epoch and resume_batch_idx > 0 and start_step == 0:
@@ -1454,12 +1455,6 @@ def train_with_orientation_tracking(config: FullConfig):
                 start_step = resume_batch_idx
 
             for step, batch in enumerate(train_iter, start=start_step):
-                # Periodic memory cleanup to prevent fragmentation (every 5000 steps)
-                if global_step > 0 and global_step % 5000 == 0:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
                 # Filter out error samples that failed to load (zero-valued samples corrupt gradients)
                 error_flags = batch.get('error')
                 if error_flags is not None and isinstance(error_flags, torch.Tensor) and error_flags.any():
@@ -1583,8 +1578,51 @@ def train_with_orientation_tracking(config: FullConfig):
                 #     skipped_batches += 1
                 #     continue
 
+                # CR-041: Extract loss scalars BEFORE backward to allow early tensor deletion
+                # This prevents VRAM leak from retaining computation graphs during gradient accumulation
+                # Extract raw loss first, then scale - avoids double division (backward also divides by accum)
+                loss_item = loss.item()
+                batch_size_current = images.size(0)
+                # Note: losses_items contains UNSCALED component losses (not divided by accum).
+                # This is intentional: loss_item represents the per-microbatch contribution to the
+                # gradient update, while losses_items shows the true magnitude of each loss component
+                # for debugging/monitoring. When logging, loss_item is used for running averages
+                # (properly weighted by batch size), and losses_items is for component breakdown.
+                losses_items = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in losses.items()}
+
+                # Periodic NaN/Inf loss detection (check every logging_steps to avoid log spam)
+                # Note: loss.item() already syncs GPU above, so this check is essentially free
+                # GradScaler only catches NaN/Inf in gradients, not in the loss itself
+                if global_step % config.training.logging_steps == 0:
+                    if not np.isfinite(loss_item):
+                        logger.error(
+                            f"NaN/Inf loss detected at step {global_step}: loss={loss_item}, "
+                            f"components={losses_items}"
+                        )
+                        monitor.log_scalar('train/nan_inf_loss_detected', 1.0, global_step)
+
+                # Save detached logits for potential image logging before we delete outputs
+                # These are lightweight copies that don't retain the computation graph
+                _saved_tag_logits = outputs['tag_logits'].detach()
+                _saved_rating_logits = outputs.get('rating_logits')
+                if _saved_rating_logits is not None:
+                    _saved_rating_logits = _saved_rating_logits.detach()
+
                 # Average the loss over accumulation micro-steps before backward
                 scaler.scale(loss / accum).backward()
+
+                # CR-041: Free computation graph IMMEDIATELY after backward to prevent VRAM leak
+                del loss, losses, outputs
+                # tag_logits/rating_logits are only defined when log_activation_stats is enabled
+                try:
+                    del tag_logits
+                except NameError:
+                    pass
+                try:
+                    del rating_logits
+                except NameError:
+                    pass
+
                 accum_count += 1
 
                 if accum_count >= accum:
@@ -1607,6 +1645,7 @@ def train_with_orientation_tracking(config: FullConfig):
                             # Use _foreach_norm for efficient per-tensor norms, then combine
                             norms = torch._foreach_norm(grads, ord=2)
                             total_norm = torch.stack(norms).norm(2).item()
+                            del norms, grads
                         else:
                             total_norm = 0.0
                         monitor.log_scalar('train/grad_norm', total_norm, global_step)
@@ -1624,7 +1663,8 @@ def train_with_orientation_tracking(config: FullConfig):
                         # torch._foreach_norm returns a list of norms - check if any is inf/nan
                         norms = torch._foreach_norm(grads, ord=2)
                         stacked = torch.stack(norms)
-                        grads_finite = torch.isfinite(stacked).all().item()
+                        grads_finite = torch.isfinite(stacked).all().item()  # Keep on GPU, no sync
+                        del stacked, norms, grads
                     else:
                         grads_finite = True
                     if not grads_finite:
@@ -1641,9 +1681,9 @@ def train_with_orientation_tracking(config: FullConfig):
                     global_step += 1
                     try:
                         scheduler.step()
-                    except Exception:
+                    except Exception as sched_exc:
                         # keep training even if a rare scheduler state issue occurs
-                        pass
+                        logger.warning(f"Scheduler step failed at global_step={global_step}: {sched_exc}")
 
                     # Count optimizer updates and handle periodic checkpointing
                     try:
@@ -1655,7 +1695,8 @@ def train_with_orientation_tracking(config: FullConfig):
                     if save_every > 0 and (training_state.optimizer_updates % save_every == 0):
                         try:
                             # Include current batch in sample count for accurate averaging
-                            current_train_loss = (running_loss + loss.detach() * batch_size).item() / max(1, total_train_samples + batch_size)
+                            # Uses pre-extracted loss_item to avoid retaining computation graph
+                            current_train_loss = (running_loss + (loss_item * batch_size_current)) / max(1, total_train_samples + batch_size_current)
                         except Exception:
                             current_train_loss = float('nan')
 
@@ -1664,7 +1705,12 @@ def train_with_orientation_tracking(config: FullConfig):
                         training_state.train_loss = float(current_train_loss) if np.isfinite(current_train_loss) else current_train_loss
                         # Track mid-epoch position for resume
                         training_state.batch_in_epoch = step
+                        training_state.sample_in_epoch = step * train_loader.batch_size
                         training_state.is_epoch_boundary = False
+
+                        # CR-043: Light memory cleanup before periodic checkpoint save
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
                         try:
                             checkpoint_manager.save_checkpoint(
@@ -1688,9 +1734,9 @@ def train_with_orientation_tracking(config: FullConfig):
                             logger.warning("Periodic save failed: %s", e)
 
                 # Accumulate loss weighted by batch size for proper per-sample averaging
-                batch_size = images.size(0)
-                running_loss = running_loss + loss.detach() * batch_size
-                total_train_samples += batch_size
+                # Uses pre-extracted loss_item (loss tensors already deleted after backward)
+                running_loss = running_loss + (loss_item * batch_size_current)
+                total_train_samples += batch_size_current
                 processed_batches += 1
 
                 # Early soft stop check - handles step 0 and mid-accumulation
@@ -1712,7 +1758,7 @@ def train_with_orientation_tracking(config: FullConfig):
                         save_batch_position = step + 1
 
                     try:
-                        current_train_loss = running_loss.item() / max(1, total_train_samples)
+                        current_train_loss = running_loss / max(1, total_train_samples)
                     except Exception:
                         current_train_loss = float('nan')
 
@@ -1721,7 +1767,13 @@ def train_with_orientation_tracking(config: FullConfig):
                     training_state.global_step = global_step
                     training_state.train_loss = float(current_train_loss) if np.isfinite(current_train_loss) else current_train_loss
                     training_state.batch_in_epoch = save_batch_position
+                    training_state.sample_in_epoch = save_batch_position * train_loader.batch_size
                     training_state.is_epoch_boundary = False
+
+                    # CR-043: Clear GPU memory before soft stop checkpoint save
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                     try:
                         checkpoint_manager.save_checkpoint(
@@ -1770,7 +1822,13 @@ def train_with_orientation_tracking(config: FullConfig):
                         training_state.train_loss = float(current_train_loss) if np.isfinite(current_train_loss) else current_train_loss
                         # Track mid-epoch position for resume
                         training_state.batch_in_epoch = step + 1  # Next batch to process (consistent with soft stop)
+                        training_state.sample_in_epoch = (step + 1) * train_loader.batch_size
                         training_state.is_epoch_boundary = False
+
+                        # CR-043: Clear GPU memory before one-shot checkpoint save
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
                         # Save checkpoint (updates last.pt atomically)
                         try:
@@ -1798,12 +1856,13 @@ def train_with_orientation_tracking(config: FullConfig):
 
                 # Log every N steps (throttled) and ensure first-step write
                 if global_step == 1 or (global_step % config.training.logging_steps == 0):
+                    # Uses pre-extracted loss_item and losses_items (tensors already deleted after backward)
                     monitor.log_step(
                         global_step,
-                        loss.item(),
-                        losses,
+                        loss_item,
+                        losses_items,
                         optimizer.param_groups[0]['lr'],
-                        images.size(0),
+                        batch_size_current,
                     )
                     # NOTE: Histogram logging moved to optimizer step block (lines 1166-1175)
                     # using param_hist_interval_steps for proper throttling
@@ -1872,7 +1931,7 @@ def train_with_orientation_tracking(config: FullConfig):
                         logger.info(f"Manual image logging triggered at step {global_step}")
                     try:
                         with torch.no_grad():
-                            probs = torch.sigmoid(outputs['tag_logits'])
+                            probs = torch.sigmoid(_saved_tag_logits)
                             tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
                             monitor.log_predictions(
                                 step=global_step,
@@ -1883,7 +1942,7 @@ def train_with_orientation_tracking(config: FullConfig):
                                 prefix="train",
                                 max_images=config.monitor.tb_image_logging.max_samples,
                                 topk=config.monitor.tb_image_logging.topk,
-                                rating_logits=outputs.get('rating_logits'),
+                                rating_logits=_saved_rating_logits,
                                 rating_labels=rating_labels,
                             )
                             logger.info(f"Logged {config.monitor.tb_image_logging.max_samples} training images to TensorBoard at step {global_step}")
@@ -1935,7 +1994,7 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.info(f"Completed resumed epoch {epoch + 1} - cleared mid-epoch flag")
             is_mid_epoch = False
 
-        avg_train_loss = running_loss.item() / max(1, total_train_samples)  # Per-sample average, sync only at epoch end
+        avg_train_loss = running_loss / max(1, total_train_samples)  # Per-sample average
 
         # Log skipped batch statistics for monitoring
         if skipped_batches > 0:
@@ -1943,23 +2002,6 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.info(f"Epoch {epoch+1}: Skipped {skipped_batches} batches ({skip_rate:.2%} of total)")
             monitor.log_scalar('train/skipped_batches', skipped_batches, global_step)
             monitor.log_scalar('train/skip_rate', skip_rate, global_step)
-
-        # Log attention mask cache statistics
-        try:
-            from model_architecture import TransformerBlock
-            cache_stats = TransformerBlock.get_cache_stats()
-            if cache_stats['hits'] + cache_stats['misses'] > 0:
-                logger.info(
-                    f"Attention mask cache stats - "
-                    f"Hit rate: {cache_stats['hit_rate']:.2%} "
-                    f"({cache_stats['hits']}/{cache_stats['hits'] + cache_stats['misses']}), "
-                    f"Entries: {cache_stats['entries']}, "
-                    f"Size: {cache_stats['size_mb']:.2f} MB"
-                )
-                monitor.log_scalar('cache/mask_hit_rate', cache_stats['hit_rate'], global_step)
-                monitor.log_scalar('cache/mask_entries', cache_stats['entries'], global_step)
-        except Exception as e:
-            logger.debug(f"Failed to log cache stats: {e}")
 
         # Check if we should run validation this epoch (based on eval_steps)
         # eval_steps=0 means validate every epoch; otherwise validate every N steps
@@ -1986,27 +2028,8 @@ def train_with_orientation_tracking(config: FullConfig):
             model.eval()
             val_loss = torch.tensor(0.0, device=device)  # Keep on GPU to avoid per-batch sync
             # Reset validation metrics for this epoch (CR-040 fix: reuse instead of recreate)
-            try:
-                for metric in val_metrics.values():
-                    metric.reset()
-            except Exception as e:
-                logger.warning(f"Failed to reset validation metrics, recreating: {e}")
-                # CRITICAL: Clean up old metrics before recreating to prevent GPU memory leak
-                # Move old metrics to CPU and delete to free GPU memory
-                # Note: Avoid torch.cuda.empty_cache() here as it causes expensive global GPU sync.
-                # Moving to CPU + del is sufficient; the garbage collector handles cleanup.
-                for name, metric in list(val_metrics.items()):
-                    try:
-                        metric.cpu()  # Move to CPU to free GPU memory
-                    except Exception:
-                        pass
-                del val_metrics
-                # Recreate metrics on failure to ensure clean state
-                val_metrics = {
-                    'f1_macro': MultilabelF1Score(num_labels=num_tags, average="macro", threshold=threshold).to(device),
-                    'f1_micro': MultilabelF1Score(num_labels=num_tags, average="micro", threshold=threshold).to(device),
-                    'map_macro': MultilabelAveragePrecision(num_labels=num_tags, average="macro").to(device)
-                }
+            for metric in val_metrics.values():
+                metric.reset()
             total_val_samples = 0  # Track samples for proper loss averaging
             with torch.no_grad():
                 for val_step, batch in enumerate(val_loader):
@@ -2038,9 +2061,9 @@ def train_with_orientation_tracking(config: FullConfig):
                     val_loss = val_loss + loss.detach() * images.size(0)
 
                     # Update streaming metrics
-                    probs = torch.sigmoid(outputs['tag_logits'])
-                    # Keep targets as float for consistency with lightning_module.py and proper metric computation
-                    targs = tag_labels.to(device=probs.device, dtype=probs.dtype)
+                    probs = torch.sigmoid(outputs['tag_logits']).float()
+                    # Targets must be int/long for torchmetrics (mAP uses precision-recall curves)
+                    targs = tag_labels.to(device=probs.device).long()
                     val_metrics['f1_macro'].update(probs, targs)
                     val_metrics['f1_micro'].update(probs, targs)
                     val_metrics['map_macro'].update(probs, targs)
@@ -2068,6 +2091,20 @@ def train_with_orientation_tracking(config: FullConfig):
             mAP_tensor = val_metrics['map_macro'].compute()
             metrics_batch = torch.stack([val_loss_avg, f1_macro_tensor, f1_micro_tensor, mAP_tensor]).cpu()
             avg_val_loss, val_f1_macro, val_f1_micro, val_mAP = metrics_batch.tolist()
+
+            # Free GPU memory from metric tensors before checkpoint save
+            del f1_macro_tensor, f1_micro_tensor, mAP_tensor
+            # CR-042: Move metrics to CPU and clear GPU buffers after validation
+            for metric in val_metrics.values():
+                try:
+                    metric.cpu()
+                except Exception:
+                    pass
+                metric.reset()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             logger.info(
                 f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, "
                 f"Val F1(macro): {val_f1_macro:.4f}, Val F1(micro): {val_f1_micro:.4f}, Val mAP: {val_mAP:.4f}"
@@ -2151,6 +2188,12 @@ def train_with_orientation_tracking(config: FullConfig):
         # Respect "save_best_only": skip cadence saves unless this is a new best.
         # Only handle best-at-epoch saves here; periodic saves happen in-loop
         if is_best:
+            # Ensure GPU state is consistent and free memory before checkpoint save
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             # Mark as epoch boundary since this is saved at end of epoch
             training_state.is_epoch_boundary = True
             training_state.batch_in_epoch = 0
@@ -2193,25 +2236,24 @@ def train_with_orientation_tracking(config: FullConfig):
     except Exception as e:
         logger.debug(f"Failed to write orientation_safety_report.json: {e}")
 
-    # Final attention mask cache statistics
-    try:
-        from model_architecture import TransformerBlock
-        cache_stats = TransformerBlock.get_cache_stats()
-        if cache_stats['hits'] + cache_stats['misses'] > 0:
-            logger.info(
-                f"Final attention mask cache statistics:\n"
-                f"  Total accesses: {cache_stats['hits'] + cache_stats['misses']}\n"
-                f"  Cache hits: {cache_stats['hits']} ({cache_stats['hit_rate']:.2%})\n"
-                f"  Cache misses: {cache_stats['misses']}\n"
-                f"  Cached entries: {cache_stats['entries']}\n"
-                f"  Cache size: {cache_stats['size_mb']:.2f} MB\n"
-                f"  Performance gain: ~{cache_stats['hits'] * 0.01:.2f}ms saved from mask inversions"
-            )
-    except Exception as e:
-        logger.debug(f"Failed to log final cache stats: {e}")
-
     # Guaranteed resource cleanup on all exit paths
     logger.debug("Cleaning up training resources...")
+
+    # Shutdown async checkpoint writer first (waits for pending saves)
+    try:
+        checkpoint_manager.shutdown(wait=True, timeout=60.0)
+        logger.debug("Checkpoint manager shutdown successfully")
+    except Exception as e:
+        logger.warning(f"Error shutting down checkpoint manager: {e}")
+
+    # Synchronize CUDA and clear cache before final cleanup
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            logger.debug("CUDA synchronized and cache cleared")
+    except Exception as e:
+        logger.warning(f"Error during CUDA cleanup: {e}")
 
     # Close monitor (flushes TensorBoard)
     try:
