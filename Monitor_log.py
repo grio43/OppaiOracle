@@ -35,7 +35,7 @@ import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 import torchvision
 import matplotlib.pyplot as plt
-from utils.logging_sanitize import sanitize_metrics
+from utils.logging_sanitize import sanitize_metrics, _to_safe_float
 import seaborn as sns
 from tqdm import tqdm
 
@@ -462,6 +462,18 @@ class ThreadSafeMetricsTracker:
     
     def add_metric(self, name: str, value: float, step: Optional[int] = None):
         """Add a metric value (thread-safe)"""
+        # CRITICAL: Detach tensors and convert to float to prevent memory leaks
+        # holding the graph in history
+        safe_value = _to_safe_float(value)
+        if safe_value is None:
+            # If conversion failed (e.g. non-scalar tensor), try to keep as is but detached
+            if hasattr(value, 'detach'):
+                value = value.detach().cpu()
+                if value.numel() == 1:
+                    value = value.item()
+        else:
+            value = safe_value
+
         with self.lock:
             timestamp = time.time()
             self.metrics[name].append({
@@ -901,6 +913,9 @@ class TrainingMonitor:
         self.writer = None
         # Preserve existing logger if present
         self.logger = getattr(self, "logger", None)
+        # Normalization params for inverting preprocessing before TensorBoard display
+        self._norm_mean = tuple(getattr(config, 'normalize_mean', (0.5, 0.5, 0.5)))
+        self._norm_std = tuple(getattr(config, 'normalize_std', (0.5, 0.5, 0.5)))
 
         # Core state
         self.start_time = time.time()
@@ -978,8 +993,8 @@ class TrainingMonitor:
             tb_dir.mkdir(parents=True, exist_ok=True)
             self._tb_dir = str(tb_dir)
 
-            # Tighter flush and bounded queue for durability and memory
-            self.writer = SummaryWriter(log_dir=self._tb_dir, flush_secs=30, max_queue=1000)
+            # Increased flush interval to reduce I/O blocking; bounded queue for memory
+            self.writer = SummaryWriter(log_dir=self._tb_dir, flush_secs=120, max_queue=1000)
             if self.logger: self.logger.info(f"TensorBoard logging to {self._tb_dir}")
 
             # Optional: small curated dashboard panels (best-effort)
@@ -1279,6 +1294,13 @@ class TrainingMonitor:
             images[:num_images], predictions=predictions, labels=targets, step=step
         )
 
+    def _denormalize_img(self, img: torch.Tensor) -> torch.Tensor:
+        """Inverse of Normalize(mean, std) so images display correctly in TensorBoard.
+        Maps normalized tensors (e.g. [-1, 1] with mean=0.5/std=0.5) back to [0, 1]."""
+        mean = torch.tensor(self._norm_mean, dtype=torch.float32).view(-1, 1, 1)
+        std = torch.tensor(self._norm_std, dtype=torch.float32).view(-1, 1, 1)
+        return img.float() * std + mean
+
     # Rating index to name mapping
     RATING_NAMES = ['safe', 'sensitive', 'questionable', 'explicit', 'unknown']
 
@@ -1321,7 +1343,7 @@ class TrainingMonitor:
         for i in range(num_samples):
             img = images[i]
             if torch.is_floating_point(img):
-                img = img.clamp(0, 1)
+                img = self._denormalize_img(img).clamp(0, 1)
                 img = (img * 255).round().to(torch.uint8)
             else:
                 img = img.to(torch.uint8)
@@ -1421,7 +1443,7 @@ class TrainingMonitor:
         for i in range(num_samples):
             img = images[i]
             if torch.is_floating_point(img):
-                img = img.clamp(0, 1)
+                img = self._denormalize_img(img).clamp(0, 1)
                 img = img.permute(1, 2, 0).numpy()
             else:
                 img = img.permute(1, 2, 0).numpy()
@@ -1600,6 +1622,11 @@ class TrainingMonitor:
     
     def _check_training_health(self, step: int, loss: float, step_time: float):
         """Check training health and send alerts if needed"""
+        # Defense: ensure loss is a plain float so np.isnan / comparisons work
+        # even if the caller passes None or a non-numeric type.
+        if loss is None:
+            return
+        loss = float(loss)
         # NaN loss
         if np.isnan(loss) and self.config.alert_on_nan_loss:
             self.alerts.send_alert(

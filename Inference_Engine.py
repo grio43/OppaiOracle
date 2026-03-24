@@ -66,9 +66,15 @@ if TYPE_CHECKING:
 
 # Import the actual model architecture
 try:
-    from model_architecture import SimplifiedTagger, VisionTransformerConfig
+    from model_architecture import SimplifiedTagger, SwinV2Tagger, VisionTransformerConfig
 except ImportError:
-    raise ImportError("model_architecture.py not found. Cannot load SimplifiedTagger model.")   
+    raise ImportError("model_architecture.py not found. Cannot load model architectures.")
+
+# Import SwinV2 config for architecture detection
+try:
+    from Configuration_System import SwinV2ModelConfig
+except ImportError:
+    SwinV2ModelConfig = None  # type: ignore[assignment, misc]   
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +208,7 @@ class ImagePreprocessor:
         """Build tensor + normalize transform (geometry handled manually to avoid stretching/upscale)."""
         return transforms_v2.Compose([
             transforms_v2.ToImage(),
-            transforms_v2.ToDtype(torch.float32, scale=True),
+            transforms_v2.ToDtype(torch.bfloat16, scale=True),
             transforms_v2.Normalize(
                 mean=self.config.normalize_mean,
                 std=self.config.normalize_std
@@ -401,6 +407,7 @@ class ImagePreprocessor:
 class DatasetItem(NamedTuple):
     """Item returned by InferenceDataset"""
     image: torch.Tensor
+    padding_mask: torch.Tensor
     path: str
     is_valid: bool
 
@@ -419,19 +426,22 @@ class InferenceDataset(Dataset):
         """Load and preprocess an image.
 
         Returns:
-            DatasetItem: Contains image tensor, path, and validity flag.
+            DatasetItem: Contains image tensor, padding mask, path, and validity flag.
                         If loading fails, returns zero tensor with is_valid=False.
                         Consumers MUST check is_valid flag!
         """
         path = self.image_paths[idx]
         try:
-            image = self.preprocessor.preprocess_image(path)
-            return DatasetItem(image, path, True)
+            image, padding_mask = self.preprocessor.preprocess_image(path, return_mask=True)
+            return DatasetItem(image, padding_mask, path, True)
         except Exception as e:
             logger.error(f"Failed to load {path}: {e}")
+            # Full padding mask for invalid images (True=PAD semantics)
             return DatasetItem(
                 torch.zeros(3, self.preprocessor.config.image_size,
                            self.preprocessor.config.image_size),
+                torch.ones(self.preprocessor.config.image_size,
+                          self.preprocessor.config.image_size, dtype=torch.bool),
                 path,
                 False
             )
@@ -444,9 +454,10 @@ def inference_collate_fn(batch):
     is a list of booleans instead of a tuple.
     """
     images = torch.stack([item.image for item in batch])
+    padding_masks = torch.stack([item.padding_mask for item in batch])
     paths = [item.path for item in batch]
     valid_flags = [item.is_valid for item in batch]
-    return images, paths, valid_flags
+    return images, padding_masks, paths, valid_flags
 
 
 class ModelWrapper:
@@ -573,7 +584,7 @@ class ModelWrapper:
                 logger.warning("Preprocessing params not found in checkpoint. Using config defaults.")
 
             # Load model config
-            vit_config_dict = config.model.to_dict()
+            vit_config_dict = asdict(config.model)
 
             # Set number of tags based on the loaded vocabulary
             if self.tag_names:
@@ -583,6 +594,13 @@ class ModelWrapper:
                 raise ValueError("Cannot determine num_tags from vocabulary or config")
 
             # Ensure critical parameters are present with sensible defaults
+            # Handle legacy image size conversion with warning
+            if self.config.image_size == _LEGACY_IMAGE_SIZE:
+                logger.warning(
+                    f"Legacy image size {_LEGACY_IMAGE_SIZE} detected in config. "
+                    f"Automatically converting to 512 for compatibility. "
+                    f"Update your config to use image_size: 512 to suppress this warning."
+                )
             vit_config_defaults = {
                 'image_size': self.config.image_size if self.config.image_size != _LEGACY_IMAGE_SIZE else 512,
                 'patch_size': 16,
@@ -610,9 +628,82 @@ class ModelWrapper:
                     vit_config_dict[key] = default_value
                     logger.debug(f"Using default value for {key}: {default_value}")
             
-            # Create Vision Transformer model with correct architecture
-            vit_config = VisionTransformerConfig(**vit_config_dict)
-            self.model = SimplifiedTagger(vit_config)
+            # Detect architecture type from checkpoint metadata or config
+            architecture_type = meta.get('architecture_type',
+                                        vit_config_dict.get('architecture_type', 'vit'))
+
+            # Validate architecture type
+            valid_architectures = ('vit', 'swinv2')
+            if architecture_type not in valid_architectures:
+                logger.error(
+                    f"Invalid architecture_type '{architecture_type}' detected. "
+                    f"Valid options are: {valid_architectures}. "
+                    f"Please check your checkpoint or config file."
+                )
+                raise ValueError(
+                    f"Invalid architecture_type '{architecture_type}'. "
+                    f"Must be one of: {valid_architectures}"
+                )
+
+            # Create model with correct architecture
+            if architecture_type == 'swinv2':
+                # SwinV2 architecture
+                logger.info("Detected SwinV2 architecture from checkpoint")
+
+                # Build SwinV2-specific config from checkpoint or config
+                swin_config_data = meta.get('swin_config') or vit_config_dict.get('swin_config')
+
+                if swin_config_data and SwinV2ModelConfig is not None:
+                    # Convert dict to SwinV2ModelConfig if needed
+                    if isinstance(swin_config_data, dict):
+                        # Convert list depths/num_heads to tuples as expected by SwinV2ModelConfig
+                        if 'depths' in swin_config_data and isinstance(swin_config_data['depths'], list):
+                            swin_config_data['depths'] = tuple(swin_config_data['depths'])
+                        if 'num_heads' in swin_config_data and isinstance(swin_config_data['num_heads'], list):
+                            swin_config_data['num_heads'] = tuple(swin_config_data['num_heads'])
+                        swin_config = SwinV2ModelConfig(**swin_config_data)
+                    else:
+                        swin_config = swin_config_data
+                elif SwinV2ModelConfig is not None:
+                    # Use default SwinV2 config
+                    logger.warning("No swin_config found in checkpoint, using defaults")
+                    swin_config = SwinV2ModelConfig()
+                else:
+                    raise ImportError(
+                        "SwinV2ModelConfig not available from Configuration_System. "
+                        "Cannot load SwinV2 model."
+                    )
+
+                # Filter vit_config_dict to only VisionTransformerConfig fields
+                vit_fields = {'image_size', 'patch_size', 'num_channels', 'hidden_size',
+                             'num_hidden_layers', 'num_attention_heads', 'intermediate_size',
+                             'num_tags', 'num_ratings', 'dropout', 'attention_dropout',
+                             'layer_norm_eps', 'use_flex_attention', 'flex_block_size',
+                             'attention_bias', 'token_ignore_threshold', 'gradient_checkpointing',
+                             'checkpoint_every_n_layers', 'drop_path_rate',
+                             'check_numerical_stability', 'logit_clamp_value', 'use_fp32_layernorm'}
+                filtered_vit_config = {k: v for k, v in vit_config_dict.items() if k in vit_fields}
+
+                vit_config = VisionTransformerConfig(**filtered_vit_config)
+                self.model = SwinV2Tagger(vit_config, swin_config)
+                # SwinV2 always uses patch_size=4 (hardcoded in timm)
+                self.patch_size = 4
+            else:
+                # Default: ViT architecture (SimplifiedTagger)
+                logger.info("Using ViT (SimplifiedTagger) architecture")
+
+                # Filter config dict to only VisionTransformerConfig fields
+                vit_fields = {'image_size', 'patch_size', 'num_channels', 'hidden_size',
+                             'num_hidden_layers', 'num_attention_heads', 'intermediate_size',
+                             'num_tags', 'num_ratings', 'dropout', 'attention_dropout',
+                             'layer_norm_eps', 'use_flex_attention', 'flex_block_size',
+                             'attention_bias', 'token_ignore_threshold', 'gradient_checkpointing',
+                             'checkpoint_every_n_layers', 'drop_path_rate',
+                             'check_numerical_stability', 'logit_clamp_value', 'use_fp32_layernorm'}
+                filtered_vit_config = {k: v for k, v in vit_config_dict.items() if k in vit_fields}
+
+                vit_config = VisionTransformerConfig(**filtered_vit_config)
+                self.model = SimplifiedTagger(vit_config)
 
             # Load weights with explicit strict checking
             # Note: load_state_dict(strict=True) returns None on success, raises RuntimeError on mismatch
@@ -663,7 +754,9 @@ class ModelWrapper:
                 logger.warning(f"Unknown precision '{precision}', defaulting to bf16")
                 self.model = self.model.to(torch.bfloat16)
             
-            logger.info(f"SimplifiedTagger model loaded successfully:")
+            model_type = "SwinV2Tagger" if architecture_type == 'swinv2' else "SimplifiedTagger"
+            logger.info(f"{model_type} model loaded successfully:")
+            logger.info(f"  - Architecture: {architecture_type}")
             logger.info(f"  - Image size: {vit_config.image_size}")
             logger.info(f"  - Patch size: {vit_config.patch_size}")
             logger.info(f"  - Number of tags: {vit_config.num_tags}")
@@ -734,7 +827,8 @@ class ModelWrapper:
             Prediction probabilities (N, num_tags)
         """
         # Match model precision and device in a single transfer
-        # Using non_blocking=False to ensure transfer completes before model forward
+        # non_blocking=True enables async CPU->GPU transfer; CUDA stream synchronization
+        # ensures the transfer completes before model.forward() uses the tensor
         model_dtype = next(self.model.parameters()).dtype
         memory_format = (torch.channels_last
                         if getattr(self.config, "memory_format", "contiguous") == "channels_last"
@@ -743,12 +837,12 @@ class ModelWrapper:
             device=self.device,
             dtype=model_dtype,
             memory_format=memory_format,
-            non_blocking=False  # Ensure transfer completes before model.forward()
+            non_blocking=True
         )
 
         # Transfer padding mask to device if provided
         if padding_mask is not None:
-            padding_mask = padding_mask.to(device=self.device, dtype=torch.bool)
+            padding_mask = padding_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
 
         outputs = self.model(images, padding_mask=padding_mask)
         if self.config.tta_flip:
@@ -761,14 +855,9 @@ class ModelWrapper:
                 if 'tag_logits' in outputs and self._tta_index_map is not None:
                     # Use advanced indexing to reorder flipped outputs
                     # self._tta_index_map[i] = index of tag in flipped image that corresponds to tag i in original
-                    batch_size = outputs_flipped['tag_logits'].shape[0]
-
-                    # Create batch indices
-                    batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(1)
-
                     # Reorder flipped predictions using index map
                     # tags_f[b, i] = outputs_flipped[b, index_map[i]]
-                    tags_f = outputs_flipped['tag_logits'][batch_idx, self._tta_index_map.unsqueeze(0)]
+                    tags_f = outputs_flipped['tag_logits'][:, self._tta_index_map]
 
                     # Average original and reordered flipped
                     outputs['tag_logits'] = 0.5 * (outputs['tag_logits'] + tags_f)
@@ -792,11 +881,13 @@ class ModelWrapper:
             tag_outputs = outputs.get('tag_logits', outputs.get('logits'))
             if tag_outputs is None:
                 raise ValueError("Model output missing 'tag_logits' or 'logits' key")
-            predictions = torch.sigmoid(tag_outputs)
+            # Convert to float32 before sigmoid to avoid bfloat16 precision loss at thresholds
+            predictions = torch.sigmoid(tag_outputs.float())
         else:
-            predictions = torch.sigmoid(outputs)
+            # Convert to float32 before sigmoid to avoid bfloat16 precision loss at thresholds
+            predictions = torch.sigmoid(outputs.float())
 
-        return predictions.cpu().float()
+        return predictions.cpu()  # Returns float32 for accurate threshold comparison
 
 
 class ResultProcessor:
@@ -1095,9 +1186,22 @@ class InferenceEngine:
                 self.model_wrapper
             )
 
-            # Update preprocessor with loaded normalization params if available
+            # Update preprocessor with loaded normalization params from checkpoint
+            # The model_wrapper.load_model() updates its self.config with checkpoint values,
+            # so we need to sync those back to our config and rebuild the preprocessor
+            # to ensure it uses the correct normalization parameters.
             if self.model_wrapper.normalization_params:
+                # Sync normalization params from model_wrapper's config back to our config
+                self.config.normalize_mean = self.model_wrapper.config.normalize_mean
+                self.config.normalize_std = self.model_wrapper.config.normalize_std
+                self.config.image_size = self.model_wrapper.config.image_size
+                # Rebuild preprocessor with updated config
                 self.preprocessor = ImagePreprocessor(self.config)
+                logger.info(
+                    f"Rebuilt preprocessor with checkpoint normalization: "
+                    f"mean={self.config.normalize_mean}, std={self.config.normalize_std}, "
+                    f"image_size={self.config.image_size}"
+                )
 
             # Setup monitoring
             if self.config.enable_monitoring and MONITORING_AVAILABLE:
@@ -1303,7 +1407,7 @@ class InferenceEngine:
         # Build worker kwargs safely: only enable multiprocessing knobs when workers > 0
         _worker_kwargs = {
             "num_workers": self.config.num_workers,
-            "pin_memory": getattr(self.config, "pin_memory", False),
+            "pin_memory": getattr(self.config, "pin_memory", True),
             # persistent_workers is multiprocessing-only; disable when workers == 0
             "persistent_workers": (
                 getattr(self.config, "persistent_workers", False)
@@ -1328,9 +1432,9 @@ class InferenceEngine:
         start_time = time.time()
 
         try:
-            for batch_images, batch_paths, batch_valid in dataloader:
-                # Run inference
-                predictions = self.model_wrapper.predict(batch_images)
+            for batch_images, batch_padding_masks, batch_paths, batch_valid in dataloader:
+                # Run inference with padding masks for proper flex attention masking
+                predictions = self.model_wrapper.predict(batch_images, padding_mask=batch_padding_masks)
 
                 # Process results - batch_valid is already a list
                 batch_results = self.result_processor.process_predictions(

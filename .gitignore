@@ -12,6 +12,12 @@ l2_cache/
 tensorboard/
 experiments/
 test_downsample/
+analysis_sample_cache/
+analysis_sample_output/
+image_review/
+analysis_sample_paths.txt
+orphan_files_list.txt
+nul
 
 # SQLite database files
 *.sqlite
@@ -19,5 +25,7 @@ test_downsample/
 # IDE and tool configs
 .claude/
 .code-review/
+.gemini/
+.ruff_cache/
 .vscode/
 sensitive_config.py

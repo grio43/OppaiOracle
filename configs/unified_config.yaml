@@ -4,7 +4,7 @@
 
 # Global Settings
 project_name: "anime-image-tagger"
-experiment_name: "default_experiment"
+experiment_name: "vit_run1"
 output_root: "./experiments"
 log_level: "INFO"
 log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -21,33 +21,65 @@ default_output_dir: "./outputs"
 
 # Model Configuration
 model:
-    architecture_type: "vit_wide_shallow"
-    hidden_size: 1152
-    num_hidden_layers: 16
-    num_attention_heads: 18
-    intermediate_size: 4608
+    # Architecture type: "vit" (default), "vit_wide_shallow", or "swinv2"
+    architecture_type: "vit"
+
+    # SwinV2-specific configuration (used when architecture_type == "swinv2")
+    swin_config:
+      # Custom "XLarge" targeting ~350M params
+      embed_dim: 256
+      depths: [2, 2, 18, 2]
+      num_heads: [8, 16, 32, 64]
+      window_size: 16
+      mlp_ratio: 4.0
+      # Drop path rate for SwinV2 architecture (stochastic depth regularization)
+      # NOTE: This value is ONLY used when architecture_type == "swinv2"
+      # For ViT architectures, see model.drop_path_rate below
+      drop_path_rate: 0.2
+      pretrained_name: null  # Train from scratch
+      # custom_name enables a fully custom SwinV2 backbone (non-timm preset).
+      custom_name: "OppaiOracleV01"
+      # Gradient checkpointing for SwinV2 - reduces VRAM usage at cost of ~20% slower training.
+      # NOTE: This is the SwinV2-specific setting. For ViT models, use model.gradient_checkpointing below.
+      # If you set model.gradient_checkpointing=true for SwinV2, it will automatically enable this.
+      # Interval is controlled by model.checkpoint_every_n_layers (1=every block).
+      use_checkpoint: true
+
+    # ViT-specific parameters (used when architecture_type == "vit" or "vit_wide_shallow")
+    # These are ignored when using SwinV2, which uses swin_config above instead.
+    hidden_size: 1024
+    num_hidden_layers: 22
+    num_attention_heads: 16
+    intermediate_size: 4096
     image_size: 512
-    patch_size: 16
+    patch_size: 16  # ViT uses patch_size=16 (SwinV2 uses 4)
     num_channels: 3
     use_cls_token: true
     use_style_token: true
     use_line_token: true
     use_color_token: true
     num_special_tokens: 4
-    hidden_dropout_prob: 0.18
-    attention_probs_dropout_prob: 0.18
-    drop_path_rate: 0.15   # recommended range 0.08–0.3 (must be < 1.0)
+    hidden_dropout_prob: 0.1
+    attention_probs_dropout_prob: 0.0
+    # Drop path rate for ViT architectures (stochastic depth regularization)
+    # NOTE: This value is ONLY used when architecture_type == "vit" or "vit_wide_shallow"
+    # For SwinV2 architecture, see swin_config.drop_path_rate above (currently 0.2)
+    drop_path_rate: 0.3   # recommended range 0.08–0.3 (must be < 1.0)
     initializer_range: 0.02
     layer_norm_eps: 1.0e-6
-    use_flex_attention: true  # Enables Flex Attention (PyTorch 2.5+)
+    use_flex_attention: true
     attention_bias: true
     flex_block_size: 128  # Block size for Flex Attention sparse computation
     token_ignore_threshold: 0.9
     num_labels: 0  # Auto-detect from vocabulary
     num_groups: 20
     tags_per_group: 10000
-    gradient_checkpointing: false
-    # checkpoint_every_n_layers: 4   # Checkpoint every 4th layer (layers 0,4,8,12 of 16)
+    # IMPORTANT: For SwinV2 models, gradient checkpointing is controlled via swin_config.use_checkpoint above.
+    # This setting (gradient_checkpointing) is primarily for ViT models. If you set it to true for SwinV2,
+    # it will automatically enable swin_config.use_checkpoint during training.
+    gradient_checkpointing: true
+    checkpoint_every_n_layers: 4   # Checkpoint every layer/block - max memory savings (ViT + SwinV2)
+    # End of ViT-specific parameters
 
 # Data Configuration (consolidates dataloader.yaml, train_config.yaml, augmentation.yaml)
 data:
@@ -78,18 +110,39 @@ data:
   
   # Image processing
   image_size: 512
+  # IMPORTANT: Normalization values depend on training approach!
+  #   - Training from scratch (current): [0.5, 0.5, 0.5] is fine (anime-optimized)
+  #   - Pretrained SwinV2/ViT from ImageNet: Use ImageNet normalization:
+  #       normalize_mean: [0.485, 0.456, 0.406]
+  #       normalize_std: [0.229, 0.224, 0.225]
+  #     Pretrained weights were trained with ImageNet stats; using different
+  #     normalization can degrade pretrained feature quality.
   normalize_mean: [0.5, 0.5, 0.5]  # Anime-optimized (from inference_config.yaml)
   normalize_std: [0.5, 0.5, 0.5]   # Anime-optimized
+  # SwinV2-specific normalization (used when model.architecture_type == "swinv2")
+  # Set these to ImageNet stats for pretrained SwinV2 weights.
+  swinv2_normalize_mean: [0.485, 0.456, 0.406]
+  swinv2_normalize_std: [0.229, 0.224, 0.225]
   pad_color: [114, 114, 114]
 
   # Data loading (from dataloader.yaml)
-  batch_size: 32
-  num_workers: 10  # Arrow mmap shares metadata (~500MB/worker overhead), 32-core system
+  # IMPORTANT: batch_size depends on architecture and GPU memory!
+  #   - ViT (vit, vit_wide_shallow): batch_size=32 is safe on 16GB GPU
+  #   - SwinV2: batch_size=8 recommended for 16GB GPU (512px images)
+  #     SwinV2 needs ~2-3x more memory than ViT due to shifted window attention.
+  #     Use gradient_accumulation_steps to maintain effective batch size.
+  #   - 24GB GPU: SwinV2 can use batch_size=12 with 512px images
+  #   - See training_config.py:check_swinv2_batch_size() for memory guidance
+  batch_size: 34  # ViT with 512px images on 16GB GPU
+  num_workers: 6  # Arrow mmap shares metadata (~500MB/worker overhead), 32-core system
   pin_memory: true   # Enables async DMA transfer for PCIe 4.0/5.0
-  prefetch_factor:  4 
+  prefetch_factor: 5  # 8 workers × 3 batches × 128 = 3072 samples prefetched 
   persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   drop_last: false
   worker_log_level: WARNING  # Worker log level: WARNING allows debugging, CRITICAL minimizes overhead
+  
+  # Vocabulary
+  vocab_min_frequency: 300
 
   # Validation split limiting
   # Limits validation set size at split time (before Arrow cache loading).
@@ -127,30 +180,9 @@ data:
   cache_count_tolerance_percent: 0.1  # 0.1% tolerance (down from 1%, stricter validation)
   cache_count_tolerance_min: 100  # Minimum absolute tolerance
 
-  # Augmentation (from augmentation.yaml)
-  # NOTE: Most augmentations are NOT IMPLEMENTED yet - only random_flip_prob is active.
-  # With 5-6 million images, augmentation is generally unnecessary.
-  augmentation_enabled: true
-  random_flip_prob: 0.5  # IMPLEMENTED: Horizontal flipping with orientation tag swapping
-
-  # NOT IMPLEMENTED: Color augmentations below are configured but not applied in training
-  color_jitter: false
-  color_jitter_brightness: 0.1
-  color_jitter_contrast: 0.1
-  color_jitter_saturation: 0.1
-  color_jitter_hue: 0.05
-  eye_color_weight_boost: 0.0
-
-  # NOT IMPLEMENTED: Geometric augmentations below are configured but not applied in training
-  random_crop_scale: [0.8, 1.0]
-  random_rotation_degrees: 0.0
-
-  # NOT IMPLEMENTED: Advanced augmentations below are configured but not applied in training
-  randaugment_num_ops: 2
-  randaugment_magnitude: 9
-  mixup_alpha: 0.0
-  cutmix_alpha: 0.0
-  random_erasing_p: 0.0
+  # Augmentation
+  # Only random_flip_prob is implemented. With large datasets, additional augmentation is unnecessary.
+  random_flip_prob: 0.5  # Horizontal flipping with orientation tag swapping
 
   # Orientation mapping (from augmentation.yaml)
   orientation_map_path: "./configs/orientation_map.json"
@@ -160,32 +192,84 @@ data:
   # Legacy mapping: strict → conservative, balanced → balanced, lenient → permissive
   orientation_safety_mode: "conservative"
 
+  # Color jitter augmentation (applied before normalization)
+  color_jitter_enabled: true
+  color_jitter_brightness: 0.06
+  color_jitter_brightness_p: 0.5
+  color_jitter_contrast: 0.04
+  color_jitter_contrast_p: 0.5
+  color_jitter_saturation: 0.04
+  color_jitter_saturation_p: 0.5
+
+  # Random erasing augmentation (applied after normalization)
+  random_erasing_enabled: false
+  random_erasing_p: 0.35
+  random_erasing_scale_min: 0.007
+  random_erasing_scale_max: 0.03
+  random_erasing_ratio_min: 0.3
+  random_erasing_ratio_max: 2.0
+
+  # Random rotation augmentation (applied after letterboxing, image only)
+  random_rotation_enabled: false
+  random_rotation_p: .40
+  random_rotation_min_degrees: 0.5
+  random_rotation_max_degrees: 3.0
+
 # Training Configuration (from training_config.yaml)
 training:
     memory_format: "channels_last"
-    num_epochs: 25
-    learning_rate: 1.0e-4
-    weight_decay: 0.03
-    gradient_accumulation_steps: 4  # Effective batch size: 32 × 4 = 128
+    num_epochs: 16
+    # IMPORTANT: learning_rate is the BASE rate (tuned for lr_base_batch_size=256).
+    # It is automatically scaled at runtime based on effective batch size and lr_scaling_mode.
+    #
+    # Current setup:
+    #   - Architecture: ViT (from scratch)
+    #   - Effective batch size: batch_size (34) * gradient_accumulation_steps (15) = 510 samples/step
+    #   - Dataset: 5.4M images, 16 epochs
+    #   - Scaling: sqrt(510/256) = 1.412x → effective LR = 2.5e-4 * 1.412 = 3.53e-4
+    #
+    # Alternative values:
+    #   - 1.0e-4: Conservative base rate
+    #   - For fine-tuning pretrained weights: consider 5.0e-5 to 1.0e-4
+    learning_rate: 2.5e-4  # Base rate for ViT at batch_size=256 (scaled at runtime via lr_scaling_mode)
+    lr_scaling_mode: "sqrt"  # "sqrt" (recommended for AdamW), "linear", or "none"
+    lr_base_batch_size: 256  # Reference batch size that learning_rate was tuned for
+
+    # SwinV2-specific learning rate (used when model.architecture_type == 'swinv2')
+    # -------------------------------------------------------------------------
+    # SwinV2 typically needs ~50% lower learning rate than ViT due to:
+    #   - Shifted window attention has different gradient dynamics
+    #   - Hierarchical feature extraction is more sensitive to large LR
+    #   - Higher memory overhead means smaller effective batches
+    #
+    # When architecture_type is 'swinv2', this value is used instead of learning_rate.
+    # If set to null, falls back to learning_rate for backward compatibility.
+    #
+    # Recommended range: 5e-5 to 1e-4 (vs 1e-4 to 2.5e-4 for ViT)
+    # Current value 8e-5 is conservative for training from scratch with large dataset.
+    swinv2_learning_rate: null
+
+    weight_decay: 0.1
+    gradient_accumulation_steps: 15  # Effective batch size: 34 * 15 = 510 samples/step
 
     # Optimizer
     # NOTE: Using "adamw8bit" for memory-efficient 8-bit quantized optimizer states
-    # The auto-config system (optimizer_config.py + scheduler_config.py) will automatically:
+    # The auto-config system (training_config.py) will automatically:
     #   - Scale learning rate based on effective batch size
     #   - Adjust weight decay based on dataset size
     #   - Select optimal scheduler (cosine/cosine_restarts)
     #   - Save memory with 8-bit quantized optimizer states (~3 GB savings vs standard adamw)
     optimizer: "adamw8bit"
     adam_beta1: 0.9
-    adam_beta2: 0.999
+    adam_beta2: 0.95
     adan_beta3: 0.99
-    adam_epsilon: 1.0e-8
+    adam_epsilon: 1.0e-7  # 1e-7 is safer for bfloat16 (coarser dynamic range than fp32)
 
     # Scheduler
     scheduler: "cosine_restarts"
-    warmup_steps: 100  # number of OPTIMIZER STEPS to warm up (step-based)
+    warmup_steps: 10000  # ~94% of first epoch warmup (5.4M images / 510 effective batch = ~10.6k updates/epoch)
     warmup_ratio: 0.0
-    num_cycles: 3
+    num_cycles: 1  # Single cosine decay (no restarts)
     lr_end: 1.0e-6
 
     # Mixed precision
@@ -200,11 +284,6 @@ training:
       enabled: true
       max_norm: 1.0
 
-    # Optionally reduce LR after a non-finite loss to help recovery.
-    overflow_backoff_on_nan:
-      enabled: true
-      factor: 0.1   # multiply each param group lr by this factor on NaN/Inf loss
-
     # Checkpointing
     save_steps: 10000
     save_total_limit: 3
@@ -215,32 +294,27 @@ training:
     # or point to an exact checkpoint to branch experiments safely.
     resume_from: "latest"
 
-    eval_steps: 15000  # ~3 validations per epoch (46,667 steps/epoch)
+    eval_steps: 10547  # 1 epoch - validates after every epoch for early overfitting detection
     logging_steps: 5000  # Reduced TensorBoard overhead (was 3000)
     # Resume-aware reseeding: avoid replaying the same early-epoch order after resume
     resume_reseed: true
 
     # Loss configuration
     tag_loss:
-      alpha: 0.5            # Balancing factor between positive/negative examples
-      gamma_neg: 1.0        # Focusing parameter for negatives
+      alpha: 0.5            # Non-standard in canonical ASL; with binary targets this is effectively neutral (gamma handles imbalance)
+      gamma_neg: 4.0        # Canonical ASL uses 4 for MS-COCO (3% pos rate); our 0.6% pos rate needs strong neg downweighting
       gamma_pos: 1.0        # Focusing parameter for positives
-      label_smoothing: 0.1  # Smoothing for tag targets (regularization boost)
+      label_smoothing: 0.0   # Disabled — label smoothing + focal loss corrupts focal weights on sparse multi-label targets
       clip: 0.05            # Prevent extreme logits
     rating_loss:
       alpha: 0.5
       gamma_neg: 1.0
       gamma_pos: 1.0
-      label_smoothing: 0.1  # Smoothing for rating targets
+      label_smoothing: 0.08  # Smoothing for rating targets (reduced to compensate for increased regularization)
       clip: 0.05
+      class_weights: [0.3, 0.0, 2.0, 2.5, 0.0]  # [general, sensitive, questionable, explicit, unknown (ignored)] - inverse frequency weights
     use_class_weights: true
   
-    # Curriculum learning
-    use_curriculum: true
-    start_region_training_epoch: 20
-    region_training_interval: 5
-    curriculum_difficulty_schedule: "linear"
-
     # Hardware
     device: "cuda"
     distributed: false
@@ -270,10 +344,10 @@ training:
     benchmark: true
 
     # Early stopping
-    early_stopping_patience: 6
-    early_stopping_threshold: 0.0001
+    early_stopping_patience: 4
+    early_stopping_threshold: 0.0005
     # Ignore first N epochs for early-stopping to avoid initial instability
-    early_stopping_burn_in_epochs: 2
+    early_stopping_burn_in_epochs: 3
     # One of: median, mean, last, max
     early_stopping_burn_in_strategy: median
 
@@ -366,16 +440,16 @@ export:
 validation:
   max_samples: 30000  # Subsample validation set (30K of 280K) for faster epochs
   dataloader:
-    batch_size: 128  # Balanced for validation throughput
-    num_workers: 6  # Increased from 4 for smoother validation throughput
+    batch_size: 64  # Balanced for validation throughput
+    num_workers: 6  # Increased for smoother validation throughput
     pin_memory: true  # Enables async DMA transfer for faster CPU-GPU transfer
-    prefetch_factor: 4   # Match training - deeper queue for consistent throughput
+    prefetch_factor: 3  # 6 workers × 3 batches × 128 = 2304 samples prefetched
     persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   preprocessing:
     # Uses data.normalize_mean/std by default; keep in sync with
     # training/inference unless intentionally different.
     image_size: 512
-    patch_size: 16
+    patch_size: 16  # ViT uses patch_size=16 (SwinV2 uses 4)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Monitoring & Alerts
