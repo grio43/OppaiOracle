@@ -57,6 +57,7 @@ USAGE:
 
 # Standard library imports
 import atexit
+from collections import OrderedDict
 import hashlib
 import json
 import logging
@@ -146,6 +147,82 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover
     OrientationHandler = None  # type: ignore
     SwapResult = None  # type: ignore
 
+# SwinV2 image size validation (optional; allows early validation at dataset creation)
+try:
+    from model_architecture import validate_image_size_for_swinv2
+except (ImportError, ModuleNotFoundError):  # pragma: no cover
+    validate_image_size_for_swinv2 = None  # type: ignore
+
+
+class IndependentColorJitter:
+    """
+    Color jitter with independent per-parameter probability.
+    Unlike torchvision.transforms.ColorJitter which applies all parameters together,
+    this applies each transformation independently based on its own probability.
+
+    Optimized to:
+    - Pre-compute random decisions in batch to reduce random.random() calls
+    - Short-circuit early when no transforms are active
+    - Store parameters for potential combined transform creation
+    """
+
+    def __init__(
+        self,
+        brightness: float = 0.1,
+        brightness_p: float = 0.15,
+        contrast: float = 0.1,
+        contrast_p: float = 0.15,
+        saturation: float = 0.1,
+        saturation_p: float = 0.15,
+    ):
+        # Store probabilities as tuple for batch random comparison
+        self._probs = (brightness_p, contrast_p, saturation_p)
+        # Store parameters for dynamic combined transform creation
+        self._params = (brightness, contrast, saturation)
+
+        # Pre-create individual transforms for efficiency
+        # Store as tuple for indexed access (faster than dict)
+        if T is not None:
+            self._transforms = (
+                T.ColorJitter(brightness=brightness) if brightness > 0 else None,
+                T.ColorJitter(contrast=contrast) if contrast > 0 else None,
+                T.ColorJitter(saturation=saturation) if saturation > 0 else None,
+            )
+            # Pre-compute which transforms are available (avoid None checks in hot path)
+            self._active_indices = tuple(i for i, t in enumerate(self._transforms) if t is not None)
+            # Early exit flag: if no transforms configured, __call__ can return immediately
+            self._has_any_transform = len(self._active_indices) > 0
+        else:
+            self._transforms = (None, None, None)
+            self._active_indices = ()
+            self._has_any_transform = False
+
+    def __call__(self, img):
+        # Fast path: no transforms configured
+        if not self._has_any_transform:
+            return img
+
+        # Batch random decision: generate all random values at once
+        # This is faster than 3 separate random.random() calls due to reduced function call overhead
+        rand_vals = (random.random(), random.random(), random.random())
+
+        # Determine which transforms to apply based on pre-computed active indices
+        # Only iterate over transforms that are actually configured (not None)
+        apply_mask = tuple(
+            rand_vals[i] < self._probs[i] for i in self._active_indices
+        )
+
+        # Fast path: no transforms selected this call
+        if not any(apply_mask):
+            return img
+
+        # Apply only the selected transforms
+        for idx, should_apply in zip(self._active_indices, apply_mask):
+            if should_apply:
+                img = self._transforms[idx](img)
+
+        return img
+
 # Pillow resampling compatibility and truncated image handling
 try:  # Pillow ≥10
     RESAMPLE_BILINEAR = Image.Resampling.BILINEAR  # type: ignore[attr-defined]
@@ -171,6 +248,10 @@ _MAX_ERROR_STATS_TAGS = 5000    # Max unique tags to track error stats for
 # from other workers. Lower = faster sync, Higher = less I/O overhead
 # Set to 300s to reduce lock contention during training (exclusions change rarely)
 _EXCLUSION_RELOAD_INTERVAL = 300.0
+
+# Sample interval for exclusion staleness checks - avoids calling reload_if_stale()
+# on every single sample access. Check once per batch (64 samples) is sufficient.
+_EXCLUSION_CHECK_SAMPLE_INTERVAL = 64
 
 # Minimal dtype mapping for cache plumbing
 _DTYPE_MAP = {
@@ -282,6 +363,25 @@ def process_image_cpu(
     return canvas, pmask
 
 
+def apply_random_rotation(
+    canvas: Image.Image,
+    min_degrees: float,
+    max_degrees: float,
+    pad_color: Tuple[int, int, int],
+) -> Image.Image:
+    """Rotate canvas by a random angle from [-max,-min] ∪ [+min,+max].
+
+    Padding mask is intentionally NOT rotated — at 5-10 degrees the
+    rotated-in corner pixels are filled with pad_color and are
+    negligible (~1-4% of area). The model handles these the same
+    way it handles existing letterbox padding.
+    """
+    angle = random.uniform(min_degrees, max_degrees)
+    if random.random() < 0.5:
+        angle = -angle
+    return canvas.rotate(angle, resample=RESAMPLE_BILINEAR, expand=False, fillcolor=pad_color)
+
+
 ## moved to utils/cache_keys.py: compute_cache_config_hash
 
 
@@ -317,6 +417,16 @@ class ResumableSampler(DistributedSampler):
 
     def load_state(self, state: dict):
         """Restore sampler state from checkpoint."""
+        saved_size = state.get('total_size', self.total_size)
+        if saved_size != self.total_size:
+            logging.getLogger(__name__).warning(
+                "Dataset size changed from %d to %d since checkpoint was saved. "
+                "Mid-epoch sample offset cannot be applied safely — resuming from epoch start.",
+                saved_size, self.total_size
+            )
+            self._start_index = 0
+            self.set_epoch(state.get('epoch', self.epoch))
+            return
         self.set_epoch(state['epoch'])
         self._start_index = state.get('start_index', 0)
 
@@ -566,9 +676,19 @@ def _write_cached_split(root: Path, train_list: list[Path], val_list: list[Path]
     """
     train_file, val_file = _split_cache_paths(root)
     try:
-        # Atomic write pattern: write to temp then rename
+        # Atomic write pattern: write to temp then replace
+        # Use os.replace() instead of Path.rename() — on Windows, rename() raises
+        # WinError 183 if the destination already exists; os.replace() overwrites atomically.
+        import os as _os
         train_tmp = train_file.with_suffix(".tmp")
         val_tmp = val_file.with_suffix(".tmp")
+
+        # Remove any stale .tmp files left by a previously interrupted write
+        for tmp in (train_tmp, val_tmp):
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         # Build header (v2.0 format with seed)
         exclusion_hash = _compute_exclusion_hash()
@@ -587,8 +707,8 @@ def _write_cached_split(root: Path, train_list: list[Path], val_list: list[Path]
         train_tmp.write_text(train_content, encoding="utf-8")
         val_tmp.write_text(val_content, encoding="utf-8")
 
-        train_tmp.rename(train_file)
-        val_tmp.rename(val_file)
+        _os.replace(train_tmp, train_file)
+        _os.replace(val_tmp, val_file)
 
         logging.getLogger(__name__).debug(
             f"Cached split files written (train={len(train_list)}, val={len(val_list)})"
@@ -865,6 +985,7 @@ class DatasetLoader(Dataset):
         joint_transforms=None,  # NEW: torchvision v2 transforms applied to (image, mask) together
         max_retries=2,
         num_classes=None,
+        vocab=None,  # Optional TagVocabulary for num_classes validation
         # Image pipeline params
         image_size: int = 512,
         pad_color: Tuple[int, int, int] = (114, 114, 114),
@@ -886,17 +1007,33 @@ class DatasetLoader(Dataset):
         self.joint_transforms = joint_transforms
         self.max_retries = max_retries
         # Validate num_classes to prevent dimension mismatches in tag vectors
-        if num_classes is None:
+        if num_classes is not None and vocab is not None:
+            vocab_size = len(vocab.tag_to_index)
+            if num_classes != vocab_size:
+                raise ValueError(
+                    f"num_classes ({num_classes}) does not match vocabulary size ({vocab_size}). "
+                    f"Pass num_classes=len(vocab.tag_to_index) for consistency."
+                )
+        elif vocab is not None and num_classes is None:
+            # Auto-set num_classes from vocab size
+            num_classes = len(vocab.tag_to_index)
+            logging.info(f"DatasetLoader: auto-set num_classes={num_classes} from vocabulary size")
+        elif num_classes is None:
             logging.warning(
-                "DatasetLoader: num_classes not provided. Tag vectors may have incorrect dimensions. "
+                "DatasetLoader: num_classes not provided and no vocab available. "
+                "Tag vectors may have incorrect dimensions. "
                 "Pass num_classes=len(vocab.tag_to_index) for consistency."
             )
         self.num_classes = num_classes
-        self.retry_counts = {}
+        self.vocab = vocab
+        # Use OrderedDict for O(1) FIFO eviction instead of O(n) list conversion
+        self.retry_counts: OrderedDict[int, int] = OrderedDict()
         self.failed_samples = set()
         self._sample_error_log_count = 0  # Rate-limit error logs
         self.logger = logging.getLogger(__name__)
         # Track error distribution per tag to detect bias
+        # Memory bound: limited to _MAX_ERROR_STATS_TAGS unique tags (see _track_error_for_tags)
+        # Once limit reached, new tags are not tracked but existing tags continue accumulating
         from collections import defaultdict
         self.error_stats = defaultdict(lambda: defaultdict(int))
         self._error_warn_counts = defaultdict(int)  # Rate limit warnings per tag
@@ -914,6 +1051,9 @@ class DatasetLoader(Dataset):
         self.excluded_image_ids = self._exclusion_manager.load()
         if self.excluded_image_ids:
             self.logger.info(f"Loaded {len(self.excluded_image_ids)} excluded image IDs from {exclusion_path}")
+        # Counter to avoid checking exclusion staleness on every sample access
+        # Only check every _EXCLUSION_CHECK_SAMPLE_INTERVAL samples (batch boundaries)
+        self._exclusion_check_counter = 0
 
         # Image pipeline settings
         self.image_size = int(image_size)
@@ -958,15 +1098,19 @@ class DatasetLoader(Dataset):
 
         # --- Pre-created transforms for performance (avoid recreating per sample) ---
         # Use v2 API to avoid deprecation warning (ToTensor is deprecated)
+        # Image dtype for tensor outputs - bfloat16 for efficiency when supported
+        self._image_dtype = torch.bfloat16
         if T is not None:
-            self._to_tensor_v2 = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
+            self._to_tensor_v2 = T.Compose([T.ToImage(), T.ToDtype(self._image_dtype, scale=True)])
             self._to_tensor = self._to_tensor_v2  # Use v2 for v1 fallback too
         elif transforms is not None:
             self._to_tensor_v2 = None
             self._to_tensor = transforms.ToTensor()  # Legacy fallback
+            self._image_dtype = torch.float32  # ToTensor outputs float32
         else:
             self._to_tensor_v2 = None
             self._to_tensor = None
+            self._image_dtype = torch.float32  # Default fallback dtype
 
     # ---------- Pickling support for multiprocessing ----------
     def __getstate__(self):
@@ -1209,8 +1353,12 @@ class DatasetLoader(Dataset):
         self.logger.debug(f"Dataset epoch set to {self._current_epoch}")
 
     def __getitem__(self, idx):
-        # Periodically reload exclusions to pick up failures from other workers
-        if self._exclusion_manager:
+        # PERF: Only check exclusion staleness every N samples (batch boundaries)
+        # instead of on every single sample access. This reduces function call
+        # overhead from O(samples) to O(samples/N) where N=_EXCLUSION_CHECK_SAMPLE_INTERVAL
+        self._exclusion_check_counter += 1
+        if self._exclusion_manager and self._exclusion_check_counter >= _EXCLUSION_CHECK_SAMPLE_INTERVAL:
+            self._exclusion_check_counter = 0
             if self._exclusion_manager.reload_if_stale():
                 new_exclusions = self._exclusion_manager.get_excluded_ids()
                 if len(new_exclusions) > len(self.excluded_image_ids):
@@ -1218,37 +1366,49 @@ class DatasetLoader(Dataset):
 
         # HL002 Fix: Return error sample immediately on failure, don't bias distribution
         if idx in self.failed_samples:
-            return self._create_error_sample(idx, "Previously failed sample")
-
-        # Check if this sample was excluded by another worker (cross-worker sync)
-        if idx < len(self.annotations):
-            item_image_id = sanitize_identifier(str(self.annotations[idx].get('image_id', '')))
-            if item_image_id and item_image_id in self.excluded_image_ids:
-                if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
-                    self.failed_samples.add(idx)
-                return self._create_error_sample(idx, f"Excluded: {item_image_id}")
+            failed_image_id = None
+            try:
+                failed_image_id = self.annotations[idx].get('image_id')
+            except Exception:
+                pass
+            return self._create_error_sample(idx, "Previously failed sample", image_id=failed_image_id)
 
         # Track retries with memory bounds to prevent unbounded growth
+        # PERF: Using OrderedDict for O(1) FIFO eviction via popitem(last=False)
+        # instead of O(n) list(dict.keys()) conversion
         if idx not in self.retry_counts:
-            # Evict oldest entries if at capacity (simple FIFO-like eviction)
+            # Evict oldest entries if at capacity (simple FIFO eviction)
+            # Remove 20% of entries to reduce eviction frequency and amortize cost
             if len(self.retry_counts) >= _MAX_RETRY_COUNTS:
-                # Remove ~10% of entries to amortize eviction cost
-                keys_to_remove = list(self.retry_counts.keys())[:_MAX_RETRY_COUNTS // 10]
-                for k in keys_to_remove:
-                    del self.retry_counts[k]
+                num_to_remove = _MAX_RETRY_COUNTS // 5
+                for _ in range(num_to_remove):
+                    self.retry_counts.popitem(last=False)  # O(1) removal of oldest
             self.retry_counts[idx] = 0
 
+        annotation = None
+        raw_image_id = None
+        safe_image_id = None
+        filename = None
+        img_path = None
         try:
             annotation = self.annotations[idx]
+            raw_image_id = annotation.get('image_id')
+            filename = annotation.get('filename') or annotation.get('file_name')
             # Enforce allowlist and strip any sneaky path components
-            raw_image_id = sanitize_identifier(str(annotation['image_id']))
+            safe_image_id = sanitize_identifier(str(raw_image_id))
+
+            # Check if this sample was excluded by another worker (cross-worker sync)
+            if safe_image_id and safe_image_id in self.excluded_image_ids:
+                if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
+                    self.failed_samples.add(idx)
+                return self._create_error_sample(idx, f"Excluded: {safe_image_id}", image_id=safe_image_id)
 
             # --- Load + transform (confined path) ---
             # Use the sanitized image identifier we derived above.
             # Allow symlink targets to live under the dataset root (manifest symlinks → shard files)
             img_path = validate_image_path(
                 Path(self.image_dir),
-                raw_image_id,
+                safe_image_id,
                 allowed_external_roots=([Path(self.dataset_root)] if self.dataset_root else None),
             )
 
@@ -1277,9 +1437,8 @@ class DatasetLoader(Dataset):
                 # v2 ops automatically use NEAREST for Mask; geometry stays in sync
                 img_tv, mask_tv = self.joint_transforms(img_tv, mask_tv)
                 # Pre-norm 0..1 tensor for L1; then normalize for model
-                img_01 = self._to_tensor_v2(img_tv)  # 0..1 float
-                if self._cpu_bf16_cache:
-                    img_01 = img_01.to(torch.bfloat16)
+                # _to_tensor_v2 already converts to bfloat16 via ToDtype
+                img_01 = self._to_tensor_v2(img_tv)  # 0..1 bfloat16
                 t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
                 pmask = mask_tv.to(torch.bool)
             else:
@@ -1290,10 +1449,8 @@ class DatasetLoader(Dataset):
                         if self._to_tensor is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         # Ensure we can derive 0..1 image for L1 regardless of transform type
+                        # _to_tensor already converts to bfloat16 (aliased to _to_tensor_v2)
                         img_01 = transformed if isinstance(transformed, torch.Tensor) else self._to_tensor(transformed)
-                        # Keep dtype as-is; bf16 preferred when configured
-                        if self._cpu_bf16_cache:
-                            img_01 = img_01.to(torch.bfloat16)
                         t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
                     except Exception as e:
                         if self.logger.isEnabledFor(logging.DEBUG):
@@ -1301,15 +1458,11 @@ class DatasetLoader(Dataset):
                         if self._to_tensor is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img_01 = self._to_tensor(canvas)
-                        if self._cpu_bf16_cache:
-                            img_01 = img_01.to(torch.bfloat16)
                         t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
                 else:
                     if self._to_tensor is None:
                         raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                     img_01 = self._to_tensor(canvas)
-                    if self._cpu_bf16_cache:
-                        img_01 = img_01.to(torch.bfloat16)
                     t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
 
             # Reset retry count on success
@@ -1317,7 +1470,7 @@ class DatasetLoader(Dataset):
 
             # Build sample using helper to avoid duplication
             return self._build_sample_dict(
-                t, pmask, annotation, raw_image_id, cached=False
+                t, pmask, annotation, safe_image_id, cached=False
             )
 
         except Exception as e:
@@ -1325,7 +1478,15 @@ class DatasetLoader(Dataset):
             self._sample_error_log_count += 1
             # Rate-limit warning logs: log first, then every 100th
             if self._sample_error_log_count == 1 or self._sample_error_log_count % 100 == 0:
-                self.logger.warning(f"Failed to load sample {idx}: {e} (total errors: {self._sample_error_log_count})")
+                self.logger.warning(
+                    "Failed to load sample idx=%s image_id=%s filename=%s path=%s error=%s (total errors: %s)",
+                    idx,
+                    safe_image_id or raw_image_id,
+                    filename,
+                    img_path,
+                    e,
+                    self._sample_error_log_count,
+                )
 
             # Track error distribution to detect bias
             error_type = 'load_failed' if 'load' in str(e).lower() else 'decode_failed'
@@ -1338,7 +1499,9 @@ class DatasetLoader(Dataset):
 
                 # Persist failed sample to exclusion file immediately
                 try:
-                    failed_image_id = sanitize_identifier(str(self.annotations[idx].get('image_id', '')))
+                    failed_image_id = safe_image_id
+                    if not failed_image_id and raw_image_id:
+                        failed_image_id = sanitize_identifier(str(raw_image_id))
                     if failed_image_id and self._exclusion_manager:
                         was_new = self._exclusion_manager.add_exclusion(failed_image_id, immediate=True)
                         if was_new:
@@ -1351,11 +1514,15 @@ class DatasetLoader(Dataset):
                     self.logger.warning(f"Could not persist exclusion for sample {idx}: {persist_err}")
 
                 # Always log when sample permanently fails (rate-limited by max_retries)
-                self.logger.error(f"Sample {idx} exceeded max retries, marking as failed")
-                return self._create_error_sample(idx, str(e))
+                self.logger.error(
+                    "Sample idx=%s image_id=%s exceeded max retries, marking as failed",
+                    idx,
+                    safe_image_id or raw_image_id,
+                )
+                return self._create_error_sample(idx, str(e), image_id=safe_image_id or raw_image_id)
 
             # Return error sample instead of silently advancing to next index
-            return self._create_error_sample(idx, f"Temporary failure: {e}")
+            return self._create_error_sample(idx, f"Temporary failure: {e}", image_id=safe_image_id or raw_image_id)
 
     def _track_error_distribution(self, idx: int, error_type: str):
         """Track error rates per tag to detect distribution bias.
@@ -1407,7 +1574,7 @@ class DatasetLoader(Dataset):
                                     f"This may bias training distribution."
                                 )
 
-    def _create_error_sample(self, idx, reason):
+    def _create_error_sample(self, idx, reason, image_id: Optional[str] = None):
         """Create a clearly marked error sample"""
         # Default to a common square size when transform is unknown
         sz = int(getattr(self, "image_size", 224) or 224)
@@ -1417,12 +1584,17 @@ class DatasetLoader(Dataset):
                 f"Cannot create error sample: num_classes={self.num_classes} is invalid. "
                 "Pass num_classes=len(vocab.tag_to_index) when creating DatasetLoader."
             )
+        # Use configured image dtype to match normal sample dtype for batch collation
+        img_dtype = getattr(self, "_image_dtype", torch.float32)
+        resolved_image_id = str(image_id).strip() if image_id else ""
+        if not resolved_image_id:
+            resolved_image_id = f"error_{idx}"
         return {
-            "images": torch.zeros((3, sz, sz)),  # Placeholder tensor
+            "images": torch.zeros((3, sz, sz), dtype=img_dtype),
             "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
             "tag_labels": torch.zeros(self.num_classes, dtype=self._tag_vector_dtype),
             "rating_labels": torch.tensor(4, dtype=torch.long),  # unknown
-            "image_id": f"error_{idx}",
+            "image_id": resolved_image_id,
             "cached": False,
             "flip_applied": False,
             "flip_mode": "none",
@@ -1691,6 +1863,29 @@ class SidecarJsonDataset(Dataset):
         force_rebuild_metadata_cache: bool = False,
         metadata_cache_staleness_check_samples: int = 100,
         prebuilt_arrow_table: Optional[Any] = None,  # Pre-loaded Arrow table to avoid rebuild
+        # Color jitter augmentation (applied before normalization)
+        color_jitter_enabled: bool = False,
+        color_jitter_brightness: float = 0.1,
+        color_jitter_brightness_p: float = 0.15,
+        color_jitter_contrast: float = 0.1,
+        color_jitter_contrast_p: float = 0.15,
+        color_jitter_saturation: float = 0.1,
+        color_jitter_saturation_p: float = 0.15,
+        # Random erasing augmentation (applied BEFORE normalization, after ColorJitter)
+        random_erasing_enabled: bool = False,
+        random_erasing_p: float = 0.25,
+        random_erasing_scale_min: float = 0.02,
+        random_erasing_scale_max: float = 0.20,
+        random_erasing_ratio_min: float = 0.3,
+        random_erasing_ratio_max: float = 3.3,
+        # Random rotation augmentation (applied after letterboxing, image only)
+        random_rotation_enabled: bool = False,
+        random_rotation_p: float = 0.3,
+        random_rotation_min_degrees: float = 5.0,
+        random_rotation_max_degrees: float = 10.0,
+        # Architecture-aware cache key parameters
+        architecture_type: str = "vit",
+        patch_size: Optional[int] = None,
     ):
         self.root = Path(root_dir)
         self.json_files = list(json_files)
@@ -1698,7 +1893,8 @@ class SidecarJsonDataset(Dataset):
         self.transform = transform
         self.joint_transforms = joint_transforms
         self.max_retries = max_retries
-        self.retry_counts: Dict[int, int] = {}
+        # Use OrderedDict for O(1) FIFO eviction instead of O(n) list conversion
+        self.retry_counts: OrderedDict[int, int] = OrderedDict()
         self.failed_samples = set()
         self._sample_error_log_count = 0  # Rate-limit error logs
         self.logger = logging.getLogger(__name__)
@@ -1713,6 +1909,9 @@ class SidecarJsonDataset(Dataset):
         self.excluded_image_ids = self._exclusion_manager.load()
         if self.excluded_image_ids:
             self.logger.info(f"Loaded {len(self.excluded_image_ids)} excluded image IDs from {exclusion_path}")
+        # Counter to avoid checking exclusion staleness on every sample access
+        # Only check every _EXCLUSION_CHECK_SAMPLE_INTERVAL samples (batch boundaries)
+        self._exclusion_check_counter = 0
 
         # Image pipeline settings
         self.image_size = int(image_size)
@@ -1739,51 +1938,36 @@ class SidecarJsonDataset(Dataset):
                 self._cpu_bf16_cache = True
                 self.logger.debug("CPU BF16 cache pipeline enabled")
             else:
-                self._cpu_bf16_cache = False
-                # Also fall back storage dtype to float32 to ensure cache consistency
-                # This prevents issues where bf16 tensors are stored but operations fail
-                if self._sidecar_dtype is torch.bfloat16:
-                    self._sidecar_dtype = torch.float32
-                    self._sidecar_dtype_str = "float32"
-                self.logger.warning(
-                    "CPU does not support bfloat16 operations. "
-                    "Falling back to float32 for both cache pipeline and storage. "
-                    "IMPACT: Existing bfloat16 cache files will be automatically re-processed during training "
-                    "because the storage_dtype change affects the config hash (from 'bfloat16' to 'float32'). "
-                    "No manual cache deletion is needed - stale entries are detected and replaced. "
-                    "To suppress this warning, set sidecar_storage_dtype='float32' in config."
+                # CPU bfloat16 required - no fallback to float32
+                raise RuntimeError(
+                    "CPU bfloat16 support required but not available. "
+                    "Upgrade PyTorch to a version that supports CPU bfloat16 operations, "
+                    "or use a CPU that supports bfloat16."
                 )
         else:
-            self._cpu_bf16_cache = False
-            # Force sidecar dtype to float32 for consistency with non-cached images
-            # Without this, cached images would be bfloat16 but non-cached would be float32,
-            # causing batch collation to crash with "expected all tensors to be same dtype"
+            # cpu_bf16_cache_pipeline is required for bfloat16 storage
             if self._sidecar_dtype is torch.bfloat16:
-                self._sidecar_dtype = torch.float32
-                self._sidecar_dtype_str = "float32"
-                self.logger.warning(
-                    "cpu_bf16_cache_pipeline disabled but sidecar_storage_dtype was bfloat16. "
-                    "Forcing sidecar_storage_dtype to float32 for batch consistency. "
-                    "Existing bfloat16 caches will be re-processed (config hash changed)."
+                raise RuntimeError(
+                    "sidecar_storage_dtype is bfloat16 but cpu_bf16_cache_pipeline is disabled. "
+                    "Enable cpu_bf16_cache_pipeline=true in config to use bfloat16 throughout."
                 )
+            self._cpu_bf16_cache = False
 
-        # Defensive validation: ensure sidecar dtype matches what non-cached processing produces
-        # This prevents batch collation crashes from dtype mismatches between cached and non-cached images
+        # Defensive validation: ensure sidecar dtype is bfloat16 (required)
+        # All GPU storage must use bfloat16
         if self._sidecar_enabled:
-            expected_dtype = torch.bfloat16 if self._cpu_bf16_cache else torch.float32
-            if self._sidecar_dtype != expected_dtype:
+            if self._sidecar_dtype != torch.bfloat16:
                 raise ValueError(
-                    f"Dtype inconsistency detected: sidecar_storage_dtype={self._sidecar_dtype}, "
-                    f"but cpu_bf16_cache_pipeline would produce {expected_dtype}. "
-                    "This would cause batch collation failures with mixed cached/uncached images. "
-                    "Either set cpu_bf16_cache_pipeline=true with sidecar_storage_dtype=bfloat16, "
-                    "or set both to use float32."
+                    f"sidecar_storage_dtype must be bfloat16, got {self._sidecar_dtype}. "
+                    "All GPU tensor storage requires bfloat16."
                 )
 
         # Compute config hash for sidecar cache invalidation
         # Include vocab_size to invalidate cache if vocabulary changes
         # Include has_joint_transforms to invalidate cache if transforms change
         # Include flip params to invalidate cache if flip augmentation settings change
+        # Include architecture_type to ensure ViT/SwinV2 don't share caches inappropriately
+        # For SwinV2, patch_size is always 4 (hardcoded in timm); for ViT it's configurable
         self._config_hash = compute_cache_config_hash(
             image_size=self.image_size,
             pad_color=self.pad_color,
@@ -1794,6 +1978,8 @@ class SidecarJsonDataset(Dataset):
             has_joint_transforms=(self.joint_transforms is not None),
             random_flip_prob=float(random_flip_prob or 0.0),
             has_orientation_handler=(orientation_handler is not None),
+            architecture_type=architecture_type,
+            patch_size=patch_size,
         )
 
         # --- Orientation / flipping state ---
@@ -1844,7 +2030,7 @@ class SidecarJsonDataset(Dataset):
         # --- Pre-created transforms for performance (avoid recreating per sample) ---
         # Use v2 API to avoid deprecation warning (ToTensor is deprecated)
         if T is not None:
-            self._to_tensor_v2 = T.Compose([T.ToImage(), T.ToDtype(torch.float32, scale=True)])
+            self._to_tensor_v2 = T.Compose([T.ToImage(), T.ToDtype(torch.bfloat16, scale=True)])
             self._to_tensor = self._to_tensor_v2  # Use v2 for v1 fallback too
         elif transforms is not None:
             self._to_tensor_v2 = None
@@ -1852,6 +2038,42 @@ class SidecarJsonDataset(Dataset):
         else:
             self._to_tensor_v2 = None
             self._to_tensor = None
+
+        # Augmentation transforms (applied fresh each sample, NOT cached)
+        self._color_jitter = None
+        self._random_erasing = None
+
+        if T is not None:
+            if color_jitter_enabled:
+                self._color_jitter = IndependentColorJitter(
+                    brightness=color_jitter_brightness,
+                    brightness_p=color_jitter_brightness_p,
+                    contrast=color_jitter_contrast,
+                    contrast_p=color_jitter_contrast_p,
+                    saturation=color_jitter_saturation,
+                    saturation_p=color_jitter_saturation_p,
+                )
+
+            if random_erasing_enabled:
+                # Use value=0.5 (mid-gray) which normalizes to 0.0 (center of [-1,1] range)
+                # Note: value='random' was problematic as it samples from N(0,1) producing values outside [0,1]
+                self._random_erasing = T.RandomErasing(
+                    p=random_erasing_p,
+                    scale=(random_erasing_scale_min, random_erasing_scale_max),
+                    ratio=(random_erasing_ratio_min, random_erasing_ratio_max),
+                    value=0.5,
+                )
+
+        # Random rotation augmentation
+        self._rotation_enabled = bool(random_rotation_enabled)
+        self._rotation_p = float(random_rotation_p)
+        self._rotation_min_deg = float(random_rotation_min_degrees)
+        self._rotation_max_deg = float(random_rotation_max_degrees)
+        if self._rotation_enabled:
+            self.logger.info(
+                f"Random rotation enabled: p={self._rotation_p}, "
+                f"angle=[{self._rotation_min_deg}, {self._rotation_max_deg}] degrees"
+            )
 
         # Pre-parse minimal fields for speed
         # items can be List[Dict] (legacy) or ArrowMetadataAccessor (zero-copy)
@@ -2250,9 +2472,12 @@ class SidecarJsonDataset(Dataset):
         }
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Periodically reload exclusions to pick up failures from other workers
-        # This runs every ~30 seconds (configurable via _EXCLUSION_RELOAD_INTERVAL)
-        if self._exclusion_manager:
+        # PERF: Only check exclusion staleness every N samples (batch boundaries)
+        # instead of on every single sample access. This reduces function call
+        # overhead from O(samples) to O(samples/N) where N=_EXCLUSION_CHECK_SAMPLE_INTERVAL
+        self._exclusion_check_counter += 1
+        if self._exclusion_manager and self._exclusion_check_counter >= _EXCLUSION_CHECK_SAMPLE_INTERVAL:
+            self._exclusion_check_counter = 0
             if self._exclusion_manager.reload_if_stale():
                 # Update local reference if new exclusions were found
                 new_exclusions = self._exclusion_manager.get_excluded_ids()
@@ -2260,27 +2485,42 @@ class SidecarJsonDataset(Dataset):
                     self.excluded_image_ids = new_exclusions
 
         if idx in self.failed_samples:
-            return self._error_sample(idx, "Previously failed sample")
+            failed_image_id = None
+            try:
+                failed_image_id = self.items[idx].get("image_id") if idx < len(self.items) else None
+            except Exception:
+                pass
+            return self._error_sample(idx, "Previously failed sample", image_id=failed_image_id)
 
         # Check if this sample was excluded by another worker (cross-worker sync)
         if idx < len(self.items):
-            item_image_id = self.items[idx].get("image_id")
+            item_image_id = None
+            try:
+                item_image_id = self.items[idx].get("image_id")
+            except Exception:
+                item_image_id = None
             if item_image_id and item_image_id in self.excluded_image_ids:
                 # Mark as failed in memory too to speed up subsequent checks
                 if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
                     self.failed_samples.add(idx)
-                return self._error_sample(idx, f"Excluded by other worker: {item_image_id}")
+                return self._error_sample(idx, f"Excluded by other worker: {item_image_id}", image_id=item_image_id)
 
         # Track retries with memory bounds to prevent unbounded growth
+        # PERF: Using OrderedDict for O(1) FIFO eviction via popitem(last=False)
+        # instead of O(n) list(dict.keys()) conversion
         if idx not in self.retry_counts:
-            # Evict oldest entries if at capacity (simple FIFO-like eviction)
+            # Evict oldest entries if at capacity (simple FIFO eviction)
+            # Remove 20% of entries to reduce eviction frequency and amortize cost
             if len(self.retry_counts) >= _MAX_RETRY_COUNTS:
-                # Remove ~10% of entries to amortize eviction cost
-                keys_to_remove = list(self.retry_counts.keys())[:_MAX_RETRY_COUNTS // 10]
-                for k in keys_to_remove:
-                    del self.retry_counts[k]
+                num_to_remove = _MAX_RETRY_COUNTS // 5
+                for _ in range(num_to_remove):
+                    self.retry_counts.popitem(last=False)  # O(1) removal of oldest
             self.retry_counts[idx] = 0
 
+        ann = None
+        image_id = None
+        img_root = None
+        img_path = None
         try:
             ann = self.items[idx]
             image_id = ann["image_id"]
@@ -2313,12 +2553,9 @@ class SidecarJsonDataset(Dataset):
 
             # Try sidecar cache first
             if self._sidecar_enabled:
-                # Get source file mtime for cache invalidation when source is modified
-                # Only fetch when sidecar cache is enabled to avoid unnecessary syscalls
-                try:
-                    source_mtime = os.path.getmtime(img_path)
-                except OSError:
-                    source_mtime = None  # File might not exist yet, will fail later
+                # Skip mtime syscall for performance - config hash is sufficient for invalidation
+                # Source file changes are rare during training and config hash catches param changes
+                source_mtime = None
                 sidecar_path = get_sidecar_path(str(img_path), self._sidecar_extension)
                 cache_result = load_sidecar(
                     sidecar_path,
@@ -2337,8 +2574,18 @@ class SidecarJsonDataset(Dataset):
                     if shape_ok and dtype_ok:
                         # Apply flip transformation to cached data if needed
                         if flip_bit:
+                            # Performance optimization: Removed .contiguous() calls after flip.
+                            # Modern PyTorch handles non-contiguous tensors efficiently, and the
+                            # subsequent operations don't require contiguous memory layout.
                             img_t = torch.flip(img_t, dims=[2])  # Flip width dimension (CHW format)
                             pmask = torch.flip(pmask, dims=[1])  # Flip width dimension (HW format)
+
+                        # NOTE: RandomErasing is NOT applied to cached data because:
+                        # 1. Cache stores normalized data (range [-1, 1])
+                        # 2. RandomErasing expects [0,1] input and fills with 0.5 (mid-gray)
+                        # 3. Applying to normalized data would produce inconsistent results
+                        # RandomErasing is only applied in the fresh-load path BEFORE normalization
+
                         # Use tags that already reflect the flip decision
                         tag_vec = self.vocab.encode_tags(tags_now)
                         monitor.l2_hit()  # Sidecar cache hit
@@ -2364,7 +2611,12 @@ class SidecarJsonDataset(Dataset):
             # Fully decode and correct EXIF while file is open
             with Image.open(img_path) as pil_img:
                 pil_img.load()
-                pil_img = ImageOps.exif_transpose(pil_img)
+                # Performance optimization: Only call exif_transpose when EXIF orientation
+                # data is actually present. exif_transpose() parses EXIF on every call,
+                # which is wasteful for images without orientation metadata.
+                exif = pil_img.getexif()
+                if exif and exif.get(0x0112):  # 0x0112 = EXIF Orientation tag
+                    pil_img = ImageOps.exif_transpose(pil_img)
                 if pil_img.mode in ("RGBA", "LA") or ("transparency" in pil_img.info):
                     rgba = pil_img.convert("RGBA")
                     bg = Image.new("RGB", rgba.size, self.pad_color)
@@ -2374,7 +2626,19 @@ class SidecarJsonDataset(Dataset):
                 else:
                     pil = pil_img.convert("RGB")
 
+                # Apply color jitter to PIL image BEFORE letterboxing onto canvas.
+                # This ensures jitter only affects actual image content, not padding regions.
+                # (Padding is added by process_image_cpu and should remain at pad_color)
+                if self._color_jitter is not None:
+                    pil = self._color_jitter(pil)
+
                 canvas, pmask = process_image_cpu(pil, self.image_size, self.pad_color)
+
+                # Random rotation (image only, mask unchanged — fill matches pad_color)
+                if self._rotation_enabled and random.random() < self._rotation_p:
+                    canvas = apply_random_rotation(
+                        canvas, self._rotation_min_deg, self._rotation_max_deg, self.pad_color
+                    )
 
             # NOTE: Flip is applied AFTER joint_transforms to ensure correct ordering
             # (transforms operate on canonical unflipped images, flip is applied last)
@@ -2383,10 +2647,19 @@ class SidecarJsonDataset(Dataset):
                 img_tv = tv_tensors.Image(canvas)
                 mask_tv = tv_tensors.Mask(pmask.to(torch.uint8))
                 img_tv, mask_tv = self.joint_transforms(img_tv, mask_tv)
+                # _to_tensor_v2 already converts to bfloat16 via ToDtype
                 img = self._to_tensor_v2(img_tv)
-                if self._cpu_bf16_cache:
-                    img = img.to(torch.bfloat16)
+
+                # Note: Color jitter is applied to PIL image BEFORE letterboxing (see above)
+                # to avoid jittering the padding regions.
+
+                # Random erasing BEFORE normalization (fills with 0.5 mid-gray,
+                # which normalizes to 0.0 - the center of [-1,1] range)
+                if self._random_erasing is not None:
+                    img = self._random_erasing(img)
+
                 img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
+
                 pmask = mask_tv.to(torch.bool)
             else:
                 # Fallback: color-only transforms permitted
@@ -2395,9 +2668,16 @@ class SidecarJsonDataset(Dataset):
                         transformed = self.transform(canvas)
                         if self._to_tensor is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
+                        # _to_tensor already converts to bfloat16 (aliased to _to_tensor_v2)
                         img = transformed if isinstance(transformed, torch.Tensor) else self._to_tensor(transformed)
-                        if self._cpu_bf16_cache:
-                            img = img.to(torch.bfloat16)
+
+                        # Note: Color jitter is applied to PIL image BEFORE letterboxing (see above)
+
+                        # Random erasing BEFORE normalization (value='random' samples from N(0,1)
+                        # which produces values up to ±4, incompatible with normalized [-1,1] range)
+                        if self._random_erasing is not None:
+                            img = self._random_erasing(img)
+
                         img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
                     except Exception as e:
                         if self.logger.isEnabledFor(logging.DEBUG):
@@ -2405,15 +2685,27 @@ class SidecarJsonDataset(Dataset):
                         if self._to_tensor is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img = self._to_tensor(canvas)
-                        if self._cpu_bf16_cache:
-                            img = img.to(torch.bfloat16)
+
+                        # Note: Color jitter is applied to PIL image BEFORE letterboxing (see above)
+
+                        # Random erasing BEFORE normalization (value='random' samples from N(0,1)
+                        # which produces values up to ±4, incompatible with normalized [-1,1] range)
+                        if self._random_erasing is not None:
+                            img = self._random_erasing(img)
+
                         img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
                 else:
                     if self._to_tensor is None:
                         raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                     img = self._to_tensor(canvas)
-                    if self._cpu_bf16_cache:
-                        img = img.to(torch.bfloat16)
+
+                    # Note: Color jitter is applied to PIL image BEFORE letterboxing (see above)
+
+                    # Random erasing BEFORE normalization (value='random' samples from N(0,1)
+                    # which produces values up to ±4, incompatible with normalized [-1,1] range)
+                    if self._random_erasing is not None:
+                        img = self._random_erasing(img)
+
                     img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
 
             # Encode labels (tags already account for flipping)
@@ -2460,6 +2752,9 @@ class SidecarJsonDataset(Dataset):
             # Apply horizontal flip AFTER caching (ensures correct transform ordering)
             # Flip is applied at tensor level after all other transforms complete
             if flip_bit:
+                # Performance optimization: Removed .contiguous() calls after flip.
+                # Modern PyTorch handles non-contiguous tensors efficiently, and the
+                # subsequent operations don't require contiguous memory layout.
                 img = torch.flip(img, dims=[2])  # Flip width dimension (CHW format)
                 pmask = torch.flip(pmask, dims=[1])  # Flip width dimension (HW format)
 
@@ -2477,7 +2772,14 @@ class SidecarJsonDataset(Dataset):
             self._sample_error_log_count += 1
             # Rate-limit warning logs: log first, then every 100th
             if self._sample_error_log_count == 1 or self._sample_error_log_count % 100 == 0:
-                self.logger.warning(f"Failed to load sample {idx}: {e} (total errors: {self._sample_error_log_count})")
+                self.logger.warning(
+                    "Failed to load sample idx=%s image_id=%s path=%s error=%s (total errors: %s)",
+                    idx,
+                    image_id,
+                    img_path,
+                    e,
+                    self._sample_error_log_count,
+                )
             if self.retry_counts[idx] >= self.max_retries:
                 # Add to failed set with memory bounds
                 if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
@@ -2486,7 +2788,9 @@ class SidecarJsonDataset(Dataset):
                 # Persist failed sample to exclusion file immediately
                 # This ensures the sample is skipped in future epochs/runs
                 try:
-                    failed_image_id = self.items[idx].get("image_id") if idx < len(self.items) else None
+                    failed_image_id = image_id
+                    if not failed_image_id and idx < len(self.items):
+                        failed_image_id = self.items[idx].get("image_id")
                     if failed_image_id and self._exclusion_manager:
                         was_new = self._exclusion_manager.add_exclusion(failed_image_id, immediate=True)
                         if was_new:
@@ -2499,9 +2803,13 @@ class SidecarJsonDataset(Dataset):
                     self.logger.warning(f"Could not persist exclusion for sample {idx}: {persist_err}")
 
                 # Always log when sample permanently fails (rate-limited by max_retries)
-                self.logger.error(f"Sample {idx} exceeded max retries, marking as failed")
-                return self._error_sample(idx, str(e))
-            return self._error_sample(idx, f"Temporary failure: {e}")
+                self.logger.error(
+                    "Sample idx=%s image_id=%s exceeded max retries, marking as failed",
+                    idx,
+                    image_id,
+                )
+                return self._error_sample(idx, str(e), image_id=image_id)
+            return self._error_sample(idx, f"Temporary failure: {e}", image_id=image_id)
         finally:
             # Opportunistic telemetry: push orientation stats every 128 samples
             try:
@@ -2520,19 +2828,22 @@ class SidecarJsonDataset(Dataset):
             except Exception:
                 pass
 
-    def _error_sample(self, idx: int, reason: str) -> Dict[str, Any]:
+    def _error_sample(self, idx: int, reason: str, image_id: Optional[str] = None) -> Dict[str, Any]:
         # Always use self.image_size for consistency with actual samples
         # This ensures error samples have the same shape as valid samples for batching
         sz = self.image_size  # Already int from __init__
         # Match image dtype to what cached/non-cached samples use to avoid batch collation issues
         # Use _sidecar_dtype directly since that's what both paths now produce
         img_dtype = self._sidecar_dtype
+        resolved_image_id = str(image_id).strip() if image_id else ""
+        if not resolved_image_id:
+            resolved_image_id = f"error_{idx}"
         return {
             "images": torch.zeros((3, sz, sz), dtype=img_dtype),
             "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
             "tag_labels": torch.zeros(len(self.vocab.tag_to_index), dtype=self._tag_vector_dtype),
             "rating_labels": torch.tensor(4, dtype=torch.long),
-            "image_id": f"error_{idx}",
+            "image_id": resolved_image_id,
             "cached": False,
             "flip_applied": False,
             "flip_mode": "none",
@@ -2590,6 +2901,9 @@ def create_dataloaders(
     world_size=1,
     seed=42,
     debug_config=None,
+    architecture_type: str = "vit",
+    patch_size: Optional[int] = None,
+    swin_config: Optional[Any] = None,
     **kwargs,
 ):
     logger = logging.getLogger(__name__)
@@ -2624,7 +2938,64 @@ def create_dataloaders(
         'metadata_cache_staleness_check_samples': int(getattr(data_config, "metadata_cache_staleness_check_samples", 100)),
         # Validation split limiting
         'max_val_samples': getattr(data_config, "max_val_samples", None),
+        # Color jitter augmentation
+        'color_jitter_enabled': bool(getattr(data_config, "color_jitter_enabled", False)),
+        'color_jitter_brightness': float(getattr(data_config, "color_jitter_brightness", 0.1)),
+        'color_jitter_brightness_p': float(getattr(data_config, "color_jitter_brightness_p", 0.15)),
+        'color_jitter_contrast': float(getattr(data_config, "color_jitter_contrast", 0.1)),
+        'color_jitter_contrast_p': float(getattr(data_config, "color_jitter_contrast_p", 0.15)),
+        'color_jitter_saturation': float(getattr(data_config, "color_jitter_saturation", 0.1)),
+        'color_jitter_saturation_p': float(getattr(data_config, "color_jitter_saturation_p", 0.15)),
+        # Random erasing augmentation
+        'random_erasing_enabled': bool(getattr(data_config, "random_erasing_enabled", False)),
+        'random_erasing_p': float(getattr(data_config, "random_erasing_p", 0.25)),
+        'random_erasing_scale_min': float(getattr(data_config, "random_erasing_scale_min", 0.02)),
+        'random_erasing_scale_max': float(getattr(data_config, "random_erasing_scale_max", 0.20)),
+        'random_erasing_ratio_min': float(getattr(data_config, "random_erasing_ratio_min", 0.3)),
+        'random_erasing_ratio_max': float(getattr(data_config, "random_erasing_ratio_max", 3.3)),
+        # Random rotation augmentation
+        'random_rotation_enabled': bool(getattr(data_config, "random_rotation_enabled", False)),
+        'random_rotation_p': float(getattr(data_config, "random_rotation_p", 0.3)),
+        'random_rotation_min_degrees': float(getattr(data_config, "random_rotation_min_degrees", 5.0)),
+        'random_rotation_max_degrees': float(getattr(data_config, "random_rotation_max_degrees", 10.0)),
+        # Architecture-aware cache key parameters
+        # SwinV2 always uses patch_size=4 (hardcoded in timm); ViT uses configurable patch_size
+        'architecture_type': str(architecture_type).lower(),
+        'patch_size': int(patch_size) if patch_size is not None else None,
     }
+
+    # Early validation of image size for SwinV2 architecture
+    # This catches incompatible image_size/window_size before training starts,
+    # rather than failing late during model forward pass
+    if architecture_type == 'swinv2' and validate_image_size_for_swinv2 is not None:
+        _image_size = config_cache['image_size']
+        # Extract window_size from swin_config if provided, otherwise use default
+        _window_size = 16  # SwinV2 default
+        _num_stages = 4    # SwinV2 default (4 stages)
+        if swin_config is not None:
+            _window_size = getattr(swin_config, 'window_size', None) or _window_size
+            _depths = getattr(swin_config, 'depths', None)
+            if _depths is not None:
+                _num_stages = len(_depths) if hasattr(_depths, '__len__') else 4
+
+        try:
+            validate_image_size_for_swinv2(
+                image_size=_image_size,
+                window_size=_window_size,
+                num_stages=_num_stages,
+                initial_patch_size=4,  # Always 4 for SwinV2
+            )
+            logger.info(
+                f"SwinV2 image size validation passed: image_size={_image_size}, "
+                f"window_size={_window_size}, num_stages={_num_stages}"
+            )
+        except ValueError as e:
+            # Re-raise with additional context about when this validation happens
+            raise ValueError(
+                f"SwinV2 image size validation failed at dataset creation time. "
+                f"This check prevents late failures during model forward pass. "
+                f"Original error: {e}"
+            ) from e
 
     if config_cache['sidecar_cache_enabled']:
         logger.info(
@@ -2659,10 +3030,26 @@ def create_dataloaders(
         logger.debug("Shared memory not available (requires Python 3.8+), using vocabulary pickling")
 
     image_size = config_cache['image_size']
-    mean = config_cache['normalize_mean']
-    std = config_cache['normalize_std']
     pad_color = config_cache['pad_color']
     transform = None
+
+    # Select normalization based on architecture type:
+    # - ViT: inception-style normalization (0.5/0.5/0.5 mean/std)
+    # - SwinV2: ImageNet normalization required for pretrained weights
+    if architecture_type == "swinv2":
+        # SwinV2 pretrained weights expect ImageNet normalization
+        mean = tuple(getattr(data_config, "swinv2_normalize_mean", (0.485, 0.456, 0.406)))
+        std = tuple(getattr(data_config, "swinv2_normalize_std", (0.229, 0.224, 0.225)))
+        logger.info(
+            f"Using SwinV2 (ImageNet) normalization: mean={mean}, std={std}"
+        )
+    else:
+        # ViT and other architectures use inception-style normalization
+        mean = config_cache['normalize_mean']
+        std = config_cache['normalize_std']
+        logger.info(
+            f"Using ViT (inception-style) normalization: mean={mean}, std={std}"
+        )
 
     # Determine dataset mode
     root = Path(active_data_path)
@@ -2829,6 +3216,27 @@ def create_dataloaders(
             force_rebuild_metadata_cache=False,  # Already built above
             metadata_cache_staleness_check_samples=config_cache['metadata_cache_staleness_check_samples'],
             prebuilt_arrow_table=prebuilt_arrow_table,
+            # Augmentation (training only)
+            color_jitter_enabled=config_cache['color_jitter_enabled'],
+            color_jitter_brightness=config_cache['color_jitter_brightness'],
+            color_jitter_brightness_p=config_cache['color_jitter_brightness_p'],
+            color_jitter_contrast=config_cache['color_jitter_contrast'],
+            color_jitter_contrast_p=config_cache['color_jitter_contrast_p'],
+            color_jitter_saturation=config_cache['color_jitter_saturation'],
+            color_jitter_saturation_p=config_cache['color_jitter_saturation_p'],
+            random_erasing_enabled=config_cache['random_erasing_enabled'],
+            random_erasing_p=config_cache['random_erasing_p'],
+            random_erasing_scale_min=config_cache['random_erasing_scale_min'],
+            random_erasing_scale_max=config_cache['random_erasing_scale_max'],
+            random_erasing_ratio_min=config_cache['random_erasing_ratio_min'],
+            random_erasing_ratio_max=config_cache['random_erasing_ratio_max'],
+            random_rotation_enabled=config_cache['random_rotation_enabled'],
+            random_rotation_p=config_cache['random_rotation_p'],
+            random_rotation_min_degrees=config_cache['random_rotation_min_degrees'],
+            random_rotation_max_degrees=config_cache['random_rotation_max_degrees'],
+            # Architecture-aware cache key parameters
+            architecture_type=config_cache['architecture_type'],
+            patch_size=config_cache['patch_size'],
         )
 
         val_ds = SidecarJsonDataset(
@@ -2854,6 +3262,13 @@ def create_dataloaders(
             force_rebuild_metadata_cache=False,  # Already built above
             metadata_cache_staleness_check_samples=config_cache['metadata_cache_staleness_check_samples'],
             prebuilt_arrow_table=prebuilt_arrow_table,
+            # No augmentation for validation (deterministic evaluation)
+            color_jitter_enabled=False,
+            random_erasing_enabled=False,
+            random_rotation_enabled=False,
+            # Architecture-aware cache key parameters
+            architecture_type=config_cache['architecture_type'],
+            patch_size=config_cache['patch_size'],
         )
 
     # Samplers for distributed training

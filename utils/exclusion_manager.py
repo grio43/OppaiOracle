@@ -43,6 +43,29 @@ else:
 
 logger = logging.getLogger(__name__)
 
+_IMAGE_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp",
+    ".gif",
+    ".tif",
+    ".tiff",
+)
+
+
+def _normalize_exclusion_line(line: str) -> str:
+    value = line.strip()
+    if not value:
+        return ""
+    if "/" in value or "\\" in value:
+        return Path(value).stem
+    lower = value.lower()
+    if any(lower.endswith(ext) for ext in _IMAGE_EXTENSIONS):
+        return Path(value).stem
+    return value
+
 
 class ExclusionManager:
     """
@@ -123,10 +146,9 @@ class ExclusionManager:
                 try:
                     self._excluded_ids = set()
                     for line in f:
-                        line = line.strip()
-                        if line:
-                            # Handle both old format (full path) and new format (just id)
-                            self._excluded_ids.add(Path(line).stem)
+                        normalized = _normalize_exclusion_line(line)
+                        if normalized:
+                            self._excluded_ids.add(normalized)
                     self._last_load_time = time.time()
                     try:
                         self._last_mtime = self.exclusion_path.stat().st_mtime

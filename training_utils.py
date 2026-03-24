@@ -355,10 +355,78 @@ def _get_nested_value(obj, key_path: str, default=None):
     return current if current is not None else default
 
 
+def detect_architecture_from_state_dict(state_dict_keys: list[str]) -> Optional[str]:
+    """Detect model architecture type from state dict key patterns.
+
+    This is used to infer architecture from old checkpoints that may not have
+    the architecture_type field in their config.
+
+    Args:
+        state_dict_keys: List of keys from the model state dict.
+
+    Returns:
+        'swinv2' if SwinV2 architecture detected,
+        'vit' if ViT architecture detected,
+        None if architecture cannot be determined.
+    """
+    # Normalize keys: remove 'module.' prefix (DDP) and '_orig_mod.' prefix (torch.compile)
+    normalized_keys = []
+    for key in state_dict_keys:
+        k = key
+        if k.startswith('module.'):
+            k = k[7:]  # len('module.') = 7
+        if k.startswith('_orig_mod.'):
+            k = k[10:]  # len('_orig_mod.') = 10
+        normalized_keys.append(k)
+
+    # SwinV2 architecture indicators (from timm SwinTransformerV2)
+    # SwinV2 models have 'backbone.layers...' structure
+    swinv2_indicators = [
+        'backbone.layers.',
+        'backbone.patch_embed.',
+        'backbone.norm.',
+    ]
+
+    # ViT architecture indicators (SimplifiedTagger)
+    # ViT models have 'patch_embed', 'blocks', 'cls_token', 'pos_embed' at top level
+    vit_indicators = [
+        'patch_embed.',
+        'blocks.',
+        'cls_token',
+        'pos_embed',
+    ]
+
+    has_swinv2_keys = any(
+        any(key.startswith(indicator) for indicator in swinv2_indicators)
+        for key in normalized_keys
+    )
+
+    has_vit_keys = any(
+        any(key.startswith(indicator) for indicator in vit_indicators)
+        for key in normalized_keys
+    )
+
+    # Determine architecture based on key patterns
+    if has_swinv2_keys and not has_vit_keys:
+        return 'swinv2'
+    elif has_vit_keys and not has_swinv2_keys:
+        return 'vit'
+    elif has_swinv2_keys and has_vit_keys:
+        # Both patterns present - this is unexpected, prefer explicit indicators
+        # backbone.layers is very specific to SwinV2
+        if any('backbone.layers.' in k for k in normalized_keys):
+            return 'swinv2'
+        return 'vit'
+
+    # Cannot determine architecture
+    return None
+
+
 def validate_config_compatibility(
     checkpoint_config: dict,
     current_config,
-    strict: bool = False
+    strict: bool = False,
+    state_dict_keys: Optional[list[str]] = None
 ) -> tuple[bool, list[str]]:
     """Validate that critical config parameters match between checkpoint and current config.
 
@@ -366,6 +434,8 @@ def validate_config_compatibility(
         checkpoint_config: Config dict from checkpoint
         current_config: Current config (dict or object with attributes)
         strict: If True, raise exception on critical mismatches. If False, just warn.
+        state_dict_keys: Optional list of keys from checkpoint state dict for architecture detection.
+                        Used to detect architecture when config field is missing.
 
     Returns:
         Tuple of (is_compatible, list of warning messages)
@@ -374,6 +444,18 @@ def validate_config_compatibility(
         ValueError: If strict=True and critical parameters don't match
     """
     if not checkpoint_config:
+        # Even without config, we can try to detect architecture from state dict
+        if state_dict_keys and strict:
+            detected_arch = detect_architecture_from_state_dict(state_dict_keys)
+            current_arch = _get_nested_value(current_config, 'model.architecture_type')
+            if detected_arch and current_arch and detected_arch != current_arch:
+                raise ValueError(
+                    f"Architecture mismatch detected from checkpoint state dict.\n"
+                    f"  - Detected from state dict: {detected_arch}\n"
+                    f"  - Current config: {current_arch}\n"
+                    f"Cannot resume {detected_arch} checkpoint with {current_arch} architecture.\n"
+                    f"To start fresh, set training.resume_from='none' in config."
+                )
         return True, ["No config in checkpoint - skipping validation"]
 
     warning_messages = []
@@ -384,12 +466,11 @@ def validate_config_compatibility(
         ('model.num_labels', 'Vocabulary size', 'Model head size mismatch will cause crashes'),
         ('data.image_size', 'Image size', 'Images will be wrong size for model'),
         ('data.patch_size', 'Patch size', 'Patch embedding size mismatch'),
+        ('model.architecture_type', 'Architecture type', 'Cannot resume ViT checkpoint with SwinV2 or vice versa'),
     ]
 
     # Important parameters that SHOULD match (may cause subtle issues)
     important_params = [
-        ('data.normalize_mean', 'Normalization mean', 'Input normalization differs'),
-        ('data.normalize_std', 'Normalization std', 'Input normalization differs'),
         ('training.gradient_accumulation_steps', 'Gradient accumulation', 'Effective batch size changed'),
     ]
 
@@ -411,6 +492,91 @@ def validate_config_compatibility(
         if ckpt_val != curr_val:
             msg = f"CRITICAL: {name} mismatch - checkpoint: {ckpt_val}, current: {curr_val}. {impact}"
             errors.append(msg)
+
+    # Check architecture type - detect from state dict if not in config
+    checkpoint_arch = _get_nested_value(checkpoint_config, 'model.architecture_type')
+    current_arch = _get_nested_value(current_config, 'model.architecture_type')
+
+    # If checkpoint config is missing architecture_type, try to detect from state dict
+    if checkpoint_arch is None and state_dict_keys:
+        detected_arch = detect_architecture_from_state_dict(state_dict_keys)
+        if detected_arch:
+            checkpoint_arch = detected_arch
+            logger.info(f"Detected architecture '{detected_arch}' from checkpoint state dict keys "
+                       f"(config missing architecture_type field)")
+
+    # Validate architecture match - don't allow silent fallthrough
+    if checkpoint_arch is not None and current_arch is not None:
+        if checkpoint_arch != current_arch:
+            msg = (f"CRITICAL: Architecture type mismatch - checkpoint: {checkpoint_arch}, "
+                   f"current: {current_arch}. Cannot resume ViT checkpoint with SwinV2 or vice versa")
+            errors.append(msg)
+    elif checkpoint_arch is None and current_arch is not None and state_dict_keys:
+        # Could not detect architecture from state dict - this is suspicious
+        # Log a warning but don't block (might be a very old checkpoint format)
+        logger.warning(
+            f"Could not detect architecture from checkpoint. Current config uses '{current_arch}'. "
+            f"If checkpoint was created with different architecture, loading will fail with cryptic errors."
+        )
+
+    def _get_norm_params(cfg, arch):
+        if arch == 'swinv2':
+            mean_val = _get_nested_value(cfg, 'data.swinv2_normalize_mean')
+            std_val = _get_nested_value(cfg, 'data.swinv2_normalize_std')
+            if mean_val is None:
+                mean_val = _get_nested_value(cfg, 'data.normalize_mean')
+            if std_val is None:
+                std_val = _get_nested_value(cfg, 'data.normalize_std')
+        else:
+            mean_val = _get_nested_value(cfg, 'data.normalize_mean')
+            std_val = _get_nested_value(cfg, 'data.normalize_std')
+        return mean_val, std_val
+
+    if checkpoint_arch is not None and current_arch is not None:
+        ckpt_mean, ckpt_std = _get_norm_params(checkpoint_config, checkpoint_arch)
+        curr_mean, curr_std = _get_norm_params(current_config, current_arch)
+
+        if ckpt_mean is not None and curr_mean is not None:
+            if isinstance(ckpt_mean, (list, tuple)):
+                ckpt_mean = tuple(ckpt_mean)
+            if isinstance(curr_mean, (list, tuple)):
+                curr_mean = tuple(curr_mean)
+            if ckpt_mean != curr_mean:
+                warning_messages.append(
+                    f"WARNING: Normalization mean changed - checkpoint: {ckpt_mean}, "
+                    f"current: {curr_mean}. Input normalization differs"
+                )
+
+        if ckpt_std is not None and curr_std is not None:
+            if isinstance(ckpt_std, (list, tuple)):
+                ckpt_std = tuple(ckpt_std)
+            if isinstance(curr_std, (list, tuple)):
+                curr_std = tuple(curr_std)
+            if ckpt_std != curr_std:
+                warning_messages.append(
+                    f"WARNING: Normalization std changed - checkpoint: {ckpt_std}, "
+                    f"current: {curr_std}. Input normalization differs"
+                )
+
+    # Check SwinV2-specific parameters when both configs use SwinV2
+    if checkpoint_arch == 'swinv2' and current_arch == 'swinv2':
+        critical_swin_params = ['embed_dim', 'depths', 'num_heads', 'window_size', 'mlp_ratio', 'drop_path_rate', 'pretrained_name']
+        for param in critical_swin_params:
+            ckpt_val = _get_nested_value(checkpoint_config, f'model.swin_config.{param}')
+            curr_val = _get_nested_value(current_config, f'model.swin_config.{param}')
+
+            if ckpt_val is None or curr_val is None:
+                continue
+
+            # Handle list/tuple comparison
+            if isinstance(ckpt_val, (list, tuple)):
+                ckpt_val = tuple(ckpt_val)
+            if isinstance(curr_val, (list, tuple)):
+                curr_val = tuple(curr_val)
+
+            if ckpt_val != curr_val:
+                msg = f"CRITICAL: SwinV2 {param} mismatch - checkpoint: {ckpt_val}, current: {curr_val}. Model architecture incompatible"
+                errors.append(msg)
 
     # Check important parameters
     for key_path, name, impact in important_params:
@@ -548,6 +714,7 @@ class TrainingState:
     completed_epochs: int = 0
     is_epoch_boundary: bool = True
     batch_in_epoch: int = 0
+    sample_in_epoch: int = 0  # Batch-size agnostic sample index for resume
 
     # Loss tracking
     train_loss: float = 0.0
@@ -730,7 +897,15 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
         self.step_in_cycle = 0
         
         self.base_max_lr = max_lr
-        
+
+        # Warn about edge case that can cause cycle_steps to remain constant
+        if cycle_mult == 1.0 and warmup_steps == 0:
+            warnings.warn(
+                "CosineAnnealingWarmupRestarts: cycle_mult=1.0 with warmup_steps=0 "
+                "means cycle length never changes. This is valid but may not be intended.",
+                UserWarning
+            )
+
         super().__init__(optimizer, last_epoch)
     
     def get_lr(self):
@@ -745,6 +920,26 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
                     (self.cur_cycle_steps - self.warmup_steps))) / 2
                     for _ in self.base_lrs]
     
+    def state_dict(self):
+        d = super().state_dict()
+        d['step_in_cycle'] = self.step_in_cycle
+        d['cycle'] = self.cycle
+        d['cur_cycle_steps'] = self.cur_cycle_steps
+        return d
+
+    def load_state_dict(self, state_dict):
+        # Extract custom keys before passing to super (which doesn't know about them)
+        step_in_cycle = state_dict.pop('step_in_cycle', None)
+        cycle = state_dict.pop('cycle', None)
+        cur_cycle_steps = state_dict.pop('cur_cycle_steps', None)
+        super().load_state_dict(state_dict)
+        if step_in_cycle is not None:
+            self.step_in_cycle = step_in_cycle
+        if cycle is not None:
+            self.cycle = cycle
+        if cur_cycle_steps is not None:
+            self.cur_cycle_steps = cur_cycle_steps
+
     def step(self, epoch=None):
         if epoch is None:
             self.step_in_cycle += 1
@@ -752,8 +947,11 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
             if self.step_in_cycle >= self.cur_cycle_steps:
                 self.cycle += 1
                 self.step_in_cycle = 0
-                self.cur_cycle_steps = int((self.cur_cycle_steps - self.warmup_steps) * self.cycle_mult) + self.warmup_steps
-                self.max_lr = self.base_max_lr * (self.gamma ** self.cycle)
+                # Calculate new cycle steps with minimum bound to prevent 0 or negative values
+                new_cycle_steps = int((self.cur_cycle_steps - self.warmup_steps) * self.cycle_mult) + self.warmup_steps
+                self.cur_cycle_steps = max(new_cycle_steps, max(1, self.warmup_steps + 1))
+                # Apply gamma decay with floor to prevent max_lr from becoming too small
+                self.max_lr = max(self.base_max_lr * (self.gamma ** self.cycle), self.min_lr)
         else:
             if epoch >= self.first_cycle_steps:
                 if self.cycle_mult == 1.0:
@@ -948,13 +1146,14 @@ class AsyncCheckpointWriter:
             lock_context = nullcontext()
 
         import queue
+        with self._lock:
+            self._pending_count += 1
         try:
             self._queue.put_nowait((checkpoint, path, lock_context, callback))
-            # Increment AFTER successful queue operation to avoid race condition
-            with self._lock:
-                self._pending_count += 1
             return True
         except queue.Full:
+            with self._lock:
+                self._pending_count -= 1
             # Queue is full, caller should save synchronously
             return False
 
@@ -1099,10 +1298,10 @@ class CheckpointManager:
                 except Exception:
                     pass
 
-    def shutdown(self):
+    def shutdown(self, wait: bool = True, timeout: float = 300.0):
         """Shutdown async writer. Call at end of training."""
         if self._async_writer is not None:
-            self._async_writer.shutdown(wait=True)
+            self._async_writer.shutdown(wait=wait, timeout=timeout)
             self._async_writer = None
 
     def _deep_to_cpu(self, obj):
@@ -1133,7 +1332,8 @@ class CheckpointManager:
         training_state: TrainingState,
         is_best: bool = False,
         config: Optional[Dict] = None,
-        train_loader: Optional['DataLoader'] = None
+        train_loader: Optional['DataLoader'] = None,
+        scaler: Optional[GradScaler] = None
     ) -> Optional[Path]:
         """Save a checkpoint"""
 
@@ -1167,6 +1367,24 @@ class CheckpointManager:
                     return getattr(sub, key)
             return None
 
+        def _get_architecture_type(cfg: Dict[str, Any]) -> Optional[str]:
+            arch = None
+            if isinstance(cfg, dict):
+                model_cfg = cfg.get('model')
+                if isinstance(model_cfg, dict):
+                    arch = model_cfg.get('architecture_type')
+                elif model_cfg is not None:
+                    arch = getattr(model_cfg, 'architecture_type', None)
+                if arch is None:
+                    arch = cfg.get('architecture_type')
+            else:
+                model_cfg = getattr(cfg, 'model', None)
+                if model_cfg is not None:
+                    arch = getattr(model_cfg, 'architecture_type', None)
+            return str(arch).lower() if arch else None
+
+        architecture_type = _get_architecture_type(config) or 'vit'
+
         missing_params = [p for p in required_params if get_param(config, p) is None]
         if missing_params:
             raise RuntimeError(
@@ -1176,8 +1394,19 @@ class CheckpointManager:
 
         # Validate preprocessing parameter types and values
         try:
-            normalize_mean = tuple(get_param(config, 'normalize_mean'))
-            normalize_std = tuple(get_param(config, 'normalize_std'))
+            if architecture_type == 'swinv2':
+                swinv2_mean = get_param(config, 'swinv2_normalize_mean')
+                swinv2_std = get_param(config, 'swinv2_normalize_std')
+                if swinv2_mean is None or swinv2_std is None:
+                    logger.warning(
+                        "SwinV2 architecture detected but swinv2_normalize_mean/std missing; "
+                        "falling back to normalize_mean/std for checkpoint preprocessing."
+                    )
+                normalize_mean = tuple(swinv2_mean or get_param(config, 'normalize_mean'))
+                normalize_std = tuple(swinv2_std or get_param(config, 'normalize_std'))
+            else:
+                normalize_mean = tuple(get_param(config, 'normalize_mean'))
+                normalize_std = tuple(get_param(config, 'normalize_std'))
             if len(normalize_mean) != 3 or len(normalize_std) != 3:
                 raise ValueError("normalize_mean and normalize_std must have exactly 3 values")
 
@@ -1186,6 +1415,12 @@ class CheckpointManager:
 
             if image_size <= 0 or patch_size <= 0:
                 raise ValueError("image_size and patch_size must be positive")
+            if architecture_type == 'swinv2' and patch_size != 4:
+                logger.warning(
+                    "SwinV2 uses patch_size=4. Overriding checkpoint patch_size from %s to 4.",
+                    patch_size
+                )
+                patch_size = 4
             if image_size % patch_size != 0:
                 raise ValueError(f"image_size ({image_size}) must be divisible by patch_size ({patch_size})")
 
@@ -1226,10 +1461,16 @@ class CheckpointManager:
                 'max_lr': getattr(scheduler, 'max_lr', None),
                 'min_lr': getattr(scheduler, 'min_lr', None),
             }
-        
+
+        # Save GradScaler state for AMP training continuity
+        if scaler is not None:
+            checkpoint['scaler_state_dict'] = scaler.state_dict()
+
         if config is not None:
             # Convert config to dict to avoid pickling Enum types (PyTorch 2.6+ weights_only=True compatibility)
             checkpoint['config'] = config.to_dict() if hasattr(config, 'to_dict') else config
+            # Store architecture type for checkpoint compatibility checking
+            checkpoint['architecture_type'] = architecture_type
 
         # Embed RNG states to enable exact stream continuation on resume
         try:
@@ -1332,10 +1573,47 @@ class CheckpointManager:
         lock_path = self.checkpoint_dir / ".checkpoint_write.lock"
         lock_context = filelock.FileLock(lock_path, timeout=60) if HAS_FILELOCK else nullcontext()
 
+        should_save_best = bool(is_best)
+
+        def _save_best_from_checkpoint(source_path: Path) -> None:
+            if not should_save_best:
+                return
+
+            best_path = self.checkpoint_dir / "best_model.pt"
+            temp_best = None
+            best_lock = filelock.FileLock(lock_path, timeout=60) if HAS_FILELOCK else nullcontext()
+            try:
+                with best_lock:
+                    fd_best, temp_best = tempfile.mkstemp(
+                        suffix='.tmp',
+                        prefix='best_',
+                        dir=self.checkpoint_dir
+                    )
+                    try:
+                        os.close(fd_best)
+                    except Exception:
+                        pass
+
+                    shutil.copy2(source_path, temp_best)
+                    os.replace(temp_best, best_path)
+                    temp_best = None  # Mark as consumed
+                    self.best_checkpoint = best_path
+                    logger.info(f"Saved best model to {best_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save best model to {best_path}: {e}")
+            finally:
+                if temp_best is not None:
+                    try:
+                        if Path(temp_best).exists():
+                            Path(temp_best).unlink()
+                    except Exception:
+                        pass
+
         # Callback for async save completion logging
         def _on_save_complete(path, success, error):
             if success:
                 logger.info(f"Async checkpoint saved to {path}")
+                _save_best_from_checkpoint(path)
             else:
                 logger.error(f"Async checkpoint save failed for {path}: {error}")
 
@@ -1350,65 +1628,57 @@ class CheckpointManager:
                         wrote_numbered = True
                         self.checkpoints.append(checkpoint_path)
                         logger.debug(f"Queued async checkpoint save to {checkpoint_path}")
+                        # Note: cpu_checkpoint ownership transferred to async writer, don't delete here
                     else:
-                        # Queue full, fall back to sync save
+                        # Queue full, fall back to sync save (use CPU checkpoint to avoid VRAM spike)
                         logger.warning("Async checkpoint queue full, falling back to sync save")
-                        self._sync_save_checkpoint(checkpoint, checkpoint_path, lock_context)
+                        self._sync_save_checkpoint(cpu_checkpoint, checkpoint_path, lock_context)
                         wrote_numbered = True
                         self.checkpoints.append(checkpoint_path)
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
+                        _save_best_from_checkpoint(checkpoint_path)
+                        del cpu_checkpoint  # Free CPU copy after sync save completes
                 except Exception as e:
                     logger.warning(f"Failed to prepare async checkpoint: {e}. Falling back to sync save.")
-                    self._sync_save_checkpoint(checkpoint, checkpoint_path, lock_context)
+                    # Try to create CPU checkpoint for sync save to avoid VRAM spike
+                    try:
+                        cpu_checkpoint = self._deep_to_cpu(checkpoint)
+                        self._sync_save_checkpoint(cpu_checkpoint, checkpoint_path, lock_context)
+                        del cpu_checkpoint  # Free CPU copy after saving
+                    except Exception:
+                        # Last resort: save with GPU tensors if CPU conversion also fails
+                        self._sync_save_checkpoint(checkpoint, checkpoint_path, lock_context)
                     wrote_numbered = True
                     self.checkpoints.append(checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    _save_best_from_checkpoint(checkpoint_path)
             else:
-                # Sync save (original behavior)
-                self._sync_save_checkpoint(checkpoint, checkpoint_path, lock_context)
+                # Sync save (original behavior) - use CPU checkpoint to avoid VRAM spike
+                cpu_checkpoint = self._deep_to_cpu(checkpoint)
+                self._sync_save_checkpoint(cpu_checkpoint, checkpoint_path, lock_context)
+                del cpu_checkpoint  # Free CPU copy after sync save completes
                 wrote_numbered = True
                 self.checkpoints.append(checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
+                _save_best_from_checkpoint(checkpoint_path)
         else:
             logger.debug("save_best_only=True: skipping numbered checkpoint at step %s", step)
 
         # Always update last.pt atomically for crash-resume
         # Use sync save for last.pt to ensure crash recovery works
+        # Convert to CPU to avoid VRAM spike during save
         if self.save_last:
             last_path = self.checkpoint_dir / LAST_CKPT_NAME
             try:
-                self._sync_save_checkpoint(checkpoint, last_path, lock_context)
+                last_cpu_checkpoint = self._deep_to_cpu(checkpoint)
+                self._sync_save_checkpoint(last_cpu_checkpoint, last_path, lock_context)
+                del last_cpu_checkpoint  # Free CPU copy after sync save completes
             except Exception as e:
-                logger.warning("Failed to update %s: %s", last_path, e)
-        
-        # Save best model if applicable (use atomic copy via temp file with locking)
-        if is_best and self.keep_best and wrote_numbered:
-            best_path = self.checkpoint_dir / "best_model.pt"
-            temp_best = None
-            try:
-                with lock_context:  # Use same lock for DDP safety
-                    fd_best, temp_best = tempfile.mkstemp(suffix='.tmp', prefix='best_', dir=self.checkpoint_dir)
-                    try:
-                        os.close(fd_best)
-                    except Exception:
-                        pass
-
-                    # Copy to temp, then atomic rename
-                    shutil.copy2(checkpoint_path, temp_best)
-                    os.replace(temp_best, best_path)
-                    temp_best = None  # Mark as consumed
-                    self.best_checkpoint = best_path
-                    logger.info(f"Saved best model to {best_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save best model to {best_path}: {e}")
-            finally:
-                # Clean up temp file if it wasn't consumed
-                if temp_best is not None:
-                    try:
-                        if Path(temp_best).exists():
-                            Path(temp_best).unlink()
-                    except Exception:
-                        pass
+                logger.warning("Failed to update %s using CPU copy: %s. Retrying with original tensors.", last_path, e)
+                try:
+                    self._sync_save_checkpoint(checkpoint, last_path, lock_context)
+                except Exception as e2:
+                    logger.error("Failed to update %s: %s", last_path, e2)
         
         # Manage checkpoint limit
         if wrote_numbered:
@@ -1420,7 +1690,11 @@ class CheckpointManager:
         else:
             training_state.checkpoints_saved.append(str(self.checkpoint_dir / LAST_CKPT_NAME))
         training_state.last_checkpoint_step = step
-        
+
+        # Explicit cleanup to help garbage collector release GPU memory
+        # (checkpoint is a local reference to the passed-in dict, deleting removes this reference)
+        del checkpoint
+
         return checkpoint_path if wrote_numbered else None
     
     def _cleanup_old_checkpoints(self):
@@ -1573,7 +1847,8 @@ class CheckpointManager:
         model: Optional[nn.Module] = None,
         optimizer: Optional[optim.Optimizer] = None,
         scheduler: Optional[_LRScheduler] = None,
-        device: torch.device = torch.device('cpu')
+        device: torch.device = torch.device('cpu'),
+        scaler: Optional[GradScaler] = None
     ) -> Dict:
         """Load a checkpoint"""
         
@@ -1621,7 +1896,31 @@ class CheckpointManager:
                 state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
                 logger.info("Removed '_orig_mod.' prefix from state dict keys for non-compiled model")
 
-            model.load_state_dict(state_dict)
+            try:
+                model.load_state_dict(state_dict)
+            except RuntimeError as e:
+                # Catch common mismatch errors (keys or shapes) to provide helpful guidance
+                msg = str(e)
+                if "Missing key(s)" in msg or "Unexpected key(s)" in msg or "size mismatch" in msg:
+                    # Heuristic: if massive mismatch, it's likely an architecture change
+                    # e.g. ViT -> SwinV2 or vocab size change
+                    logger.error("=" * 60)
+                    logger.error("CRITICAL: Model architecture mismatch during checkpoint loading!")
+                    logger.error("The checkpoint architecture does not match the current model.")
+                    logger.error("This often happens when:")
+                    logger.error("  1. Switching architectures (e.g. ViT -> SwinV2)")
+                    logger.error("  2. Changing model size/dimensions (e.g. hidden_size, image_size)")
+                    logger.error("  3. Changing vocabulary size without rebuilding the head")
+                    logger.error("  4. Loading an old checkpoint into a modified model")
+                    logger.error("")
+                    logger.error("To fix this, you must start training fresh:")
+                    logger.error("  Set training.resume_from='none' in your config")
+                    logger.error("=" * 60)
+                    raise RuntimeError(
+                        f"Architecture mismatch (keys/shapes). Cannot resume from this checkpoint. "
+                        f"Set training.resume_from='none' to start fresh. Original error: {e}"
+                    ) from e
+                raise  # Re-raise other runtime errors
 
         # Load optimizer state
         if optimizer is not None and 'optimizer_state_dict' in meta:
@@ -1756,6 +2055,15 @@ class CheckpointManager:
                     f"To start fresh, set training.resume_from='none'. Error: {e}"
                 ) from e
 
+        # Load GradScaler state for AMP training continuity
+        if scaler is not None and 'scaler_state_dict' in meta:
+            try:
+                scaler.load_state_dict(meta['scaler_state_dict'])
+                saved_scale = meta['scaler_state_dict'].get('scale', 'unknown')
+                logger.info(f"GradScaler state loaded successfully (scale={saved_scale})")
+            except Exception as e:
+                logger.warning(f"Failed to load GradScaler state: {e}. Starting with default scale.")
+
         # Restore RNG states to ensure reproducible dataset shuffling
         if 'rng_states' in meta:
             try:
@@ -1865,6 +2173,66 @@ class CheckpointManager:
         self._refresh_checkpoint_list()
         existing = [p for p in self.checkpoints if p.exists()]
         return max(existing, key=lambda p: p.stat().st_mtime) if existing else None
+
+    def peek_checkpoint_config(
+        self,
+        checkpoint_path: Union[str, Path],
+        include_state_dict_keys: bool = False
+    ) -> Union[Optional[Dict[str, Any]], Tuple[Optional[Dict[str, Any]], Optional[List[str]]]]:
+        """Load only the config/metadata from a checkpoint without loading model weights.
+
+        This enables fast architecture validation BEFORE attempting to load state_dict
+        into the model, avoiding cryptic PyTorch errors on architecture mismatch.
+
+        Args:
+            checkpoint_path: Path to the checkpoint file.
+            include_state_dict_keys: If True, also return the list of state dict keys
+                                    for architecture detection from old checkpoints.
+
+        Returns:
+            If include_state_dict_keys is False:
+                The config dict from the checkpoint, or None if not available.
+            If include_state_dict_keys is True:
+                A tuple of (config dict, list of state dict keys).
+                Either or both may be None if not available.
+
+        Raises:
+            FileNotFoundError: If checkpoint file doesn't exist.
+        """
+        path = Path(checkpoint_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+        try:
+            # Load checkpoint to CPU - we only need metadata, not model weights
+            try:
+                checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+            except TypeError:
+                # PyTorch < 1.13 doesn't support weights_only
+                checkpoint = torch.load(path, map_location="cpu")
+            except pickle.UnpicklingError:
+                # PyTorch 2.6+ blocks custom classes with weights_only=True
+                checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+
+            if not isinstance(checkpoint, dict):
+                if include_state_dict_keys:
+                    return None, None
+                return None
+
+            config = checkpoint.get('config')
+
+            if include_state_dict_keys:
+                # Extract state dict keys for architecture detection
+                state_dict = checkpoint.get('state_dict') or checkpoint.get('model_state_dict')
+                state_dict_keys = list(state_dict.keys()) if state_dict else None
+                return config, state_dict_keys
+
+            return config
+        except Exception as e:
+            logger.warning(f"Could not peek checkpoint config from {path}: {e}")
+            if include_state_dict_keys:
+                return None, None
+            return None
 
     def load_latest_checkpoint(self) -> Optional[Dict[str, Any]]:
         """Load the most recent checkpoint."""
@@ -2248,7 +2616,8 @@ class TrainingUtils:
                 params,
                 lr=learning_rate,
                 betas=kwargs.get('betas', (0.9, 0.999)),
-                eps=kwargs.get('eps', 1e-8)
+                eps=kwargs.get('eps', 1e-8),
+                weight_decay=weight_decay,
             )
         
         elif optimizer_type.lower() == 'sgd':

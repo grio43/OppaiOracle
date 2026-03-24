@@ -25,15 +25,15 @@ def _to_safe_float(x: Any, reduce: str = "mean") -> Optional[float]:
             return None
         if x.is_cuda:
             x = x.cpu()
-        # Reduce to scalar if necessary
+        # Reduce to scalar if necessary (keep native dtype, .item() handles conversion)
         if x.ndim > 0:
             if reduce == "mean":
-                x = x.float().mean()
+                x = x.mean()
             elif reduce == "sum":
-                x = x.float().sum()
+                x = x.sum()
             else:
                 # Fallback: take mean
-                x = x.float().mean()
+                x = x.mean()
         # Extract Python float
         x = x.item()
 

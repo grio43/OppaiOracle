@@ -5,10 +5,158 @@ import hashlib
 import struct
 import logging
 import uuid
+import threading
+from collections import OrderedDict
 from typing import Optional, Tuple
 
 import torch
 from safetensors.torch import save, load, save_file, load_file
+
+
+# =============================================================================
+# LRU Cache for Sidecar Tensors
+# =============================================================================
+# Performance optimization: Avoid repeated tensor cloning on cache hits.
+# Memory-mapped tensors from safetensors must be cloned to avoid Windows file
+# locking issues. This LRU cache stores already-cloned tensors, eliminating
+# the clone overhead (~512KB memcpy per image) for recently accessed items.
+#
+# Thread-safe implementation using a lock since DataLoader workers may access
+# concurrently in threaded mode (num_workers=0 with threads or shared cache).
+# =============================================================================
+
+class _SidecarLRUCache:
+    """
+    Thread-safe LRU cache for cloned sidecar tensors.
+
+    Caches (image, mask) tensor pairs by (path, config_hash) to avoid repeated
+    cloning of memory-mapped tensors. Returns deep clones from cache to ensure
+    callers can safely modify tensors without affecting cached copies.
+    """
+
+    def __init__(self, max_size: int = 256):
+        """
+        Initialize the LRU cache.
+
+        Args:
+            max_size: Maximum number of (image, mask) pairs to cache.
+                      Default 256 entries ~= 128MB for 512x512 RGB images.
+        """
+        self._cache: OrderedDict[Tuple[str, Optional[str]], Tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._max_size = max_size
+        self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+
+    def get(self, key: Tuple[str, Optional[str]]) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Get cached tensors, returning clones to prevent modification of cached data.
+
+        Args:
+            key: Tuple of (sidecar_path, config_hash)
+
+        Returns:
+            Tuple of (image, mask) tensor clones if cached, None otherwise.
+        """
+        with self._lock:
+            if key not in self._cache:
+                self._misses += 1
+                return None
+
+            # Move to end (most recently used)
+            self._cache.move_to_end(key)
+            image, mask = self._cache[key]
+            self._hits += 1
+
+            # Return clones so callers can safely modify without affecting cache
+            # Use non_blocking=False to ensure clone completes before return
+            return image.clone(), mask.clone()
+
+    def put(self, key: Tuple[str, Optional[str]], image: torch.Tensor, mask: torch.Tensor) -> None:
+        """
+        Cache tensor pair. Tensors should already be cloned from mmap.
+
+        Args:
+            key: Tuple of (sidecar_path, config_hash)
+            image: Image tensor (already cloned from mmap)
+            mask: Mask tensor (already cloned from mmap)
+        """
+        with self._lock:
+            # Remove if exists to update position
+            if key in self._cache:
+                del self._cache[key]
+
+            # Add to end (most recently used)
+            self._cache[key] = (image, mask)
+
+            # Evict oldest if over capacity
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+
+    def invalidate(self, path: str) -> None:
+        """
+        Invalidate all cache entries for a given path (any config_hash).
+
+        Call this when a sidecar file is updated/replaced.
+
+        Args:
+            path: Sidecar file path to invalidate
+        """
+        with self._lock:
+            # Find and remove all entries for this path
+            keys_to_remove = [k for k in self._cache if k[0] == path]
+            for k in keys_to_remove:
+                del self._cache[k]
+
+    def clear(self) -> None:
+        """Clear all cached entries."""
+        with self._lock:
+            self._cache.clear()
+            self._hits = 0
+            self._misses = 0
+
+    def stats(self) -> dict:
+        """Return cache statistics."""
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = self._hits / total if total > 0 else 0.0
+            return {
+                "size": len(self._cache),
+                "max_size": self._max_size,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": hit_rate,
+            }
+
+
+# Global sidecar cache instance
+# Size can be adjusted via set_sidecar_cache_size() before training starts
+_sidecar_cache = _SidecarLRUCache(max_size=256)
+
+
+def set_sidecar_cache_size(max_size: int) -> None:
+    """
+    Set the maximum size of the sidecar LRU cache.
+
+    Call this before training starts to adjust cache size based on available
+    memory and dataset access patterns. Clears existing cache.
+
+    Args:
+        max_size: Maximum number of (image, mask) pairs to cache.
+                  Set to 0 to disable caching.
+    """
+    global _sidecar_cache
+    _sidecar_cache = _SidecarLRUCache(max_size=max_size)
+
+
+def get_sidecar_cache_stats() -> dict:
+    """Return sidecar cache statistics for monitoring."""
+    return _sidecar_cache.stats()
+
+
+def clear_sidecar_cache() -> None:
+    """Clear the sidecar tensor cache."""
+    _sidecar_cache.clear()
 
 # Optional HMAC key for integrity checks
 _HMAC_KEY = os.environ.get("CACHE_CODEC_HMAC_KEY")
@@ -278,6 +426,10 @@ def save_sidecar(
 
         # Atomic rename (works on same filesystem)
         os.replace(tmp_path, path)
+
+        # Invalidate LRU cache entry for this path since file contents changed
+        _sidecar_cache.invalidate(path)
+
         return True
 
     except Exception as e:
@@ -298,6 +450,7 @@ def load_sidecar(
     path: str,
     expected_config_hash: Optional[str] = None,
     expected_source_mtime: Optional[float] = None,
+    use_lru_cache: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """
     Load preprocessed image and mask from a sidecar file.
@@ -308,6 +461,8 @@ def load_sidecar(
             Returns None if hash mismatch (cache invalidation).
         expected_source_mtime: If provided, validates against stored source mtime.
             Returns None if source file has been modified since caching.
+        use_lru_cache: If True (default), use in-memory LRU cache to avoid
+            repeated tensor cloning for recently accessed files.
 
     Returns:
         Tuple of (image, mask) tensors if successful and validation passes,
@@ -315,10 +470,33 @@ def load_sidecar(
 
     Note:
         Mask is returned as torch.bool dtype.
+
+    Performance:
+        When use_lru_cache=True, recently accessed tensors are served from an
+        in-memory cache, avoiding the ~512KB memcpy overhead of cloning
+        memory-mapped tensors. The cache returns clones to ensure callers
+        can safely modify tensors without affecting cached copies.
     """
     # Removed os.path.exists() check to prevent TOCTOU race condition
     # Another worker could delete/replace file between check and open
     # Instead, handle FileNotFoundError directly in the exception handler
+
+    # ===========================================================================
+    # LRU Cache Lookup (Performance Optimization)
+    # ===========================================================================
+    # Check in-memory cache first to avoid disk I/O and tensor cloning overhead.
+    # Cache key includes config_hash to handle config changes correctly.
+    # Note: We don't include expected_source_mtime in key because:
+    # 1. It's rarely used (skipped for performance in main training loop)
+    # 2. If mtime validation is needed, we should read from disk anyway
+    # ===========================================================================
+    cache_key = (path, expected_config_hash)
+
+    if use_lru_cache and expected_source_mtime is None:
+        cached = _sidecar_cache.get(cache_key)
+        if cached is not None:
+            # Cache hit! Return clones (get() already clones for safety)
+            return cached
 
     try:
         # Load with metadata
@@ -423,6 +601,17 @@ def load_sidecar(
             logging.debug(f"Sidecar mask has dtype {mask.dtype}, converting to bool")
             mask = mask.to(torch.bool)
 
+        # ===========================================================================
+        # Store in LRU Cache (Performance Optimization)
+        # ===========================================================================
+        # Cache the validated, cloned tensors for future access. The tensors are
+        # already cloned from the mmap above, so we store them directly.
+        # On subsequent accesses, _sidecar_cache.get() will return fresh clones
+        # to ensure callers can safely modify without affecting the cached copy.
+        # ===========================================================================
+        if use_lru_cache and expected_source_mtime is None:
+            _sidecar_cache.put(cache_key, image, mask)
+
         return image, mask
 
     except FileNotFoundError:
@@ -433,4 +622,14 @@ def load_sidecar(
         return None
 
 
-__all__ = ["encode_tensor", "decode_tensor", "get_sidecar_path", "save_sidecar", "load_sidecar"]
+__all__ = [
+    "encode_tensor",
+    "decode_tensor",
+    "get_sidecar_path",
+    "save_sidecar",
+    "load_sidecar",
+    # LRU cache management functions
+    "set_sidecar_cache_size",
+    "get_sidecar_cache_stats",
+    "clear_sidecar_cache",
+]

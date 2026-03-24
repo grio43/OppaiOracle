@@ -30,6 +30,8 @@ class ImagePrediction:
     tags: List[TagPrediction]
     processing_time: Optional[float] = None  # in milliseconds
     error: Optional[str] = None  # Error message if processing failed
+    rating: Optional[str] = None  # Predicted rating (safe, sensitive, questionable, explicit, unknown)
+    rating_confidence: Optional[float] = None  # Confidence score for rating prediction
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -38,6 +40,10 @@ class ImagePrediction:
         }
         if self.processing_time is not None:
             result["processing_time"] = self.processing_time
+        if self.rating is not None:
+            result["rating"] = self.rating
+        if self.rating_confidence is not None:
+            result["rating_confidence"] = round(self.rating_confidence, 4)
         if self.error is not None:
             result["error"] = self.error
             result["status"] = "failed"

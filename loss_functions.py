@@ -30,8 +30,15 @@ class AsymmetricFocalLoss(nn.Module):
     """
 
     # Class-level cache for ignore_indices masks to avoid creating new tensors per forward pass
-    # Key: (num_classes, device_index, tuple(sorted_ignore_indices)) -> mask tensor
-    _keep_mask_cache: Dict[Tuple[int, int, Tuple[int, ...]], torch.Tensor] = {}
+    # Key: (num_classes, device_type, device_index, tuple(sorted_ignore_indices)) -> mask tensor
+    # Limited to _KEEP_MASK_CACHE_MAX_SIZE entries with LRU-style eviction
+    _keep_mask_cache: Dict[Tuple[int, str, int, Tuple[int, ...]], torch.Tensor] = {}
+    _KEEP_MASK_CACHE_MAX_SIZE: ClassVar[int] = 100
+
+    @classmethod
+    def clear_keep_mask_cache(cls) -> None:
+        """Clear the keep mask cache. Useful for memory management or device changes."""
+        cls._keep_mask_cache.clear()
 
     def __init__(
         self,
@@ -42,7 +49,48 @@ class AsymmetricFocalLoss(nn.Module):
         reduction: str = 'mean',
         label_smoothing: float = 0.05,
         ignore_indices: Optional[Union[int, List[int]]] = 0,
+        class_weights: Optional[List[float]] = None,
     ):
+        """
+        Initialize the Asymmetric Focal Loss.
+
+        Args:
+            gamma_pos: Focusing parameter for positive examples. Higher values
+                down-weight easy positives more aggressively. Default: 1.0.
+            gamma_neg: Focusing parameter for negative examples. Higher values
+                down-weight easy negatives more aggressively. Default: 3.0.
+            alpha: Balance factor between positive and negative loss contributions.
+                Controls the relative importance of positive vs negative samples
+                in the final loss calculation.
+
+                The loss is computed as:
+                    loss = alpha * pos_loss + (1 - alpha) * neg_loss
+
+                Value interpretation:
+                - alpha = 0.5: Equal weighting of positive and negative contributions.
+                - alpha > 0.5: Favors positives (increases penalty for missing true
+                  labels). Use when false negatives are more costly.
+                - alpha < 0.5: Favors negatives (increases penalty for false alarms).
+                  Use when false positives are more costly.
+
+                For imbalanced multi-label classification (where most labels are
+                negative for any given sample), recommended values are in the range
+                0.25 to 0.75. Higher values (0.6-0.75) help the model learn rare
+                positive labels by weighting their contribution more heavily.
+                Default: 0.75 (favors positive contributions).
+
+            clip: Probability margin for hard thresholding on negative samples.
+                Shifts negative probabilities by this amount before computing
+                focal weights, effectively reducing the contribution of easy
+                negatives. Set to 0.0 to disable. Default: 0.05.
+            reduction: Specifies the reduction to apply to the output:
+                'none' | 'mean' | 'sum'. Default: 'mean'.
+            label_smoothing: Amount of label smoothing to apply. Default: 0.05.
+            ignore_indices: Class index or list of indices to exclude from loss
+                computation. Default: 0 (ignores the PAD token at index 0).
+            class_weights: Optional list of per-class weights for handling class
+                imbalance. Applied after focal loss computation.
+        """
         super().__init__()
 
         # Validate reduction parameter
@@ -86,6 +134,17 @@ class AsymmetricFocalLoss(nn.Module):
             self.ignore_indices = [ignore_indices]
         else:
             self.ignore_indices = list(ignore_indices)
+
+        # Per-class weights for handling class imbalance (e.g., rating distribution)
+        # Weights are applied after focal loss computation
+        if class_weights is not None:
+            self.register_buffer('class_weights', torch.tensor(class_weights, dtype=torch.float32))
+        else:
+            self.class_weights = None
+
+        # Cache for class_weights on specific devices to avoid repeated .to() calls
+        # Key: (device_type, device_index) -> cached tensor on that device
+        self._class_weights_device_cache: Dict[Tuple[str, int], torch.Tensor] = {}
 
     def forward(
         self,
@@ -172,31 +231,50 @@ class AsymmetricFocalLoss(nn.Module):
                 )
 
         # Optionally ignore specified classes (e.g., PAD at index 0, UNK at index 1)
+        # Track the keep mask for reuse in class_weights filtering
+        ignore_keep_mask = None
         if self.ignore_indices:
             c = logits.size(1)
             # Filter to valid indices only
             valid_ignore = tuple(sorted(idx for idx in self.ignore_indices if 0 <= idx < c))
             if valid_ignore:
                 # Use cached mask to avoid creating new tensors per forward pass
-                # Key: (num_classes, device_index, tuple(sorted_ignore_indices))
-                device_idx = logits.device.index if logits.device.type == 'cuda' else -1
-                cache_key = (c, device_idx, valid_ignore)
+                # Key: (num_classes, device_type, device_index, tuple(sorted_ignore_indices))
+                # Include device type to avoid cache key collisions between CPU and CUDA tensors
+                device_type = logits.device.type
+                device_idx = logits.device.index if logits.device.index is not None else -1
+                cache_key = (c, device_type, device_idx, valid_ignore)
 
                 if cache_key not in AsymmetricFocalLoss._keep_mask_cache:
+                    # Enforce cache size limit with LRU-style eviction (remove oldest entries)
+                    if len(AsymmetricFocalLoss._keep_mask_cache) >= AsymmetricFocalLoss._KEEP_MASK_CACHE_MAX_SIZE:
+                        # Remove the first (oldest) entry - dict preserves insertion order in Python 3.7+
+                        oldest_key = next(iter(AsymmetricFocalLoss._keep_mask_cache))
+                        del AsymmetricFocalLoss._keep_mask_cache[oldest_key]
                     keep = torch.ones(c, dtype=torch.bool, device=logits.device)
                     for idx in valid_ignore:
                         keep[idx] = False
                     AsymmetricFocalLoss._keep_mask_cache[cache_key] = keep
 
+                # Mask is already cached per-device (device info is part of cache_key),
+                # so no .to() call needed - avoids GPU transfer on every forward pass
                 keep = AsymmetricFocalLoss._keep_mask_cache[cache_key]
                 logits = logits[:, keep]
                 targets = targets[:, keep]
+                # Save for reuse in class_weights filtering
+                ignore_keep_mask = keep
+
+        # Save binary targets before smoothing for focal weight masks.
+        # Focal gating must use clean {0,1} masks so absent tags contribute zero
+        # to pos_weights and present tags contribute zero to neg_weights.
+        # Smoothed targets go into BCE (where smoothing has its intended effect).
+        targets_for_focal = targets
 
         # Apply label smoothing if specified
-        # Compute in float32 for numerical stability, especially for bfloat16 training
+        # Compute in float32 for numerical stability, then convert to logits dtype in one step
+        # (Avoids two separate dtype conversions: .float() then .to(dtype=logits.dtype))
         if self.label_smoothing > 0:
-            targets = targets.float() * (1 - self.label_smoothing) + self.label_smoothing / 2
-            targets = targets.to(dtype=logits.dtype)
+            targets = (targets.float() * (1 - self.label_smoothing) + self.label_smoothing / 2).to(dtype=logits.dtype)
 
         # Use BCEWithLogitsLoss for numerical stability.
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
@@ -220,17 +298,21 @@ class AsymmetricFocalLoss(nn.Module):
         # Using log-space: exp(gamma * log(x)) = x^gamma
         # This avoids pow(0, gamma) numerically while maintaining gradients everywhere
 
+        # Use 1e-6 as minimum to avoid gradient underflow with high gamma values.
+        # With 1e-7 and gamma=3: log(1e-7)^3 ≈ (-16.1)^3 ≈ -4160, exp(-4160) underflows to 0.
+        # Using 1e-6: log(1e-6)^3 ≈ (-13.8)^3 ≈ -2628, more stable while still preventing log(0).
+        _LOG_FLOOR = 1e-6
         # log(1-p) for positive focal weight
-        log_one_minus_probs = torch.log((1 - probs).clamp(min=1e-8))
+        log_one_minus_probs = torch.log((1 - probs).clamp(min=_LOG_FLOOR))
         # log(p_clipped) for negative focal weight
-        log_probs_neg = torch.log(probs_neg.clamp(min=1e-8))
+        log_probs_neg = torch.log(probs_neg.clamp(min=_LOG_FLOOR))
 
         # Clamp the exponent to prevent overflow: exp(88) ≈ 2e38 (near float32 max)
         MAX_EXP = 88.0
         pos_exp = torch.clamp(self.gamma_pos * log_one_minus_probs, min=-MAX_EXP, max=MAX_EXP)
         neg_exp = torch.clamp(self.gamma_neg * log_probs_neg, min=-MAX_EXP, max=MAX_EXP)
-        pos_weights = targets * torch.exp(pos_exp)
-        neg_weights = (1 - targets) * torch.exp(neg_exp)
+        pos_weights = targets_for_focal * torch.exp(pos_exp)
+        neg_weights = (1 - targets_for_focal) * torch.exp(neg_exp)
 
         # Apply focal weights with separate positive/negative weighting
         pos_loss = pos_weights * bce_loss
@@ -243,8 +325,41 @@ class AsymmetricFocalLoss(nn.Module):
                 sample_weights = sample_weights.unsqueeze(1)
             focal_loss = focal_loss * sample_weights
 
+        # Apply class weights if provided (for class imbalance)
+        if self.class_weights is not None:
+            # class_weights shape: (num_classes,) -> broadcast to (1, num_classes)
+            # Use device-specific cache to avoid .to() transfer on every forward pass
+            device_type = focal_loss.device.type
+            device_idx = focal_loss.device.index if focal_loss.device.index is not None else -1
+            device_key = (device_type, device_idx)
+
+            if device_key not in self._class_weights_device_cache:
+                # Cache the weights on this device (one-time transfer per device)
+                self._class_weights_device_cache[device_key] = self.class_weights.to(focal_loss.device)
+
+            weights = self._class_weights_device_cache[device_key]
+
+            # Filter weights using the same keep mask from logits/targets filtering
+            if ignore_keep_mask is not None:
+                # Reuse the keep mask from ignore_indices filtering to ensure consistency
+                # The mask may need resizing if class_weights has different size than logits
+                if self.class_weights.size(0) == ignore_keep_mask.size(0):
+                    weights = weights[ignore_keep_mask]
+                else:
+                    # If class_weights size differs from logits, we cannot safely map indices.
+                    # Previous fallback logic was risky and could lead to shape mismatches.
+                    raise ValueError(
+                        f"Shape mismatch: class_weights size ({self.class_weights.size(0)}) "
+                        f"must match logits original size ({ignore_keep_mask.size(0)})."
+                    )
+            focal_loss = focal_loss * weights.unsqueeze(0)
+
         # Reduction
         if self.reduction == 'mean':
+            # When sample_weights are provided, focal_loss already contains loss * weight
+            # from line 320. We take the regular mean to preserve relative weighting
+            # without double-dividing by weights.
+            # This gives: mean(loss * weight), not sum(loss * weight) / sum(weight)
             return focal_loss.mean()
         elif self.reduction == 'sum':
             return focal_loss.sum()
@@ -346,50 +461,3 @@ class MultiTaskLoss(nn.Module):
             'rating_loss': rating_loss,
         }
         return total_loss, losses
-
-
-class FrequencyWeightedSampler:
-    """
-    Helper class to compute frequency‑based sample weights.
-
-    Used during training to balance common vs rare tags.  Tags with high
-    frequency receive lower weights, while rare tags receive higher weights.
-
-    Note: Weights are computed during __init__. For large vocabularies (10K+ tags),
-    avoid creating multiple instances with the same frequencies. Instead, create
-    the sampler once and reuse it, or compute the weights once and reuse them.
-    This design prioritizes simplicity over caching complexity.
-    """
-
-    def __init__(
-        self,
-        tag_frequencies: torch.Tensor,
-        weighting_type: str = 'sqrt_inverse',
-        min_weight: float = 0.1,
-        max_weight: float = 10.0,
-    ):
-        self.weighting_type = weighting_type
-        self.min_weight = min_weight
-        self.max_weight = max_weight
-        # Precompute weights per class (excluding pad index)
-        self.weights = self._compute_weights(tag_frequencies)
-
-    def _compute_weights(self, freqs: torch.Tensor) -> torch.Tensor:
-        """Compute weights inversely proportional to frequencies."""
-        # Avoid division by zero
-        freqs = freqs.float().clamp(min=1)
-        if self.weighting_type == 'inverse':
-            weights = 1.0 / freqs
-        elif self.weighting_type == 'sqrt_inverse':
-            weights = 1.0 / torch.sqrt(freqs)
-        elif self.weighting_type == 'log_inverse':
-            weights = 1.0 / torch.log(freqs + 1.0)
-        else:
-            logger.warning(
-                "Unknown weighting_type %s, defaulting to sqrt_inverse",
-                self.weighting_type,
-            )
-            weights = 1.0 / torch.sqrt(freqs)
-        weights = weights / weights.max()
-        weights = torch.clamp(weights, self.min_weight, self.max_weight)
-        return weights

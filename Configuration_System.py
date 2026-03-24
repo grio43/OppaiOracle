@@ -747,9 +747,23 @@ class BaseConfig:
 
 @dataclass
 class ModelConfig(BaseConfig):
-    """Model architecture configuration"""
+    """Model architecture configuration.
+
+    Architecture-Specific Learning Rate Guidance:
+    ---------------------------------------------
+    SwinV2 typically requires ~50% lower learning rate than ViT due to:
+    - Shifted window attention having different gradient dynamics
+    - Hierarchical feature extraction being more sensitive to large LR
+    - Pretrained SwinV2 weights expecting conservative fine-tuning rates
+
+    Recommended learning rates (base values, scale with batch size):
+    - ViT:    2.5e-4 (default)
+    - SwinV2: 1.25e-4 (50% of ViT rate)
+
+    Use get_recommended_learning_rate() method to get architecture-appropriate LR.
+    """
     # Architecture
-    architecture_type: str = "vit_large_extended"
+    architecture_type: str = "vit"  # "vit" or "swinv2"
     hidden_size: int = 1536
     num_hidden_layers: int = 28
     num_attention_heads: int = 24
@@ -791,10 +805,19 @@ class ModelConfig(BaseConfig):
     num_labels: int = 0
     num_groups: int = 20
     tags_per_group: int = 10000
-    
+
     # Efficiency
+    # NOTE: For SwinV2 models, gradient checkpointing is controlled via swin_config.use_checkpoint.
+    # Setting gradient_checkpointing=True here will automatically enable swin_config.use_checkpoint
+    # during training, but for clarity it's recommended to use swin_config.use_checkpoint directly.
+    # For ViT models, use this setting (gradient_checkpointing) directly.
     gradient_checkpointing: bool = False
-    checkpoint_every_n_layers: int = 1  # 1=all layers, 2=every 2nd, 4=every 4th, etc.
+    # For SwinV2, this controls per-block checkpoint interval when use_checkpoint is enabled.
+    checkpoint_every_n_layers: int = 1  # 1=all layers/blocks, 2=every 2nd, 4=every 4th, etc.
+
+    # SwinV2-specific configuration (only used when architecture_type="swinv2")
+    # For SwinV2, gradient checkpointing is controlled via swin_config.use_checkpoint
+    swin_config: Optional['SwinV2ModelConfig'] = None
 
     def validate(self):
         """Validate model configuration"""
@@ -842,9 +865,216 @@ class ModelConfig(BaseConfig):
                 f"drop_path_rate={self.drop_path_rate} is unusually high; "
                 "values between 0.08 and 0.3 are typical for ViT."
             )
-        
+
+        # Validate swin_config is provided when using SwinV2 architecture
+        if self.architecture_type == 'swinv2' and self.swin_config is None:
+            errors.append(
+                "swin_config must be provided when architecture_type='swinv2'. "
+                "Add a [model.swin_config] section to your configuration file."
+            )
+        if self.architecture_type == 'swinv2' and self.swin_config is not None:
+            custom_name = getattr(self.swin_config, 'custom_name', None)
+            if custom_name:
+                if getattr(self.swin_config, 'pretrained_name', None):
+                    errors.append(
+                        "swin_config.custom_name cannot be used with pretrained_name. "
+                        "Custom SwinV2 architectures do not support pretrained weights."
+                    )
+                if getattr(self.swin_config, 'model_name', None):
+                    errors.append(
+                        "swin_config.custom_name cannot be used with model_name. "
+                        "Use either a timm preset (model_name) or a custom architecture (custom_name)."
+                    )
+
         if errors:
             raise ConfigValidationError("Model config validation failed:\n" + "\n".join(errors))
+
+        # Validate SwinV2 window_size vs image_size compatibility at config load time
+        # This runs after basic validation so we can assume swin_config exists if architecture_type is swinv2
+        if self.architecture_type == 'swinv2' and self.swin_config is not None:
+            self.swin_config.validate_window_size_for_image(self.image_size)
+
+    def get_recommended_learning_rate(self, base_lr: float = 2.5e-4) -> float:
+        """Get architecture-appropriate learning rate recommendation.
+
+        SwinV2 typically needs ~50% lower learning rate than ViT due to:
+        - Shifted window attention having different gradient dynamics
+        - Hierarchical feature extraction being more sensitive to large LR
+        - Pretrained SwinV2 weights expecting conservative fine-tuning rates
+
+        Args:
+            base_lr: Base learning rate tuned for ViT (default: 2.5e-4)
+
+        Returns:
+            Recommended learning rate for the current architecture
+
+        Example:
+            >>> model_config = ModelConfig(architecture_type="swinv2")
+            >>> lr = model_config.get_recommended_learning_rate(2.5e-4)
+            >>> print(lr)  # 1.25e-4
+        """
+        # Architecture-specific learning rate multipliers
+        lr_multipliers = {
+            "vit": 1.0,
+            "vit_wide_shallow": 1.0,
+            "swinv2": 0.5,  # SwinV2 needs ~50% lower LR
+        }
+
+        multiplier = lr_multipliers.get(self.architecture_type, 1.0)
+        recommended_lr = base_lr * multiplier
+
+        if self.architecture_type == "swinv2":
+            logger.info(
+                f"SwinV2 architecture detected: reducing learning rate from {base_lr:.2e} "
+                f"to {recommended_lr:.2e} (50% reduction recommended for SwinV2)"
+            )
+
+        return recommended_lr
+
+    def get_learning_rate_guidance(self) -> str:
+        """Get detailed learning rate guidance for the current architecture.
+
+        Returns:
+            Human-readable guidance string for learning rate selection.
+        """
+        if self.architecture_type == "swinv2":
+            return (
+                "SwinV2 Learning Rate Guidance:\n"
+                "  - Recommended base LR: 1.25e-4 (vs 2.5e-4 for ViT)\n"
+                "  - SwinV2 needs ~50% lower LR than ViT due to:\n"
+                "    * Shifted window attention has different gradient dynamics\n"
+                "    * Hierarchical features are more sensitive to large LR\n"
+                "    * Pretrained weights expect conservative fine-tuning\n"
+                "  - If using pretrained weights, consider starting even lower (1e-4)\n"
+                "  - Scale LR with sqrt(batch_size) as usual\n"
+            )
+        else:
+            return (
+                f"{self.architecture_type.upper()} Learning Rate Guidance:\n"
+                "  - Recommended base LR: 2.5e-4\n"
+                "  - Scale with sqrt(effective_batch_size / 256)\n"
+                "  - Use warmup for stable training start\n"
+            )
+
+
+@dataclass
+class SwinV2ModelConfig(BaseConfig):
+    """SwinV2-specific architecture configuration.
+
+    Custom "XLarge" config targeting ~350M params (between Large 197M and Huge 658M).
+    """
+    # Embedding dimension (192 for Large, 352 for Huge, 256 for custom XLarge)
+    embed_dim: int = 256
+
+    # Depths per stage - standard 4-stage structure
+    depths: Tuple[int, ...] = (2, 2, 18, 2)
+
+    # Number of attention heads per stage - scale with embed_dim
+    num_heads: Tuple[int, ...] = (8, 16, 32, 64)
+
+    # Window size for attention (16 for 512 input)
+    window_size: int = 16
+
+    # MLP expansion ratio
+    mlp_ratio: float = 4.0
+
+    # Stochastic depth rate
+    drop_path_rate: float = 0.2
+
+    # Pretrained model name (None for training from scratch)
+    pretrained_name: Optional[str] = None
+
+    # Enable gradient checkpointing
+    use_checkpoint: bool = True
+
+    # timm model name to use as backbone (e.g., 'swinv2_base_window12_192',
+    # 'swinv2_large_window12to16_192to256_22kft1k', etc.)
+    # If None, defaults to 'swinv2_base_window12_192' as the architecture template.
+    # The embed_dim, depths, num_heads, window_size, etc. will override the template's defaults.
+    model_name: Optional[str] = None
+
+    # Custom architecture label (enables custom SwinV2 backbone when set).
+    # Use this when you want a non-timm preset model (e.g., "OppaiOracleV01").
+    custom_name: Optional[str] = None
+
+    def validate_window_size_for_image(self, image_size: int) -> None:
+        """Validate that window_size is compatible with image_size for SwinV2.
+
+        SwinV2 uses hierarchical feature maps where each stage halves the spatial resolution.
+        For window-based attention to work correctly:
+        1. image_size must be divisible by (patch_size * 2^(num_stages-1)) for the final stage
+        2. All intermediate feature map sizes must be divisible by window_size
+        3. Final stage feature size must be >= window_size
+
+        This validation runs at config load time to fail early with clear error messages
+        instead of cryptic errors during model creation.
+
+        Args:
+            image_size: Input image size (assumes square images)
+
+        Raises:
+            ConfigValidationError: If image_size is incompatible with window_size
+        """
+        num_stages = len(self.depths)
+        initial_patch_size = 4  # SwinV2 always uses patch_size=4
+        window_size = self.window_size
+
+        # Calculate the total downsampling factor for the final stage
+        # SwinV2 downsamples by patch_size initially, then by 2 at each stage transition
+        # Final resolution = image_size / (patch_size * 2^(num_stages-1))
+        total_downsample = initial_patch_size * (2 ** (num_stages - 1))
+
+        # Check 1: image_size must produce integer feature sizes
+        if image_size % total_downsample != 0:
+            final_res = image_size / total_downsample
+            valid_sizes = [
+                s for s in [192, 224, 256, 384, 448, 512, 640, 768, 896, 1024]
+                if s % total_downsample == 0
+            ]
+            raise ConfigValidationError(
+                f"SwinV2 image_size ({image_size}) must be divisible by {total_downsample} "
+                f"(patch_size={initial_patch_size} * 2^{num_stages-1}) with {num_stages} stages. "
+                f"Current final resolution would be {final_res:.2f} (must be integer). "
+                f"Suggested valid image sizes: {valid_sizes}"
+            )
+
+        # Check 2: window_size divisibility at each stage
+        invalid_stages = []
+        for stage in range(num_stages):
+            downsample_at_stage = initial_patch_size * (2 ** stage)
+            feature_size = image_size // downsample_at_stage
+
+            if feature_size % window_size != 0:
+                invalid_stages.append(
+                    f"stage {stage}: feature_size={feature_size}, "
+                    f"feature_size % window_size = {feature_size % window_size}"
+                )
+
+        if invalid_stages:
+            required_multiple = total_downsample * window_size
+            valid_sizes = [
+                s for s in range(required_multiple, 1025, required_multiple)
+                if s <= 1024
+            ]
+            raise ConfigValidationError(
+                f"SwinV2 image_size ({image_size}) is incompatible with window_size ({window_size}) "
+                f"with {num_stages} stages. "
+                f"Feature map sizes must be divisible by window_size at all stages. "
+                f"Invalid stages: {'; '.join(invalid_stages)}. "
+                f"Suggested valid image sizes (divisible by {required_multiple}): {valid_sizes}"
+            )
+
+        # Check 3: final stage feature size >= window_size
+        final_feature_size = image_size // total_downsample
+        if final_feature_size < window_size:
+            raise ConfigValidationError(
+                f"SwinV2 final stage feature size ({final_feature_size}) is smaller than "
+                f"window_size ({window_size}). SwinV2 requires the feature map at each stage "
+                f"to be at least as large as the window size. "
+                f"Either increase image_size (current: {image_size}) or decrease window_size. "
+                f"Minimum image_size for window_size={window_size} with {num_stages} stages: "
+                f"{window_size * total_downsample}"
+            )
 
 
 @dataclass
@@ -882,11 +1112,18 @@ class DataConfig(BaseConfig):
     
     # Image processing
     image_size: int = 512
-    # Default to inception-style normalization which expects pixel values in
+    # Default normalization for ViT: inception-style (0.5/0.5/0.5) expects pixel values in
     # [0, 1] range. Using 0.5/0.5/0.5 keeps training, validation and inference
     # in sync unless explicitly overridden in the unified config.
     normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)
     normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5)
+
+    # SwinV2-specific normalization: ImageNet mean/std required for pretrained weights.
+    # These values match timm's default preprocessing for SwinV2 models.
+    # When architecture_type="swinv2", these values are used instead of normalize_mean/std.
+    swinv2_normalize_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
+    swinv2_normalize_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+
     pad_color: Tuple[int, int, int] = (114, 114, 114)
     
     # Data loading
@@ -896,6 +1133,9 @@ class DataConfig(BaseConfig):
     prefetch_factor: int = 2
     persistent_workers: bool = True
     drop_last: bool = False
+    
+    # Vocabulary
+    vocab_min_frequency: int = 125
 
     # Worker logging (WARNING allows debugging, CRITICAL minimizes queue overhead)
     worker_log_level: str = field(default="WARNING", metadata={"help": "Log level for DataLoader workers (DEBUG, INFO, WARNING, ERROR, CRITICAL)"})
@@ -919,29 +1159,32 @@ class DataConfig(BaseConfig):
     cache_count_tolerance_min: int = 100
 
     # Augmentation
-    # NOTE: Most augmentations are NOT IMPLEMENTED - only random_flip_prob is active.
-    # With large datasets (5-6M images), augmentation is generally unnecessary.
-    augmentation_enabled: bool = True
-    random_flip_prob: float = 0.0  # IMPLEMENTED: Horizontal flipping with orientation tag swapping (disabled by default)
+    # Only random_flip_prob is implemented. With large datasets (5-6M images),
+    # additional augmentation is generally unnecessary.
+    random_flip_prob: float = 0.0  # Horizontal flipping with orientation tag swapping (disabled by default)
 
-    # NOT IMPLEMENTED: Color augmentations below are configured but not applied
-    color_jitter: bool = False
-    color_jitter_brightness: float = 0.10
-    color_jitter_contrast:   float = 0.10
-    color_jitter_hue:        float = 0.03  # cap hue to protect eye-color semantics
-    color_jitter_saturation: float = 0.00
-    eye_color_weight_boost: float = 1.5  # Boost for eye color tags in sampling
+    # Color jitter augmentation
+    color_jitter_enabled: bool = field(default=False, metadata={"help": "Enable color jitter augmentation"})
+    color_jitter_brightness: float = field(default=0.1, metadata={"help": "Brightness jitter range"})
+    color_jitter_brightness_p: float = field(default=0.15, metadata={"help": "Probability of brightness jitter"})
+    color_jitter_contrast: float = field(default=0.1, metadata={"help": "Contrast jitter range"})
+    color_jitter_contrast_p: float = field(default=0.15, metadata={"help": "Probability of contrast jitter"})
+    color_jitter_saturation: float = field(default=0.1, metadata={"help": "Saturation jitter range"})
+    color_jitter_saturation_p: float = field(default=0.15, metadata={"help": "Probability of saturation jitter"})
 
-    # NOT IMPLEMENTED: Geometric augmentations below are configured but not applied
-    random_crop_scale: Tuple[float, float] = (0.8, 1.0)
-    random_rotation_degrees: float = 0.0
+    # Random erasing augmentation
+    random_erasing_enabled: bool = field(default=False, metadata={"help": "Enable random erasing"})
+    random_erasing_p: float = field(default=0.25, metadata={"help": "Probability of random erasing"})
+    random_erasing_scale_min: float = field(default=0.02, metadata={"help": "Min erased area fraction"})
+    random_erasing_scale_max: float = field(default=0.20, metadata={"help": "Max erased area fraction"})
+    random_erasing_ratio_min: float = field(default=0.3, metadata={"help": "Min aspect ratio of erased region"})
+    random_erasing_ratio_max: float = field(default=3.3, metadata={"help": "Max aspect ratio of erased region"})
 
-    # NOT IMPLEMENTED: Advanced augmentations below are configured but not applied
-    randaugment_num_ops: int = 2
-    randaugment_magnitude: int = 9
-    mixup_alpha: float = 0.0
-    cutmix_alpha: float = 0.0
-    random_erasing_p: float = 0.0
+    # Random rotation augmentation
+    random_rotation_enabled: bool = field(default=False, metadata={"help": "Enable random rotation augmentation"})
+    random_rotation_p: float = field(default=0.3, metadata={"help": "Probability of applying rotation per sample"})
+    random_rotation_min_degrees: float = field(default=5.0, metadata={"help": "Minimum rotation angle in degrees"})
+    random_rotation_max_degrees: float = field(default=10.0, metadata={"help": "Maximum rotation angle in degrees"})
 
     # Orientation mapping (consolidated from augmentation.yaml)
     orientation_map_path: Optional[str] = None
@@ -1031,18 +1274,21 @@ class DataConfig(BaseConfig):
 
         if self.num_workers < 0:
             errors.append(f"num_workers must be non-negative, got {self.num_workers}")
+            
+        if self.vocab_min_frequency < 1:
+            errors.append(f"vocab_min_frequency must be >= 1, got {self.vocab_min_frequency}")
 
         # New bounds checks
         if self.prefetch_factor < 1:
             errors.append(f"prefetch_factor must be >= 1, got {self.prefetch_factor}")
         if self.preload_files < 0:
             errors.append(f"preload_files must be >= 0, got {self.preload_files}")
-        if self.random_rotation_degrees < 0:
-            errors.append(f"random_rotation_degrees must be >= 0, got {self.random_rotation_degrees}")
 
-        # Validate normalization parameters
-        for param_name, param_value in [('normalize_mean', self.normalize_mean), 
-                                        ('normalize_std', self.normalize_std)]:
+        # Validate normalization parameters (ViT defaults and SwinV2 ImageNet values)
+        for param_name, param_value in [('normalize_mean', self.normalize_mean),
+                                        ('normalize_std', self.normalize_std),
+                                        ('swinv2_normalize_mean', self.swinv2_normalize_mean),
+                                        ('swinv2_normalize_std', self.swinv2_normalize_std)]:
             if len(param_value) != 3:
                 errors.append(f"{param_name} must have 3 values, got {len(param_value)}")
 
@@ -1057,6 +1303,15 @@ class DataConfig(BaseConfig):
         # Validate augmentation parameters
         if self.random_flip_prob < 0 or self.random_flip_prob > 1:
             errors.append(f"random_flip_prob must be in [0, 1], got {self.random_flip_prob}")
+
+        if self.random_rotation_p < 0 or self.random_rotation_p > 1:
+            errors.append(f"random_rotation_p must be in [0, 1], got {self.random_rotation_p}")
+        if self.random_rotation_min_degrees < 0:
+            errors.append(f"random_rotation_min_degrees must be >= 0, got {self.random_rotation_min_degrees}")
+        if self.random_rotation_max_degrees < self.random_rotation_min_degrees:
+            errors.append(f"random_rotation_max_degrees must be >= min_degrees, got {self.random_rotation_max_degrees}")
+        if self.random_rotation_max_degrees > 45:
+            errors.append(f"random_rotation_max_degrees must be <= 45, got {self.random_rotation_max_degrees}")
 
         if self.orientation_safety_mode not in {"conservative", "balanced", "permissive"}:
             errors.append(
@@ -1080,22 +1335,6 @@ class DataConfig(BaseConfig):
                 errors.append(
                     f"orientation_safety_mode must be one of {valid_modes}, got {self.orientation_safety_mode}"
                 )
-
-        scale_min, scale_max = self.random_crop_scale
-        if not (0 < scale_min <= scale_max <= 1):
-            errors.append(f"random_crop_scale must satisfy 0 < min <= max <= 1, got {self.random_crop_scale}")
-
-        # Validate advanced augmentations
-        if self.randaugment_num_ops < 1:
-            errors.append(f"randaugment_num_ops must be positive, got {self.randaugment_num_ops}")
-        if not 0 <= self.randaugment_magnitude <= 30:
-            errors.append(f"randaugment_magnitude must be in [0, 30], got {self.randaugment_magnitude}")
-        if self.mixup_alpha < 0:
-            errors.append(f"mixup_alpha must be non-negative, got {self.mixup_alpha}")
-        if self.cutmix_alpha < 0:
-            errors.append(f"cutmix_alpha must be non-negative, got {self.cutmix_alpha}")
-        if not 0 <= self.random_erasing_p <= 1:
-            errors.append(f"random_erasing_p must be in [0, 1], got {self.random_erasing_p}")
 
         valid_precisions = ["float16", "bfloat16", "float32"]
         if self.sidecar_storage_dtype not in valid_precisions:
@@ -1158,20 +1397,16 @@ class GradientClippingConfig(BaseConfig):
     max_norm: float = 1.0
 
 
-@dataclass
-class OverflowBackoffConfig(BaseConfig):
-    enabled: bool = False
-    factor: float = 0.1
-
 
 @dataclass
 class LossConfig(BaseConfig):
     """Hyperparameters for loss functions."""
     alpha: float = 0.5
-    gamma_neg: float = 1.0
+    gamma_neg: float = 3.0
     gamma_pos: float = 1.0
     label_smoothing: float = 0.0
     clip: float = 0.05
+    class_weights: Optional[List[float]] = None  # Per-class weights for imbalanced datasets
 
     def validate(self):
         errors = []
@@ -1183,8 +1418,8 @@ class LossConfig(BaseConfig):
             errors.append(
                 f"label_smoothing must be in [0, 1], got {self.label_smoothing}"
             )
-        if not 0.0 <= self.clip < 0.5:
-            errors.append(f"clip must be in [0, 0.5), got {self.clip}")
+        if not 0.0 <= self.clip < 1.0:
+            errors.append(f"clip must be in [0, 1), got {self.clip}")
         if errors:
             raise ConfigValidationError("Loss config validation failed:\n" + "\n".join(errors))
 
@@ -1197,9 +1432,22 @@ class TrainingConfig(BaseConfig):
     # Basic settings
     num_epochs: int = 100
     learning_rate: float = 1e-4
+    # Learning rate scaling: automatically adjusts learning_rate based on effective batch size.
+    # The learning_rate field should be the BASE rate (tuned for lr_base_batch_size).
+    # Modes: "sqrt" (recommended for AdamW), "linear", or "none" (use learning_rate as-is).
+    lr_scaling_mode: str = "sqrt"
+    lr_base_batch_size: int = 256
+    # SwinV2-specific learning rate (used when model.architecture_type == 'swinv2')
+    # SwinV2 typically needs ~50% lower learning rate than ViT due to:
+    #   - Shifted window attention has different gradient dynamics
+    #   - Hierarchical feature extraction is more sensitive to large LR
+    #   - Higher memory overhead means smaller effective batches
+    # Recommended range: 5e-5 to 1e-4 (vs 1e-4 to 2.5e-4 for ViT)
+    # If None, falls back to learning_rate (for backward compatibility)
+    swinv2_learning_rate: Optional[float] = None
     weight_decay: float = 0.01
     gradient_accumulation_steps: int = 4
-    
+
     # Optimizer
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
@@ -1223,9 +1471,6 @@ class TrainingConfig(BaseConfig):
     max_grad_norm: float = 1.0  # deprecated, use gradient_clipping.max_norm
     gradient_clipping: GradientClippingConfig = field(default_factory=GradientClippingConfig)
 
-    # Optional LR backoff when loss becomes non-finite
-    overflow_backoff_on_nan: OverflowBackoffConfig = field(default_factory=OverflowBackoffConfig)
-    
     # Checkpointing
     save_steps: int = 5000
     save_total_limit: int = 5
@@ -1247,12 +1492,6 @@ class TrainingConfig(BaseConfig):
     tag_loss: LossConfig = field(default_factory=LossConfig)
     rating_loss: LossConfig = field(default_factory=LossConfig)
     use_class_weights: bool = True
-    
-    # Curriculum learning
-    use_curriculum: bool = True
-    start_region_training_epoch: int = 20
-    region_training_interval: int = 5
-    curriculum_difficulty_schedule: str = "linear"  # linear, exponential, step
     
     # Hardware
     device: str = "cuda"
@@ -1309,7 +1548,11 @@ class TrainingConfig(BaseConfig):
         
         if self.learning_rate <= 0:
             errors.append(f"learning_rate must be positive, got {self.learning_rate}")
-        
+
+        # Validate swinv2_learning_rate if provided
+        if self.swinv2_learning_rate is not None and self.swinv2_learning_rate <= 0:
+            errors.append(f"swinv2_learning_rate must be positive, got {self.swinv2_learning_rate}")
+
         if self.num_epochs <= 0:
             errors.append(f"num_epochs must be positive, got {self.num_epochs}")
         
@@ -1528,7 +1771,19 @@ class ExportConfig(BaseConfig):
     
     # Output
     output_path: str = "./exported_model"
-    
+
+    # Vocabulary embedding
+    require_embedded_vocabulary: bool = True  # Require vocabulary to be embedded in ONNX model
+
+    # Architecture-specific export controls
+    # SwinV2 ONNX Export Behavior:
+    # - By default, SwinV2 ONNX export is BLOCKED because shifted window attention
+    #   uses torch.roll() which cannot be properly traced to ONNX. The resulting
+    #   models may have incorrect attention patterns or fail at runtime.
+    # - Set force_swinv2_export=True to override this block (NOT RECOMMENDED for production)
+    # - For production ONNX deployments, use ViT or SimplifiedTagger architectures instead
+    force_swinv2_export: bool = False  # Override to allow SwinV2 ONNX export (not recommended)
+
     def validate(self):
         """Validate export configuration"""
         errors = []
@@ -1623,7 +1878,7 @@ class ValidationConfig(BaseConfig):
 @dataclass
 class TBImageLoggingConfig(BaseConfig):
     """Configuration for TensorBoard image and text sample logging."""
-    max_samples: int = 4
+    max_samples: int = 32
     topk: int = 15
     log_native_resolution: bool = True
     dpi_for_figures: int = 220
@@ -1700,6 +1955,10 @@ class MonitorConfig(BaseConfig):
 
     # TensorBoard image logging helpers
     tb_image_logging: TBImageLoggingConfig = field(default_factory=TBImageLoggingConfig)
+
+    # Normalization params for image denormalization before TensorBoard display
+    normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)
+    normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5)
 
     # History
     max_history_size: int = 1000
@@ -2411,7 +2670,8 @@ def create_config_parser(config_type: ConfigType = ConfigType.FULL) -> argparse.
         # Training arguments
         train_group = parser.add_argument_group('training')
         train_group.add_argument('--training.num_epochs', type=int, help='Number of epochs')
-        train_group.add_argument('--training.learning_rate', type=float, help='Learning rate')
+        train_group.add_argument('--training.learning_rate', type=float, help='Learning rate (used for ViT)')
+        train_group.add_argument('--training.swinv2_learning_rate', type=float, help='SwinV2-specific learning rate (recommended: 5e-5 to 1e-4)')
         train_group.add_argument('--training.weight_decay', type=float, help='Weight decay')
         train_group.add_argument('--training.device', type=str, help='Device (cuda/cpu)')
         train_group.add_argument('--training.distributed', action='store_true', default=None, help='Use distributed training')

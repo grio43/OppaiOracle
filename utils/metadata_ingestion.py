@@ -38,9 +38,16 @@ def dedupe_preserve_order(items: Iterable[str]) -> List[str]:
     return out
 
 def safe_join(root: Path, rel: str) -> Path:
-    """Join root and rel, raising if the result escapes the dataset root."""
-    p = (root / rel).resolve()
-    if not str(p).startswith(str(root.resolve())):
+    """Join root and rel, raising if the result escapes the dataset root.
+
+    Uses relative_to() for proper path containment check, avoiding the
+    startswith() vulnerability where /foo/bar would match /foo/barbaz.
+    """
+    resolved_root = root.resolve()
+    p = (resolved_root / rel).resolve()
+    try:
+        p.relative_to(resolved_root)
+    except ValueError:
         raise ValueError(f"Path escapes dataset root: {rel}")
     return p
 

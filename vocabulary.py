@@ -1138,7 +1138,7 @@ def create_dataset_config(vocab: TagVocabulary) -> Dict:
 def create_vocabulary_from_datasets(
     dataset_path: Optional[List[Union[str, Path]]] = None,
     *,
-    min_frequency: int = 50,
+    min_frequency: int = 125,
     top_k: int = 100_000,
     num_workers: int = 20,
     chunk_size: int = 10_000,

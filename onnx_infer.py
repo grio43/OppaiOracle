@@ -43,7 +43,7 @@ def _load_metadata(session: ort.InferenceSession):
             RuntimeWarning
         )
         # Return None to signal external vocab needed
-        return None, None, None, None, None, meta
+        return None, None, None, None, None, None, meta
 
     # Try to decode and decompress the vocabulary with robust error handling
     try:
@@ -76,19 +76,20 @@ def _load_metadata(session: ort.InferenceSession):
             "(--mean, --std, --image-size, --patch-size) for inference.",
             RuntimeWarning
         )
-        return None, None, None, None, None, meta
+        return None, None, None, None, None, None, meta
 
     mean = json.loads(meta.get('normalize_mean', '[0.5, 0.5, 0.5]'))
     std = json.loads(meta.get('normalize_std', '[0.5, 0.5, 0.5]'))
     image_size = int(meta.get('image_size', 512))
     patch_size = int(meta.get('patch_size', 16))
-    return vocab, mean, std, image_size, patch_size, meta
+    pad_color = tuple(json.loads(meta.get('pad_color', '[114, 114, 114]')))
+    return vocab, mean, std, image_size, patch_size, pad_color, meta
 
 
-def _preprocess(image_path: str) -> tuple[np.ndarray, bool]:
+def _preprocess(image_path: str, pad_color: tuple[int, int, int] = (114, 114, 114)) -> tuple[np.ndarray, bool]:
     """
     Loads an image and prepares it for the self-contained ONNX model.
-    Handles transparent images by compositing them on a grey background.
+    Handles transparent images by compositing them on a background using pad_color.
     Returns the image array and a flag indicating if compositing occurred.
     """
     was_composited = False
@@ -98,8 +99,8 @@ def _preprocess(image_path: str) -> tuple[np.ndarray, bool]:
         # Check for transparency and composite if necessary
         if img.mode in ('RGBA', 'LA') or 'transparency' in img.info:
             was_composited = True
-            # Create a grey background to match training
-            background = Image.new('RGB', img.size, (114, 114, 114))
+            # Create background using pad_color to match training
+            background = Image.new('RGB', img.size, pad_color)
             # Ensure we have explicit alpha and RGB color data, even for 'LA' or 'P' images
             img_rgba = img.convert('RGBA')           # normalizes 'LA'/'P' w/ transparency to RGBA
             alpha = img_rgba.getchannel('A')         # single-band (L) mask
@@ -159,7 +160,7 @@ def main():
         logger.info(f"Using providers: {session.get_providers()}")
 
         # Load metadata - this contains the vocabulary
-        vocab, mean, std, image_size, patch_size, meta = _load_metadata(session)
+        vocab, mean, std, image_size, patch_size, pad_color, meta = _load_metadata(session)
         vocab_embedded = True
 
         if vocab is None:
@@ -172,6 +173,9 @@ def main():
             vocab = TagVocabulary(Path(args.vocab))
             verify_vocabulary_integrity(vocab, Path(args.vocab))
             vocab_embedded = False
+            # Use default pad_color for old models without metadata
+            if pad_color is None:
+                pad_color = (114, 114, 114)
 
         input_name = session.get_inputs()[0].name
         input_info = session.get_inputs()[0]
@@ -182,7 +186,7 @@ def main():
             start = time.time()
             try:
                 # Preprocessing now returns a flag for compositing
-                inp, was_composited = _preprocess(path)
+                inp, was_composited = _preprocess(path, pad_color)
             except Exception as e:
                 logger.error(f"Preprocessing failed for {path}: {e}")
                 # Add failed result instead of skipping
@@ -197,12 +201,28 @@ def main():
             try:
                 outputs = session.run(None, {input_name: inp})
 
-                if len(outputs) == 1:
-                    scores = outputs[0][0]
+                # Handle dual outputs (tag_scores, rating_scores) or legacy single output
+                if len(outputs) == 2:
+                    # New format: (tag_scores, rating_scores)
+                    tag_scores = outputs[0][0]
+                    rating_scores = outputs[1][0]
+                    # Get predicted rating (argmax of rating logits)
+                    rating_idx = int(np.argmax(rating_scores))
+                    rating_labels = ['safe', 'sensitive', 'questionable', 'explicit', 'unknown']
+                    predicted_rating = rating_labels[rating_idx] if rating_idx < len(rating_labels) else 'unknown'
+                    rating_confidence = float(np.exp(rating_scores[rating_idx]) / np.sum(np.exp(rating_scores)))
+                elif len(outputs) == 1:
+                    # Legacy single output format
+                    tag_scores = outputs[0][0]
+                    predicted_rating = None
+                    rating_confidence = None
                 else:
-                    scores = outputs[-1][0]
+                    # Fallback: use last output as tags
+                    tag_scores = outputs[-1][0]
+                    predicted_rating = None
+                    rating_confidence = None
 
-                idxs = np.argsort(scores)[::-1][:args.top_k]
+                idxs = np.argsort(tag_scores)[::-1][:args.top_k]
                 # Resolve special-token indices once
                 try:
                     pad_idx = vocab.tag_to_index.get(getattr(vocab, "pad_token", "<PAD>"), 0)
@@ -214,7 +234,7 @@ def main():
 
                 tags = []
                 for idx in idxs:
-                    score = float(scores[idx])
+                    score = float(tag_scores[idx])
                     if score < args.threshold:
                         continue
                     # Skip special tokens (padding/unknown)
@@ -231,11 +251,18 @@ def main():
                 if was_composited:
                     tags = [tag for tag in tags if tag.name != 'gray_background']
 
-                results.append(ImagePrediction(
+                # Build result with optional rating
+                result = ImagePrediction(
                     image=path,
                     tags=tags,
                     processing_time=int((time.time() - start) * 1000)
-                ))
+                )
+                # Add rating if available (new dual-output models)
+                if predicted_rating is not None:
+                    result.rating = predicted_rating
+                    result.rating_confidence = rating_confidence
+
+                results.append(result)
 
             except Exception as e:
                 logger.error(f"Inference failed for {path}: {e}")
