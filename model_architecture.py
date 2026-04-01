@@ -149,7 +149,7 @@ class BaseTagger(ABC, nn.Module):
         pixel_values: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Forward pass returning tag_logits, rating_logits, and logits alias."""
+        """Forward pass returning tag_logits dict."""
         pass
 
     @abstractmethod
@@ -162,6 +162,39 @@ class BaseTagger(ABC, nn.Module):
     def config(self):
         """Return model configuration."""
         pass
+
+
+def initialize_tag_head_bias(
+    model: BaseTagger,
+    index_to_tag: Dict[int, str],
+    tag_frequencies: Dict[str, int],
+    total_samples: int,
+    min_prior: float = 1e-5,
+    max_prior: float = 0.99,
+) -> None:
+    """Initialize tag_head bias with log-prior for focal loss (RetinaNet technique).
+
+    Sets each tag's bias to log(prior / (1 - prior)) based on empirical tag frequency.
+    This makes the model start by predicting "mostly negative" for sparse labels,
+    providing meaningful gradients from the first step instead of random 0.5 predictions.
+
+    Must be called AFTER model creation (which zeros the bias) and BEFORE checkpoint
+    loading (which will overwrite the bias if resuming).
+    """
+    with torch.no_grad():
+        bias = model.tag_head.bias
+        num_tags = bias.shape[0]
+        for idx in range(num_tags):
+            tag = index_to_tag.get(idx, "")
+            freq = tag_frequencies.get(tag, 0)
+            prior = max(min_prior, min(max_prior, freq / max(1, total_samples)))
+            bias[idx] = math.log(prior / (1 - prior))
+
+        bias_vals = bias.tolist()
+        logger.info(
+            "Tag head bias initialized with log-prior: min=%.2f, max=%.2f, mean=%.2f",
+            min(bias_vals), max(bias_vals), sum(bias_vals) / len(bias_vals),
+        )
 
 
 class LayerNormFp32(nn.LayerNorm):
@@ -190,16 +223,15 @@ class LayerNormFp32(nn.LayerNorm):
 @dataclass
 class VisionTransformerConfig:
     """Configuration for the Vision Transformer used in direct training."""
-    image_size: int = 512
+    image_size: int = 448
     # Patch size must divide image_size evenly to avoid losing border information (validated in __post_init__)
     patch_size: int = 16
     num_channels: int = 3
-    hidden_size: int = 1280
-    num_hidden_layers: int = 24
+    hidden_size: int = 1024
+    num_hidden_layers: int = 17
     num_attention_heads: int = 16
-    intermediate_size: int = 5120
-    num_tags: int = 100000  # This should be overridden with actual vocab size
-    num_ratings: int = 5
+    intermediate_size: int = 4096
+    num_tags: int = 100000  # This should be overridden with actual vocab size (includes rating tags)
     dropout: float = 0.1
     attention_dropout: float = 0.1
     layer_norm_eps: float = 1e-6
@@ -470,9 +502,8 @@ class SimplifiedTagger(BaseTagger):
         ])
         # Final layer norm
         self.norm = LayerNormFp32(config.hidden_size, eps=config.layer_norm_eps, use_fp32=config.use_fp32_layernorm)
-        # Classification heads
+        # Classification head (ratings are now part of the tag vocabulary)
         self.tag_head = nn.Linear(config.hidden_size, config.num_tags)
-        self.rating_head = nn.Linear(config.hidden_size, config.num_ratings)
         # Weight initialization
         self.apply(self._init_weights)
 
@@ -516,18 +547,14 @@ class SimplifiedTagger(BaseTagger):
     def _check_numerical_stability(
         self,
         tag_logits: torch.Tensor,
-        rating_logits: torch.Tensor
     ) -> None:
         """Check for NaN/Inf in logits and log statistics.
 
         This method is only called when config.check_numerical_stability=True.
         It helps diagnose numerical instability issues during training/inference.
         """
-        # Check for non-finite values before clamping
         tag_has_nan = torch.isnan(tag_logits).any().item()
         tag_has_inf = torch.isinf(tag_logits).any().item()
-        rating_has_nan = torch.isnan(rating_logits).any().item()
-        rating_has_inf = torch.isinf(rating_logits).any().item()
 
         if tag_has_nan or tag_has_inf:
             warnings.warn(
@@ -537,29 +564,13 @@ class SimplifiedTagger(BaseTagger):
                 f"mean={tag_logits.mean():.2f}, std={tag_logits.std():.2f}"
             )
 
-        if rating_has_nan or rating_has_inf:
-            warnings.warn(
-                f"Numerical instability in rating_logits: "
-                f"NaN={rating_has_nan}, Inf={rating_has_inf}"
-            )
-
-        # Check if values exceed clamping thresholds
         clamp_threshold = 15.0
         tag_needs_clamp = (tag_logits.abs() > clamp_threshold).any().item()
-        rating_needs_clamp = (rating_logits.abs() > clamp_threshold).any().item()
-
         if tag_needs_clamp:
             num_clamped = (tag_logits.abs() > clamp_threshold).sum().item()
             warnings.warn(
                 f"Clamping {num_clamped} tag logits "
                 f"(max abs value: {tag_logits.abs().max():.2f})"
-            )
-
-        if rating_needs_clamp:
-            num_clamped = (rating_logits.abs() > clamp_threshold).sum().item()
-            warnings.warn(
-                f"Clamping {num_clamped} rating logits "
-                f"(max abs value: {rating_logits.abs().max():.2f})"
             )
 
     def _create_block_mask(self, key_padding_mask: torch.Tensor, seq_len: int) -> BlockMask:
@@ -740,23 +751,20 @@ class SimplifiedTagger(BaseTagger):
         x = self.norm(x)
         # Use CLS token for classification
         cls_output = x[:, 0]
-        # Predictions
+        # Predictions (ratings are included as tags in the vocabulary)
         tag_logits = self.tag_head(cls_output)
-        rating_logits = self.rating_head(cls_output)
 
         # Monitor for numerical issues (optional, controlled by config)
         if self._config.check_numerical_stability:
-            self._check_numerical_stability(tag_logits, rating_logits)
+            self._check_numerical_stability(tag_logits)
 
         # Clamp logits to prevent numerical instability with mixed precision
         if self._config.logit_clamp_value is not None:
             clamp_val = self._config.logit_clamp_value
             tag_logits = torch.clamp(tag_logits, min=-clamp_val, max=clamp_val)
-            rating_logits = torch.clamp(rating_logits, min=-clamp_val, max=clamp_val)
 
         return {
             'tag_logits': tag_logits,
-            'rating_logits': rating_logits,
             'logits': tag_logits
         }
 
@@ -815,8 +823,8 @@ class SimplifiedTagger(BaseTagger):
 class SwinV2Tagger(BaseTagger):
     """SwinV2-based tagger for anime images.
 
-    Uses timm's SwinV2 backbone with custom dual-head classification
-    for tags (100k) and ratings (5 classes).
+    Uses timm's SwinV2 backbone with classification head
+    for tags (including rating tags).
     """
 
     # Known SwinV2 model configurations from timm
@@ -1051,9 +1059,8 @@ class SwinV2Tagger(BaseTagger):
         if not use_custom:
             self._warn_if_config_ignored(model_name, embed_dim, depths, num_heads, window_size)
 
-        # Dual classification heads
+        # Classification head (ratings are now part of the tag vocabulary)
         self.tag_head = nn.Linear(self.feature_dim, config.num_tags)
-        self.rating_head = nn.Linear(self.feature_dim, config.num_ratings)
 
         # Initialize classification heads
         self._init_weights()
@@ -1396,11 +1403,9 @@ class SwinV2Tagger(BaseTagger):
         return self.backbone.num_features
 
     def _init_weights(self):
-        """Initialize classification heads with truncated normal."""
+        """Initialize classification head with truncated normal."""
         nn.init.trunc_normal_(self.tag_head.weight, std=0.02)
         nn.init.zeros_(self.tag_head.bias)
-        nn.init.trunc_normal_(self.rating_head.weight, std=0.02)
-        nn.init.zeros_(self.rating_head.bias)
 
     def set_onnx_mode(self, enabled: bool = True) -> None:
         """Enable ONNX-compatible mode.
@@ -1433,21 +1438,10 @@ class SwinV2Tagger(BaseTagger):
     def _check_numerical_stability(
         self,
         tag_logits: torch.Tensor,
-        rating_logits: torch.Tensor
     ) -> None:
-        """Check for NaN/Inf in logits and log statistics.
-
-        This method is only called when config.check_numerical_stability=True.
-        It helps diagnose numerical instability issues during training/inference.
-
-        Similar to SimplifiedTagger._check_numerical_stability for consistent
-        monitoring across architectures.
-        """
-        # Check for non-finite values before clamping
+        """Check for NaN/Inf in logits and log statistics."""
         tag_has_nan = torch.isnan(tag_logits).any().item()
         tag_has_inf = torch.isinf(tag_logits).any().item()
-        rating_has_nan = torch.isnan(rating_logits).any().item()
-        rating_has_inf = torch.isinf(rating_logits).any().item()
 
         if tag_has_nan or tag_has_inf:
             warnings.warn(
@@ -1457,29 +1451,13 @@ class SwinV2Tagger(BaseTagger):
                 f"mean={tag_logits.mean():.2f}, std={tag_logits.std():.2f}"
             )
 
-        if rating_has_nan or rating_has_inf:
-            warnings.warn(
-                f"[SwinV2] Numerical instability in rating_logits: "
-                f"NaN={rating_has_nan}, Inf={rating_has_inf}"
-            )
-
-        # Check if values exceed clamping thresholds
         clamp_threshold = getattr(self._config, 'logit_clamp_value', 15.0) or 15.0
         tag_needs_clamp = (tag_logits.abs() > clamp_threshold).any().item()
-        rating_needs_clamp = (rating_logits.abs() > clamp_threshold).any().item()
-
         if tag_needs_clamp:
             num_clamped = (tag_logits.abs() > clamp_threshold).sum().item()
             warnings.warn(
                 f"[SwinV2] Clamping {num_clamped} tag logits "
                 f"(max abs value: {tag_logits.abs().max():.2f}, threshold: {clamp_threshold})"
-            )
-
-        if rating_needs_clamp:
-            num_clamped = (rating_logits.abs() > clamp_threshold).sum().item()
-            warnings.warn(
-                f"[SwinV2] Clamping {num_clamped} rating logits "
-                f"(max abs value: {rating_logits.abs().max():.2f}, threshold: {clamp_threshold})"
             )
 
     def forward(
@@ -1546,23 +1524,20 @@ class SwinV2Tagger(BaseTagger):
             # features: (B, H', W', C) -> (B, C)
             features = features.mean(dim=(1, 2))
 
-        # Classification heads
+        # Classification head (ratings are included as tags)
         tag_logits = self.tag_head(features)
-        rating_logits = self.rating_head(features)
 
         # Monitor for numerical issues (optional, controlled by config)
         if getattr(self._config, 'check_numerical_stability', False):
-            self._check_numerical_stability(tag_logits, rating_logits)
+            self._check_numerical_stability(tag_logits)
 
         # Logit clamping for numerical stability
         if hasattr(self._config, 'logit_clamp_value') and self._config.logit_clamp_value:
             clamp_val = self._config.logit_clamp_value
             tag_logits = torch.clamp(tag_logits, min=-clamp_val, max=clamp_val)
-            rating_logits = torch.clamp(rating_logits, min=-clamp_val, max=clamp_val)
 
         return {
             'tag_logits': tag_logits,
-            'rating_logits': rating_logits,
             'logits': tag_logits,  # Alias for backward compatibility
         }
 

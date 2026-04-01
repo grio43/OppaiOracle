@@ -1896,6 +1896,70 @@ class CheckpointManager:
                 state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
                 logger.info("Removed '_orig_mod.' prefix from state dict keys for non-compiled model")
 
+            # Filter out removed rating_head keys from old checkpoints
+            rating_head_keys = [k for k in state_dict if 'rating_head' in k]
+            if rating_head_keys:
+                for k in rating_head_keys:
+                    del state_dict[k]
+                logger.info(f"Removed {len(rating_head_keys)} rating_head keys from checkpoint (rating merged into tags)")
+
+            # Interpolate positional embeddings if resolution changed between checkpoint and model.
+            # This enables loading a checkpoint trained at one resolution (e.g. 224) into a model
+            # configured for a different resolution (e.g. 448) by bicubic-interpolating the
+            # learned spatial positional embeddings to the new grid size.
+            pos_embed_key = None
+            for key in state_dict:
+                if key.endswith('pos_embed'):
+                    pos_embed_key = key
+                    break
+            if pos_embed_key is not None:
+                saved_pos_embed = state_dict[pos_embed_key]
+                # Get the model's expected pos_embed shape
+                model_to_check = model
+                if hasattr(model_to_check, 'module'):
+                    model_to_check = model_to_check.module
+                if hasattr(model_to_check, '_orig_mod'):
+                    model_to_check = model_to_check._orig_mod
+                model_pos_embed = None
+                for name, param in model_to_check.named_parameters():
+                    if name.endswith('pos_embed'):
+                        model_pos_embed = param
+                        break
+                if model_pos_embed is not None and saved_pos_embed.shape != model_pos_embed.shape:
+                    # Shape: (1, num_tokens, hidden_size) where num_tokens = num_patches + num_special_tokens
+                    saved_len = saved_pos_embed.shape[1]
+                    model_len = model_pos_embed.shape[1]
+                    hidden_size = saved_pos_embed.shape[2]
+                    # Determine number of non-patch (special) tokens by comparing with known grid sizes
+                    saved_grid = int(math.isqrt(saved_len - 1))
+                    # Try common special token counts (1 for CLS, up to 4 for CLS+style+line+color)
+                    num_special = saved_len - saved_grid * saved_grid
+                    model_grid = int(math.isqrt(model_len - num_special))
+                    if saved_grid * saved_grid + num_special == saved_len and model_grid * model_grid + num_special == model_len:
+                        logger.info(
+                            f"Interpolating pos_embed from {saved_grid}x{saved_grid} "
+                            f"({saved_len} tokens) to {model_grid}x{model_grid} "
+                            f"({model_len} tokens), {num_special} special token(s)"
+                        )
+                        # Separate special tokens (CLS, etc.) from patch embeddings
+                        special_tokens = saved_pos_embed[:, :num_special, :]
+                        patch_embed = saved_pos_embed[:, num_special:, :]
+                        # Reshape to 2D spatial grid, interpolate, flatten back
+                        patch_embed = patch_embed.reshape(1, saved_grid, saved_grid, hidden_size).permute(0, 3, 1, 2).float()
+                        patch_embed = torch.nn.functional.interpolate(
+                            patch_embed, size=(model_grid, model_grid), mode='bicubic', align_corners=False
+                        )
+                        patch_embed = patch_embed.permute(0, 2, 3, 1).reshape(1, model_grid * model_grid, hidden_size)
+                        patch_embed = patch_embed.to(saved_pos_embed.dtype)
+                        state_dict[pos_embed_key] = torch.cat([special_tokens, patch_embed], dim=1)
+                        logger.info(f"pos_embed interpolated: {saved_pos_embed.shape} -> {state_dict[pos_embed_key].shape}")
+                    else:
+                        logger.warning(
+                            f"pos_embed shape mismatch ({saved_pos_embed.shape} vs {model_pos_embed.shape}) "
+                            f"but could not determine valid grid sizes for interpolation. "
+                            f"Skipping interpolation — load_state_dict will likely fail."
+                        )
+
             try:
                 model.load_state_dict(state_dict)
             except RuntimeError as e:
@@ -2655,13 +2719,15 @@ class TrainingUtils:
         """Create CosineAnnealingWarmupRestarts scheduler from training config."""
         steps_per_epoch = getattr(training_cfg, "steps_per_epoch", 1)
         total_steps = steps_per_epoch * training_cfg.num_epochs
+        warmup_epochs = int(getattr(training_cfg, "warmup_epochs", 5))
+        warmup_steps = warmup_epochs * steps_per_epoch
         return CosineAnnealingWarmupRestarts(
             optimizer,
             first_cycle_steps=total_steps,
             cycle_mult=1.0,
             max_lr=training_cfg.learning_rate,
             min_lr=getattr(training_cfg, "lr_end", 1e-6),
-            warmup_steps=training_cfg.warmup_steps,
+            warmup_steps=warmup_steps,
         )
     
     @staticmethod
@@ -2673,7 +2739,7 @@ class TrainingUtils:
         """Get parameter groups with proper weight decay and layer-wise learning rate decay"""
         
         # Parameters that should not have weight decay
-        no_decay = ['bias', 'LayerNorm.weight', 'LayerNorm.bias', 'layer_norm', 'ln']
+        no_decay = ['bias', 'norm']
         
         if layer_decay is None or layer_decay == 1.0:
             # Standard parameter groups

@@ -11,7 +11,7 @@ from packaging.version import Version
 import logging
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Union, Any
 from dataclasses import dataclass, asdict, field
 from collections import defaultdict
 import yaml
@@ -80,23 +80,15 @@ def _check_versions_and_env(opset: int) -> None:
         _fail(f"opset >= 18 required (requested {opset}). Set export.opset_version to 18 or 19.")
 
 class InferenceWrapper(nn.Module):
-    """Wrapper that adds preprocessing matching the training pipeline.
+    """Thin wrapper: preprocessed input -> model -> sigmoid probabilities.
 
-    Preprocessing steps (matching dataset_loader.py):
-    1. Convert from uint8 (B, H, W, C) to float32 (B, C, H, W)
-    2. Letterbox resize: scale to fit target while preserving aspect ratio
-    3. Pad to square with gray background (114, 114, 114)
-    4. Normalize with mean/std
+    Preprocessing (letterbox, pad, normalize) is NOT included in the ONNX graph.
+    Consumers must preprocess externally using params from the model metadata.
     """
 
-    def __init__(self, model, image_size, normalize_mean, normalize_std, pad_color=(114, 114, 114)):
+    def __init__(self, model):
         super().__init__()
         self.model = model
-        self.image_size = image_size
-        self.register_buffer('mean', torch.tensor(normalize_mean).view(1, 3, 1, 1))
-        self.register_buffer('std', torch.tensor(normalize_std).view(1, 3, 1, 1))
-        # Pad color normalized to 0-1 range for canvas creation
-        self.register_buffer('pad_color', torch.tensor(pad_color).float() / 255.0)
 
         # Enable ONNX-compatible attention mode (uses SDPA instead of flex_attention)
         # The actual tagger (SimplifiedTagger/SwinV2Tagger) may be directly in self.model
@@ -105,58 +97,18 @@ class InferenceWrapper(nn.Module):
         if hasattr(inner_model, 'set_onnx_mode'):
             inner_model.set_onnx_mode(True)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass with preprocessing.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass on preprocessed input.
 
         Args:
-            x: Input tensor of shape (B, H, W, C) in uint8 format [0, 255]
+            x: Preprocessed tensor (B, C, H, W) float32, already normalized.
 
         Returns:
-            Tuple of (tag_scores, rating_scores):
-                - tag_scores: (B, num_tags) raw logits for tag predictions
-                - rating_scores: (B, num_ratings) raw logits for rating predictions
+            probabilities: (B, num_tags) sigmoid probabilities in [0, 1].
         """
-        # Input: (B, H, W, C) uint8
-        B, H, W, C = x.shape
-        target = self.image_size
-
-        # Convert to (B, C, H, W) float32 in 0-1 range
-        x = x.permute(0, 3, 1, 2).contiguous().to(torch.float32) / 255.0
-
-        # Letterbox resize: compute scale to fit inside target while preserving aspect ratio
-        # Match training: scale = min(target/w, target/h), capped at 1.0 (no upscaling)
-        scale_w = target / W
-        scale_h = target / H
-        scale = min(scale_w, scale_h, 1.0)  # Never upscale, only downscale
-
-        new_w = max(1, int(round(W * scale)))
-        new_h = max(1, int(round(H * scale)))
-
-        # Resize with bilinear interpolation (matching PIL BILINEAR in training)
-        if new_w != W or new_h != H:
-            x = F.interpolate(x, size=(new_h, new_w), mode='bilinear', align_corners=False)
-
-        # Create canvas with pad color and center the image
-        # pad_color is (3,) tensor, expand to (1, 3, 1, 1) for broadcasting
-        canvas = self.pad_color.view(1, 3, 1, 1).expand(B, 3, target, target).clone()
-
-        # Calculate centering offsets
-        left = (target - new_w) // 2
-        top = (target - new_h) // 2
-
-        # Paste resized image onto canvas
-        canvas[:, :, top:top + new_h, left:left + new_w] = x
-
-        # Normalize
-        x = (canvas - self.mean) / self.std
-
-        # Run model
         outputs = self.model(x)
-
-        # Return both tag_logits and rating_logits for ONNX export
-        if isinstance(outputs, dict):
-            return outputs['tag_logits'], outputs['rating_logits']
-        return outputs, outputs  # Fallback if model returns single tensor
+        tag_logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
+        return torch.sigmoid(tag_logits)
 
 class ONNXExporter:
     """Main ONNX export class"""
@@ -536,7 +488,10 @@ class ONNXExporter:
         # Handle DDP weights
         if any(k.startswith('module.') for k in state_dict.keys()):
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        
+
+        # Filter out removed rating_head keys from old checkpoints
+        state_dict = {k: v for k, v in state_dict.items() if 'rating_head' not in k}
+
         # Load state dict with strict=False to handle minor mismatches
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
         
@@ -547,15 +502,8 @@ class ONNXExporter:
         
         model.eval()
         
-        # Wrap model for inference with preprocessing matching training pipeline
-        pad_color = getattr(self.config.data, 'pad_color', (114, 114, 114))
-        wrapped_model = InferenceWrapper(
-            model,
-            image_size=self.config.data.image_size,
-            normalize_mean=self.config.data.normalize_mean,
-            normalize_std=self.config.data.normalize_std,
-            pad_color=pad_color
-        )
+        # Wrap model for inference (preprocessing is external; sigmoid applied on output)
+        wrapped_model = InferenceWrapper(model)
         wrapped_model.to(self.device)
         
         return wrapped_model
@@ -661,62 +609,81 @@ class ONNXExporter:
         output_path = Path(self.export_config.output_path)
         
         try:
-            # Create dummy input for the new InferenceWrapper
-            # Input is a raw image: (B, H, W, C) with dtype=uint8
-            # Use small size for faster export - exact size doesn't matter with dynamic axes
-            dummy_batch_size = max(1, self.config.data.batch_size)
-            dummy_height = 256  # Small representative size for faster export
-            dummy_width = 256
-            dummy_input = torch.randint(
-                0, 255,
-                (dummy_batch_size, dummy_height, dummy_width, 3),
-                dtype=torch.uint8,
-                device=self.device
+            # Dummy input: preprocessed tensor (B, C, H, W) float32
+            # Input is always image_size x image_size after external preprocessing
+            image_size = self.config.data.image_size
+            dummy_input = torch.randn(
+                1, 3, image_size, image_size,
+                dtype=torch.float32,
+                device=self.device,
             )
-            logger.debug(f"Using dummy input shape for export: ({dummy_batch_size}, {dummy_height}, {dummy_width}, 3)")
+            logger.debug(f"Using dummy input shape for export: (1, 3, {image_size}, {image_size})")
 
-            # The model is internally converted to float32 for processing
             logger.info("Ensuring model is in float32 for export")
             self.model.float()
 
             # Export
             logger.info(f"Exporting to {output_path}")
-            
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore")
-                
-                torch.onnx.export(
-                    self.model,
-                    dummy_input,
-                    str(output_path),
-                    export_params=self.export_config.export_params,
-                    opset_version=self.export_config.opset_version,
-                    do_constant_folding=self.export_config.do_constant_folding,
-                    input_names=["input_image"],
-                    output_names=["tag_scores", "rating_scores"],
-                    dynamic_axes={
-                        "input_image": {0: "batch_size", 1: "height", 2: "width"},
-                        "tag_scores": {0: "batch_size"},
-                        "rating_scores": {0: "batch_size"}
-                    } if self.export_config.dynamic_batch_size else None,
-                    verbose=False
-                )
-            
-            # Add metadata
-            if self.export_config.add_metadata:
-                self._add_metadata(output_path)
 
-            # Validate BEFORE optimization (critical fix)
+            use_dynamo = getattr(self.export_config, 'use_dynamo_export', False)
+
+            if use_dynamo:
+                # Dynamo-based export (PyTorch 2.5+) — better graph capture
+                logger.info("Using Dynamo-based ONNX exporter")
+                dynamic_shapes = None
+                if self.export_config.dynamic_batch_size:
+                    batch_dim = torch.export.Dim("batch_size", min=1, max=self.export_config.max_batch_size)
+                    dynamic_shapes = {"x": {0: batch_dim}}
+
+                export_output = torch.onnx.export(
+                    self.model,
+                    (dummy_input,),
+                    dynamo=True,
+                    dynamic_shapes=dynamic_shapes,
+                    input_names=["pixel_values"],
+                    output_names=["probabilities"],
+                )
+                export_output.save(str(output_path))
+            else:
+                # Legacy TorchScript-based export
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=UserWarning, module="torch.onnx")
+                    warnings.filterwarnings("ignore", message=".*TracerWarning.*")
+
+                    torch.onnx.export(
+                        self.model,
+                        dummy_input,
+                        str(output_path),
+                        export_params=self.export_config.export_params,
+                        opset_version=self.export_config.opset_version,
+                        do_constant_folding=self.export_config.do_constant_folding,
+                        input_names=["pixel_values"],
+                        output_names=["probabilities"],
+                        dynamic_axes={
+                            "pixel_values": {0: "batch_size"},
+                            "probabilities": {0: "batch_size"},
+                        } if self.export_config.dynamic_batch_size else None,
+                        verbose=False
+                    )
+            
+            # Validate structure before optimization
             if self.export_config.validate_export:
                 self._validate_model(output_path)
 
-            # Optimize
+            # Optimize (must run before adding metadata — optimizer rebuilds
+            # the graph and strips metadata_props)
             if self.export_config.optimize:
                 self._optimize_model(output_path)
 
-            # Validate ORT inference after optimization
+            # Add metadata AFTER optimization so it persists in the final model
+            if self.export_config.add_metadata:
+                self._add_metadata(output_path)
+
+            # Validate ORT inference on the final model
             if self.export_config.validate_export:
-                self._validate_ort_inference(output_path)
+                if not self._validate_ort_inference(output_path):
+                    logger.error("Post-optimization inference validation failed! "
+                                 "The exported model may produce incorrect outputs.")
             
             logger.info(f"✓ Full model exported to {output_path}")
             
@@ -797,8 +764,14 @@ class ONNXExporter:
             # Get model config
             cfg = self.model_config
 
-            # Create fusion options
-            fusion_options = FusionOptions('bert')  # Use BERT-style optimizations for transformers
+            # Create fusion options — prefer 'vit' (ORT 1.17+), fall back to 'bert'
+            try:
+                fusion_options = FusionOptions('vit')
+                model_type = 'vit'
+            except Exception:
+                fusion_options = FusionOptions('bert')
+                model_type = 'bert'
+                logger.info("ORT does not support model_type='vit', using 'bert' fallback")
             fusion_options.enable_gelu = True
             fusion_options.enable_bias_gelu = True
             fusion_options.enable_attention = True
@@ -818,7 +791,7 @@ class ONNXExporter:
             # Optimize using the correct API
             optimized_model = optimize_model(
                 input=str(model_path),
-                model_type='bert',  # Use BERT optimizations for Vision Transformer
+                model_type=model_type,
                 num_heads=cfg.get('num_heads', 12),
                 hidden_size=cfg.get('hidden_size', 768),
                 optimization_options=fusion_options,
@@ -854,13 +827,12 @@ class ONNXExporter:
             image_size = self.config.data.image_size
 
             # Simplify with onnx-simplifier
-            # Input shape is (B, H, W, C) for the raw image input
             model_simp, check = simplify(
                 model,
                 check_n=3,
                 perform_optimization=True,
                 skip_fuse_bn=False,
-                input_shapes={'input_image': [batch_size, image_size, image_size, 3]}
+                input_shapes={'pixel_values': [1, 3, image_size, image_size]}
             )
 
             if check:
@@ -878,8 +850,8 @@ class ONNXExporter:
     def _validate_ort_inference(self, model_path: Path):
         """Validate model through ORT inference and compare with PyTorch outputs.
 
-        This validates both tag_scores and rating_scores outputs match between
-        PyTorch and ONNX Runtime within tolerance.
+        Validates probabilities output matches between PyTorch and ONNX Runtime
+        within tolerance. Uses preprocessed float32 input matching the new export format.
         """
         logger.info("Validating model inference (comparing PyTorch vs ONNX)...")
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
@@ -888,61 +860,54 @@ class ONNXExporter:
             # Create ONNX Runtime session
             session = ort.InferenceSession(str(model_path), providers=providers)
 
-            # Test with dummy input matching export format: (B, H, W, C) uint8
-            batch_size = min(2, self.config.data.batch_size)  # Small batch for validation
+            # Test with preprocessed float32 input: (B, C, H, W)
             image_size = self.config.data.image_size
-            test_input = np.random.randint(
-                0, 255,
-                (batch_size, image_size, image_size, 3),
-                dtype=np.uint8
-            )
+            test_input = np.random.randn(1, 3, image_size, image_size).astype(np.float32)
 
-            # Run ONNX inference
-            onnx_outputs = session.run(None, {"input_image": test_input})
+            # Run ONNX inference — use actual input name from session
+            input_name = session.get_inputs()[0].name
+            onnx_outputs = session.run(None, {input_name: test_input})
 
-            # Check we have two outputs (tag_scores, rating_scores)
-            if len(onnx_outputs) != 2:
-                logger.warning(f"Expected 2 outputs, got {len(onnx_outputs)}. Skipping comparison.")
+            if len(onnx_outputs) < 1:
+                logger.warning(f"Expected 1 output, got {len(onnx_outputs)}. Skipping comparison.")
                 logger.info("✓ Model inference validation passed (basic)")
                 return True
 
-            onnx_tag_scores = onnx_outputs[0]
-            onnx_rating_scores = onnx_outputs[1]
+            onnx_probs = onnx_outputs[0]
 
             # Run PyTorch inference for comparison
             torch_input = torch.from_numpy(test_input).to(self.device)
             self.model.eval()
             with torch.no_grad():
-                torch_tag_scores, torch_rating_scores = self.model(torch_input)
-                torch_tag_scores = torch_tag_scores.cpu().numpy()
-                torch_rating_scores = torch_rating_scores.cpu().numpy()
+                torch_probs = self.model(torch_input)
+                torch_probs = torch_probs.cpu().numpy()
 
             # Compare outputs
             rtol = self.export_config.tolerance_rtol
             atol = self.export_config.tolerance_atol
 
-            tag_max_diff = np.max(np.abs(torch_tag_scores - onnx_tag_scores))
-            tag_mean_diff = np.mean(np.abs(torch_tag_scores - onnx_tag_scores))
-            rating_max_diff = np.max(np.abs(torch_rating_scores - onnx_rating_scores))
-            rating_mean_diff = np.mean(np.abs(torch_rating_scores - onnx_rating_scores))
+            max_diff = np.max(np.abs(torch_probs - onnx_probs))
+            mean_diff = np.mean(np.abs(torch_probs - onnx_probs))
 
-            logger.info(f"  Tag scores    - max diff: {tag_max_diff:.6f}, mean diff: {tag_mean_diff:.6f}")
-            logger.info(f"  Rating scores - max diff: {rating_max_diff:.6f}, mean diff: {rating_mean_diff:.6f}")
+            logger.info(f"  Probabilities - max diff: {max_diff:.6f}, mean diff: {mean_diff:.6f}")
 
-            # Check tolerances
-            tag_ok = np.allclose(torch_tag_scores, onnx_tag_scores, rtol=rtol, atol=atol)
-            rating_ok = np.allclose(torch_rating_scores, onnx_rating_scores, rtol=rtol, atol=atol)
+            # Sanity check: output should be in [0, 1] (sigmoid)
+            if onnx_probs.min() < -0.01 or onnx_probs.max() > 1.01:
+                logger.warning(
+                    f"Output range [{onnx_probs.min():.4f}, {onnx_probs.max():.4f}] "
+                    f"outside expected [0, 1] — sigmoid may not be applied correctly"
+                )
 
-            if tag_ok and rating_ok:
+            ok = np.allclose(torch_probs, onnx_probs, rtol=rtol, atol=atol)
+
+            if ok:
                 logger.info("✓ Model inference validation passed (outputs match)")
                 return True
             else:
-                if not tag_ok:
-                    logger.warning(f"Tag scores exceed tolerance (rtol={rtol}, atol={atol})")
-                if not rating_ok:
-                    logger.warning(f"Rating scores exceed tolerance (rtol={rtol}, atol={atol})")
-                logger.warning("Model validation passed with warnings (outputs differ slightly)")
-                return True  # Still consider it passed, just with warnings
+                logger.warning(f"Outputs exceed tolerance (rtol={rtol}, atol={atol})")
+                logger.warning(f"  Max difference: {max_diff:.6f}, Mean difference: {mean_diff:.6f}")
+                logger.error("Model inference validation FAILED — outputs differ beyond acceptable tolerance")
+                return False
 
         except Exception as e:
             logger.error(f"Inference validation failed: {e}")
@@ -954,10 +919,10 @@ class ONNXExporter:
         
         try:
             quantize_dynamic(
-                model_input=str(input_path),
-                model_output=str(output_path),
+                model_input=input_path,
+                model_output=output_path,
                 weight_type=QuantType.QUInt8,
-                optimize_model=True,
+                optimize_model=False,  # Already optimized upstream
                 per_channel=True,
                 reduce_range=True
             )
@@ -1080,6 +1045,9 @@ class ONNXExporter:
                 'normalize_mean': json.dumps(self.config.data.normalize_mean),
                 'normalize_std': json.dumps(self.config.data.normalize_std),
                 'pad_color': json.dumps(list(self.config.data.pad_color)),
+                'output_activation': 'sigmoid',
+                'input_format': 'BCHW_float32_normalized',
+                'preprocessing': 'external',
                 'framework': 'PyTorch',
                 'framework_version': torch.__version__,
                 'onnx_version': onnx.__version__,
@@ -1120,88 +1088,6 @@ class ONNXExporter:
             onnx.checker.check_model(model)
             logger.info("✓ ONNX model structure is valid")
             # Do NOT run inference validation here - save for after optimization
-        except Exception as e:
-            logger.error(f"Validation failed: {e}")
-            raise
-
-    def _validate_model_old(self, model_path: Path):
-        '''DEPRECATED: Old validation method that combines structure and inference checks'''
-        logger.info("Validating ONNX model...")
-
-        batch_size = self.config.data.batch_size
-        image_size = self.config.data.image_size
-
-        try:
-            # Check model structure
-            model = onnx.load(str(model_path))
-            onnx.checker.check_model(model)
-            logger.info("✓ ONNX model structure is valid")
-
-            # Create test input matching export format: (B, H, W, C) uint8
-            test_input = np.random.randint(
-                0, 255,
-                (batch_size, image_size, image_size, 3),
-                dtype=np.uint8
-            )
-
-            # Run inference with PyTorch
-            torch_input = torch.from_numpy(test_input).to(self.device)
-
-            # CRITICAL FIX: Ensure model is in eval mode and use no_grad
-            self.model.eval()
-            if hasattr(self.model, 'model'):
-                self.model.model.eval()
-
-            with torch.no_grad():
-                torch_scores = self.model(torch_input)
-                torch_scores = torch_scores.cpu().numpy()
-
-            torch_predictions = (torch_scores > 0.5).astype(np.float32)
-
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            session = ort.InferenceSession(str(model_path), providers=providers)
-
-            onnx_outputs = session.run(
-                None,
-                {"input_image": test_input}
-            )
-
-            onnx_scores = onnx_outputs[0]
-            onnx_predictions = (onnx_scores > 0.5).astype(np.float32)
-
-            max_diff = np.max(np.abs(torch_scores - onnx_scores))
-            mean_diff = np.mean(np.abs(torch_scores - onnx_scores))
-
-            rtol = getattr(self.export_config, 'tolerance_rtol', 1e-3)
-            atol = getattr(self.export_config, 'tolerance_atol', 1e-5)
-            if max_diff < 5e-4:
-                rtol = max(rtol, 1e-3)
-                atol = max(atol, 5e-4)
-
-            scores_close = np.allclose(
-                torch_scores, onnx_scores,
-                rtol=rtol, atol=atol
-            )
-
-            top_k = min(100, torch_scores.shape[-1])
-            torch_top_k = np.argsort(torch_scores, axis=-1)[:, -top_k:]
-            onnx_top_k = np.argsort(onnx_scores, axis=-1)[:, -top_k:]
-            top_k_stable = np.array_equal(torch_top_k, onnx_top_k)
-
-            if scores_close:
-                logger.info("✓ Model validation passed!")
-                logger.info(f"  Max score difference: {max_diff:.6f}")
-                logger.info(f"  Mean score difference: {mean_diff:.6f}")
-                logger.info(f"  Top-{top_k} stability: {'✓' if top_k_stable else '⚠ (minor differences)'}")
-            else:
-                if max_diff < 1e-3:
-                    logger.warning("⚠ Model validation: small numerical differences detected")
-                    logger.warning(f"  Max difference: {max_diff:.6f} (acceptable for deployment)")
-                else:
-                    logger.error("✗ Model validation failed!")
-                    logger.error(f"  Max score diff: {max_diff}")
-                    raise ValueError("ONNX model output does not match PyTorch model")
-
         except Exception as e:
             logger.error(f"Validation failed: {e}")
             raise
@@ -1294,24 +1180,24 @@ class ONNXExporter:
             # Log which provider is being used
             logger.info(f"Using providers: {session.get_providers()}")
 
-            # Prepare input matching export format: (B, H, W, C) uint8
-            input_data = np.random.randint(
-                0, 255,
-                (batch_size, image_size, image_size, 3),
-                dtype=np.uint8
-            )
+            # Prepare input matching export format: (B, C, H, W) float32
+            input_data = np.random.randn(
+                batch_size, 3, image_size, image_size
+            ).astype(np.float32)
+
+            input_name = session.get_inputs()[0].name
 
             # Warmup runs
             logger.info("Warming up...")
             for _ in range(5):
-                _ = session.run(None, {"input_image": input_data})
+                _ = session.run(None, {input_name: input_data})
 
             # Benchmark runs
             logger.info(f"Running {num_runs} inference iterations...")
             times = []
             for _ in tqdm(range(num_runs), desc="Benchmarking"):
                 start = time.perf_counter()
-                _ = session.run(None, {"input_image": input_data})
+                _ = session.run(None, {input_name: input_data})
                 end = time.perf_counter()
                 times.append((end - start) * 1000)  # Convert to ms
 

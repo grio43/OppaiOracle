@@ -61,7 +61,7 @@ def _shutdown_dataloader_workers(loader: "Optional[DataLoader]") -> None:
 
 from Monitor_log import MonitorConfig, TrainingMonitor
 from utils.cache_monitor import monitor as cache_monitor
-from evaluation_metrics import MetricComputer
+from evaluation_metrics import MetricComputer, FrequencyBucketMetrics, ThresholdCalibrator
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -78,12 +78,6 @@ from orientation_handler import OrientationHandler, OrientationMonitor
 # Cache monitor interval (steps). Configurable via CACHE_MONITOR_INTERVAL_STEPS env var.
 # Default: 3000 steps (~50 minutes at 1 step/sec, ~96k images with batch_size=32)
 CACHE_MONITOR_EVERY_STEPS = int(os.getenv('CACHE_MONITOR_INTERVAL_STEPS', '3000'))
-
-# Rating index for "unknown" rating class to ignore during loss computation.
-# This must match the vocabulary definition in vocabulary.py:
-#   rating_to_index = {"general": 0, "sensitive": 1, "questionable": 2, "explicit": 3, "unknown": 4}
-# If the vocabulary changes, update this constant accordingly.
-RATING_UNKNOWN_INDEX = 4
 
 # Periodic NaN/Inf check interval (steps). Configurable via NAN_CHECK_INTERVAL_STEPS env var.
 # Default: 50 steps - balances early detection with minimal GPU sync overhead.
@@ -102,7 +96,7 @@ Import error: {e}"""
     raise ImportError(error_msg)
 
 try:
-    from model_architecture import create_model, VisionTransformerConfig
+    from model_architecture import create_model, VisionTransformerConfig, initialize_tag_head_bias
 except ImportError as e:
     error_msg = (
         f"""MISSING REQUIRED FILE: model_architecture.py
@@ -140,119 +134,6 @@ Please ensure loss_functions.py exists in the current directory with MultiTaskLo
 Import error: {e}"""
     )
     raise ImportError(error_msg)
-
-
-class RatingValidator:
-    """Validator for rating labels with error tracking and configurable error handling.
-
-    This class handles validation of rating labels during training and provides
-    flexible error handling strategies to prevent training crashes from data quality issues.
-    """
-
-    def __init__(self, num_ratings: int, action: str = 'warn'):
-        """
-        Initialize the rating validator.
-
-        Args:
-            num_ratings: Number of valid rating classes (labels must be in [0, num_ratings))
-            action: Error handling strategy:
-                - 'error': Crash like before (raises RuntimeError)
-                - 'warn': Log warning and skip batch (recommended for production)
-                - 'clamp': Fix labels by clamping to valid range
-                - 'ignore': Continue with invalid data (not recommended)
-        """
-        self.num_ratings = num_ratings
-        self.action = action
-        self.stats = {
-            'total_batches': 0,
-            'invalid_batches': 0,
-            'invalid_samples': 0,
-        }
-        self.logger = logging.getLogger(__name__)
-
-    def validate_and_handle(
-        self,
-        rating_labels: torch.Tensor,
-        batch: dict,
-        global_step: int
-    ) -> Tuple[torch.Tensor, bool]:
-        """
-        Validate rating labels and handle errors based on configured action.
-
-        Args:
-            rating_labels: The rating labels tensor to validate
-            batch: The full batch dict (may contain image_ids for logging)
-            global_step: Current training step number
-
-        Returns:
-            (labels, is_valid): Tuple of (potentially fixed labels, whether batch is valid)
-        """
-        self.stats['total_batches'] += 1
-
-        # Skip validation for float labels (used in some loss functions)
-        if rating_labels.dtype not in (torch.long, torch.int64):
-            return rating_labels, True
-
-        # Check for out-of-range labels
-        mask_valid = (rating_labels >= 0) & (rating_labels < self.num_ratings)
-
-        if mask_valid.all():
-            return rating_labels, True  # All valid
-
-        # Found invalid labels - handle based on action
-        num_invalid = (~mask_valid).sum().item()
-        self.stats['invalid_batches'] += 1
-        self.stats['invalid_samples'] += num_invalid
-
-        min_val = rating_labels.min().item()
-        max_val = rating_labels.max().item()
-
-        error_msg = (
-            f"Invalid rating labels at step {global_step}: "
-            f"{num_invalid}/{len(rating_labels)} samples out of range. "
-            f"Found min={min_val}, max={max_val}, expected [0, {self.num_ratings})."
-        )
-
-        # Log which samples are invalid (if batch has identifiers)
-        if 'image_ids' in batch:
-            invalid_indices = (~mask_valid).nonzero(as_tuple=True)[0].tolist()
-            invalid_ids = [batch['image_ids'][i] for i in invalid_indices[:10]]  # Log first 10
-            if len(invalid_indices) > 10:
-                self.logger.warning(f"{error_msg} First 10 invalid samples: {invalid_ids}")
-            else:
-                self.logger.warning(f"{error_msg} Invalid samples: {invalid_ids}")
-
-        if self.action == 'error':
-            # Crash like before
-            raise RuntimeError(error_msg)
-
-        elif self.action == 'warn':
-            # Log and skip this batch
-            self.logger.warning(f"{error_msg} Skipping batch.")
-            return rating_labels, False  # Signal to skip batch
-
-        elif self.action == 'clamp':
-            # Fix the labels by clamping
-            rating_labels = rating_labels.clamp(0, self.num_ratings - 1)
-            self.logger.warning(f"{error_msg} Clamped to valid range.")
-            return rating_labels, True
-
-        elif self.action == 'ignore':
-            # Continue with invalid data (not recommended)
-            self.logger.debug(f"{error_msg} Ignoring.")
-            return rating_labels, True
-
-        else:
-            raise ValueError(f"Unknown rating validation action: {self.action}")
-
-    def get_stats(self) -> dict:
-        """Return validation statistics for monitoring."""
-        stats = self.stats.copy()
-        if stats['total_batches'] > 0:
-            stats['invalid_rate'] = stats['invalid_batches'] / stats['total_batches']
-        else:
-            stats['invalid_rate'] = 0.0
-        return stats
 
 
 def assert_finite(*tensors, names=None, batch=None, outputs=None, config=None):
@@ -308,6 +189,69 @@ def _loss_to_float(value: Any) -> float:
             value = value.mean()
         return float(value)
     return float(value)
+
+
+def _compute_class_weights(
+    vocab,
+    strategy: str,
+    clip_min: float = 0.1,
+    clip_max: float = 10.0,
+) -> list:
+    """Compute per-class weights from tag frequencies.
+
+    Args:
+        vocab: TagVocabulary with tag_frequencies and index_to_tag.
+        strategy: Weighting strategy ("inverse_sqrt").
+        clip_min: Floor for weights (prevents near-zero).
+        clip_max: Cap for weights (prevents extreme values).
+
+    Returns:
+        List of floats, length = vocab size, suitable for AsymmetricFocalLoss.
+    """
+    import math
+
+    vocab_size = len(vocab.tag_to_index)
+    freqs = vocab.tag_frequencies
+    raw_weights = []
+
+    for idx in range(vocab_size):
+        tag = vocab.index_to_tag.get(idx, "")
+        # PAD (0) and UNK (1) get zero weight — already excluded by ignore_indices
+        if idx <= 1:
+            raw_weights.append(0.0)
+            continue
+        freq = freqs.get(tag, 0)
+        if freq <= 0:
+            raw_weights.append(1.0)
+            continue
+
+        if strategy == "inverse_sqrt":
+            raw_weights.append(1.0 / math.sqrt(freq))
+        else:
+            raise ValueError(f"Unknown class_weight_strategy: {strategy}")
+
+    # Normalize non-special weights to mean=1.0
+    active_weights = [w for w in raw_weights if w > 0]
+    if active_weights:
+        mean_w = sum(active_weights) / len(active_weights)
+        if mean_w > 0:
+            raw_weights = [w / mean_w if w > 0 else 0.0 for w in raw_weights]
+
+    # Clip active weights
+    weights = []
+    for w in raw_weights:
+        if w > 0:
+            weights.append(max(clip_min, min(clip_max, w)))
+        else:
+            weights.append(0.0)
+
+    active = [w for w in weights if w > 0]
+    logger.info(
+        f"Computed class weights (strategy={strategy}): "
+        f"min={min(active):.4f}, max={max(active):.4f}, "
+        f"mean={sum(active)/len(active):.4f}, active_tags={len(active)}/{vocab_size}"
+    )
+    return weights
 
 
 def setup_orientation_aware_training(
@@ -759,7 +703,6 @@ def train_with_orientation_tracking(config: FullConfig):
         logger.info("Pre-training input validation complete.")
 
     num_tags = len(vocab.tag_to_index)
-    num_ratings = len(vocab.rating_to_index)
 
     # Sync config.model.num_labels with actual vocabulary size
     # This is deferred until after vocabulary is loaded (config validation allows 0)
@@ -767,27 +710,18 @@ def train_with_orientation_tracking(config: FullConfig):
         config.model.num_labels = num_tags
         logger.debug(f"Set config.model.num_labels to vocabulary size: {num_tags}")
     elif config.model.num_labels != num_tags:
-        # This is a critical mismatch that will cause model loading failures
-        # or incorrect predictions. Fail fast to prevent silent corruption.
         raise ValueError(
             f"CRITICAL: config.model.num_labels ({config.model.num_labels}) does not match "
             f"vocabulary size ({num_tags}). This mismatch will cause model architecture errors. "
             f"Please update your config or use a compatible vocabulary/checkpoint."
         )
 
-    logger.info(f"Creating model with {num_tags} tags and {num_ratings} ratings")
+    logger.info(f"Creating model with {num_tags} tags (including rating tags)")
 
     metric_computer = MetricComputer(
         num_labels=num_tags,
         skip_indices=[0, 1],  # Skip <PAD> (0) and <UNK> (1) in metric computation
     )
-
-    rating_validation_action = getattr(config.training, 'rating_validation_action', 'warn')
-    rating_validator = RatingValidator(
-        num_ratings=num_ratings,
-        action=rating_validation_action
-    )
-    logger.info(f"Rating validator created with action='{rating_validation_action}'")
 
     # Determine architecture type
     architecture_type = getattr(config.model, 'architecture_type', 'vit')
@@ -817,7 +751,6 @@ def train_with_orientation_tracking(config: FullConfig):
 
         model_config = config.model.to_dict()
         model_config["num_tags"] = num_tags
-        model_config["num_ratings"] = num_ratings
         vit_fields = {field_obj.name for field_obj in fields(VisionTransformerConfig)}
         filtered_model_config = {k: v for k, v in model_config.items() if k in vit_fields}
 
@@ -831,12 +764,11 @@ def train_with_orientation_tracking(config: FullConfig):
         # Existing ViT model creation
         model_config = config.model.to_dict()
         model_config["num_tags"] = num_tags
-        model_config["num_ratings"] = num_ratings
 
         # Filter out config keys that are in unified_config.yaml but not used by VisionTransformerConfig
         # These are legacy/alternate config fields that don't map to the current model architecture
         _unused_config_keys = {
-            'architecture_type', 'attention_probs_dropout_prob',
+            'architecture_type',
             'hidden_dropout_prob', 'initializer_range', 'num_groups', 'num_labels',
             'num_special_tokens', 'tags_per_group', 'use_cls_token', 'use_color_token',
             'use_line_token', 'use_style_token', 'swin_config'
@@ -844,6 +776,16 @@ def train_with_orientation_tracking(config: FullConfig):
         model_config = {k: v for k, v in model_config.items() if k not in _unused_config_keys}
 
         model = create_model(**model_config)
+
+    # Initialize tag_head bias with log-prior (RetinaNet technique).
+    # Checkpoint resume will overwrite this via load_state_dict.
+    initialize_tag_head_bias(
+        model,
+        index_to_tag=vocab.index_to_tag,
+        tag_frequencies=vocab.tag_frequencies,
+        total_samples=len(train_loader.dataset),
+    )
+
     # Move model to device first, then apply dtype conversion
     # NOTE: channels_last memory format is applied LATER (after checkpoint loading and dtype conversion)
     # to ensure it's not lost during transformations. See the channels_last application block below.
@@ -894,10 +836,8 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # Log loss hyperparameters
     tag_loss_cfg = config.training.tag_loss
-    rating_loss_cfg = config.training.rating_loss
     loss_hparams = {
         "tag_loss": tag_loss_cfg.to_dict() if hasattr(tag_loss_cfg, "to_dict") else vars(tag_loss_cfg),
-        "rating_loss": rating_loss_cfg.to_dict() if hasattr(rating_loss_cfg, "to_dict") else vars(rating_loss_cfg),
     }
     logger.info(f"Loss hyperparameters: {loss_hparams}")
     try:
@@ -965,41 +905,17 @@ def train_with_orientation_tracking(config: FullConfig):
     if not use_compile:
         logger.info("torch.compile() disabled (use_compile=false in config)")
 
-    # Validate rating class weights before creating loss function
-    # CrossEntropyLoss can produce NaN if weights contain zeros or NaN values
-    rating_class_weights = None
-    if rating_loss_cfg.class_weights:
-        weights_array = np.array(rating_loss_cfg.class_weights, dtype=np.float32)
-        # Check for NaN/Inf values
-        if not np.all(np.isfinite(weights_array)):
-            nan_mask = ~np.isfinite(weights_array)
-            logger.error(
-                f"Rating class_weights contain non-finite values at indices {np.where(nan_mask)[0].tolist()}: "
-                f"{weights_array[nan_mask].tolist()}. These will be replaced with 1.0."
-            )
-            weights_array = np.where(np.isfinite(weights_array), weights_array, 1.0)
-        # Check for zero values (can cause NaN in loss computation for some edge cases)
-        zero_mask = weights_array == 0.0
-        if np.any(zero_mask):
-            zero_indices = np.where(zero_mask)[0].tolist()
-            logger.warning(
-                f"Rating class_weights contain zeros at indices {zero_indices}. "
-                f"Zero weights effectively disable learning for those classes. "
-                f"If this is intentional (e.g., ignoring 'sensitive' class), this warning can be ignored."
-            )
-        # Check for negative values
-        if np.any(weights_array < 0):
-            neg_mask = weights_array < 0
-            logger.error(
-                f"Rating class_weights contain negative values at indices {np.where(neg_mask)[0].tolist()}: "
-                f"{weights_array[neg_mask].tolist()}. Negative weights will cause undefined behavior."
-            )
-            raise ValueError("Rating class_weights cannot contain negative values")
-        rating_class_weights = torch.tensor(weights_array, dtype=amp_dtype)
+    # Compute class weights from tag frequencies if configured
+    class_weights = tag_loss_cfg.class_weights  # Manual override takes priority
+    if class_weights is None and tag_loss_cfg.class_weight_strategy is not None:
+        class_weights = _compute_class_weights(
+            vocab=vocab,
+            strategy=tag_loss_cfg.class_weight_strategy,
+            clip_min=tag_loss_cfg.class_weight_clip_min,
+            clip_max=tag_loss_cfg.class_weight_clip_max,
+        )
 
     criterion = MultiTaskLoss(
-        tag_loss_weight=0.9,
-        rating_loss_weight=0.1,
         tag_loss_fn=AsymmetricFocalLoss(
             alpha=tag_loss_cfg.alpha,
             clip=tag_loss_cfg.clip,
@@ -1007,13 +923,7 @@ def train_with_orientation_tracking(config: FullConfig):
             gamma_pos=tag_loss_cfg.gamma_pos,
             label_smoothing=tag_loss_cfg.label_smoothing,
             ignore_indices=[0, 1],  # Ignore <PAD> (0) and <UNK> (1) for tags
-        ),
-        # For ratings (single-label classification), use CrossEntropyLoss instead of
-        # AsymmetricFocalLoss which is designed for multi-label classification.
-        rating_loss_fn=torch.nn.CrossEntropyLoss(
-            weight=rating_class_weights,
-            ignore_index=RATING_UNKNOWN_INDEX,  # Ignore "unknown" rating (see vocabulary.py)
-            label_smoothing=rating_loss_cfg.label_smoothing,
+            class_weights=class_weights,
         ),
     )
     criterion = criterion.to(device)
@@ -1113,7 +1023,9 @@ def train_with_orientation_tracking(config: FullConfig):
         f"{accum}x gradient accumulation = {updates_per_epoch} optimizer updates/epoch "
         f"({total_updates} total updates)"
     )
-    warmup_steps = int(getattr(config.training, "warmup_steps", 10_000))
+    warmup_epochs = int(getattr(config.training, "warmup_epochs", 5))
+    warmup_steps = warmup_epochs * updates_per_epoch
+    logger.info(f"Warmup: {warmup_epochs} epochs = {warmup_steps} optimizer updates")
     num_cycles = int(getattr(config.training, "num_cycles", 1))
     cycle_decay = float(getattr(config.training, "cycle_decay", 0.9))
 
@@ -1466,14 +1378,6 @@ def train_with_orientation_tracking(config: FullConfig):
         logger.info(f"  fullgraph: {compile_fullgraph}")
         logger.info(f"  dynamic: {compile_dynamic}")
 
-        # Clear inductor cache to avoid stale compiled kernels from previous runs
-        # with different memory formats. This forces recompilation with current settings.
-        try:
-            torch._inductor.codecache.FxGraphCache.clear()
-            logger.info("Cleared inductor FxGraphCache")
-        except (AttributeError, Exception):
-            pass  # Cache clearing API may not exist in all PyTorch versions
-
         try:
             model = torch.compile(
                 model,
@@ -1555,12 +1459,14 @@ def train_with_orientation_tracking(config: FullConfig):
     # These will be reset each epoch instead of being recreated
     tc = getattr(config, "threshold_calibration", {})
     threshold = tc.get("default_threshold", 0.5) if isinstance(tc, dict) else getattr(tc, "default_threshold", 0.5)
+    skip_metric_cols = 2  # PAD=0, UNK=1 — consistent with loss ignore_indices and bucketed metrics
+    num_metric_labels = num_tags - skip_metric_cols
     val_metrics = {
-        'f1_macro': MultilabelF1Score(num_labels=num_tags, average="macro", threshold=threshold).to(device),
-        'f1_micro': MultilabelF1Score(num_labels=num_tags, average="micro", threshold=threshold).to(device),
-        'map_macro': MultilabelAveragePrecision(num_labels=num_tags, average="macro").to(device)
+        'f1_macro': MultilabelF1Score(num_labels=num_metric_labels, average="macro", threshold=threshold).to(device),
+        'f1_micro': MultilabelF1Score(num_labels=num_metric_labels, average="micro", threshold=threshold).to(device),
+        'map_macro': MultilabelAveragePrecision(num_labels=num_metric_labels, average="macro").to(device)
     }
-    logger.info(f"Validation metrics initialized with {num_tags} tags, threshold={threshold}")
+    logger.info(f"Validation metrics initialized with {num_metric_labels} labels (skipping {skip_metric_cols} special tokens), threshold={threshold}")
 
     # Initialize memory monitor to track RAM usage and prevent OOM
     mem_monitor = MemoryMonitor(warn_threshold_gb=115.0, critical_threshold_gb=125.0)
@@ -1678,23 +1584,7 @@ def train_with_orientation_tracking(config: FullConfig):
                         for k, v in batch.items()
                     }
 
-                # Validate rating labels on CPU BEFORE GPU transfer (avoids GPU sync per batch)
-                cpu_rating_labels, is_valid = rating_validator.validate_and_handle(
-                    batch['rating_labels'], batch, global_step
-                )
-                if not is_valid:
-                    logger.warning(f"Skipping batch {global_step} due to invalid rating labels")
-                    if accum_count > 0:
-                        logger.warning(
-                            f"Discarding {accum_count} accumulated gradient steps due to invalid batch. "
-                            f"Consider reducing gradient_accumulation_steps if this happens frequently."
-                        )
-                        optimizer.zero_grad(set_to_none=True)
-                        accum_count = 0
-                    skipped_batches += 1
-                    continue
-
-                # Transfer tensors to GPU (after CPU validation to avoid unnecessary GPU syncs)
+                # Transfer tensors to GPU
                 # Use dedicated H2D stream to overlap transfers with compute from previous batch
                 pmask = batch.get('padding_mask', None)
                 h2d_ctx = torch.cuda.stream(h2d_stream) if h2d_stream is not None else nullcontext()
@@ -1703,7 +1593,6 @@ def train_with_orientation_tracking(config: FullConfig):
                     if use_channels_last:
                         images = images.contiguous(memory_format=torch.channels_last)
                     tag_labels = batch['tag_labels'].to(device, non_blocking=True)
-                    rating_labels = cpu_rating_labels.to(device, non_blocking=True)
                     if pmask is not None:
                         pmask = pmask.to(device=device, dtype=torch.bool, non_blocking=True)
 
@@ -1739,9 +1628,7 @@ def train_with_orientation_tracking(config: FullConfig):
                         outputs = model(images, padding_mask=pmask)
 
                         if getattr(config.debug, 'log_activation_stats', False) and (global_step % config.training.logging_steps == 0):
-                            # OPTIMIZED: Single GPU sync via .tolist() instead of multiple .item() calls
                             tag_logits = outputs.get('tag_logits')
-                            rating_logits = outputs.get('rating_logits')
                             with torch.no_grad():
                                 if tag_logits is not None:
                                     t_min, t_max, t_mean = torch.stack([tag_logits.min(), tag_logits.max(), tag_logits.mean()]).cpu().tolist()
@@ -1749,25 +1636,18 @@ def train_with_orientation_tracking(config: FullConfig):
                                     monitor.log_scalar('train/tag_logits_max', t_max, global_step)
                                     monitor.log_scalar('train/tag_logits_mean', t_mean, global_step)
                                     logger.debug(f"Tag logits stats - min: {t_min:.6f}, mean: {t_mean:.6f}, max: {t_max:.6f}")
-                                if rating_logits is not None:
-                                    r_min, r_max, r_mean = torch.stack([rating_logits.min(), rating_logits.max(), rating_logits.mean()]).cpu().tolist()
-                                    monitor.log_scalar('train/rating_logits_min', r_min, global_step)
-                                    monitor.log_scalar('train/rating_logits_max', r_max, global_step)
-                                    monitor.log_scalar('train/rating_logits_mean', r_mean, global_step)
-                                    logger.debug(f"Rating logits stats - min: {r_min:.6f}, mean: {r_mean:.6f}, max: {r_max:.6f}")
 
                         # Assert that model outputs are finite before loss calculation (only when debug enabled to avoid GPU sync)
                         if config.debug.enabled:
                             assert_finite(
                                 outputs['tag_logits'],
-                                outputs['rating_logits'],
-                                names=['tag_logits', 'rating_logits'],
+                                names=['tag_logits'],
                                 batch=batch,
                                 outputs=outputs,
                                 config=config
                             )
 
-                        loss, losses = criterion(outputs['tag_logits'], outputs['rating_logits'], tag_labels, rating_labels)
+                        loss, losses = criterion(outputs['tag_logits'], tag_labels)
 
                     # Periodic pre-backward NaN/Inf check on GPU tensor (avoids per-step sync overhead)
                     # This catches NaN loss early before backward pass corrupts gradients.
@@ -1838,9 +1718,6 @@ def train_with_orientation_tracking(config: FullConfig):
                     # Save detached logits for potential image logging before we delete outputs
                     # These are lightweight copies that don't retain the computation graph
                     _saved_tag_logits = outputs['tag_logits'].detach()
-                    _saved_rating_logits = outputs.get('rating_logits')
-                    if _saved_rating_logits is not None:
-                        _saved_rating_logits = _saved_rating_logits.detach()
 
                     # Divide loss by accumulation steps BEFORE backward so each micro-batch
                     # contributes equally-scaled gradients during accumulation.
@@ -1849,13 +1726,9 @@ def train_with_orientation_tracking(config: FullConfig):
 
                 # CR-041: Free computation graph IMMEDIATELY after backward to prevent VRAM leak
                 del loss, scaled_loss, losses, outputs
-                # tag_logits/rating_logits are only defined when log_activation_stats is enabled
+                # tag_logits is only defined when log_activation_stats is enabled
                 try:
                     del tag_logits
-                except NameError:
-                    pass
-                try:
-                    del rating_logits
                 except NameError:
                     pass
 
@@ -2119,20 +1992,6 @@ def train_with_orientation_tracking(config: FullConfig):
                     except Exception:
                         pass
 
-                # Log rating validation statistics periodically
-                if global_step % 1000 == 0:
-                    stats = rating_validator.get_stats()
-                    if stats.get('invalid_batches', 0) > 0:
-                        logger.warning(
-                            f"Rating validation stats at step {global_step}: "
-                            f"{stats['invalid_batches']} invalid batches "
-                            f"({stats['invalid_samples']} samples, "
-                            f"{stats['invalid_rate']:.2%} rate)"
-                        )
-                        # Log to monitor for tracking
-                        monitor.log_scalar('validation/invalid_rating_batches', stats['invalid_batches'], global_step)
-                        monitor.log_scalar('validation/invalid_rating_rate', stats['invalid_rate'], global_step)
-
                 # Memory monitoring (check every 2000 steps to reduce psutil overhead)
                 # psutil calls are ~1-5ms each; at scale this adds up
                 if global_step % 2000 == 0:
@@ -2187,8 +2046,6 @@ def train_with_orientation_tracking(config: FullConfig):
                                 prefix="train",
                                 max_images=config.monitor.tb_image_logging.max_samples,
                                 topk=config.monitor.tb_image_logging.topk,
-                                rating_logits=_saved_rating_logits,
-                                rating_labels=rating_labels,
                             )
                             logger.info(f"Logged {config.monitor.tb_image_logging.max_samples} training images to TensorBoard at step {global_step}")
                     except Exception as e:
@@ -2337,6 +2194,8 @@ def train_with_orientation_tracking(config: FullConfig):
             for metric in val_metrics.values():
                 metric.reset()
             total_val_samples = 0  # Track samples for proper loss averaging
+            all_val_probs = []  # Accumulate for frequency-bucketed metrics
+            all_val_targs = []
             with torch.no_grad():
                 for val_step, batch in enumerate(val_loader):
                     # Filter out error samples that failed to load
@@ -2354,7 +2213,6 @@ def train_with_orientation_tracking(config: FullConfig):
                     if use_channels_last:
                         images = images.contiguous(memory_format=torch.channels_last)
                     tag_labels = batch['tag_labels'].to(device, non_blocking=True)
-                    rating_labels = batch['rating_labels'].to(device, non_blocking=True)
                     total_val_samples += images.size(0)  # Count actual samples processed
 
                     with amp_autocast():
@@ -2362,7 +2220,7 @@ def train_with_orientation_tracking(config: FullConfig):
                         if pmask is not None:
                             pmask = pmask.to(device=device, dtype=torch.bool, non_blocking=True)
                         outputs = model(images, padding_mask=pmask)
-                        loss, _ = criterion(outputs['tag_logits'], outputs['rating_logits'], tag_labels, rating_labels)
+                        loss, _ = criterion(outputs['tag_logits'], tag_labels)
                     # Accumulate loss weighted by batch size for proper per-sample averaging
                     val_loss = val_loss + loss.detach() * images.size(0)
 
@@ -2370,9 +2228,14 @@ def train_with_orientation_tracking(config: FullConfig):
                     probs = torch.sigmoid(outputs['tag_logits']).float()
                     # Targets must be int/long for torchmetrics (mAP uses precision-recall curves)
                     targs = tag_labels.long()
-                    val_metrics['f1_macro'].update(probs, targs)
-                    val_metrics['f1_micro'].update(probs, targs)
-                    val_metrics['map_macro'].update(probs, targs)
+                    # Skip PAD/UNK columns (indices 0,1) for streaming metrics
+                    metric_probs = probs[:, skip_metric_cols:]
+                    metric_targs = targs[:, skip_metric_cols:]
+                    val_metrics['f1_macro'].update(metric_probs, metric_targs)
+                    val_metrics['f1_micro'].update(metric_probs, metric_targs)
+                    val_metrics['map_macro'].update(metric_probs, metric_targs)
+                    all_val_probs.append(probs.cpu())
+                    all_val_targs.append(targs.cpu())
 
                     if val_step == 0 and config.training.use_tensorboard:
                         tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
@@ -2385,8 +2248,6 @@ def train_with_orientation_tracking(config: FullConfig):
                             prefix="val",
                             max_images=config.monitor.tb_image_logging.max_samples,
                             topk=config.monitor.tb_image_logging.topk,
-                            rating_logits=outputs.get('rating_logits'),
-                            rating_labels=rating_labels,
                         )
 
             # Compute metrics (now on CPU to prevent VRAM accumulation)
@@ -2410,6 +2271,66 @@ def train_with_orientation_tracking(config: FullConfig):
                 f"Val F1(macro): {val_f1_macro:.4f}, Val F1(micro): {val_f1_micro:.4f}, Val mAP: {val_mAP:.4f}"
             )
             monitor.log_validation(global_step, {'loss': avg_val_loss, 'f1_macro': val_f1_macro, 'f1_micro': val_f1_micro, 'mAP': val_mAP})
+
+            # Frequency-bucketed diagnostic metrics
+            try:
+                if all_val_probs and config.training.use_tensorboard:
+                    cat_probs = torch.cat(all_val_probs, dim=0).float()
+                    cat_targs = torch.cat(all_val_targs, dim=0)
+                    freq_bins = getattr(config.validation, 'frequency_bins', None) or [300, 500, 1000, 5000, 10000, float('inf')]
+                    tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
+                    bucket_metrics = FrequencyBucketMetrics(
+                        tag_frequencies=vocab.tag_frequencies,
+                        frequency_bins=freq_bins,
+                        tag_names=tag_names,
+                        skip_indices=[0, 1],
+                    )
+                    bucketed_results = bucket_metrics.compute_bucketed_metrics(
+                        cat_probs, cat_targs, threshold=config.inference.prediction_threshold,
+                    )
+                    for bucket_name, metrics in bucketed_results.items():
+                        for metric_name, value in metrics.items():
+                            monitor.log_scalar(f"val_bucketed/{bucket_name}/{metric_name}", value, global_step)
+                    bucket_summary = ", ".join(
+                        f"{b}: F1={m['f1_macro']:.3f} ({int(m['num_tags'])} tags)"
+                        for b, m in bucketed_results.items() if m['num_tags'] > 0
+                    )
+                    logger.info(f"Bucketed metrics: {bucket_summary}")
+
+                    # Threshold calibration (reuses accumulated tensors)
+                    if getattr(config, 'threshold_calibration', None) and config.threshold_calibration.enabled:
+                        try:
+                            calibrator = ThresholdCalibrator(
+                                mode=config.threshold_calibration.mode,
+                                default_threshold=config.threshold_calibration.default_threshold,
+                                search_min=config.threshold_calibration.search_min,
+                                search_max=config.threshold_calibration.search_max,
+                                search_step=config.threshold_calibration.search_step,
+                            )
+                            calibrated_thresholds = calibrator.calibrate(
+                                cat_probs, cat_targs, tag_names=tag_names,
+                                skip_indices=[0, 1], frequency_bins=freq_bins,
+                                tag_frequencies=vocab.tag_frequencies,
+                            )
+                            save_path = config.threshold_calibration.save_path
+                            ThresholdCalibrator.save(calibrated_thresholds, save_path)
+                            logger.info(f"Calibrated thresholds saved to {save_path}")
+                            thresh_summary = ", ".join(
+                                f"{k}: {v:.3f}" for k, v in calibrated_thresholds.items()
+                            )
+                            logger.info(f"Calibrated thresholds ({config.threshold_calibration.mode}): {thresh_summary}")
+                            for name, thresh_val in calibrated_thresholds.items():
+                                monitor.log_scalar(f"val_threshold/{name}", thresh_val, global_step)
+                        except Exception as e:
+                            logger.warning(f"Failed to calibrate thresholds: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to compute bucketed metrics: {e}")
+            finally:
+                del all_val_probs, all_val_targs
+                try:
+                    del cat_probs, cat_targs
+                except NameError:
+                    pass
 
         # Restore train mode immediately after validation so checkpoint saving
         # and any inter-epoch operations see consistent model state (dropout/batchnorm).
