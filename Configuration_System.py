@@ -764,13 +764,13 @@ class ModelConfig(BaseConfig):
     """
     # Architecture
     architecture_type: str = "vit"  # "vit" or "swinv2"
-    hidden_size: int = 1536
-    num_hidden_layers: int = 28
-    num_attention_heads: int = 24
-    intermediate_size: int = 6144
-    
+    hidden_size: int = 1024
+    num_hidden_layers: int = 17
+    num_attention_heads: int = 16
+    intermediate_size: int = 4096
+
     # Vision specific
-    image_size: int = 512
+    image_size: int = 448
     patch_size: int = 16
     num_channels: int = 3
     
@@ -783,7 +783,7 @@ class ModelConfig(BaseConfig):
     
     # Regularization
     hidden_dropout_prob: float = 0.1
-    attention_probs_dropout_prob: float = 0.1
+    attention_dropout: float = 0.1
     drop_path_rate: float = 0.1
     
     # Initialization
@@ -850,7 +850,7 @@ class ModelConfig(BaseConfig):
             )
         
         # Validate dropout probabilities
-        for prob_name in ['hidden_dropout_prob', 'attention_probs_dropout_prob']:
+        for prob_name in ['hidden_dropout_prob', 'attention_dropout']:
             prob_value = getattr(self, prob_name)
             if not 0 <= prob_value <= 1:
                 errors.append(f"{prob_name} must be in [0, 1], got {prob_value}")
@@ -1209,10 +1209,6 @@ class DataConfig(BaseConfig):
     skip_error_samples: bool = field(default=True, metadata={"help": "Skip samples that cause loading errors"})
     collect_augmentation_stats: bool = field(default=False, metadata={"help": "Collect detailed augmentation stats"})
 
-    # Weighted Sampling (from dataset_loader.py usage)
-    frequency_weighted_sampling: bool = field(default=False, metadata={"help": "Enable frequency-weighted sampling"})
-    sample_weight_power: float = field(default=0.5, metadata={"help": "Power for inverse frequency weighting"})
-
     # Working Set Sampler (from dataset_loader.py usage)
     use_working_set_sampler: bool = field(default=False, metadata={"help": "Enable working set sampler"})
     working_set_pct: float = field(default=5.0, metadata={"help": "Percentage of dataset in the working set"})
@@ -1406,7 +1402,10 @@ class LossConfig(BaseConfig):
     gamma_pos: float = 1.0
     label_smoothing: float = 0.0
     clip: float = 0.05
-    class_weights: Optional[List[float]] = None  # Per-class weights for imbalanced datasets
+    class_weights: Optional[List[float]] = None  # Manual per-class weight override
+    class_weight_strategy: Optional[str] = None  # None | "inverse_sqrt" — auto-compute from tag frequencies
+    class_weight_clip_min: float = 0.1  # Floor for computed weights
+    class_weight_clip_max: float = 10.0  # Cap for computed weights
 
     def validate(self):
         errors = []
@@ -1420,6 +1419,12 @@ class LossConfig(BaseConfig):
             )
         if not 0.0 <= self.clip < 1.0:
             errors.append(f"clip must be in [0, 1), got {self.clip}")
+        if self.class_weight_strategy is not None and self.class_weight_strategy not in ("inverse_sqrt",):
+            errors.append(f"class_weight_strategy must be null or 'inverse_sqrt', got '{self.class_weight_strategy}'")
+        if self.class_weight_clip_min <= 0:
+            errors.append(f"class_weight_clip_min must be > 0, got {self.class_weight_clip_min}")
+        if self.class_weight_clip_max <= self.class_weight_clip_min:
+            errors.append(f"class_weight_clip_max must be > class_weight_clip_min")
         if errors:
             raise ConfigValidationError("Loss config validation failed:\n" + "\n".join(errors))
 
@@ -1457,8 +1462,7 @@ class TrainingConfig(BaseConfig):
     
     # Scheduler
     scheduler: str = "cosine"
-    warmup_steps: int = 10000
-    warmup_ratio: float = 0.0  # Deprecated - use warmup_steps directly
+    warmup_epochs: int = 5  # Linear LR warmup over this many epochs
     num_cycles: float = 0.5
     lr_end: float = 1e-6
     
@@ -1490,9 +1494,6 @@ class TrainingConfig(BaseConfig):
     
     # Loss configuration
     tag_loss: LossConfig = field(default_factory=LossConfig)
-    rating_loss: LossConfig = field(default_factory=LossConfig)
-    use_class_weights: bool = True
-    
     # Hardware
     device: str = "cuda"
     distributed: bool = False
@@ -1579,10 +1580,6 @@ class TrainingConfig(BaseConfig):
             self.tag_loss.validate()
         except ConfigValidationError as e:
             errors.append(f"tag_loss: {e}")
-        try:
-            self.rating_loss.validate()
-        except ConfigValidationError as e:
-            errors.append(f"rating_loss: {e}")
         
         # Validate device
         valid_devices = ["cuda", "cpu", "mps"]
@@ -1611,8 +1608,8 @@ class InferenceConfig(BaseConfig):
     compile_model: bool = False
     
     # Prediction
-    prediction_threshold: float = 0.5
-    adaptive_threshold: bool = True
+    prediction_threshold: float = 0.2653
+    adaptive_threshold: bool = True  # NOTE: unused in codebase, superseded by threshold_calibration
     min_predictions: int = 5
     max_predictions: int = 50
     top_k: Optional[int] = None
@@ -1784,6 +1781,11 @@ class ExportConfig(BaseConfig):
     # - For production ONNX deployments, use ViT or SimplifiedTagger architectures instead
     force_swinv2_export: bool = False  # Override to allow SwinV2 ONNX export (not recommended)
 
+    # Dynamo-based ONNX export (PyTorch 2.5+)
+    # Uses torch.onnx.export(dynamo=True) instead of the legacy TorchScript tracer.
+    # Better graph capture but less mature — off by default.
+    use_dynamo_export: bool = False
+
     def validate(self):
         """Validate export configuration"""
         errors = []
@@ -1867,6 +1869,18 @@ class ValidationPreprocessingConfig(BaseConfig):
     normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5)
     image_size: int = 512
     patch_size: int = 16
+
+@dataclass
+class ThresholdCalibrationConfig(BaseConfig):
+    """Configuration for post-training per-tag/per-bucket threshold calibration."""
+    enabled: bool = False
+    mode: str = "per_bucket"  # "per_tag" | "per_bucket"
+    default_threshold: float = 0.2653
+    search_min: float = 0.1
+    search_max: float = 0.9
+    search_step: float = 0.02
+    save_path: str = "./thresholds.json"
+
 
 @dataclass
 class ValidationConfig(BaseConfig):
@@ -2113,6 +2127,7 @@ class FullConfig(BaseConfig):
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    threshold_calibration: ThresholdCalibrationConfig = field(default_factory=ThresholdCalibrationConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     optimizer: AdamW8bitConfig = field(default_factory=AdamW8bitConfig)
@@ -2164,11 +2179,25 @@ class FullConfig(BaseConfig):
                 memory_threshold = int(self.max_memory_gb * 1024 / 16)  # Rough heuristic
             if effective_batch > memory_threshold:
                 logger.warning(f"Large effective batch size ({effective_batch}) may cause memory issues (threshold: {memory_threshold})")
-            # Check image size consistency
+            # Sync image_size: data.image_size is the single source of truth
             if self.model.image_size != self.data.image_size:
-                errors.append(
-                    f"Model image_size ({self.model.image_size}) != Data image_size ({self.data.image_size})"
+                logger.info(
+                    f"Syncing model.image_size ({self.model.image_size}) "
+                    f"from data.image_size ({self.data.image_size})"
                 )
+                self.model.image_size = self.data.image_size
+            if self.validation.preprocessing.image_size != self.data.image_size:
+                logger.info(
+                    f"Syncing validation.preprocessing.image_size ({self.validation.preprocessing.image_size}) "
+                    f"from data.image_size ({self.data.image_size})"
+                )
+                self.validation.preprocessing.image_size = self.data.image_size
+            if self.validation.preprocessing.patch_size != self.model.patch_size:
+                logger.info(
+                    f"Syncing validation.preprocessing.patch_size ({self.validation.preprocessing.patch_size}) "
+                    f"from model.patch_size ({self.model.patch_size})"
+                )
+                self.validation.preprocessing.patch_size = self.model.patch_size
             
             # Check device availability
             if self.training.device.startswith("cuda"):

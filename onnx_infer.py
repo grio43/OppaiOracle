@@ -86,11 +86,12 @@ def _load_metadata(session: ort.InferenceSession):
     return vocab, mean, std, image_size, patch_size, pad_color, meta
 
 
-def _preprocess(image_path: str, pad_color: tuple[int, int, int] = (114, 114, 114)) -> tuple[np.ndarray, bool]:
-    """
-    Loads an image and prepares it for the self-contained ONNX model.
-    Handles transparent images by compositing them on a background using pad_color.
-    Returns the image array and a flag indicating if compositing occurred.
+def _load_image(image_path: str, pad_color: tuple[int, int, int] = (114, 114, 114)) -> tuple[np.ndarray, bool]:
+    """Load an image from disk, handling EXIF rotation and transparency.
+
+    Returns:
+        (H, W, 3) uint8 RGB numpy array and a flag indicating if transparency
+        compositing occurred (used to suppress gray_background tag).
     """
     was_composited = False
     with Image.open(image_path) as img:
@@ -101,22 +102,81 @@ def _preprocess(image_path: str, pad_color: tuple[int, int, int] = (114, 114, 11
             was_composited = True
             # Create background using pad_color to match training
             background = Image.new('RGB', img.size, pad_color)
-            # Ensure we have explicit alpha and RGB color data, even for 'LA' or 'P' images
-            img_rgba = img.convert('RGBA')           # normalizes 'LA'/'P' w/ transparency to RGBA
-            alpha = img_rgba.getchannel('A')         # single-band (L) mask
-            rgb   = img_rgba.convert('RGB')
-            # Paste with a single-channel mask for correct transparency handling
+            img_rgba = img.convert('RGBA')
+            alpha = img_rgba.getchannel('A')
+            rgb = img_rgba.convert('RGB')
             background.paste(rgb, mask=alpha)
             img = background
         else:
             img = img.convert('RGB')
 
-        # Convert to numpy array
         arr = np.asarray(img, dtype=np.uint8)
 
-    # Add batch dimension -> (1, H, W, 3)
-    arr = np.expand_dims(arr, axis=0)
     return arr, was_composited
+
+
+def _preprocess_for_model(
+    image: np.ndarray,
+    image_size: int,
+    mean: list[float],
+    std: list[float],
+    pad_color: tuple[int, int, int] = (114, 114, 114),
+) -> np.ndarray:
+    """Letterbox, normalize, and format an image for the ONNX model.
+
+    Matches the training pipeline preprocessing:
+    1. Scale to fit inside image_size x image_size (no upscaling)
+    2. Center on a pad_color canvas
+    3. Normalize with mean/std
+    4. Return (1, 3, H, W) float32
+
+    Args:
+        image: (H, W, 3) uint8 RGB numpy array.
+        image_size: Target square size.
+        mean: Per-channel mean for normalization.
+        std: Per-channel std for normalization.
+        pad_color: RGB fill for letterbox padding.
+
+    Returns:
+        (1, 3, image_size, image_size) float32 numpy array, normalized.
+    """
+    h, w = image.shape[:2]
+    target = image_size
+
+    # Scale to fit, never upscale
+    scale = min(target / w, target / h, 1.0)
+    new_w = max(1, round(w * scale))
+    new_h = max(1, round(h * scale))
+
+    # Resize with PIL (BILINEAR matches training pipeline)
+    if new_w != w or new_h != h:
+        pil_img = Image.fromarray(image)
+        pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
+        image = np.asarray(pil_img, dtype=np.uint8)
+
+    # Create canvas and center the image
+    canvas = np.full((target, target, 3), pad_color, dtype=np.uint8)
+    top = (target - new_h) // 2
+    left = (target - new_w) // 2
+    canvas[top:top + new_h, left:left + new_w] = image
+
+    # Convert to float32 [0, 1], normalize, transpose to (C, H, W)
+    x = canvas.astype(np.float32) / 255.0
+    mean_arr = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
+    std_arr = np.array(std, dtype=np.float32).reshape(1, 1, 3)
+    x = (x - mean_arr) / std_arr
+    x = x.transpose(2, 0, 1)  # (H, W, C) -> (C, H, W)
+
+    return np.expand_dims(x, axis=0)  # (1, C, H, W)
+
+
+def _preprocess_legacy(image_path: str, pad_color: tuple[int, int, int] = (114, 114, 114)) -> tuple[np.ndarray, bool]:
+    """Legacy preprocessing for old ONNX models that bake preprocessing into the graph.
+
+    Returns (1, H, W, 3) uint8 array and compositing flag.
+    """
+    arr, was_composited = _load_image(image_path, pad_color)
+    return np.expand_dims(arr, axis=0), was_composited
 
 
 def main():
@@ -177,19 +237,69 @@ def main():
             if pad_color is None:
                 pad_color = (114, 114, 114)
 
+        # Load calibrated thresholds if available (supports both per-tag and per-bucket)
+        calibrated_thresholds = None
+        model_dir = Path(args.model).parent
+        thresholds_path = model_dir / "thresholds.json"
+        if thresholds_path.exists():
+            try:
+                with open(thresholds_path, 'r') as f:
+                    raw_thresholds = json.load(f)
+                # Detect per-bucket mode: keys look like "300-499" or "10000+"
+                sample_key = next(iter(raw_thresholds)) if raw_thresholds else ""
+                is_bucket_mode = bool(sample_key and (sample_key[-1] == '+' or '-' in sample_key) and sample_key[0].isdigit())
+                if is_bucket_mode and hasattr(vocab, 'tag_frequencies'):
+                    # Expand bucket thresholds to per-tag thresholds
+                    calibrated_thresholds = {}
+                    for tag_name, freq in vocab.tag_frequencies.items():
+                        matched = False
+                        for bucket_key, thresh_val in raw_thresholds.items():
+                            if bucket_key.endswith('+'):
+                                low = int(bucket_key[:-1])
+                                if freq >= low:
+                                    calibrated_thresholds[tag_name] = thresh_val
+                                    matched = True
+                                    break
+                            elif '-' in bucket_key:
+                                low, high = bucket_key.split('-', 1)
+                                if int(low) <= freq <= int(high):
+                                    calibrated_thresholds[tag_name] = thresh_val
+                                    matched = True
+                                    break
+                        if not matched:
+                            calibrated_thresholds[tag_name] = args.threshold
+                    logger.info(f"Loaded per-bucket thresholds from {thresholds_path}, expanded to {len(calibrated_thresholds)} tags")
+                else:
+                    calibrated_thresholds = raw_thresholds
+                    logger.info(f"Loaded per-tag thresholds from {thresholds_path} ({len(calibrated_thresholds)} entries)")
+            except Exception as e:
+                logger.warning(f"Failed to load thresholds from {thresholds_path}: {e}")
+
         input_name = session.get_inputs()[0].name
         input_info = session.get_inputs()[0]
         logger.info(f"Model expects input '{input_name}' with type: {input_info.type}")
+
+        # Detect model format: new models have preprocessing=external in metadata
+        is_new_format = meta.get('preprocessing', '') == 'external'
+        has_sigmoid = meta.get('output_activation', '') == 'sigmoid'
+        if is_new_format:
+            logger.info("New model format: preprocessing is external, output is sigmoid probabilities")
+        else:
+            logger.info("Legacy model format: preprocessing baked in, applying sigmoid post-hoc")
 
         results = []
         for path in args.images:
             start = time.time()
             try:
-                # Preprocessing now returns a flag for compositing
-                inp, was_composited = _preprocess(path, pad_color)
+                if is_new_format:
+                    # New format: load image, preprocess externally, feed (1, C, H, W) float32
+                    raw_image, was_composited = _load_image(path, pad_color)
+                    inp = _preprocess_for_model(raw_image, image_size, mean, std, pad_color)
+                else:
+                    # Legacy format: model expects (1, H, W, 3) uint8
+                    inp, was_composited = _preprocess_legacy(path, pad_color)
             except Exception as e:
                 logger.error(f"Preprocessing failed for {path}: {e}")
-                # Add failed result instead of skipping
                 results.append(ImagePrediction(
                     image=path,
                     tags=[],
@@ -201,26 +311,13 @@ def main():
             try:
                 outputs = session.run(None, {input_name: inp})
 
-                # Handle dual outputs (tag_scores, rating_scores) or legacy single output
-                if len(outputs) == 2:
-                    # New format: (tag_scores, rating_scores)
-                    tag_scores = outputs[0][0]
-                    rating_scores = outputs[1][0]
-                    # Get predicted rating (argmax of rating logits)
-                    rating_idx = int(np.argmax(rating_scores))
-                    rating_labels = ['safe', 'sensitive', 'questionable', 'explicit', 'unknown']
-                    predicted_rating = rating_labels[rating_idx] if rating_idx < len(rating_labels) else 'unknown'
-                    rating_confidence = float(np.exp(rating_scores[rating_idx]) / np.sum(np.exp(rating_scores)))
-                elif len(outputs) == 1:
-                    # Legacy single output format
-                    tag_scores = outputs[0][0]
-                    predicted_rating = None
-                    rating_confidence = None
-                else:
-                    # Fallback: use last output as tags
-                    tag_scores = outputs[-1][0]
-                    predicted_rating = None
-                    rating_confidence = None
+                # Single output: probabilities (new) or raw logits (legacy)
+                tag_scores = outputs[0][0]
+
+                # Legacy models output raw logits — apply sigmoid
+                if not has_sigmoid:
+                    tag_scores = 1.0 / (1.0 + np.exp(-tag_scores.astype(np.float64)))
+                    tag_scores = tag_scores.astype(np.float32)
 
                 idxs = np.argsort(tag_scores)[::-1][:args.top_k]
                 # Resolve special-token indices once
@@ -233,31 +330,40 @@ def main():
                     unk_idx = 1
 
                 tags = []
+                predicted_rating = None
+                rating_confidence = None
                 for idx in idxs:
                     score = float(tag_scores[idx])
-                    if score < args.threshold:
-                        continue
                     # Skip special tokens (padding/unknown)
                     if int(idx) in (pad_idx, unk_idx):
                         continue
                     try:
                         tag_name = vocab.get_tag_from_index(int(idx))
                     except ValueError:
-                        # Defensive: ignore corrupted/placeholder tags
                         continue
+                    # Use per-tag calibrated threshold if available, else global threshold
+                    if calibrated_thresholds is not None:
+                        tag_thresh = calibrated_thresholds.get(tag_name, args.threshold)
+                    else:
+                        tag_thresh = args.threshold
+                    if score < tag_thresh:
+                        continue
+                    # Extract rating from rating:* tags
+                    if tag_name.startswith("rating:"):
+                        if predicted_rating is None or score > rating_confidence:
+                            predicted_rating = tag_name.split(":", 1)[1]
+                            rating_confidence = score
                     tags.append(TagPrediction(name=tag_name, score=score))
 
                 # Conditionally filter the gray_background tag if we added it
                 if was_composited:
                     tags = [tag for tag in tags if tag.name != 'gray_background']
 
-                # Build result with optional rating
                 result = ImagePrediction(
                     image=path,
                     tags=tags,
                     processing_time=int((time.time() - start) * 1000)
                 )
-                # Add rating if available (new dual-output models)
                 if predicted_rating is not None:
                     result.rating = predicted_rating
                     result.rating_confidence = rating_confidence

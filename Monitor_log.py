@@ -921,6 +921,7 @@ class TrainingMonitor:
         self.start_time = time.time()
         self.metrics = ThreadSafeMetricsTracker(config)
         self.last_step_time = self.start_time
+        self.last_logged_step = 0
         self.last_loss = None
         self.steps_without_improvement = 0
         self.best_val_metric = float('inf')
@@ -1148,11 +1149,14 @@ class TrainingMonitor:
         self.metrics.increment_counter('batches_processed')
         self.metrics.increment_counter('images_processed', batch_size)
         
-        # Calculate step time
+        # Calculate per-step time (elapsed / steps since last log)
         current_time = time.time()
-        step_time = current_time - self.last_step_time
+        elapsed = current_time - self.last_step_time
+        steps_since_last_log = step - self.last_logged_step
+        step_time = elapsed / max(steps_since_last_log, 1)
         self.metrics.add_metric('step_time', step_time, step)
         self.last_step_time = current_time
+        self.last_logged_step = step
         
         # Check for issues and send alerts
         if self.alerts:
@@ -1301,9 +1305,6 @@ class TrainingMonitor:
         std = torch.tensor(self._norm_std, dtype=torch.float32).view(-1, 1, 1)
         return img.float() * std + mean
 
-    # Rating index to name mapping
-    RATING_NAMES = ['safe', 'sensitive', 'questionable', 'explicit', 'unknown']
-
     def log_predictions(
         self,
         *,
@@ -1316,14 +1317,12 @@ class TrainingMonitor:
         max_images: int = 4,
         topk: int = 35,
         threshold: float = 0.4,
-        rating_logits: Optional[torch.Tensor] = None,
-        rating_labels: Optional[torch.Tensor] = None,
     ):
         """Log per-sample images with ground truth tags and predictions to TensorBoard.
 
         Shows ground truth tags + top predictions, sorted by probability (strongest first).
         Table format: tag | predicted_prob | expected (YES/no) | status (TP/FN/FP)
-        Also logs rating prediction vs actual if rating_logits/rating_labels provided.
+        Rating predictions appear naturally as rating:* tags in the tag list.
         """
         if getattr(self, "writer", None) is None:
             return
@@ -1331,13 +1330,6 @@ class TrainingMonitor:
         images = images.detach().cpu()
         predictions = predictions.detach().cpu()
         targets = targets.detach().cpu()
-
-        # Process rating data if provided
-        has_rating = rating_logits is not None and rating_labels is not None
-        if has_rating:
-            rating_logits = rating_logits.detach().cpu()
-            rating_labels = rating_labels.detach().cpu()
-            rating_probs = torch.softmax(rating_logits, dim=-1)
 
         num_samples = min(images.shape[0], max_images)
         for i in range(num_samples):
@@ -1380,26 +1372,7 @@ class TrainingMonitor:
             # Sort by probability (strongest to weakest)
             combined_indices = sorted(combined_indices, key=lambda idx: probs[idx].item(), reverse=True)
 
-            # Build rating header if available
-            rating_lines = []
-            if has_rating and i < len(rating_labels):
-                actual_rating_idx = int(rating_labels[i].item())
-                actual_rating = self.RATING_NAMES[actual_rating_idx] if 0 <= actual_rating_idx < len(self.RATING_NAMES) else 'unknown'
-
-                # Get predicted rating (highest probability)
-                sample_probs = rating_probs[i]
-                pred_rating_idx = int(sample_probs.argmax().item())
-                pred_rating = self.RATING_NAMES[pred_rating_idx] if 0 <= pred_rating_idx < len(self.RATING_NAMES) else 'unknown'
-                pred_conf = sample_probs[pred_rating_idx].item()
-
-                # Rating match status
-                rating_match = "CORRECT" if pred_rating_idx == actual_rating_idx else "WRONG"
-                rating_lines = [
-                    f"**Rating:** {pred_rating} ({pred_conf:.1%}) | Actual: {actual_rating} | {rating_match}",
-                    ""
-                ]
-
-            lines = rating_lines + ["| tag | prob | expected | status |", "| --- | --- | --- | --- |"]
+            lines = ["| tag | prob | expected | status |", "| --- | --- | --- | --- |"]
             for idx in combined_indices:
                 tag = tag_names[idx] if idx < len(tag_names) else str(idx)
                 prob = probs[idx].item()

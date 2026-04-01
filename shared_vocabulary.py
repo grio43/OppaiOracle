@@ -118,7 +118,7 @@ class SharedVocabularyManager:
             'ignored_tag_indices': list(vocab.ignored_tag_indices) if isinstance(vocab.ignored_tag_indices, set) else vocab.ignored_tag_indices,
             'pad_token': vocab.pad_token,
             'unk_token': vocab.unk_token,
-            'rating_to_index': vocab.rating_to_index,
+            'RATING_TAGS': vocab.RATING_TAGS,
             'tags': list(vocab.tags) if isinstance(vocab.tags, set) else vocab.tags,
             'unk_index': vocab.unk_index,
         }
@@ -282,7 +282,9 @@ def populate_vocab_from_shared(vocab, vocab_data: dict, verify: bool = True):
     vocab.ignored_tag_indices = vocab_data['ignored_tag_indices']
     vocab.pad_token = vocab_data['pad_token']
     vocab.unk_token = vocab_data['unk_token']
-    vocab.rating_to_index = vocab_data['rating_to_index']
+    vocab.RATING_TAGS = vocab_data.get('RATING_TAGS', [
+        "rating:general", "rating:sensitive", "rating:questionable", "rating:explicit",
+    ])
     vocab.tags = vocab_data['tags']
     vocab.unk_index = vocab_data['unk_index']
 

@@ -48,10 +48,10 @@ model:
     # ViT-specific parameters (used when architecture_type == "vit" or "vit_wide_shallow")
     # These are ignored when using SwinV2, which uses swin_config above instead.
     hidden_size: 1024
-    num_hidden_layers: 22
+    num_hidden_layers: 17
     num_attention_heads: 16
     intermediate_size: 4096
-    image_size: 512
+    image_size: 448  # Auto-synced from data.image_size at startup — change data.image_size instead
     patch_size: 16  # ViT uses patch_size=16 (SwinV2 uses 4)
     num_channels: 3
     use_cls_token: true
@@ -60,11 +60,11 @@ model:
     use_color_token: true
     num_special_tokens: 4
     hidden_dropout_prob: 0.1
-    attention_probs_dropout_prob: 0.0
+    attention_dropout: 0.0  # Dropout on attention weights (0.0 = rely on drop_path for regularization)
     # Drop path rate for ViT architectures (stochastic depth regularization)
     # NOTE: This value is ONLY used when architecture_type == "vit" or "vit_wide_shallow"
     # For SwinV2 architecture, see swin_config.drop_path_rate above (currently 0.2)
-    drop_path_rate: 0.3   # recommended range 0.08–0.3 (must be < 1.0)
+    drop_path_rate: 0.2   # recommended range 0.08–0.3 (must be < 1.0)
     initializer_range: 0.02
     layer_norm_eps: 1.0e-6
     use_flex_attention: true
@@ -109,7 +109,9 @@ data:
   output_dir: "./outputs"
   
   # Image processing
-  image_size: 512
+  # >>> SINGLE SOURCE OF TRUTH for resolution. model.image_size and
+  # >>> validation.preprocessing.image_size are auto-synced from this value.
+  image_size: 448
   # IMPORTANT: Normalization values depend on training approach!
   #   - Training from scratch (current): [0.5, 0.5, 0.5] is fine (anime-optimized)
   #   - Pretrained SwinV2/ViT from ImageNet: Use ImageNet normalization:
@@ -132,11 +134,11 @@ data:
   #     SwinV2 needs ~2-3x more memory than ViT due to shifted window attention.
   #     Use gradient_accumulation_steps to maintain effective batch size.
   #   - 24GB GPU: SwinV2 can use batch_size=12 with 512px images
-  #   - See training_config.py:check_swinv2_batch_size() for memory guidance
-  batch_size: 34  # ViT with 512px images on 16GB GPU
+  #   - See training_config.py:check_swinv2_batch_size() for memory guidance58
+  batch_size: 58   # ViT with 448px images, 17 layers, yse 58 when doing 448px. It is guess at 170 at 256 images
   num_workers: 6  # Arrow mmap shares metadata (~500MB/worker overhead), 32-core system
   pin_memory: true   # Enables async DMA transfer for PCIe 4.0/5.0
-  prefetch_factor: 5  # 8 workers × 3 batches × 128 = 3072 samples prefetched 
+  prefetch_factor: 3  # 8 workers × 3 batches × 128 = 3072 samples prefetched 
   persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   drop_last: false
   worker_log_level: WARNING  # Worker log level: WARNING allows debugging, CRITICAL minimizes overhead
@@ -218,20 +220,20 @@ data:
 # Training Configuration (from training_config.yaml)
 training:
     memory_format: "channels_last"
-    num_epochs: 16
+    num_epochs: 36
     # IMPORTANT: learning_rate is the BASE rate (tuned for lr_base_batch_size=256).
     # It is automatically scaled at runtime based on effective batch size and lr_scaling_mode.
     #
     # Current setup:
     #   - Architecture: ViT (from scratch)
-    #   - Effective batch size: batch_size (34) * gradient_accumulation_steps (15) = 510 samples/step
-    #   - Dataset: 5.4M images, 16 epochs
-    #   - Scaling: sqrt(510/256) = 1.412x → effective LR = 2.5e-4 * 1.412 = 3.53e-4
+    #   - Effective batch size: batch_size (56) * gradient_accumulation_steps (9) = 504 samples/step
+    #   - Dataset: 5.4M images, 36 epochs
+    #   - Scaling: sqrt(504/256) = 1.403x → effective LR = 5.0e-4 * 1.403 = 7.0e-4
     #
     # Alternative values:
-    #   - 1.0e-4: Conservative base rate
+    #   - 2.5e-4: Conservative base rate (previous default)
     #   - For fine-tuning pretrained weights: consider 5.0e-5 to 1.0e-4
-    learning_rate: 2.5e-4  # Base rate for ViT at batch_size=256 (scaled at runtime via lr_scaling_mode)
+    learning_rate: 5.0e-4  # Base rate for ViT at batch_size=256 (scaled at runtime via lr_scaling_mode)
     lr_scaling_mode: "sqrt"  # "sqrt" (recommended for AdamW), "linear", or "none"
     lr_base_batch_size: 256  # Reference batch size that learning_rate was tuned for
 
@@ -250,7 +252,7 @@ training:
     swinv2_learning_rate: null
 
     weight_decay: 0.1
-    gradient_accumulation_steps: 15  # Effective batch size: 34 * 15 = 510 samples/step
+    gradient_accumulation_steps: 9  # Effective batch size: 56 * 9 = 504 samples/step
 
     # Optimizer
     # NOTE: Using "adamw8bit" for memory-efficient 8-bit quantized optimizer states
@@ -267,8 +269,7 @@ training:
 
     # Scheduler
     scheduler: "cosine_restarts"
-    warmup_steps: 10000  # ~94% of first epoch warmup (5.4M images / 510 effective batch = ~10.6k updates/epoch)
-    warmup_ratio: 0.0
+    warmup_epochs: 10  # Linear ramp from lr_end to learning_rate over first 10 epochs, then cosine decay
     num_cycles: 1  # Single cosine decay (no restarts)
     lr_end: 1.0e-6
 
@@ -306,15 +307,11 @@ training:
       gamma_pos: 1.0        # Focusing parameter for positives
       label_smoothing: 0.0   # Disabled — label smoothing + focal loss corrupts focal weights on sparse multi-label targets
       clip: 0.05            # Prevent extreme logits
-    rating_loss:
-      alpha: 0.5
-      gamma_neg: 1.0
-      gamma_pos: 1.0
-      label_smoothing: 0.08  # Smoothing for rating targets (reduced to compensate for increased regularization)
-      clip: 0.05
-      class_weights: [0.3, 0.0, 2.0, 2.5, 0.0]  # [general, sensitive, questionable, explicit, unknown (ignored)] - inverse frequency weights
-    use_class_weights: true
-  
+      # class_weight_strategy: "inverse_sqrt"  # Auto-compute weights from tag frequencies (w=1/sqrt(freq), normalized)
+      # class_weight_clip_min: 0.1             # Floor for computed weights
+      # class_weight_clip_max: 10.0            # Cap for computed weights
+    # Ratings are now encoded as regular tags (rating:general, rating:sensitive, etc.)
+    # and trained with the same tag loss. No separate rating_loss section needed.
     # Hardware
     device: "cuda"
     distributed: false
@@ -345,7 +342,7 @@ training:
 
     # Early stopping
     early_stopping_patience: 4
-    early_stopping_threshold: 0.0005
+    early_stopping_threshold: 0.0000005
     # Ignore first N epochs for early-stopping to avoid initial instability
     early_stopping_burn_in_epochs: 3
     # One of: median, mean, last, max
@@ -358,7 +355,7 @@ inference:
   compile_model: false
   
   # Prediction
-  prediction_threshold: 0.5
+  prediction_threshold: 0.2653
   adaptive_threshold: true
   min_predictions: 5
   max_predictions: 50
@@ -408,6 +405,13 @@ inference:
   cache_ttl_seconds: 3600
   max_cache_size: 1000
 
+# Threshold Calibration (post-training, inference-time)
+threshold_calibration:
+  enabled: false
+  mode: "per_bucket"  # "per_tag" | "per_bucket"
+  default_threshold: 0.2653
+  save_path: "./thresholds.json"
+
 # Export Configuration (from export_config.yaml)
 export:
   export_format: "onnx"
@@ -440,7 +444,7 @@ export:
 validation:
   max_samples: 30000  # Subsample validation set (30K of 280K) for faster epochs
   dataloader:
-    batch_size: 64  # Balanced for validation throughput
+    batch_size: 58  # Balanced for validation throughput
     num_workers: 6  # Increased for smoother validation throughput
     pin_memory: true  # Enables async DMA transfer for faster CPU-GPU transfer
     prefetch_factor: 3  # 6 workers × 3 batches × 128 = 2304 samples prefetched
@@ -448,8 +452,8 @@ validation:
   preprocessing:
     # Uses data.normalize_mean/std by default; keep in sync with
     # training/inference unless intentionally different.
-    image_size: 512
-    patch_size: 16  # ViT uses patch_size=16 (SwinV2 uses 4)
+    image_size: 448  # Auto-synced from data.image_size at startup
+    patch_size: 16   # Auto-synced from model.patch_size at startup
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Monitoring & Alerts

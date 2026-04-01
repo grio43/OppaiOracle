@@ -544,6 +544,7 @@ class TagVocabulary:
         self.min_frequency = min_frequency
         self.ignored_tags: Set[str] = _load_ignore_tags(ignore_file)
         self.ignored_tag_indices: List[int] = []
+        self._dropped_tag_counts: Dict[str, int] = {}
         self.pad_token = pad_token
         self.unk_token = unk_token
 
@@ -561,14 +562,14 @@ class TagVocabulary:
             )
         self._tag_vector_dtype = dtype_map[dtype_key]
 
-        # Rating classes (fixed)
-        self.rating_to_index: Dict[str, int] = {
-            "general": 0,
-            "sensitive": 1,
-            "questionable": 2,
-            "explicit": 3,
-            "unknown": 4,
-        }
+        # Rating tags are now part of the regular tag vocabulary.
+        # These are the canonical tag names used to encode/decode ratings.
+        self.RATING_TAGS: List[str] = [
+            "rating:general",
+            "rating:sensitive",
+            "rating:questionable",
+            "rating:explicit",
+        ]
         
         # Convenience attributes for compatibility
         self.tags: List[str] = []
@@ -605,7 +606,8 @@ class TagVocabulary:
         new_vocab.ignored_tags = self.ignored_tags.copy()
         new_vocab.ignored_tag_indices = self.ignored_tag_indices.copy()
         new_vocab.tags = self.tags.copy()
-        new_vocab.rating_to_index = self.rating_to_index.copy()
+        new_vocab.RATING_TAGS = self.RATING_TAGS.copy()
+        new_vocab._dropped_tag_counts = self._dropped_tag_counts.copy()
         # Copy immutable/scalar attributes directly
         new_vocab.min_frequency = self.min_frequency
         new_vocab.pad_token = self.pad_token
@@ -621,6 +623,19 @@ class TagVocabulary:
         """
         return self.ignored_tag_indices.copy()
     
+    def _ensure_rating_tags(self) -> None:
+        """Ensure rating tags are present in the vocabulary, appending if missing."""
+        for tag in self.RATING_TAGS:
+            if tag not in self.tag_to_index:
+                idx = len(self.tag_to_index)
+                self.tag_to_index[tag] = idx
+                self.index_to_tag[idx] = tag
+                logger.info(f"Added missing rating tag '{tag}' at index {idx}")
+
+    def get_rating_tag_indices(self) -> Dict[str, int]:
+        """Return a mapping of rating tag name to vocabulary index."""
+        return {tag: self.tag_to_index[tag] for tag in self.RATING_TAGS if tag in self.tag_to_index}
+
     def encode_tags(self, tags: Iterable[str]) -> torch.Tensor:
         """Encode tag strings into a multi-hot tensor of shape (vocab_size,).
 
@@ -755,6 +770,37 @@ class TagVocabulary:
 
         self.tags = sorted_tags
 
+        # Ensure rating tags are always present in the vocabulary
+        self._ensure_rating_tags()
+
+        # Track and log tags that were dropped due to min_frequency threshold
+        self._dropped_tag_counts = {
+            t: c for t, c in tag_counts.items()
+            if 0 < c < self.min_frequency
+        }
+        if self._dropped_tag_counts:
+            total_dropped = len(self._dropped_tag_counts)
+            total_occurrences = sum(self._dropped_tag_counts.values())
+            sub_buckets = {
+                "1-9": 0, "10-49": 0, "50-99": 0, "100-199": 0, "200-299": 0,
+            }
+            for count in self._dropped_tag_counts.values():
+                if count < 10:
+                    sub_buckets["1-9"] += 1
+                elif count < 50:
+                    sub_buckets["10-49"] += 1
+                elif count < 100:
+                    sub_buckets["50-99"] += 1
+                elif count < 200:
+                    sub_buckets["100-199"] += 1
+                else:
+                    sub_buckets["200-299"] += 1
+            bucket_str = ", ".join(f"{k}: {v}" for k, v in sub_buckets.items() if v > 0)
+            logger.info(
+                f"Dropped {total_dropped} tags below min_frequency={self.min_frequency} "
+                f"({total_occurrences} total occurrences). Distribution: {bucket_str}"
+            )
+
         logger.info(f"Vocabulary built with {len(self.tag_to_index)} tags (incl. special tokens)")
     
     def save_vocabulary(self, vocab_path: Path) -> None:
@@ -832,6 +878,9 @@ class TagVocabulary:
             if tag in self.tag_to_index
         ]
 
+        # Ensure rating tags are present (auto-migrate older vocabularies)
+        self._ensure_rating_tags()
+
         # Validate vocabulary integrity unless skipped (for trusted/cached sources)
         if not skip_validation:
             _verify_vocabulary_integrity(self, vocab_path)
@@ -895,6 +944,9 @@ class TagVocabulary:
             if t in vocab.tag_to_index
         ]
 
+        # Ensure rating tags are present (auto-migrate older vocabularies)
+        vocab._ensure_rating_tags()
+
         _verify_vocabulary_integrity(vocab, Path('embedded'))
         return vocab
     
@@ -945,6 +997,9 @@ class TagVocabulary:
             vocab.index_to_tag[idx] = tag
 
         vocab.tags = tags
+
+        # Ensure rating tags are present
+        vocab._ensure_rating_tags()
 
         # Validate vocabulary integrity
         _verify_vocabulary_integrity(vocab, filepath)

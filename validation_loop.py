@@ -117,8 +117,8 @@ class ValidationConfig:
     
     # Evaluation settings
     max_samples: Optional[int] = None  # Limit samples for fast validation
-    prediction_threshold: float = 0.5
-    adaptive_threshold: bool = True
+    prediction_threshold: float = 0.2653
+    adaptive_threshold: bool = True  # NOTE: unused in codebase, superseded by threshold_calibration
     save_predictions: bool = False
     save_per_image_results: bool = False
     
@@ -455,7 +455,7 @@ class ValidationRunner:
         
         # Default frequency bins if not provided
         if config.frequency_bins is None:
-            self.config.frequency_bins = [0, 10, 100, 1000, 10000, float('inf')]
+            self.config.frequency_bins = [300, 500, 1000, 5000, 10000, float('inf')]
 
     # ---------- Pickling support for multiprocessing ----------
     def __getstate__(self):
@@ -640,7 +640,10 @@ class ValidationRunner:
             # Handle DDP wrapped models
             if any(key.startswith('module.') for key in state_dict.keys()):
                 state_dict = {key.replace('module.', ''): value for key, value in state_dict.items()}
-            
+
+            # Filter out removed rating_head keys from old checkpoints
+            state_dict = {k: v for k, v in state_dict.items() if 'rating_head' not in k}
+
             model.load_state_dict(state_dict)
 
             # Always try to extract preprocessing; handle legacy inside the extractor.

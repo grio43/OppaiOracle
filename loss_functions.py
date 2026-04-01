@@ -369,49 +369,32 @@ class AsymmetricFocalLoss(nn.Module):
 
 class MultiTaskLoss(nn.Module):
     """
-    Combined loss for tag prediction and rating classification.
+    Loss for tag prediction (ratings are now part of the tag vocabulary).
 
-    A simple weighted combination of the asymmetric focal loss for tags
-    and the cross‑entropy loss for ratings.
+    Wraps the asymmetric focal loss for multi-label tag classification.
     """
 
     def __init__(
         self,
-        tag_loss_weight: float = 0.9,
-        rating_loss_weight: float = 0.1,
         tag_loss_fn: Optional[nn.Module] = None,
-        rating_loss_fn: Optional[nn.Module] = None,
     ):
         super().__init__()
-        self.tag_loss_weight = tag_loss_weight
-        self.rating_loss_weight = rating_loss_weight
         self.tag_loss_fn = tag_loss_fn or AsymmetricFocalLoss()
-        self.rating_loss_fn = rating_loss_fn or nn.CrossEntropyLoss(
-            label_smoothing=0.1
-        )
 
     def forward(
         self,
         tag_logits: torch.Tensor,
-        rating_logits: torch.Tensor,
         tag_targets: torch.Tensor,
-        rating_targets: torch.Tensor,
         sample_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Compute combined loss for tags and ratings.
+        Compute loss for tags (including rating tags).
 
         Args:
             tag_logits: (B, num_tags) logits for tag prediction.
-            rating_logits: (B, num_ratings) logits for rating classification.
             tag_targets: (B, num_tags) binary targets for tags.
-            rating_targets: (B,) or (B, num_ratings) targets for ratings.
-            sample_weights: Optional per‑sample weights.
-
-        Raises:
-            ValueError: If required inputs are None or invalid type.
+            sample_weights: Optional per-sample weights.
         """
-        # Validate required inputs
         if tag_logits is None:
             raise ValueError(
                 "tag_logits cannot be None. "
@@ -422,42 +405,10 @@ class MultiTaskLoss(nn.Module):
                 "tag_targets cannot be None. "
                 "This indicates a dataloader issue - check batch preparation."
             )
-        if rating_logits is None:
-            raise ValueError(
-                "rating_logits cannot be None. "
-                "This indicates a model output issue - check forward() implementation."
-            )
-        if rating_targets is None:
-            raise ValueError(
-                "rating_targets cannot be None. "
-                "This indicates a dataloader issue - check batch preparation."
-            )
-
-        # Validate types
-        if not isinstance(tag_logits, torch.Tensor):
-            raise TypeError(f"tag_logits must be torch.Tensor, got {type(tag_logits)}")
-        if not isinstance(tag_targets, torch.Tensor):
-            raise TypeError(f"tag_targets must be torch.Tensor, got {type(tag_targets)}")
-        if not isinstance(rating_logits, torch.Tensor):
-            raise TypeError(f"rating_logits must be torch.Tensor, got {type(rating_logits)}")
-        if not isinstance(rating_targets, torch.Tensor):
-            raise TypeError(f"rating_targets must be torch.Tensor, got {type(rating_targets)}")
 
         tag_loss = self.tag_loss_fn(tag_logits, tag_targets, sample_weights)
-        # Compute rating loss
-        if isinstance(self.rating_loss_fn, AsymmetricFocalLoss):
-            rating_loss = self.rating_loss_fn(rating_logits, rating_targets)
-        else:
-            if rating_targets.dim() == 2:
-                rating_targets = rating_targets.argmax(dim=1)
-            rating_loss = self.rating_loss_fn(rating_logits, rating_targets)
-        total_loss = (
-            self.tag_loss_weight * tag_loss +
-            self.rating_loss_weight * rating_loss
-        )
         losses = {
-            'total': total_loss,
+            'total': tag_loss,
             'tag_loss': tag_loss,
-            'rating_loss': rating_loss,
         }
-        return total_loss, losses
+        return tag_loss, losses

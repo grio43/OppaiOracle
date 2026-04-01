@@ -1,6 +1,9 @@
+import json
 import torch
+import numpy as np
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Literal, Optional, Tuple, Union
 from torchmetrics.functional.classification import (
     multilabel_f1_score,
     multilabel_average_precision,
@@ -34,8 +37,9 @@ class MetricComputer:
                           Good compromise for imbalanced multi-label classification.
 
     Note on threshold selection:
-        The default threshold of 0.5 assumes symmetric decision boundaries, which
-        may not be optimal for:
+        The default threshold of 0.2653 matches the P=R threshold used by
+        competing v2.0 models for comparable evaluation. Note that this may not
+        be optimal for:
         - Imbalanced datasets where positive class is rare
         - Models trained with class weights or focal loss
         - Applications where precision/recall trade-off favors one over the other
@@ -50,7 +54,7 @@ class MetricComputer:
                     between macro and micro approaches.
     """
     num_labels: int
-    threshold: float = 0.5
+    threshold: float = 0.2653
     skip_indices: Optional[List[int]] = None
     mAP_average: AveragingMode = "macro"
 
@@ -303,3 +307,313 @@ class MetricComputer:
             }
 
         return per_tag_metrics
+
+
+@dataclass
+class FrequencyBucketMetrics:
+    """Compute metrics broken down by tag frequency buckets.
+
+    Implements LVIS-style frequency-bucketed evaluation (AP_rare, AP_common, AP_frequent)
+    to diagnose whether model performance degrades for rare vs common tags.
+
+    Args:
+        tag_frequencies: Dict mapping tag name to occurrence count in training data.
+        frequency_bins: Bin edges for frequency buckets (required, no default).
+            Example: [300, 500, 1000, 5000, 10000, float('inf')]
+            Creates buckets: [300-499], [500-999], [1000-4999], [5000-9999], [10000+]
+        tag_names: Ordered list of tag names matching model output indices.
+        skip_indices: Indices to exclude from metric computation (e.g., [0, 1] for PAD/UNK).
+    """
+    tag_frequencies: Dict[str, int]
+    frequency_bins: List[float]
+    tag_names: List[str]
+    skip_indices: Optional[List[int]] = None
+
+    # Computed in __post_init__
+    _bucket_assignments: Dict[str, List[int]] = field(default_factory=dict, init=False, repr=False)
+    _bucket_names: List[str] = field(default_factory=list, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        skip_set = set(self.skip_indices) if self.skip_indices else set()
+        bins = self.frequency_bins
+
+        # Build bucket names from bin edges
+        self._bucket_names = []
+        for i in range(len(bins) - 1):
+            low = int(bins[i])
+            high = bins[i + 1]
+            if high == float('inf'):
+                self._bucket_names.append(f"{low}+")
+            else:
+                self._bucket_names.append(f"{low}-{int(high) - 1}")
+
+        # Assign each tag index to a bucket
+        self._bucket_assignments = {name: [] for name in self._bucket_names}
+        for idx, tag_name in enumerate(self.tag_names):
+            if idx in skip_set:
+                continue
+            freq = self.tag_frequencies.get(tag_name, 0)
+            for i in range(len(bins) - 1):
+                if bins[i] <= freq < bins[i + 1]:
+                    self._bucket_assignments[self._bucket_names[i]].append(idx)
+                    break
+
+    def compute_bucketed_metrics(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        threshold: float = 0.2653,
+    ) -> Dict[str, Dict[str, float]]:
+        """Compute per-bucket F1 (macro/micro), mAP, tag count, and mean support.
+
+        Args:
+            predictions: Probability tensor, shape (N, num_labels).
+            targets: Binary target tensor, shape (N, num_labels).
+            threshold: Threshold for binarizing predictions.
+
+        Returns:
+            Dict mapping bucket name to {f1_macro, f1_micro, mAP, num_tags, mean_support}.
+        """
+        targs = targets.detach()
+        if targs.dtype.is_floating_point:
+            targs = (targs > 0.5).to(torch.long)
+        else:
+            targs = targs.to(torch.long)
+        preds = predictions.detach()
+
+        results: Dict[str, Dict[str, float]] = {}
+        for bucket_name, indices in self._bucket_assignments.items():
+            num_tags = len(indices)
+            if num_tags == 0:
+                results[bucket_name] = {
+                    "f1_macro": 0.0, "f1_micro": 0.0, "mAP": 0.0,
+                    "num_tags": 0, "mean_support": 0.0,
+                }
+                continue
+
+            idx_tensor = torch.tensor(indices, dtype=torch.long, device=preds.device)
+            bucket_preds = preds[:, idx_tensor]
+            bucket_targs = targs[:, idx_tensor]
+
+            f1_macro = multilabel_f1_score(
+                bucket_preds, bucket_targs, num_labels=num_tags,
+                average="macro", threshold=threshold,
+            ).item()
+            f1_micro = multilabel_f1_score(
+                bucket_preds, bucket_targs, num_labels=num_tags,
+                average="micro", threshold=threshold,
+            ).item()
+            mAP = multilabel_average_precision(
+                bucket_preds, bucket_targs, num_labels=num_tags, average="macro",
+            ).item()
+            mean_support = bucket_targs.sum(dim=0).float().mean().item()
+
+            results[bucket_name] = {
+                "f1_macro": f1_macro,
+                "f1_micro": f1_micro,
+                "mAP": mAP,
+                "num_tags": num_tags,
+                "mean_support": mean_support,
+            }
+
+        return results
+
+    @property
+    def bucket_names(self) -> List[str]:
+        return list(self._bucket_names)
+
+    @property
+    def bucket_tag_counts(self) -> Dict[str, int]:
+        return {name: len(indices) for name, indices in self._bucket_assignments.items()}
+
+
+@dataclass
+class ThresholdCalibrator:
+    """Calibrate per-tag or per-bucket prediction thresholds by maximizing F1.
+
+    Searches over a range of thresholds to find optimal values, either independently
+    per tag or grouped by frequency bucket. Zero training risk — operates on
+    accumulated validation predictions post-training.
+
+    Args:
+        mode: "per_tag" for individual tag thresholds, "per_bucket" for one per frequency bucket.
+        default_threshold: Fallback for tags with zero validation support.
+        search_min: Lower bound of threshold search range.
+        search_max: Upper bound of threshold search range.
+        search_step: Step size for threshold grid search.
+    """
+    mode: str = "per_bucket"
+    default_threshold: float = 0.2653
+    search_min: float = 0.1
+    search_max: float = 0.9
+    search_step: float = 0.02
+
+    def calibrate(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        tag_names: List[str],
+        skip_indices: Optional[List[int]] = None,
+        frequency_bins: Optional[List[float]] = None,
+        tag_frequencies: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, float]:
+        """Find optimal thresholds for each tag or frequency bucket.
+
+        Args:
+            predictions: Probability tensor, shape (N, num_labels).
+            targets: Binary target tensor, shape (N, num_labels).
+            tag_names: Ordered list of tag names matching model output indices.
+            skip_indices: Indices to exclude (e.g., PAD/UNK).
+            frequency_bins: Required when mode="per_bucket".
+            tag_frequencies: Required when mode="per_bucket".
+
+        Returns:
+            Dict mapping tag name (per_tag) or bucket name (per_bucket) to optimal threshold.
+        """
+        preds_np = predictions.detach().float().numpy()
+        targs_np = targets.detach().numpy()
+        if targs_np.dtype != np.int64:
+            targs_np = (targs_np > 0.5).astype(np.int64)
+
+        skip_set = set(skip_indices) if skip_indices else set()
+        thresholds = np.arange(self.search_min, self.search_max + self.search_step / 2, self.search_step)
+
+        if self.mode == "per_tag":
+            return self._calibrate_per_tag(preds_np, targs_np, tag_names, skip_set, thresholds)
+        elif self.mode == "per_bucket":
+            if frequency_bins is None or tag_frequencies is None:
+                raise ValueError("frequency_bins and tag_frequencies required for per_bucket mode")
+            return self._calibrate_per_bucket(
+                preds_np, targs_np, tag_names, skip_set, thresholds,
+                frequency_bins, tag_frequencies,
+            )
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+    def _calibrate_per_tag(
+        self,
+        preds: np.ndarray,
+        targs: np.ndarray,
+        tag_names: List[str],
+        skip_set: set,
+        thresholds: np.ndarray,
+    ) -> Dict[str, float]:
+        result = {}
+        for idx in range(preds.shape[1]):
+            if idx in skip_set:
+                continue
+            tag_name = tag_names[idx] if idx < len(tag_names) else str(idx)
+            support = targs[:, idx].sum()
+            if support == 0:
+                result[tag_name] = self.default_threshold
+                continue
+            best_thresh = self.default_threshold
+            best_f1 = -1.0
+            for t in thresholds:
+                pred_bin = (preds[:, idx] > t).astype(np.int64)
+                targ_col = targs[:, idx]
+                tp = (pred_bin * targ_col).sum()
+                fp = (pred_bin * (1 - targ_col)).sum()
+                fn = ((1 - pred_bin) * targ_col).sum()
+                f1 = 2 * tp / (2 * tp + fp + fn + 1e-8)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_thresh = float(t)
+            result[tag_name] = best_thresh
+        return result
+
+    def _calibrate_per_bucket(
+        self,
+        preds: np.ndarray,
+        targs: np.ndarray,
+        tag_names: List[str],
+        skip_set: set,
+        thresholds: np.ndarray,
+        frequency_bins: List[float],
+        tag_frequencies: Dict[str, int],
+    ) -> Dict[str, float]:
+        # Group tag indices by frequency bucket
+        buckets: Dict[str, List[int]] = {}
+        for i in range(len(frequency_bins) - 1):
+            low = int(frequency_bins[i])
+            high = frequency_bins[i + 1]
+            name = f"{low}+" if high == float('inf') else f"{low}-{int(high) - 1}"
+            buckets[name] = []
+
+        bucket_names = list(buckets.keys())
+        for idx, tag_name in enumerate(tag_names):
+            if idx in skip_set:
+                continue
+            freq = tag_frequencies.get(tag_name, 0)
+            for i in range(len(frequency_bins) - 1):
+                if frequency_bins[i] <= freq < frequency_bins[i + 1]:
+                    buckets[bucket_names[i]].append(idx)
+                    break
+
+        result = {}
+        for bucket_name, indices in buckets.items():
+            if not indices:
+                result[bucket_name] = self.default_threshold
+                continue
+            best_thresh = self.default_threshold
+            best_f1 = -1.0
+            for t in thresholds:
+                # Compute macro-F1 across all tags in this bucket
+                f1_sum = 0.0
+                count = 0
+                for idx in indices:
+                    support = targs[:, idx].sum()
+                    if support == 0:
+                        continue
+                    pred_bin = (preds[:, idx] > t).astype(np.int64)
+                    targ_col = targs[:, idx]
+                    tp = (pred_bin * targ_col).sum()
+                    fp = (pred_bin * (1 - targ_col)).sum()
+                    fn = ((1 - pred_bin) * targ_col).sum()
+                    f1_sum += 2 * tp / (2 * tp + fp + fn + 1e-8)
+                    count += 1
+                macro_f1 = f1_sum / max(count, 1)
+                if macro_f1 > best_f1:
+                    best_f1 = macro_f1
+                    best_thresh = float(t)
+            result[bucket_name] = best_thresh
+        return result
+
+    @staticmethod
+    def save(thresholds: Dict[str, float], path: Union[str, Path]) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w') as f:
+            json.dump(thresholds, f, indent=2)
+
+    @staticmethod
+    def load(path: Union[str, Path]) -> Dict[str, float]:
+        with open(path, 'r') as f:
+            return json.load(f)
+
+    @staticmethod
+    def apply_thresholds(
+        predictions: torch.Tensor,
+        tag_thresholds: Dict[str, float],
+        tag_names: List[str],
+        default_threshold: float = 0.2653,
+    ) -> torch.Tensor:
+        """Apply per-tag thresholds to convert probabilities to binary predictions.
+
+        Args:
+            predictions: Probability tensor, shape (N, num_labels).
+            tag_thresholds: Dict mapping tag name to threshold.
+            tag_names: Ordered tag names matching prediction columns.
+            default_threshold: Fallback for tags not in tag_thresholds.
+
+        Returns:
+            Binary tensor, shape (N, num_labels).
+        """
+        thresh_tensor = torch.full(
+            (predictions.shape[1],), default_threshold,
+            dtype=predictions.dtype, device=predictions.device,
+        )
+        for idx, name in enumerate(tag_names):
+            if name in tag_thresholds:
+                thresh_tensor[idx] = tag_thresholds[name]
+        return (predictions > thresh_tensor.unsqueeze(0)).long()

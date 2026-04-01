@@ -103,7 +103,7 @@ class InferenceConfig(BaseInferenceConfig):
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
-    image_size: int = 512
+    image_size: int = 448
     normalize_mean: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
     normalize_std: List[float] = field(default_factory=lambda: [0.5, 0.5, 0.5])
     use_torch_compile: bool = False
@@ -609,7 +609,6 @@ class ModelWrapper:
                 'num_hidden_layers': 24,
                 'num_attention_heads': 16,
                 'intermediate_size': 5120,
-                'num_ratings': 5,
                 'dropout': 0.1,
                 'attention_dropout': 0.1,
                 'layer_norm_eps': 1e-6,
@@ -677,7 +676,7 @@ class ModelWrapper:
                 # Filter vit_config_dict to only VisionTransformerConfig fields
                 vit_fields = {'image_size', 'patch_size', 'num_channels', 'hidden_size',
                              'num_hidden_layers', 'num_attention_heads', 'intermediate_size',
-                             'num_tags', 'num_ratings', 'dropout', 'attention_dropout',
+                             'num_tags', 'dropout', 'attention_dropout',
                              'layer_norm_eps', 'use_flex_attention', 'flex_block_size',
                              'attention_bias', 'token_ignore_threshold', 'gradient_checkpointing',
                              'checkpoint_every_n_layers', 'drop_path_rate',
@@ -695,7 +694,7 @@ class ModelWrapper:
                 # Filter config dict to only VisionTransformerConfig fields
                 vit_fields = {'image_size', 'patch_size', 'num_channels', 'hidden_size',
                              'num_hidden_layers', 'num_attention_heads', 'intermediate_size',
-                             'num_tags', 'num_ratings', 'dropout', 'attention_dropout',
+                             'num_tags', 'dropout', 'attention_dropout',
                              'layer_norm_eps', 'use_flex_attention', 'flex_block_size',
                              'attention_bias', 'token_ignore_threshold', 'gradient_checkpointing',
                              'checkpoint_every_n_layers', 'drop_path_rate',
@@ -705,8 +704,14 @@ class ModelWrapper:
                 vit_config = VisionTransformerConfig(**filtered_vit_config)
                 self.model = SimplifiedTagger(vit_config)
 
+            # Filter out removed rating_head keys from old checkpoints
+            rating_head_keys = [k for k in state_dict if 'rating_head' in k]
+            if rating_head_keys:
+                for k in rating_head_keys:
+                    del state_dict[k]
+                logger.info(f"Removed {len(rating_head_keys)} rating_head keys from checkpoint (rating merged into tags)")
+
             # Load weights with explicit strict checking
-            # Note: load_state_dict(strict=True) returns None on success, raises RuntimeError on mismatch
             try:
                 self.model.load_state_dict(state_dict, strict=True)
                 logger.info("Model state dict loaded successfully (strict=True)")
@@ -759,8 +764,7 @@ class ModelWrapper:
             logger.info(f"  - Architecture: {architecture_type}")
             logger.info(f"  - Image size: {vit_config.image_size}")
             logger.info(f"  - Patch size: {vit_config.patch_size}")
-            logger.info(f"  - Number of tags: {vit_config.num_tags}")
-            logger.info(f"  - Number of ratings: {vit_config.num_ratings}")
+            logger.info(f"  - Number of tags: {vit_config.num_tags} (including rating tags)")
             return True
             
         except Exception as e:
@@ -859,12 +863,8 @@ class ModelWrapper:
                     # tags_f[b, i] = outputs_flipped[b, index_map[i]]
                     tags_f = outputs_flipped['tag_logits'][:, self._tta_index_map]
 
-                    # Average original and reordered flipped
+                    # Average original and reordered flipped (rating tags are included in tag_logits)
                     outputs['tag_logits'] = 0.5 * (outputs['tag_logits'] + tags_f)
-
-                    # Ratings are orientation-invariant; average directly if present
-                    if 'rating_logits' in outputs and 'rating_logits' in outputs_flipped:
-                        outputs['rating_logits'] = 0.5 * (outputs['rating_logits'] + outputs_flipped['rating_logits'])
                 else:
                     # Fallback: elementwise average common keys
                     try:
@@ -1632,8 +1632,7 @@ if __name__ == "__main__":
             "num_hidden_layers": 24,
             "num_attention_heads": 16,
             "intermediate_size": 5120,
-            "num_tags": 100000,  # Should match len(tag_names)
-            "num_ratings": 5,
+            "num_tags": 100000,  # Should match len(tag_names) including rating tags
             "dropout": 0.1,
             "attention_dropout": 0.1,
             "layer_norm_eps": 1e-6,

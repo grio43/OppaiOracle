@@ -64,3 +64,4 @@ annotation_request
 fan_request
 object_request
 parody_request
+commission

@@ -1200,7 +1200,13 @@ class DatasetLoader(Dataset):
             Sample dict for training
         """
         tag_vec = self._encode_labels(annotation)
-        rating_idx = _map_rating(annotation.get("rating", "unknown"))
+
+        # Encode rating as a tag in the multi-hot vector
+        rating_tag = _map_rating_to_tag(annotation.get("rating", "unknown"))
+        if rating_tag and hasattr(self, 'vocab') and self.vocab is not None:
+            rating_idx = self.vocab.tag_to_index.get(rating_tag)
+            if rating_idx is not None and 0 <= rating_idx < tag_vec.shape[0]:
+                tag_vec[rating_idx] = 1.0
 
         # Ensure tensors are contiguous before returning for efficient pin_memory
         # Non-contiguous tensors force implicit copies during DataLoader collation/pinning
@@ -1213,7 +1219,6 @@ class DatasetLoader(Dataset):
             "images": image,
             "padding_mask": padding_mask.to(torch.bool),
             "tag_labels": tag_vec,
-            "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
             "image_id": image_id,
             "cached": cached,
             "error": False,
@@ -1593,7 +1598,6 @@ class DatasetLoader(Dataset):
             "images": torch.zeros((3, sz, sz), dtype=img_dtype),
             "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
             "tag_labels": torch.zeros(self.num_classes, dtype=self._tag_vector_dtype),
-            "rating_labels": torch.tensor(4, dtype=torch.long),  # unknown
             "image_id": resolved_image_id,
             "cached": False,
             "flip_applied": False,
@@ -2447,7 +2451,12 @@ class SidecarJsonDataset(Dataset):
         Returns:
             Sample dict for training
         """
-        rating_idx = _map_rating(rating)
+        # Encode rating as a tag in the multi-hot vector
+        rating_tag = _map_rating_to_tag(rating)
+        if rating_tag:
+            rating_tag_idx = self.vocab.tag_to_index.get(rating_tag)
+            if rating_tag_idx is not None and 0 <= rating_tag_idx < tag_vec.shape[0]:
+                tag_vec[rating_tag_idx] = 1.0
 
         # Ensure tensors are contiguous before returning for efficient pin_memory
         # torch.flip() returns a view (non-contiguous), which forces implicit copies during
@@ -2461,7 +2470,6 @@ class SidecarJsonDataset(Dataset):
             "images": image,
             "padding_mask": padding_mask.to(torch.bool),
             "tag_labels": tag_vec,
-            "rating_labels": torch.tensor(rating_idx, dtype=torch.long),
             "image_id": image_id,
             "cached": cached,
             "flip_applied": flip_applied,
@@ -2842,7 +2850,6 @@ class SidecarJsonDataset(Dataset):
             "images": torch.zeros((3, sz, sz), dtype=img_dtype),
             "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
             "tag_labels": torch.zeros(len(self.vocab.tag_to_index), dtype=self._tag_vector_dtype),
-            "rating_labels": torch.tensor(4, dtype=torch.long),
             "image_id": resolved_image_id,
             "cached": False,
             "flip_applied": False,
@@ -2853,42 +2860,37 @@ class SidecarJsonDataset(Dataset):
         }
 
 
-def _map_rating(rating: Any) -> int:
-    """Map dataset rating field to fixed indices used by the model.
+def _map_rating_to_tag(rating: Any) -> Optional[str]:
+    """Map dataset rating field to a rating tag string.
 
-    Mapping:
-        - general/safe/g -> 0
-        - sensitive -> 1
-        - questionable/q -> 2
-        - explicit/e -> 3
-        - unknown/u -> 4 (default)
+    Returns the rating tag name (e.g., "rating:general") or None for unknown.
+    Unknown ratings produce no rating tag, so the model learns nothing for
+    that sample's rating (all rating tag positions stay 0 in the multi-hot vector).
 
     Args:
         rating: Rating value from dataset (int or str)
 
     Returns:
-        Integer rating index (0-4)
+        Rating tag string, or None for unknown/invalid ratings
     """
+    _IDX_TO_TAG = {
+        0: "rating:general",
+        1: "rating:sensitive",
+        2: "rating:questionable",
+        3: "rating:explicit",
+    }
+
     if isinstance(rating, int):
-        # Validate range
-        idx = int(rating)
-        if 0 <= idx <= 4:
-            return idx
-        else:
-            logging.getLogger(__name__).warning(
-                f"Invalid rating index {idx}, defaulting to 4 (unknown)"
-            )
-            return 4
+        return _IDX_TO_TAG.get(int(rating))
 
     r = str(rating).strip().lower()
-    mapping = {
-        "g": 0, "general": 0, "safe": 0,
-        "sensitive": 1,
-        "q": 2, "questionable": 2,
-        "e": 3, "explicit": 3,
-        "u": 4, "unknown": 4,
+    _STR_TO_TAG = {
+        "g": "rating:general", "general": "rating:general", "safe": "rating:general",
+        "sensitive": "rating:sensitive",
+        "q": "rating:questionable", "questionable": "rating:questionable",
+        "e": "rating:explicit", "explicit": "rating:explicit",
     }
-    return mapping.get(r, 4)
+    return _STR_TO_TAG.get(r)
 
 
 def create_dataloaders(
