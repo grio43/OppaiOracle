@@ -48,19 +48,15 @@ model:
     # ViT-specific parameters (used when architecture_type == "vit" or "vit_wide_shallow")
     # These are ignored when using SwinV2, which uses swin_config above instead.
     hidden_size: 1024
-    num_hidden_layers: 17
+    num_hidden_layers: 18  # Phase 1: SoViT-150m validated 18L at 880-width (Alabdulmohsin et al., NeurIPS 2023)
     num_attention_heads: 16
     intermediate_size: 4096
-    image_size: 448  # Auto-synced from data.image_size at startup — change data.image_size instead
+    image_size: 320  # Auto-synced from data.image_size at startup — change data.image_size instead
     patch_size: 16  # ViT uses patch_size=16 (SwinV2 uses 4)
     num_channels: 3
-    use_cls_token: true
-    use_style_token: true
-    use_line_token: true
-    use_color_token: true
-    num_special_tokens: 4
     hidden_dropout_prob: 0.1
-    attention_dropout: 0.0  # Dropout on attention weights (0.0 = rely on drop_path for regularization)
+    pos_dropout: 0.0  # Position embedding dropout (0.0 = modern best practice; drop_path handles regularization)
+    attention_dropout: 0.05  # Dropout on attention weights (complementary to drop_path for attention pattern regularization)
     # Drop path rate for ViT architectures (stochastic depth regularization)
     # NOTE: This value is ONLY used when architecture_type == "vit" or "vit_wide_shallow"
     # For SwinV2 architecture, see swin_config.drop_path_rate above (currently 0.2)
@@ -94,24 +90,16 @@ data:
       priority: 0
       type: "local"
       enabled: true
-    - path: "/home/user/datasets/anime_curated"
-      priority: 1
-      type: "local"
-      enabled: false  # Disabled by default
-    - path: "/mnt/das/anime_archive"
-      priority: 2
-      type: "das"
-      enabled: false  # Disabled by default
   
   # Paths (from paths.yaml)
-  hdf5_dir: "./teacher_features"
   vocab_dir: "./vocabulary"
   output_dir: "./outputs"
   
   # Image processing
   # >>> SINGLE SOURCE OF TRUTH for resolution. model.image_size and
   # >>> validation.preprocessing.image_size are auto-synced from this value.
-  image_size: 448
+  # Phase 1: 320 (from-scratch, 40 epochs). Phase 2: 448 (fine-tune, 15 epochs).
+  image_size: 320
   # IMPORTANT: Normalization values depend on training approach!
   #   - Training from scratch (current): [0.5, 0.5, 0.5] is fine (anime-optimized)
   #   - Pretrained SwinV2/ViT from ImageNet: Use ImageNet normalization:
@@ -135,7 +123,7 @@ data:
   #     Use gradient_accumulation_steps to maintain effective batch size.
   #   - 24GB GPU: SwinV2 can use batch_size=12 with 512px images
   #   - See training_config.py:check_swinv2_batch_size() for memory guidance58
-  batch_size: 58   # ViT with 448px images, 17 layers, yse 58 when doing 448px. It is guess at 170 at 256 images
+  batch_size: 102  # Phase 1 (320px, 18 layers): 102 with 9 grad-accum -> effective 918. Phase 2 (448px): drop to 58.
   num_workers: 6  # Arrow mmap shares metadata (~500MB/worker overhead), 32-core system
   pin_memory: true   # Enables async DMA transfer for PCIe 4.0/5.0
   prefetch_factor: 3  # 8 workers × 3 batches × 128 = 3072 samples prefetched 
@@ -144,7 +132,7 @@ data:
   worker_log_level: WARNING  # Worker log level: WARNING allows debugging, CRITICAL minimizes overhead
   
   # Vocabulary
-  vocab_min_frequency: 300
+  vocab_min_frequency: 500
 
   # Validation split limiting
   # Limits validation set size at split time (before Arrow cache loading).
@@ -152,16 +140,6 @@ data:
   max_val_samples: 30000
 
   preload_files: 0
-
-  # Sidecar Tensor Cache (replaces L2 LMDB cache)
-  # Preprocessed images are stored as .safetensor files alongside original images.
-  # No virtual memory issues, pooled SSD-friendly, unlimited parallel reads.
-  # NOTE: Provides no benefit if the system has CPU to spare - only helps when
-  # CPU preprocessing (decode/resize) is the bottleneck starving the GPU.
-  sidecar_cache_enabled: false
-  sidecar_extension: ".safetensor"  # File extension for cached tensors
-  sidecar_storage_dtype: "bfloat16"  # Storage dtype for cached tensors
-  cpu_bf16_cache_pipeline: true  # Use bfloat16 in preprocessing pipeline if CPU supports it
 
   # Metadata Cache (JSON parsing cache)
   # Caches parsed JSON metadata to avoid re-parsing millions of files on every run.
@@ -195,12 +173,21 @@ data:
   orientation_safety_mode: "conservative"
 
   # Color jitter augmentation (applied before normalization)
+  # Phase 1 values raised toward DeiT III's validated from-scratch ViT recipe,
+  # with saturation held well below brightness/contrast because it is the only
+  # axis that directly attacks color-named tag identity (e.g. blue_eyes, pink_skin).
+  #   brightness 0.30 — DeiT III (--color-jitter 0.3, ECCV 2022); pure luminance, no chroma harm
+  #   contrast   0.20 — one-step safety margin below DeiT III's 0.30 (luminance-driven chroma compression risk)
+  #   saturation 0.08 — derived from BYOL's asymmetry (NeurIPS 2020): saturation ≈ ¼ of brightness/contrast
+  #                     when color identity must be preserved. Kirichenko et al. (NeurIPS 2023, arXiv:2401.01764)
+  #                     confirms color jitter preferentially harms color-distinguished class pairs.
+  # Phase 2 halves these: brightness 0.15, contrast 0.10, saturation 0.04.
   color_jitter_enabled: true
-  color_jitter_brightness: 0.06
+  color_jitter_brightness: 0.30
   color_jitter_brightness_p: 0.5
-  color_jitter_contrast: 0.04
+  color_jitter_contrast: 0.20
   color_jitter_contrast_p: 0.5
-  color_jitter_saturation: 0.04
+  color_jitter_saturation: 0.08
   color_jitter_saturation_p: 0.5
 
   # Random erasing augmentation (applied after normalization)
@@ -212,28 +199,60 @@ data:
   random_erasing_ratio_max: 2.0
 
   # Random rotation augmentation (applied after letterboxing, image only)
-  random_rotation_enabled: false
-  random_rotation_p: .40
-  random_rotation_min_degrees: 0.5
-  random_rotation_max_degrees: 3.0
+  # Phase 1: enabled (0-8 deg @ p=0.50, bicubic). Phase 2: disable (spatial precision at 448px).
+  # Scholarly basis:
+  #   - RandAugment (Cubuk 2020 NeurIPS-W): rotation magnitude M=9 → ±9° in original mapping;
+  #     used in DeiT (Touvron 2021 ICML) and AugReg (Steiner 2022 TMLR) for from-scratch ViT.
+  #   - Kirichenko 2024 NeurIPS ("Detrimental Class-level Effects of Data Augmentation"):
+  #     raising augmentation FREQUENCY (p) is safer for fine-grained discrimination than
+  #     raising MAGNITUDE — supports p=0.50 with capped 8° over higher max with lower p.
+  #   - Tags are not orientation-sensitive in this dataset, so the main fine-grained risk
+  #     (orientation-correlated label features) does not apply at the label level.
+  #   - Corner pad-fill at 8° is ~6.1% (closed form: tan(θ/2)(1-tan(θ/2))/(1+tan(θ/2))),
+  #     well within the letterbox padding distribution the model already sees.
+  #   - Bicubic resampling (Thévenaz/Blu/Unser 2000 IEEE TIP) preserves 3-5px features
+  #     (eye highlights, single hair strands) much better than bilinear at any rotation.
+  # Effective range is ±[min, max] (sampled in [min,max] then sign flipped 50%): so [-8°,-2°] ∪ [+2°,+8°].
+  # min=2.0 ensures every fired event is perceptibly rotated — sub-2° rotations are
+  # nearly invisible and waste an augmentation event behind the p=0.50 gate.
+  random_rotation_enabled: true
+  random_rotation_p: 0.50
+  random_rotation_min_degrees: 2.0
+  random_rotation_max_degrees: 8.0
+
+  # Gaussian blur augmentation (applied to PIL before letterboxing)
+  # Scholarly basis: DeiT III 3-Augment (Touvron et al., ECCV 2022) showed Gaussian blur
+  # outperforms RandAugment for supervised ViT. Phase 1 (320x320) only -- drop for Phase 2 (448x448).
+  # p=0.30: modest raise from 0.25 toward DeiT III's structural 1/3 (that value is an
+  # artifact of uniform 3-way selection, not a tuned optimum -- no paper ablates it).
+  # Kernel=3 with sigma<=1.5 caps effective blur to preserve fine-grained anime features
+  # (eye highlights, accessories, small details). Kirichenko 2024 (arXiv:2401.01764):
+  # raising intensity widens fine-grained class-pair confusion; raising frequency of a
+  # weak transform does not. BYOL's asymmetric blur (p=1.0/0.1 across views) further
+  # supports keeping unblurred samples in the mix.
+  gaussian_blur_enabled: true
+  gaussian_blur_p: 0.30
+  gaussian_blur_kernel_size: 3
+  gaussian_blur_sigma_min: 0.1
+  gaussian_blur_sigma_max: 1.5
 
 # Training Configuration (from training_config.yaml)
 training:
     memory_format: "channels_last"
-    num_epochs: 36
+    num_epochs: 40
     # IMPORTANT: learning_rate is the BASE rate (tuned for lr_base_batch_size=256).
     # It is automatically scaled at runtime based on effective batch size and lr_scaling_mode.
     #
-    # Current setup:
-    #   - Architecture: ViT (from scratch)
-    #   - Effective batch size: batch_size (56) * gradient_accumulation_steps (9) = 504 samples/step
-    #   - Dataset: 5.4M images, 36 epochs
-    #   - Scaling: sqrt(504/256) = 1.403x → effective LR = 5.0e-4 * 1.403 = 7.0e-4
+    # Current setup (Phase 1, 320px from-scratch):
+    #   - Architecture: ViT-L/16, 18 layers
+    #   - Effective batch size: batch_size (102) * gradient_accumulation_steps (9) = 918 samples/step
+    #   - Dataset: 5.4M images, 40 epochs
+    #   - Scaling: sqrt(918/256) = 1.894x → effective LR ≈ 2.5e-4 * 1.894 = 4.73e-4 peak
     #
-    # Alternative values:
-    #   - 2.5e-4: Conservative base rate (previous default)
-    #   - For fine-tuning pretrained weights: consider 5.0e-5 to 1.0e-4
-    learning_rate: 5.0e-4  # Base rate for ViT at batch_size=256 (scaled at runtime via lr_scaling_mode)
+    # ViT-L specific: Dosovitskiy (2021) used 4e-4 for ViT-L vs 8e-4 for ViT-B at batch 4096.
+    # muP theory (Wortsman 2024) confirms LR decreases with model width.
+    # Phase 2 (448px fine-tune) drops to ~1.0e-5.
+    learning_rate: 2.5e-4  # Phase 1 base rate (sqrt-scales to ~4.73e-4 peak at effective batch 918)
     lr_scaling_mode: "sqrt"  # "sqrt" (recommended for AdamW), "linear", or "none"
     lr_base_batch_size: 256  # Reference batch size that learning_rate was tuned for
 
@@ -252,7 +271,7 @@ training:
     swinv2_learning_rate: null
 
     weight_decay: 0.1
-    gradient_accumulation_steps: 9  # Effective batch size: 56 * 9 = 504 samples/step
+    gradient_accumulation_steps: 9  # Phase 1 effective batch: 114 * 9 = 1026 samples/step
 
     # Optimizer
     # NOTE: Using "adamw8bit" for memory-efficient 8-bit quantized optimizer states
@@ -263,13 +282,13 @@ training:
     #   - Save memory with 8-bit quantized optimizer states (~3 GB savings vs standard adamw)
     optimizer: "adamw8bit"
     adam_beta1: 0.9
-    adam_beta2: 0.95
+    adam_beta2: 0.999  # DeiT convention; standard AdamW for ViT
     adan_beta3: 0.99
     adam_epsilon: 1.0e-7  # 1e-7 is safer for bfloat16 (coarser dynamic range than fp32)
 
     # Scheduler
-    scheduler: "cosine_restarts"
-    warmup_epochs: 10  # Linear ramp from lr_end to learning_rate over first 10 epochs, then cosine decay
+    scheduler: "cosine"  # Phase 1: cosine decay. Phase 2 re-warmup handles transition.
+    warmup_epochs: 4  # Phase 1: 10% of 40 epochs (DeiT range 1.7-17%)
     num_cycles: 1  # Single cosine decay (no restarts)
     lr_end: 1.0e-6
 
@@ -295,30 +314,26 @@ training:
     # or point to an exact checkpoint to branch experiments safely.
     resume_from: "latest"
 
-    eval_steps: 10547  # 1 epoch - validates after every epoch for early overfitting detection
-    logging_steps: 5000  # Reduced TensorBoard overhead (was 3000)
+    eval_steps: 10526  # Phase 1: 2 epochs (5263 steps/epoch × 2). Validation is blocking on the train rank; halving cadence saves wall-clock without quality risk on a smooth val curve. First epoch always validates regardless.
+    logging_steps: 10000  # Reduced TensorBoard overhead (was 3000)
     # Resume-aware reseeding: avoid replaying the same early-epoch order after resume
     resume_reseed: true
 
     # Loss configuration
     tag_loss:
-      alpha: 0.5            # Non-standard in canonical ASL; with binary targets this is effectively neutral (gamma handles imbalance)
-      gamma_neg: 4.0        # Canonical ASL uses 4 for MS-COCO (3% pos rate); our 0.6% pos rate needs strong neg downweighting
-      gamma_pos: 1.0        # Focusing parameter for positives
+      alpha: 1.0            # 1.0 = disabled (pure ASL, no alpha weighting: pos_loss + neg_loss)
+      gamma_neg: 4.0        # Phase 1: curriculum value. From-scratch broader gradient signal. Phase 2: raise to 7.0 (matches Open Images sparsity regime per ASL paper).
+      gamma_pos: 0.0        # ASL paper optimal: no focal suppression on positives (preserves scarce positive gradient)
       label_smoothing: 0.0   # Disabled — label smoothing + focal loss corrupts focal weights on sparse multi-label targets
-      clip: 0.05            # Prevent extreme logits
-      # class_weight_strategy: "inverse_sqrt"  # Auto-compute weights from tag frequencies (w=1/sqrt(freq), normalized)
-      # class_weight_clip_min: 0.1             # Floor for computed weights
-      # class_weight_clip_max: 10.0            # Cap for computed weights
+      clip: 0.2             # Focal-based ASL needs higher margin than CE-based (ASL paper: m=0.2 default for focal variant on MS-COCO)
+      class_weight_strategy: null  # Removed: redundant with ASL gamma_neg (double-correction risk; ASL paper Table 2: pure ASL > FL+linear weighting)
+      class_weight_clip_min: 0.05            # No-op when class_weight_strategy is null
+      class_weight_clip_max: 5.0             # No-op when class_weight_strategy is null
+      class_weight_beta: 0.9999              # No-op when class_weight_strategy is null
     # Ratings are now encoded as regular tags (rating:general, rating:sensitive, etc.)
     # and trained with the same tag loss. No separate rating_loss section needed.
     # Hardware
     device: "cuda"
-    distributed: false
-    local_rank: -1
-    world_size: 1
-    ddp_backend: "nccl"
-
     # torch.compile() Optimization (PyTorch 2.0+)
     # Provides 15-35% speedup through graph optimization and kernel fusion
     # Especially effective for transformer models with attention mechanisms
@@ -330,21 +345,17 @@ training:
 
     # Tracking
     use_tensorboard: true
-    use_wandb: false
-    wandb_project: "anime-tagger"
-    wandb_run_name: null
-    wandb_entity: null
-
     # Training stability (from runtime.yaml)
     seed: 42
     deterministic: false
     benchmark: true
 
     # Early stopping
-    early_stopping_patience: 4
+    # Phase 1: effectively disabled (will transition to Phase 2 regardless). Phase 2: tighten to patience=4, burn_in=2.
+    early_stopping_patience: 8
     early_stopping_threshold: 0.0000005
     # Ignore first N epochs for early-stopping to avoid initial instability
-    early_stopping_burn_in_epochs: 3
+    early_stopping_burn_in_epochs: 8
     # One of: median, mean, last, max
     early_stopping_burn_in_strategy: median
 
@@ -352,53 +363,15 @@ training:
 inference:
   model_path: "./checkpoints/best_model.pt"
   precision: "bf16"  # Set precision to bf16 for inference
-  compile_model: false
-  
   # Prediction
   prediction_threshold: 0.2653
-  adaptive_threshold: true
-  min_predictions: 5
-  max_predictions: 50
   top_k: null
-  
-  # Tag filtering
-  filter_nsfw: false
-  nsfw_tags:
-    - "explicit"
-    - "questionable"
-    - "sensitive"
-    - "nude"
-    - "sexual_content"
-  blacklist_tags: []
-  whitelist_tags: null
-  
-  # Post-processing
-  apply_implications: true
-  resolve_aliases: true
-  group_by_category: false
-  remove_underscores: true
-  
+
   # Performance
-  use_tensorrt: false
-  optimize_for_speed: false
-  batch_timeout_ms: 100
   max_batch_size: 32
   
   # Output
   output_format: "json"
-  include_scores: true
-  score_decimal_places: 3
-  sort_by_score: true
-  
-  # API Settings
-  enable_api: false
-  api_host: "0.0.0.0"
-  api_port: 8000
-  api_workers: 4
-  api_max_image_size: 10485760
-  api_rate_limit: 100
-  api_cors_origins:
-    - "*"
   
   # Caching
   enable_cache: true
@@ -415,17 +388,14 @@ threshold_calibration:
 # Export Configuration (from export_config.yaml)
 export:
   export_format: "onnx"
-  opset_version: 19
+  opset_version: 21
   export_params: true
   do_constant_folding: true
   dynamic_batch_size: true
-  min_batch_size: 1
   max_batch_size: 128
   optimize: true
-  optimize_for_mobile: false
   quantize: false
   quantization_type: "dynamic"
-  calibration_dataset_size: 100
   validate_export: true
   tolerance_rtol: 1.0e-3
   tolerance_atol: 1.0e-5
@@ -434,7 +404,6 @@ export:
   model_description: "Anime Image Tagger Model"
   model_author: "AnimeTaggers"
   model_version: "1.0.0"
-  model_license: "MIT"
   output_path: "./exported_model"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -452,7 +421,7 @@ validation:
   preprocessing:
     # Uses data.normalize_mean/std by default; keep in sync with
     # training/inference unless intentionally different.
-    image_size: 448  # Auto-synced from data.image_size at startup
+    image_size: 320  # Auto-synced from data.image_size at startup
     patch_size: 16   # Auto-synced from model.patch_size at startup
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -469,23 +438,8 @@ monitor:
   system_metrics_log_interval_steps: 3000  # How often to log to TensorBoard (steps)
   track_gpu_metrics: true
   track_disk_io: true
-  track_network_io: false
-
   # Visualization
-  # Note: These are often overridden by the training config for convenience
-  use_tensorboard: true
-  # Histogram logging defaults (set conservative intervals; disable by default)
-  log_histograms: false
-  log_param_histograms: false
-  log_grad_histograms: false
-  histogram_log_interval: 4000
-  param_hist_interval_steps: 4000
-  grad_hist_interval_steps: 4000
   tensorboard_dir: "./tensorboard"
-  use_wandb: false
-  wandb_project: "anime-tagger"
-  wandb_entity: null
-  wandb_run_name: null
 
   # Alerts
   enable_alerts: true
@@ -504,7 +458,7 @@ monitor:
 
   tb_image_logging:
     max_samples: 50         # Number of images to grade per logging interval
-    topk: 50                # how many tags per sample in Text tab
+    topk: 100               # how many tags per sample in Text tab
     log_native_resolution: true  # keep images crisp in TB
     dpi_for_figures: 220          # only used if you later add composite figures
     image_log_steps: 10000  # Log training images to TensorBoard every N steps

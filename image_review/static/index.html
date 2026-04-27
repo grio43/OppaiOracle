@@ -59,6 +59,18 @@
                 </div>
             </div>
 
+            <!-- Corrections -->
+            <div class="panel corrections-panel">
+                <h3>Corrections</h3>
+                <div class="correction-key" id="correction-key" title="">-</div>
+                <div class="correction-counts">
+                    <span class="correction-count add">+<span id="count-add">0</span></span>
+                    <span class="correction-count remove">&minus;<span id="count-remove">0</span></span>
+                    <span class="correction-saved" id="correction-saved">&nbsp;</span>
+                </div>
+                <button id="btn-reset-corrections" class="reset-btn">Reset this sample</button>
+            </div>
+
             <!-- Keyboard Shortcuts -->
             <div class="panel shortcuts">
                 <h3>Shortcuts</h3>
@@ -81,7 +93,11 @@
                 <!-- Left Column: Expected Tags (Ground Truth) -->
                 <section class="column expected-tags">
                     <h2>Expected Tags</h2>
-                    <p class="column-subtitle">Ground truth labels</p>
+                    <p class="column-subtitle">Ground truth labels &mdash; click &times; to flag for removal</p>
+                    <div class="add-tag-controls">
+                        <input type="text" id="add-tag-input" placeholder="Add missing tag..." autocomplete="off">
+                        <button id="btn-add-tag">Add</button>
+                    </div>
                     <div class="tag-list" id="expected-tags"></div>
                 </section>
 
@@ -115,13 +131,6 @@
                     </div>
                     <div class="prediction-list" id="predictions"></div>
                 </section>
-            </div>
-
-            <!-- Swipe Hint (mobile only) -->
-            <div class="swipe-hint" id="swipe-hint">
-                <span>&larr;</span>
-                <span>Swipe to navigate</span>
-                <span>&rarr;</span>
             </div>
         </main>
     </div>

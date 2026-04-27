@@ -1182,56 +1182,5 @@ def test_orientation_handler():
     
     print("\nAll tests passed!")
 
-def validate_dataset_orientation_tags(dataset_tags_file: Path, mapping_file: Path,
-                                      fail_on_unmapped: bool = False,
-                                      max_unmapped_threshold: int = 50) -> int:
-    """
-    Standalone validation script for CI/CD pipelines.
-
-    Args:
-        dataset_tags_file: Path to file containing all dataset tags (one per line)
-        mapping_file: Path to orientation mapping JSON
-        fail_on_unmapped: If True, exit with error code if unmapped tags found
-        max_unmapped_threshold: Maximum allowed unmapped tags before failure
-
-    Returns:
-        Exit code (0 for success, 1 for failure)
-    """
-    # Load dataset tags
-    try:
-        with open(dataset_tags_file, 'r', encoding='utf-8') as f:
-            all_tags = set(line.strip() for line in f if line.strip())
-    except FileNotFoundError:
-        print(f"❌ Dataset tags file not found: {dataset_tags_file}")
-        return 1
-    except (OSError, IOError) as e:
-        print(f"❌ Error reading dataset tags file: {e}")
-        return 1
-
-    # Create handler and validate
-    try:
-        handler = OrientationHandler(mapping_file=mapping_file, strict_mode=True)
-    except ValueError as e:
-        print(f"❌ Configuration error: {e}")
-        return 1
-
-    issues = handler.validate_dataset_tags(all_tags)
-    
-    if issues:
-        print("Validation issues found:")
-        for issue_type, tags in issues.items():
-            print(f"\n{issue_type}: {len(tags)} tags")
-            for tag in tags[:10]:  # Show first 10
-                print(f"  - {tag}")
-    
-    # Check threshold
-    unmapped_count = len(issues.get('unmapped_orientation_tags', []))
-    if fail_on_unmapped and unmapped_count > max_unmapped_threshold:
-        print(f"\n❌ FAILED: {unmapped_count} unmapped tags exceeds threshold of {max_unmapped_threshold}")
-        return 1
-    
-    print(f"\n✅ Validation passed: {unmapped_count} unmapped tags within threshold")
-    return 0
-
 if __name__ == "__main__":
     test_orientation_handler()

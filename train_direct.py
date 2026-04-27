@@ -18,14 +18,13 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 import multiprocessing as mp
 import sys
 import platform
 import random
 import queue
 from datetime import datetime
-import torch.distributed as dist
 from dataclasses import dataclass, fields
 from contextlib import nullcontext
 import signal
@@ -60,7 +59,6 @@ def _shutdown_dataloader_workers(loader: "Optional[DataLoader]") -> None:
 
 
 from Monitor_log import MonitorConfig, TrainingMonitor
-from utils.cache_monitor import monitor as cache_monitor
 from evaluation_metrics import MetricComputer, FrequencyBucketMetrics, ThresholdCalibrator
 
 # Project paths
@@ -74,10 +72,6 @@ logger = logging.getLogger(__name__)
 
 # Import the orientation handler
 from orientation_handler import OrientationHandler, OrientationMonitor
-
-# Cache monitor interval (steps). Configurable via CACHE_MONITOR_INTERVAL_STEPS env var.
-# Default: 3000 steps (~50 minutes at 1 step/sec, ~96k images with batch_size=32)
-CACHE_MONITOR_EVERY_STEPS = int(os.getenv('CACHE_MONITOR_INTERVAL_STEPS', '3000'))
 
 # Periodic NaN/Inf check interval (steps). Configurable via NAN_CHECK_INTERVAL_STEPS env var.
 # Default: 50 steps - balances early detection with minimal GPU sync overhead.
@@ -194,16 +188,18 @@ def _loss_to_float(value: Any) -> float:
 def _compute_class_weights(
     vocab,
     strategy: str,
-    clip_min: float = 0.1,
-    clip_max: float = 10.0,
+    clip_min: float = 0.05,
+    clip_max: float = 5.0,
+    beta: float = 0.9999,
 ) -> list:
     """Compute per-class weights from tag frequencies.
 
     Args:
         vocab: TagVocabulary with tag_frequencies and index_to_tag.
-        strategy: Weighting strategy ("inverse_sqrt").
+        strategy: Weighting strategy ("inverse_sqrt" or "effective_number").
         clip_min: Floor for weights (prevents near-zero).
         clip_max: Cap for weights (prevents extreme values).
+        beta: Beta parameter for effective_number strategy (Cui et al. 2019).
 
     Returns:
         List of floats, length = vocab size, suitable for AsymmetricFocalLoss.
@@ -227,6 +223,15 @@ def _compute_class_weights(
 
         if strategy == "inverse_sqrt":
             raw_weights.append(1.0 / math.sqrt(freq))
+        elif strategy == "effective_number":
+            # Cui et al. 2019: w = (1-beta) / (1-beta^freq)
+            if freq > 1000:
+                # Log-space for large freq to avoid float overflow
+                log_term = freq * math.log(beta)
+                effective_n = (1.0 - math.exp(log_term)) / (1.0 - beta)
+            else:
+                effective_n = (1.0 - beta ** freq) / (1.0 - beta)
+            raw_weights.append(1.0 / effective_n)
         else:
             raise ValueError(f"Unknown class_weight_strategy: {strategy}")
 
@@ -237,6 +242,17 @@ def _compute_class_weights(
         if mean_w > 0:
             raw_weights = [w / mean_w if w > 0 else 0.0 for w in raw_weights]
 
+    # Log pre-clip distribution percentiles
+    active_pre_clip = sorted(w for w in raw_weights if w > 0)
+    if active_pre_clip:
+        n = len(active_pre_clip)
+        logger.info(
+            f"Class weights ({strategy}) pre-clip: "
+            f"p1={active_pre_clip[n//100]:.4f} p10={active_pre_clip[n//10]:.4f} "
+            f"p50={active_pre_clip[n//2]:.4f} p90={active_pre_clip[9*n//10]:.4f} "
+            f"p99={active_pre_clip[99*n//100]:.4f}"
+        )
+
     # Clip active weights
     weights = []
     for w in raw_weights:
@@ -246,11 +262,14 @@ def _compute_class_weights(
             weights.append(0.0)
 
     active = [w for w in weights if w > 0]
-    logger.info(
-        f"Computed class weights (strategy={strategy}): "
-        f"min={min(active):.4f}, max={max(active):.4f}, "
-        f"mean={sum(active)/len(active):.4f}, active_tags={len(active)}/{vocab_size}"
-    )
+    if active:
+        logger.info(
+            f"Computed class weights (strategy={strategy}): "
+            f"min={min(active):.4f}, max={max(active):.4f}, "
+            f"mean={sum(active)/len(active):.4f}, active_tags={len(active)}/{vocab_size}"
+        )
+    else:
+        logger.warning(f"No active class weights computed (vocab_size={vocab_size})")
     return weights
 
 
@@ -621,9 +640,6 @@ def train_with_orientation_tracking(config: FullConfig):
         validation_config=config.validation,
         vocab_path=Path(config.vocab_path),
         active_data_path=active_data_path,
-        distributed=config.training.distributed,
-        rank=config.training.local_rank,
-        world_size=config.training.world_size,
         seed=seed,
         debug_config=config.debug,
         architecture_type=config.model.architecture_type,
@@ -765,13 +781,13 @@ def train_with_orientation_tracking(config: FullConfig):
         model_config = config.model.to_dict()
         model_config["num_tags"] = num_tags
 
-        # Filter out config keys that are in unified_config.yaml but not used by VisionTransformerConfig
-        # These are legacy/alternate config fields that don't map to the current model architecture
+        # Filter out config keys that are in unified_config.yaml but not used by VisionTransformerConfig.
+        # These remain in the YAML purely for legacy reasons (grouped-prediction prototype was
+        # never shipped); strip them so create_model() doesn't choke on unknown kwargs.
         _unused_config_keys = {
             'architecture_type',
             'hidden_dropout_prob', 'initializer_range', 'num_groups', 'num_labels',
-            'num_special_tokens', 'tags_per_group', 'use_cls_token', 'use_color_token',
-            'use_line_token', 'use_style_token', 'swin_config'
+            'tags_per_group', 'swin_config'
         }
         model_config = {k: v for k, v in model_config.items() if k not in _unused_config_keys}
 
@@ -791,9 +807,11 @@ def train_with_orientation_tracking(config: FullConfig):
     # to ensure it's not lost during transformations. See the channels_last application block below.
     model.to(device)
 
-    # Convert model to bfloat16 when AMP is enabled with bf16 dtype
-    # This saves ~3.8 GB VRAM by storing parameters and gradients in bf16 instead of fp32
-    # AMP autocast still handles mixed precision during forward/backward passes
+    # Resolve AMP dtype for autocast. Parameters stay in fp32 even when AMP is bf16 —
+    # bf16 has only 7 mantissa bits, so storing master weights in bf16 makes the
+    # smallest representable update at |w|=1 ≈ 2^-7 (~7.8e-3). With lr~5e-4 and
+    # typical gradients, optimizer updates of ~5e-7 silently round to zero. Autocast
+    # handles bf16 forward/backward without requiring bf16 storage.
     amp_dtype_cfg = str(getattr(config.training, "amp_dtype", "bfloat16")).lower()
     if amp_dtype_cfg in ("bfloat16", "bf16"):
         amp_dtype = torch.bfloat16
@@ -802,11 +820,7 @@ def train_with_orientation_tracking(config: FullConfig):
     else:
         amp_dtype = torch.float32
 
-    if getattr(config.training, "use_amp", True) and amp_dtype_cfg in ("bfloat16", "bf16"):
-        model = model.bfloat16()
-        logger.info("Model converted to bfloat16 for memory efficiency (~3.8 GB VRAM savings)")
-
-    # Update monitor config with values from other parts of the config for backward compatibility
+    # Sync monitor config from training config (training.* is the single source of truth)
     if not hasattr(config, 'monitor'):
         # In case the config file is old and doesn't have a monitor section
         config.monitor = MonitorConfig()
@@ -818,7 +832,6 @@ def train_with_orientation_tracking(config: FullConfig):
         config.monitor.tensorboard_dir = str(Path(config.output_root) / config.experiment_name)
     # Ensure tensorboard directory exists before initializing monitor
     Path(config.monitor.tensorboard_dir).mkdir(parents=True, exist_ok=True)
-    config.monitor.use_wandb = config.training.use_wandb
     config.monitor.normalize_mean = tuple(getattr(config.data, 'normalize_mean', (0.5, 0.5, 0.5)))
     config.monitor.normalize_std = tuple(getattr(config.data, 'normalize_std', (0.5, 0.5, 0.5)))
 
@@ -913,6 +926,7 @@ def train_with_orientation_tracking(config: FullConfig):
             strategy=tag_loss_cfg.class_weight_strategy,
             clip_min=tag_loss_cfg.class_weight_clip_min,
             clip_max=tag_loss_cfg.class_weight_clip_max,
+            beta=tag_loss_cfg.class_weight_beta,
         )
 
     criterion = MultiTaskLoss(
@@ -1132,6 +1146,7 @@ def train_with_orientation_tracking(config: FullConfig):
     burn_in_strategy = str(getattr(config.training, "early_stopping_burn_in_strategy", "median")).lower()
     _burn_in_vals = []  # collect val metric during burn-in window
     global_step = 0
+    _last_image_log_step = -1  # Guard against duplicate image logging within accumulation window
     start_epoch = 0
     # Track mid-epoch resume info (for resuming from exact batch position)
     resume_batch_idx = 0
@@ -1239,12 +1254,23 @@ def train_with_orientation_tracking(config: FullConfig):
             if not ckpt_path:
                 logger.info("Resume skipped due to incompatible checkpoint.")
             else:
+                # Pin checkpoint to current vocabulary by SHA256 so a regenerated
+                # vocab can never silently misalign tag-head indices on resume.
+                try:
+                    from schemas import compute_vocab_sha256
+                    current_vocab_sha = compute_vocab_sha256(
+                        vocab_path=Path(getattr(config, 'vocab_path', str(DEFAULT_VOCAB_PATH)))
+                    )
+                except Exception as _vocab_e:
+                    logger.warning("Could not compute current vocab sha for resume guard: %s", _vocab_e)
+                    current_vocab_sha = None
                 ckpt = checkpoint_manager.load_checkpoint(
                     checkpoint_path=ckpt_path,
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     device=device,
+                    expected_vocab_sha256=current_vocab_sha,
                 )
                 if not ckpt:
                     raise RuntimeError(f"Checkpoint returned empty data from {ckpt_path}")
@@ -1461,11 +1487,16 @@ def train_with_orientation_tracking(config: FullConfig):
     threshold = tc.get("default_threshold", 0.5) if isinstance(tc, dict) else getattr(tc, "default_threshold", 0.5)
     skip_metric_cols = 2  # PAD=0, UNK=1 — consistent with loss ignore_indices and bucketed metrics
     num_metric_labels = num_tags - skip_metric_cols
+    # Per-class metrics (average=None) so we can filter classes with zero positives
+    # in the validation draw before macro-averaging. Without this, an 18-24K-class
+    # long-tailed vocabulary leaves thousands of classes unrepresented in any
+    # ~30k-sample draw, each contributing AP=0 and pulling the macro toward zero.
     val_metrics = {
-        'f1_macro': MultilabelF1Score(num_labels=num_metric_labels, average="macro", threshold=threshold).to(device),
+        'f1_macro_per_class': MultilabelF1Score(num_labels=num_metric_labels, average=None, threshold=threshold).to(device),
         'f1_micro': MultilabelF1Score(num_labels=num_metric_labels, average="micro", threshold=threshold).to(device),
-        'map_macro': MultilabelAveragePrecision(num_labels=num_metric_labels, average="macro").to(device)
+        'map_per_class': MultilabelAveragePrecision(num_labels=num_metric_labels, average=None).to(device)
     }
+    val_pos_counts = torch.zeros(num_metric_labels, dtype=torch.long, device=device)
     logger.info(f"Validation metrics initialized with {num_metric_labels} labels (skipping {skip_metric_cols} special tokens), threshold={threshold}")
 
     # Initialize memory monitor to track RAM usage and prevent OOM
@@ -1484,7 +1515,9 @@ def train_with_orientation_tracking(config: FullConfig):
     if h2d_stream is not None:
         logger.info("H2D transfer stream created for async CPU→GPU pipelining")
 
-    running_loss = 0.0  # CPU scalar to avoid VRAM leak from GPU tensor accumulation
+    # GPU scalar accumulator: avoids per-microbatch GPU→CPU sync that breaks compile overlap.
+    # fp32 keeps precision over thousands of microbatches per epoch.
+    running_loss = torch.zeros((), device=device, dtype=torch.float32)
     processed_batches = 0  # Excludes skipped batches for accurate loss averaging
     total_train_samples = 0  # Track total samples for proper per-sample loss averaging
     skipped_batches = 0
@@ -1517,7 +1550,7 @@ def train_with_orientation_tracking(config: FullConfig):
                 accum_count,
             )
         else:
-            running_loss = 0.0  # CPU scalar to avoid VRAM leak from GPU tensor accumulation
+            running_loss.zero_()  # In-place reset of GPU scalar accumulator
             processed_batches = 0  # Excludes skipped batches for accurate loss averaging
             total_train_samples = 0  # Track total samples for proper per-sample loss averaging
             skipped_batches = 0
@@ -1614,16 +1647,7 @@ def train_with_orientation_tracking(config: FullConfig):
                     monitor.log_scalar('train/image_mean', img_mean, global_step)
                     logger.debug(f"Input stats - min: {img_min:.6f}, mean: {img_mean:.6f}, max: {img_max:.6f}")
 
-                # Use no_sync context manager for gradient accumulation steps
-                # to prevent unnecessary gradient synchronization across GPUs.
-                # Only sync on the final accumulation step (accum_count + 1 == accum).
-                do_sync = (accum_count + 1 >= accum)
-                if not do_sync and isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                    sync_context = model.no_sync()
-                else:
-                    sync_context = nullcontext()
-
-                with sync_context:
+                with nullcontext():
                     with amp_autocast():
                         outputs = model(images, padding_mask=pmask)
 
@@ -1722,7 +1746,10 @@ def train_with_orientation_tracking(config: FullConfig):
                     # Divide loss by accumulation steps BEFORE backward so each micro-batch
                     # contributes equally-scaled gradients during accumulation.
                     scaled_loss = loss / accum if accum > 1 else loss
-                    scaler.scale(scaled_loss).backward()
+                    if use_scaler:
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
 
                 # CR-041: Free computation graph IMMEDIATELY after backward to prevent VRAM leak
                 del loss, scaled_loss, losses, outputs
@@ -1735,17 +1762,8 @@ def train_with_orientation_tracking(config: FullConfig):
                 accum_count += 1
 
                 if accum_count >= accum:
-                    # --- TensorBoard: param/grad histograms (throttled) ---
-                    try:
-                        interval = getattr(config, "param_hist_interval_steps", None)
-                        if interval is None:
-                            training_cfg = getattr(config, "training", None)
-                            interval = getattr(training_cfg, "param_hist_interval_steps", None) if training_cfg else None
-                        if interval and (global_step % int(interval) == 0):
-                            monitor.log_param_and_grad_histograms(model, global_step)
-                    except Exception:
-                        pass
-                    scaler.unscale_(optimizer)
+                    if use_scaler:
+                        scaler.unscale_(optimizer)
 
                     if getattr(config.debug, 'log_gradient_norm', False) and (global_step % config.training.logging_steps == 0):
                         # Compute gradient norm using foreach operations (avoids memory spike from concatenation)
@@ -1782,8 +1800,11 @@ def train_with_orientation_tracking(config: FullConfig):
                         skipped_batches += 1
                         continue
 
-                    scaler.step(optimizer)
-                    scaler.update()
+                    if use_scaler:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
 
                     optimizer.zero_grad(set_to_none=True)  # Use set_to_none for memory efficiency
                     accum_count = 0
@@ -1818,10 +1839,6 @@ def train_with_orientation_tracking(config: FullConfig):
                         training_state.sample_in_epoch = step * train_loader.batch_size
                         training_state.is_epoch_boundary = False
 
-                        # CR-043: Light memory cleanup before periodic checkpoint save
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
                         try:
                             checkpoint_manager.save_checkpoint(
                                 model=model,
@@ -1833,7 +1850,8 @@ def train_with_orientation_tracking(config: FullConfig):
                                 training_state=training_state,
                                 is_best=False,
                                 config=config.to_dict(),
-                                train_loader=train_loader
+                                train_loader=train_loader,
+                                scaler=scaler,
                             )
                             logger.info(
                                 "Periodic save: optimizer_update=%s, global_step=%s",
@@ -1843,8 +1861,11 @@ def train_with_orientation_tracking(config: FullConfig):
                         except Exception as e:
                             logger.warning("Periodic save failed: %s", e)
 
-                # Accumulate loss weighted by batch size for proper per-sample averaging
-                running_loss += (loss_detached * batch_size_current).item()
+                # Accumulate loss weighted by batch size for proper per-sample averaging.
+                # GPU-resident accumulation avoids per-microbatch sync; the .float() cast
+                # promotes bf16 loss to fp32 inside the running sum to preserve precision
+                # across thousands of microbatches per epoch.
+                running_loss += loss_detached.float() * batch_size_current
                 total_train_samples += batch_size_current
                 processed_batches += 1
                 
@@ -1901,7 +1922,8 @@ def train_with_orientation_tracking(config: FullConfig):
                                 training_state=training_state,
                                 is_best=False,
                                 config=config.to_dict(),
-                                train_loader=train_loader
+                                train_loader=train_loader,
+                                scaler=scaler,
                             )
                             logger.info(
                                 "Soft stop checkpoint saved at global_step=%s, batch_in_epoch=%s (accum_count was %s)",
@@ -1919,11 +1941,13 @@ def train_with_orientation_tracking(config: FullConfig):
                 if accum_count == 0 and global_step > 0 and (step % SENTINEL_CHECK_INTERVAL == 0):
                     save_now = save_sentinel.exists()
                     if save_now:
+                        # Freeze running_loss to a Python float at snapshot time so the dict
+                        # is decoupled from the GPU tensor (which keeps mutating in-place).
                         state_snapshot = {
                             'epoch': epoch + 1,
                             'global_step': global_step,
                             'step': step + 1,
-                            'running_loss': running_loss,
+                            'running_loss': _loss_to_float(running_loss),
                             'processed_batches': processed_batches,
                             'total_train_samples': total_train_samples
                         }
@@ -1960,7 +1984,8 @@ def train_with_orientation_tracking(config: FullConfig):
                                 training_state=training_state,
                                 is_best=False,
                                 config=config.to_dict(),
-                                train_loader=train_loader
+                                train_loader=train_loader,
+                                scaler=scaler,
                             )
                             logger.info("One-shot save: checkpoint written at step %s.", state_snapshot['global_step'])
                         except Exception as e:
@@ -1982,16 +2007,6 @@ def train_with_orientation_tracking(config: FullConfig):
                         optimizer.param_groups[0]['lr'],
                         batch_size_current,
                     )
-                    # NOTE: Histogram logging moved to optimizer step block (lines 1166-1175)
-                    # using param_hist_interval_steps for proper throttling
-
-                # Periodic cache summary (hardcoded interval)
-                if cache_monitor.enabled and (global_step % CACHE_MONITOR_EVERY_STEPS == 0):
-                    try:
-                        logging.getLogger('cache_monitor').info(cache_monitor.format_summary())
-                    except Exception:
-                        pass
-
                 # Memory monitoring (check every 2000 steps to reduce psutil overhead)
                 # psutil calls are ~1-5ms each; at scale this adds up
                 if global_step % 2000 == 0:
@@ -2020,12 +2035,14 @@ def train_with_orientation_tracking(config: FullConfig):
                 manual_image_trigger = (global_step % 10 == 0) and image_log_sentinel.exists()
                 should_log_images = (
                     config.training.use_tensorboard
+                    and global_step != _last_image_log_step
                     and (
                         manual_image_trigger
                         or (image_log_steps > 0 and global_step % image_log_steps == 0 and global_step > 0)
                     )
                 )
                 if should_log_images:
+                    _last_image_log_step = global_step
                     # Clear manual trigger sentinel if it was used
                     if manual_image_trigger:
                         try:
@@ -2037,6 +2054,12 @@ def train_with_orientation_tracking(config: FullConfig):
                         with torch.no_grad():
                             probs = torch.sigmoid(_saved_tag_logits)
                             tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
+                            raw_image_ids = batch.get("image_id")
+                            image_ids: Optional[List[str]] = None
+                            if raw_image_ids is not None:
+                                image_ids = [
+                                    str(x) if x is not None else None for x in raw_image_ids
+                                ]
                             monitor.log_predictions(
                                 step=global_step,
                                 images=images,
@@ -2046,6 +2069,7 @@ def train_with_orientation_tracking(config: FullConfig):
                                 prefix="train",
                                 max_images=config.monitor.tb_image_logging.max_samples,
                                 topk=config.monitor.tb_image_logging.topk,
+                                image_ids=image_ids,
                             )
                             logger.info(f"Logged {config.monitor.tb_image_logging.max_samples} training images to TensorBoard at step {global_step}")
                     except Exception as e:
@@ -2085,6 +2109,50 @@ def train_with_orientation_tracking(config: FullConfig):
                         monitor.log_augmentations(global_step, sd)
 
             # Logging moved into inner loop (above) to avoid missing epoch-boundary steps.
+
+            # Flush incomplete gradient accumulation at epoch boundary.
+            # When steps_per_epoch is not divisible by accum, the last few batches
+            # accumulate gradients but never reach the accum threshold. Rather than
+            # silently discarding them, perform a partial optimizer step with
+            # appropriately scaled gradients.
+            if accum_count > 0 and not soft_stop_pending:
+                logger.info(
+                    "Epoch %s: flushing %s/%s accumulated micro-batches at epoch boundary",
+                    epoch + 1, accum_count, accum,
+                )
+                try:
+                    scaler.unscale_(optimizer)
+                    grad_clip_cfg = getattr(config.training, 'gradient_clipping', None)
+                    if grad_clip_cfg and getattr(grad_clip_cfg, 'enabled', True):
+                        max_norm = getattr(grad_clip_cfg, 'max_norm', 1.0)
+                    else:
+                        max_norm = float('inf')
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+                    if torch.isfinite(grad_norm):
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
+                        accum_count = 0
+                        global_step += 1
+                        try:
+                            scheduler.step()
+                        except Exception as sched_exc:
+                            logger.warning("Scheduler step failed during epoch-boundary flush at global_step=%s: %s", global_step, sched_exc)
+                        training_state.optimizer_updates += 1
+                    else:
+                        logger.warning("Non-finite gradient norm during epoch-boundary flush - discarding partial accumulation")
+                        optimizer.zero_grad(set_to_none=True)
+                        accum_count = 0
+                except Exception as e:
+                    logger.warning("Epoch-boundary accumulation flush failed: %s", e)
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_count = 0
+
+            # Clear GPU cache after epoch-boundary flush before validation
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # If a soft stop was requested, exit training before validation
         # Also check sentinel at epoch boundary in case we missed it in the loop (due to throttling)
@@ -2135,7 +2203,8 @@ def train_with_orientation_tracking(config: FullConfig):
                     training_state=training_state,
                     is_best=False,
                     config=config.to_dict(),
-                    train_loader=train_loader
+                    train_loader=train_loader,
+                    scaler=scaler,
                 )
                 logger.info(
                     "Soft stop checkpoint saved at epoch boundary (epoch=%s, global_step=%s)",
@@ -2150,7 +2219,7 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.info(f"Completed resumed epoch {epoch + 1} - cleared mid-epoch flag")
             is_mid_epoch = False
 
-        avg_train_loss = running_loss / max(1, total_train_samples)  # Per-sample average
+        avg_train_loss = _loss_to_float(running_loss / max(1, total_train_samples))  # Per-sample average; sync OK at epoch end
 
         # Log skipped batch statistics for monitoring
         if skipped_batches > 0:
@@ -2196,6 +2265,7 @@ def train_with_orientation_tracking(config: FullConfig):
             total_val_samples = 0  # Track samples for proper loss averaging
             all_val_probs = []  # Accumulate for frequency-bucketed metrics
             all_val_targs = []
+            val_h2d_stream = torch.cuda.Stream() if device.type == 'cuda' else None
             with torch.no_grad():
                 for val_step, batch in enumerate(val_loader):
                     # Filter out error samples that failed to load
@@ -2209,16 +2279,22 @@ def train_with_orientation_tracking(config: FullConfig):
                             for k, v in batch.items()
                         }
 
-                    images = batch['images'].to(device, non_blocking=True)
-                    if use_channels_last:
-                        images = images.contiguous(memory_format=torch.channels_last)
-                    tag_labels = batch['tag_labels'].to(device, non_blocking=True)
+                    # Transfer tensors to GPU on dedicated H2D stream (overlap with previous batch compute)
+                    pmask = batch.get('padding_mask', None)
+                    val_h2d_ctx = torch.cuda.stream(val_h2d_stream) if val_h2d_stream is not None else nullcontext()
+                    with val_h2d_ctx:
+                        images = batch['images'].to(device, non_blocking=True)
+                        if use_channels_last:
+                            images = images.contiguous(memory_format=torch.channels_last)
+                        tag_labels = batch['tag_labels'].to(device, non_blocking=True)
+                        if pmask is not None:
+                            pmask = pmask.to(device=device, dtype=torch.bool, non_blocking=True)
+                    # Sync H2D stream before compute
+                    if val_h2d_stream is not None:
+                        torch.cuda.current_stream().wait_stream(val_h2d_stream)
                     total_val_samples += images.size(0)  # Count actual samples processed
 
                     with amp_autocast():
-                        pmask = batch.get('padding_mask', None)
-                        if pmask is not None:
-                            pmask = pmask.to(device=device, dtype=torch.bool, non_blocking=True)
                         outputs = model(images, padding_mask=pmask)
                         loss, _ = criterion(outputs['tag_logits'], tag_labels)
                     # Accumulate loss weighted by batch size for proper per-sample averaging
@@ -2231,11 +2307,12 @@ def train_with_orientation_tracking(config: FullConfig):
                     # Skip PAD/UNK columns (indices 0,1) for streaming metrics
                     metric_probs = probs[:, skip_metric_cols:]
                     metric_targs = targs[:, skip_metric_cols:]
-                    val_metrics['f1_macro'].update(metric_probs, metric_targs)
+                    val_metrics['f1_macro_per_class'].update(metric_probs, metric_targs)
                     val_metrics['f1_micro'].update(metric_probs, metric_targs)
-                    val_metrics['map_macro'].update(metric_probs, metric_targs)
-                    all_val_probs.append(probs.cpu())
-                    all_val_targs.append(targs.cpu())
+                    val_metrics['map_per_class'].update(metric_probs, metric_targs)
+                    val_pos_counts += metric_targs.sum(dim=0)
+                    all_val_probs.append(probs.to('cpu', non_blocking=True))
+                    all_val_targs.append(targs.to('cpu', non_blocking=True))
 
                     if val_step == 0 and config.training.use_tensorboard:
                         tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
@@ -2252,16 +2329,30 @@ def train_with_orientation_tracking(config: FullConfig):
 
             # Compute metrics (now on CPU to prevent VRAM accumulation)
             val_loss_avg = (val_loss / max(1, total_val_samples)).cpu()
-            
-            # Metrics are already on CPU
-            val_f1_macro = val_metrics['f1_macro'].compute().item()
+
+            # Per-class compute, then mean over classes that actually had a positive
+            # in this validation draw — see val_metrics initialization above.
+            per_class_f1 = val_metrics['f1_macro_per_class'].compute()
+            per_class_ap = val_metrics['map_per_class'].compute()
+            keep_classes = (val_pos_counts > 0)
+            num_supported = int(keep_classes.sum().item())
+            if num_supported > 0:
+                val_f1_macro = per_class_f1[keep_classes].float().mean().item()
+                val_mAP = per_class_ap[keep_classes].float().mean().item()
+            else:
+                val_f1_macro = 0.0
+                val_mAP = 0.0
             val_f1_micro = val_metrics['f1_micro'].compute().item()
-            val_mAP = val_metrics['map_macro'].compute().item()
-            avg_val_loss = val_loss_avg.item()
+            avg_val_loss = val_loss_avg.item()  # already CPU
+            logger.debug(
+                f"Macro metrics averaged over {num_supported}/{num_metric_labels} "
+                f"classes with positive support this epoch."
+            )
 
             # Reset metrics for next epoch
             for metric in val_metrics.values():
                 metric.reset()
+            val_pos_counts.zero_()
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -2271,12 +2362,18 @@ def train_with_orientation_tracking(config: FullConfig):
                 f"Val F1(macro): {val_f1_macro:.4f}, Val F1(micro): {val_f1_micro:.4f}, Val mAP: {val_mAP:.4f}"
             )
             monitor.log_validation(global_step, {'loss': avg_val_loss, 'f1_macro': val_f1_macro, 'f1_micro': val_f1_micro, 'mAP': val_mAP})
+            monitor.log_scalar('train/loss_epoch', avg_train_loss, global_step)
 
             # Frequency-bucketed diagnostic metrics
             try:
                 if all_val_probs and config.training.use_tensorboard:
                     cat_probs = torch.cat(all_val_probs, dim=0).float()
+                    del all_val_probs
                     cat_targs = torch.cat(all_val_targs, dim=0)
+                    del all_val_targs
+                    pred_thr = float(config.inference.prediction_threshold)
+                    mean_active = (cat_probs[:, skip_metric_cols:] > pred_thr).float().sum(dim=1).mean().item()
+                    monitor.log_scalar('val/mean_active', mean_active, global_step)
                     freq_bins = getattr(config.validation, 'frequency_bins', None) or [300, 500, 1000, 5000, 10000, float('inf')]
                     tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
                     bucket_metrics = FrequencyBucketMetrics(
@@ -2326,13 +2423,17 @@ def train_with_orientation_tracking(config: FullConfig):
             except Exception as e:
                 logger.warning(f"Failed to compute bucketed metrics: {e}")
             finally:
-                del all_val_probs, all_val_targs
+                # Lists may already be deleted after torch.cat above
+                try:
+                    del all_val_probs, all_val_targs
+                except NameError:
+                    pass
                 try:
                     del cat_probs, cat_targs
                 except NameError:
                     pass
 
-        # Restore train mode immediately after validation so checkpoint saving
+        # Restore train mode after validation so checkpoint saving
         # and any inter-epoch operations see consistent model state (dropout/batchnorm).
         model.train()
 
@@ -2434,7 +2535,8 @@ def train_with_orientation_tracking(config: FullConfig):
                 training_state=training_state,
                 is_best=True,
                 config=config.to_dict(),
-                train_loader=train_loader
+                train_loader=train_loader,
+                scaler=scaler,
             )
 
         if patience and training_state.patience_counter >= patience:
@@ -2531,8 +2633,6 @@ def main():
         log_dir=config.log_dir,
         log_to_file=config.file_logging_enabled,
         json_console=True, # Or get from config if you add it
-        rank=config.training.local_rank,
-        world_size=config.training.world_size,
     )
 
     if args.validate_only:

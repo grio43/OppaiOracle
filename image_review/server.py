@@ -6,9 +6,10 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .tensorboard_parser import TensorBoardParser, discover_runs, PredictionEntry, RatingInfo
+from .corrections import CorrectionsStore
 
 
 class PredictionModel(BaseModel):
@@ -37,6 +38,14 @@ class SampleModel(BaseModel):
     fp_count: int
     fn_count: int
     rating: Optional[RatingModel] = None
+    image_id: Optional[str] = None
+    correction_key: str  # key used by /api/corrections (image_id if set, else fallback)
+
+
+class CorrectionPayload(BaseModel):
+    """Body for PUT /api/corrections/{key}."""
+    add: List[str] = Field(default_factory=list)
+    remove: List[str] = Field(default_factory=list)
 
 
 class NavigationModel(BaseModel):
@@ -59,11 +68,25 @@ class StepInfo(BaseModel):
 _current_parser: Optional[TensorBoardParser] = None
 _current_run: Optional[str] = None
 _tensorboard_root: Optional[Path] = None
+_corrections_store: Optional[CorrectionsStore] = None
 
 
-def create_app(tensorboard_root: Path = None) -> FastAPI:
+def _correction_key_for(run: Optional[str], step: int, sample_idx: int, image_id: Optional[str]) -> str:
+    """Stable identifier for a sample's correction record.
+
+    Prefers the dataset filename when the training run logged it; otherwise
+    falls back to ``<run>/step_<step>/sample_<idx>`` so corrections still
+    persist for older runs.
+    """
+    if image_id:
+        return image_id
+    run_part = run or "unknown"
+    return f"{run_part}/step_{step}/sample_{sample_idx}"
+
+
+def create_app(tensorboard_root: Path = None, corrections_path: Path = None) -> FastAPI:
     """Create and configure the FastAPI application."""
-    global _tensorboard_root
+    global _tensorboard_root, _corrections_store
 
     app = FastAPI(title="Image Review Service")
 
@@ -71,6 +94,10 @@ def create_app(tensorboard_root: Path = None) -> FastAPI:
         tensorboard_root = Path(__file__).parent.parent / "tensorboard"
 
     _tensorboard_root = Path(tensorboard_root)
+
+    if corrections_path is None:
+        corrections_path = Path(__file__).parent / "corrections.json"
+    _corrections_store = CorrectionsStore(Path(corrections_path))
 
     # Mount static files
     static_dir = Path(__file__).parent / "static"
@@ -132,6 +159,35 @@ def create_app(tensorboard_root: Path = None) -> FastAPI:
             ]
         }
 
+    def _to_sample_model(s) -> SampleModel:
+        rating = None
+        if s.rating:
+            rating = RatingModel(
+                predicted=s.rating.predicted,
+                predicted_confidence=s.rating.predicted_confidence,
+                actual=s.rating.actual,
+                is_correct=s.rating.is_correct
+            )
+        return SampleModel(
+            step=s.step,
+            sample_index=s.sample_index,
+            predictions=[
+                PredictionModel(
+                    tag=p.tag,
+                    probability=p.probability,
+                    expected=p.expected,
+                    status=p.status
+                ) for p in s.predictions
+            ],
+            ground_truth_tags=s.ground_truth_tags,
+            tp_count=s.tp_count,
+            fp_count=s.fp_count,
+            fn_count=s.fn_count,
+            rating=rating,
+            image_id=s.image_id,
+            correction_key=_correction_key_for(_current_run, s.step, s.sample_index, s.image_id),
+        )
+
     @app.get("/api/samples")
     async def get_samples(
         step: Optional[int] = None,
@@ -150,35 +206,8 @@ def create_app(tensorboard_root: Path = None) -> FastAPI:
         total = len(samples)
         samples = samples[offset:offset + limit]
 
-        def to_sample_model(s):
-            rating = None
-            if s.rating:
-                rating = RatingModel(
-                    predicted=s.rating.predicted,
-                    predicted_confidence=s.rating.predicted_confidence,
-                    actual=s.rating.actual,
-                    is_correct=s.rating.is_correct
-                )
-            return SampleModel(
-                step=s.step,
-                sample_index=s.sample_index,
-                predictions=[
-                    PredictionModel(
-                        tag=p.tag,
-                        probability=p.probability,
-                        expected=p.expected,
-                        status=p.status
-                    ) for p in s.predictions
-                ],
-                ground_truth_tags=s.ground_truth_tags,
-                tp_count=s.tp_count,
-                fp_count=s.fp_count,
-                fn_count=s.fn_count,
-                rating=rating
-            )
-
         return {
-            "samples": [to_sample_model(s) for s in samples],
+            "samples": [_to_sample_model(s) for s in samples],
             "total": total,
             "offset": offset,
             "limit": limit
@@ -202,34 +231,8 @@ def create_app(tensorboard_root: Path = None) -> FastAPI:
             0
         )
 
-        # Build rating model if available
-        rating = None
-        if sample.rating:
-            rating = RatingModel(
-                predicted=sample.rating.predicted,
-                predicted_confidence=sample.rating.predicted_confidence,
-                actual=sample.rating.actual,
-                is_correct=sample.rating.is_correct
-            )
-
         return {
-            "sample": SampleModel(
-                step=sample.step,
-                sample_index=sample.sample_index,
-                predictions=[
-                    PredictionModel(
-                        tag=p.tag,
-                        probability=p.probability,
-                        expected=p.expected,
-                        status=p.status
-                    ) for p in sample.predictions
-                ],
-                ground_truth_tags=sample.ground_truth_tags,
-                tp_count=sample.tp_count,
-                fp_count=sample.fp_count,
-                fn_count=sample.fn_count,
-                rating=rating
-            ),
+            "sample": _to_sample_model(sample),
             "navigation": NavigationModel(
                 current_index=current_index,
                 total_samples=len(all_samples),
@@ -296,6 +299,31 @@ def create_app(tensorboard_root: Path = None) -> FastAPI:
             "sample_idx": sample.sample_index
         }
 
+    @app.get("/api/corrections")
+    async def list_corrections():
+        """Return every recorded correction."""
+        return {"corrections": _corrections_store.list_all()}
+
+    @app.get("/api/corrections/{key:path}")
+    async def get_correction(key: str):
+        """Return a single correction record (empty add/remove if none)."""
+        entry = _corrections_store.get(key)
+        if entry is None:
+            return {"key": key, "add": [], "remove": [], "updated_at": None}
+        return {"key": key, **entry}
+
+    @app.put("/api/corrections/{key:path}")
+    async def put_correction(key: str, payload: CorrectionPayload):
+        """Replace the correction record for ``key`` (auto-deletes if both lists empty)."""
+        entry = _corrections_store.put(key, payload.add, payload.remove)
+        return {"key": key, **entry}
+
+    @app.delete("/api/corrections/{key:path}")
+    async def delete_correction(key: str):
+        """Drop the correction record for ``key``."""
+        existed = _corrections_store.delete(key)
+        return {"key": key, "deleted": existed}
+
     return app
 
 
@@ -307,11 +335,14 @@ def main():
     parser = argparse.ArgumentParser(description='Image Review Server')
     parser.add_argument('--tensorboard-dir', type=str, default='./tensorboard',
                         help='Path to TensorBoard log directory')
+    parser.add_argument('--corrections-file', type=str, default=None,
+                        help='Path to corrections JSON (default: image_review/corrections.json)')
     parser.add_argument('--port', type=int, default=8080, help='Server port')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Server host')
     args = parser.parse_args()
 
-    app = create_app(Path(args.tensorboard_dir))
+    corrections_path = Path(args.corrections_file) if args.corrections_file else None
+    app = create_app(Path(args.tensorboard_dir), corrections_path=corrections_path)
     uvicorn.run(app, host=args.host, port=args.port)
 
 

@@ -63,8 +63,9 @@ class LinearWarmupCosineLR(_LRScheduler):
         # Warmup phase: linear increase from warmup_start_lr -> base_lr
         if e < self.warmup_epochs:
             # e runs from 0..warmup_epochs-1
-            # scale runs from 1/warmup_epochs .. warmup_epochs/warmup_epochs
-            scale = (e + 1) / max(1, self.warmup_epochs)
+            # scale runs from 0 .. (warmup_epochs-1)/warmup_epochs, so the first epoch
+            # uses warmup_start_lr and the cosine phase starts at base_lr at e=warmup_epochs.
+            scale = e / max(1, self.warmup_epochs)
             return [
                 self.warmup_start_lr + (base_lr - self.warmup_start_lr) * scale
                 for base_lr in base_lrs
@@ -78,8 +79,9 @@ class LinearWarmupCosineLR(_LRScheduler):
             # No cosine phase - return eta_min (training at minimum LR after warmup)
             return [self.eta_min for _ in base_lrs]
 
-        # Normal cosine schedule
-        t = (e - self.warmup_epochs + 1) / total_cosine  # 0..1 over cosine schedule
+        # Normal cosine schedule. At e=warmup_epochs (first cosine epoch) t=0 so LR=base_lr;
+        # at e=max_epochs-1 t=(total_cosine-1)/total_cosine, approaching eta_min.
+        t = (e - self.warmup_epochs) / total_cosine  # 0..~1 over cosine schedule
         t = min(max(t, 0.0), 1.0)
         return [
             self.eta_min + (base_lr - self.eta_min) * (1 + math.cos(math.pi * t)) / 2.0

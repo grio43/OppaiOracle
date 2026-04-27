@@ -88,11 +88,15 @@ def setup_logging(
     level = getattr(logging, log_level.upper(), logging.INFO)
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
-    root_logger.addFilter(ContextFilter())
 
-    # Remove all existing handlers from the root logger
+    # Remove all existing handlers and filters from the root logger so repeated
+    # setup_logging() calls (tests, per-rank re-init) don't stack duplicates.
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
+    for flt in root_logger.filters[:]:
+        root_logger.removeFilter(flt)
+
+    root_logger.addFilter(ContextFilter())
 
     # Console handler
     console_handler = logging.StreamHandler(sys.stdout)

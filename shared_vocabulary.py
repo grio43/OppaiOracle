@@ -194,14 +194,8 @@ class SharedVocabularyManager:
             if 'index_to_tag' in vocab_data:
                 vocab_data['index_to_tag'] = {int(k): v for k, v in vocab_data['index_to_tag'].items()}
 
-            # Convert list back to set for ignored_tag_indices
-            if 'ignored_tag_indices' in vocab_data and isinstance(vocab_data['ignored_tag_indices'], list):
-                vocab_data['ignored_tag_indices'] = set(vocab_data['ignored_tag_indices'])
-
-            # Convert list back to set for tags if it was a set
-            # Note: We store as list, caller should know if it needs set
-            if 'tags' in vocab_data and isinstance(vocab_data['tags'], list):
-                vocab_data['tags'] = set(vocab_data['tags'])
+            # Keep `ignored_tag_indices` and `tags` as lists — writer stores them as lists
+            # and downstream consumers rely on positional index order for `tags`.
 
             # Close but don't unlink (other processes may still need it)
             shm.close()

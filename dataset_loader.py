@@ -16,8 +16,7 @@ It loads images and metadata on-the-fly from JSON files using two modes:
    - Auto-splits 95/5 train/val with caching
 
 CACHING LAYERS:
-- Sidecar Cache: Preprocessed tensors stored as .safetensor files alongside original images
-  (no LMDB, no virtual memory issues, pooled SSD-friendly, unlimited parallel reads)
+- Metadata Cache: Parsed JSON metadata cached as Arrow IPC for zero-copy memory-mapped access
 
 VOCABULARY:
 - Built automatically by vocabulary.py:create_vocabulary_from_datasets()
@@ -73,13 +72,6 @@ except ImportError:
     HAS_ORJSON = False
     JSON_DECODE_ERRORS = (json.JSONDecodeError,)
 
-# Optional file locking for sidecar cache writes
-try:
-    import filelock
-    HAS_FILELOCK = True
-except ImportError:
-    HAS_FILELOCK = False
-
 # PyArrow for zero-copy metadata cache (memory-mapped, shared across workers)
 try:
     import pyarrow as pa
@@ -126,9 +118,6 @@ except (ImportError, ModuleNotFoundError, AttributeError):  # keep backward comp
     tv_tensors = None
 
 # Local imports
-from cache_codec import get_sidecar_path, save_sidecar, load_sidecar
-from utils.cache_keys import compute_cache_config_hash
-from utils.cache_monitor import monitor
 from utils.metadata_ingestion import parse_tags_field
 # Safetensors fallback removed - Arrow is now the only metadata cache format
 from utils.path_utils import sanitize_identifier, validate_image_path, resolve_and_confine
@@ -226,8 +215,10 @@ class IndependentColorJitter:
 # Pillow resampling compatibility and truncated image handling
 try:  # Pillow ≥10
     RESAMPLE_BILINEAR = Image.Resampling.BILINEAR  # type: ignore[attr-defined]
+    RESAMPLE_BICUBIC = Image.Resampling.BICUBIC  # type: ignore[attr-defined]
 except AttributeError:  # Pillow <10
     RESAMPLE_BILINEAR = Image.BILINEAR
+    RESAMPLE_BICUBIC = Image.BICUBIC
 
 # Strict mode by default: truncated/corrupt images are rejected immediately.
 # Set OO_ALLOW_TRUNCATED=1 to enable lenient mode which fills missing bytes
@@ -263,31 +254,6 @@ _DTYPE_MAP = {
 
 def _canon_dtype(s: str) -> torch.dtype:
     return _DTYPE_MAP.get(str(s).lower(), torch.bfloat16)
-
-# CPU BFloat16 support detection (cached globally)
-_CPU_BF16_SUPPORTED = None
-
-def _is_cpu_bf16_supported() -> bool:
-    """Check if CPU supports bfloat16 operations (cached).
-
-    Returns:
-        True if CPU supports BF16, False otherwise
-    """
-    global _CPU_BF16_SUPPORTED
-    if _CPU_BF16_SUPPORTED is None:
-        try:
-            # Try to create and operate on BF16 tensor
-            test_tensor = torch.tensor([1.0, 2.0], dtype=torch.float32)
-            bf16_tensor = test_tensor.to(torch.bfloat16)
-            # Try a simple operation to ensure it's actually supported
-            _ = bf16_tensor + bf16_tensor
-            _CPU_BF16_SUPPORTED = True
-            logging.getLogger(__name__).debug("CPU bfloat16 support detected")
-        except (RuntimeError, NotImplementedError):
-            _CPU_BF16_SUPPORTED = False
-            logging.getLogger(__name__).info("CPU does not support bfloat16 operations")
-    return _CPU_BF16_SUPPORTED
-
 
 # Module-level cache for Normalize transforms (avoids mutable default argument antipattern)
 # Key: (mean, std) tuple, Value: transforms.Normalize instance
@@ -371,18 +337,20 @@ def apply_random_rotation(
 ) -> Image.Image:
     """Rotate canvas by a random angle from [-max,-min] ∪ [+min,+max].
 
-    Padding mask is intentionally NOT rotated — at 5-10 degrees the
-    rotated-in corner pixels are filled with pad_color and are
-    negligible (~1-4% of area). The model handles these the same
-    way it handles existing letterbox padding.
+    Padding mask is intentionally NOT rotated — corner pixels filled with
+    pad_color follow f(θ) = tan(θ/2)·(1−tan(θ/2))/(1+tan(θ/2)), e.g. ~6.1% at
+    8° and ~10.1% at 15°, well within the letterbox padding distribution the
+    model already learns to ignore.
+
+    Uses bicubic resampling to better preserve fine-grained features (eye
+    highlights, hair strands, accessories). Per Thévenaz/Blu/Unser (2000,
+    IEEE TIP), bicubic frequency response stays >0.85 at Nyquist for typical
+    sub-pixel offsets vs. ~0.64 for bilinear.
     """
     angle = random.uniform(min_degrees, max_degrees)
     if random.random() < 0.5:
         angle = -angle
-    return canvas.rotate(angle, resample=RESAMPLE_BILINEAR, expand=False, fillcolor=pad_color)
-
-
-## moved to utils/cache_keys.py: compute_cache_config_hash
+    return canvas.rotate(angle, resample=RESAMPLE_BICUBIC, expand=False, fillcolor=pad_color)
 
 
 class ResumableSampler(DistributedSampler):
@@ -925,6 +893,22 @@ class WorkerInitializer:
         Args:
             worker_id: Worker process ID
         """
+        # Seed stdlib random and numpy from torch.initial_seed() so augmentations
+        # (IndependentColorJitter, apply_random_rotation, blur) are reproducible
+        # across resumes. PyTorch only auto-seeds torch.manual_seed in workers; the
+        # stdlib `random` module and numpy stay unseeded by default, so any sampler
+        # state we restore is undermined by drifting augmentation RNGs.
+        try:
+            base_seed = torch.initial_seed() % (2**32)
+            random.seed(base_seed)
+            try:
+                import numpy as _np
+                _np.random.seed(base_seed)
+            except ImportError:
+                pass
+        except Exception:
+            pass
+
         # Setup logging queue handler
         if self.log_queue is not None:
             logger = logging.getLogger()
@@ -1063,9 +1047,6 @@ class DatasetLoader(Dataset):
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
 
-        # CPU BF16 cache pipeline (disabled for manifest mode DatasetLoader)
-        self._cpu_bf16_cache = False
-
         # Tag vector dtype
         self._tag_vector_dtype = _canon_dtype(str(tag_vector_dtype).lower())
 
@@ -1087,9 +1068,10 @@ class DatasetLoader(Dataset):
                 "Disabled BackgroundValidator in DataLoader worker process"
             )
 
-        # Epoch tracking for future flip support and consistency with SidecarJsonDataset
-        # Default to 0 for first epoch; updated by set_epoch() in training loop
-        self._current_epoch = 0
+        # Epoch tracking for future flip support and consistency with SidecarJsonDataset.
+        # Backed by shared memory so DataLoader workers (spawned at first iter()) observe
+        # set_epoch() updates from the main process; a plain int would be frozen at fork/spawn time.
+        self._current_epoch = mp.Value('i', 0, lock=False)
 
         self._preload_n = int(preload_files or 0)
 
@@ -1354,8 +1336,8 @@ class DatasetLoader(Dataset):
         Args:
             epoch: Current training epoch (0-indexed)
         """
-        self._current_epoch = int(epoch)
-        self.logger.debug(f"Dataset epoch set to {self._current_epoch}")
+        self._current_epoch.value = int(epoch)
+        self.logger.debug(f"Dataset epoch set to {self._current_epoch.value}")
 
     def __getitem__(self, idx):
         # PERF: Only check exclusion staleness every N samples (batch boundaries)
@@ -1407,6 +1389,18 @@ class DatasetLoader(Dataset):
                 if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
                     self.failed_samples.add(idx)
                 return self._create_error_sample(idx, f"Excluded: {safe_image_id}", image_id=safe_image_id)
+
+            # Drop samples whose targets would be all-(or near-all-)negative — the
+            # train/val loops filter these via the `error` flag, so they never
+            # reach the loss. Without this guard the model would be trained that
+            # such images have zero of every tag (and zero of every rating).
+            label_list = annotation.get('labels') or []
+            if (not label_list) or _map_rating_to_tag(annotation.get('rating')) is None:
+                reason = (
+                    "empty label list" if not label_list
+                    else f"missing/unknown rating ({annotation.get('rating')!r})"
+                )
+                return self._create_error_sample(idx, reason, image_id=safe_image_id)
 
             # --- Load + transform (confined path) ---
             # Use the sanitized image identifier we derived above.
@@ -1831,8 +1825,6 @@ class SidecarJsonDataset(Dataset):
       - tags: space-delimited string or list of tags
       - rating: optional rating string or int (safe/general/questionable/explicit/unknown)
 
-    Supports sidecar tensor cache: preprocessed images are stored as .safetensor files
-    alongside original images for fast loading on subsequent runs.
     """
 
     def __init__(
@@ -1848,11 +1840,6 @@ class SidecarJsonDataset(Dataset):
         pad_color: Tuple[int, int, int] = (114, 114, 114),
         normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
-        # Sidecar cache configuration (replaces L2 LMDB cache)
-        sidecar_cache_enabled: bool = True,
-        sidecar_extension: str = ".safetensor",
-        sidecar_storage_dtype: str = "bfloat16",
-        cpu_bf16_cache_pipeline: Optional[bool] = None,
         # --- Orientation / flipping ---
         random_flip_prob: float = 0.0,
         orientation_handler: Optional["OrientationHandler"] = None,
@@ -1887,6 +1874,12 @@ class SidecarJsonDataset(Dataset):
         random_rotation_p: float = 0.3,
         random_rotation_min_degrees: float = 5.0,
         random_rotation_max_degrees: float = 10.0,
+        # Gaussian blur augmentation (applied to PIL before letterboxing)
+        gaussian_blur_enabled: bool = False,
+        gaussian_blur_p: float = 0.15,
+        gaussian_blur_kernel_size: int = 3,
+        gaussian_blur_sigma_min: float = 0.1,
+        gaussian_blur_sigma_max: float = 1.5,
         # Architecture-aware cache key parameters
         architecture_type: str = "vit",
         patch_size: Optional[int] = None,
@@ -1925,66 +1918,11 @@ class SidecarJsonDataset(Dataset):
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
 
-        # Sidecar cache configuration
-        self._sidecar_enabled = bool(sidecar_cache_enabled)
-        self._sidecar_extension = str(sidecar_extension) if sidecar_extension.startswith(".") else f".{sidecar_extension}"
-        self._sidecar_dtype_str = str(sidecar_storage_dtype).lower()
-        self._sidecar_dtype = _canon_dtype(self._sidecar_dtype_str)
+        # Image tensor dtype (matches _to_tensor_v2 output)
+        self._image_dtype = torch.bfloat16
 
         # Tag vector dtype
         self._tag_vector_dtype = _canon_dtype(str(tag_vector_dtype).lower())
-
-        # Check CPU BF16 support before enabling
-        requested_cpu_bf16 = bool(cpu_bf16_cache_pipeline) if cpu_bf16_cache_pipeline is not None else (self._sidecar_dtype is torch.bfloat16)
-
-        if requested_cpu_bf16:
-            if _is_cpu_bf16_supported():
-                self._cpu_bf16_cache = True
-                self.logger.debug("CPU BF16 cache pipeline enabled")
-            else:
-                # CPU bfloat16 required - no fallback to float32
-                raise RuntimeError(
-                    "CPU bfloat16 support required but not available. "
-                    "Upgrade PyTorch to a version that supports CPU bfloat16 operations, "
-                    "or use a CPU that supports bfloat16."
-                )
-        else:
-            # cpu_bf16_cache_pipeline is required for bfloat16 storage
-            if self._sidecar_dtype is torch.bfloat16:
-                raise RuntimeError(
-                    "sidecar_storage_dtype is bfloat16 but cpu_bf16_cache_pipeline is disabled. "
-                    "Enable cpu_bf16_cache_pipeline=true in config to use bfloat16 throughout."
-                )
-            self._cpu_bf16_cache = False
-
-        # Defensive validation: ensure sidecar dtype is bfloat16 (required)
-        # All GPU storage must use bfloat16
-        if self._sidecar_enabled:
-            if self._sidecar_dtype != torch.bfloat16:
-                raise ValueError(
-                    f"sidecar_storage_dtype must be bfloat16, got {self._sidecar_dtype}. "
-                    "All GPU tensor storage requires bfloat16."
-                )
-
-        # Compute config hash for sidecar cache invalidation
-        # Include vocab_size to invalidate cache if vocabulary changes
-        # Include has_joint_transforms to invalidate cache if transforms change
-        # Include flip params to invalidate cache if flip augmentation settings change
-        # Include architecture_type to ensure ViT/SwinV2 don't share caches inappropriately
-        # For SwinV2, patch_size is always 4 (hardcoded in timm); for ViT it's configurable
-        self._config_hash = compute_cache_config_hash(
-            image_size=self.image_size,
-            pad_color=self.pad_color,
-            normalize_mean=self.normalize_mean,
-            normalize_std=self.normalize_std,
-            storage_dtype=self._sidecar_dtype_str,
-            vocab_size=len(self.vocab.tag_to_index),
-            has_joint_transforms=(self.joint_transforms is not None),
-            random_flip_prob=float(random_flip_prob or 0.0),
-            has_orientation_handler=(orientation_handler is not None),
-            architecture_type=architecture_type,
-            patch_size=patch_size,
-        )
 
         # --- Orientation / flipping state ---
         self.random_flip_prob = float(random_flip_prob or 0.0)
@@ -2014,10 +1952,11 @@ class SidecarJsonDataset(Dataset):
         # --- Shared vocabulary flag (for worker_init_fn) ---
         self._shared_vocab_loaded = False
 
-        # Epoch tracking for flip variation across epochs
-        # This ensures that the same image can flip/not-flip differently in different epochs
-        # Default to 0 for first epoch; updated by set_epoch() in training loop
-        self._current_epoch = 0
+        # Epoch tracking for flip variation across epochs.
+        # Backed by shared memory so DataLoader workers (spawned at first iter() under
+        # persistent_workers=True) observe set_epoch() updates from the main process;
+        # a plain int would be frozen at spawn time and freeze flip decisions at epoch=0.
+        self._current_epoch = mp.Value('i', 0, lock=False)
         self._epoch_was_set = False  # Track if set_epoch() was ever called
         self._epoch_warning_issued = False  # Avoid spamming warnings
 
@@ -2077,6 +2016,23 @@ class SidecarJsonDataset(Dataset):
             self.logger.info(
                 f"Random rotation enabled: p={self._rotation_p}, "
                 f"angle=[{self._rotation_min_deg}, {self._rotation_max_deg}] degrees"
+            )
+
+        # Gaussian blur augmentation (DeiT III 3-Augment; Touvron et al. ECCV 2022)
+        # Applied to PIL before letterboxing so padding regions remain at pad_color.
+        self._blur_enabled = bool(gaussian_blur_enabled)
+        self._blur_p = float(gaussian_blur_p)
+        self._blur = None
+        if self._blur_enabled and T is not None:
+            ksize = int(gaussian_blur_kernel_size)
+            if ksize % 2 == 0:
+                ksize += 1  # torchvision requires odd kernel
+            sigma_min = float(gaussian_blur_sigma_min)
+            sigma_max = float(gaussian_blur_sigma_max)
+            self._blur = T.GaussianBlur(kernel_size=ksize, sigma=(sigma_min, sigma_max))
+            self.logger.info(
+                f"Gaussian blur enabled: p={self._blur_p}, "
+                f"kernel={ksize}, sigma=[{sigma_min}, {sigma_max}]"
             )
 
         # Pre-parse minimal fields for speed
@@ -2283,9 +2239,9 @@ class SidecarJsonDataset(Dataset):
             - Affects both training and validation datasets
             - Essential for proper cache invalidation and augmentation diversity
         """
-        self._current_epoch = int(epoch)
+        self._current_epoch.value = int(epoch)
         self._epoch_was_set = True
-        self.logger.debug(f"Dataset epoch set to {self._current_epoch}")
+        self.logger.debug(f"Dataset epoch set to {self._current_epoch.value}")
 
     def _deterministic_coin(self, image_id: str) -> bool:
         """Stable per-image, per-epoch coin flip using fast CRC32 hash.
@@ -2319,7 +2275,7 @@ class SidecarJsonDataset(Dataset):
             )
         # Include epoch in hash to get different flips across epochs
         # Use zlib.crc32 for speed - deterministic and fast (~20x faster than SHA256)
-        seed_bytes = f"{image_id}|epoch{self._current_epoch}".encode("utf-8")
+        seed_bytes = f"{image_id}|epoch{self._current_epoch.value}".encode("utf-8")
         h = zlib.crc32(seed_bytes) & 0xFFFFFFFF  # Ensure unsigned 32-bit
         v = h / 0xFFFFFFFF  # [0,1]
         return v < float(self.random_flip_prob)
@@ -2534,6 +2490,22 @@ class SidecarJsonDataset(Dataset):
             image_id = ann["image_id"]
             # Use original tags directly for read-only operations (avoid unnecessary copy)
             original_tags = ann["tags"]  # No copy - read-only reference
+
+            # Filter samples that would inject false negatives into the loss:
+            #   - Empty tag list → encode_tags() returns all-zero, training the model
+            #     to predict "no tags" for an arbitrary image.
+            #   - Missing/unknown rating → none of the four rating:* indices are set,
+            #     teaching the model that no rating applies. With ASL gamma_neg high,
+            #     this systematically biases toward "no rating".
+            # Both classes of bad data are routed to the existing error-sample path,
+            # which the train/val loops already filter via the `error` flag.
+            if not original_tags or _map_rating_to_tag(ann.get("rating")) is None:
+                reason = (
+                    "empty tag list" if not original_tags
+                    else f"missing/unknown rating ({ann.get('rating')!r})"
+                )
+                return self._error_sample(idx, reason, image_id=image_id)
+
             # Decide whether to flip and adjust tags accordingly
             mode = self._decide_flip_mode(image_id, original_tags)
             flip_bit = False
@@ -2559,63 +2531,7 @@ class SidecarJsonDataset(Dataset):
             img_root = ann.get("dir", self.root)
             img_path = validate_image_path(Path(img_root), image_id)
 
-            # Try sidecar cache first
-            if self._sidecar_enabled:
-                # Skip mtime syscall for performance - config hash is sufficient for invalidation
-                # Source file changes are rare during training and config hash catches param changes
-                source_mtime = None
-                sidecar_path = get_sidecar_path(str(img_path), self._sidecar_extension)
-                cache_result = load_sidecar(
-                    sidecar_path,
-                    expected_config_hash=self._config_hash,
-                    expected_source_mtime=source_mtime,
-                )
-                if cache_result is not None:
-                    img_t, pmask = cache_result
-                    # Verify cached shape and dtype match expected values
-                    # (self.image_size is already int from __init__)
-                    shape_ok = (img_t.dim() == 3 and
-                                img_t.shape[0] == 3 and
-                                img_t.shape[1] == self.image_size and
-                                img_t.shape[2] == self.image_size)
-                    dtype_ok = (img_t.dtype == self._sidecar_dtype)
-                    if shape_ok and dtype_ok:
-                        # Apply flip transformation to cached data if needed
-                        if flip_bit:
-                            # Performance optimization: Removed .contiguous() calls after flip.
-                            # Modern PyTorch handles non-contiguous tensors efficiently, and the
-                            # subsequent operations don't require contiguous memory layout.
-                            img_t = torch.flip(img_t, dims=[2])  # Flip width dimension (CHW format)
-                            pmask = torch.flip(pmask, dims=[1])  # Flip width dimension (HW format)
-
-                        # NOTE: RandomErasing is NOT applied to cached data because:
-                        # 1. Cache stores normalized data (range [-1, 1])
-                        # 2. RandomErasing expects [0,1] input and fills with 0.5 (mid-gray)
-                        # 3. Applying to normalized data would produce inconsistent results
-                        # RandomErasing is only applied in the fresh-load path BEFORE normalization
-
-                        # Use tags that already reflect the flip decision
-                        tag_vec = self.vocab.encode_tags(tags_now)
-                        monitor.l2_hit()  # Sidecar cache hit
-                        return self._build_sample_dict(
-                            img_t, pmask, tag_vec, ann.get("rating", "unknown"), image_id,
-                            cached=True,
-                            flip_applied=flip_bit,
-                            flip_mode=mode,
-                            has_tag_mismatch=has_tag_mismatch,
-                        )
-                    else:
-                        # Cache file loaded but validation failed - this is a stale entry, not a miss
-                        if self.logger.isEnabledFor(logging.DEBUG):
-                            if not shape_ok:
-                                self.logger.debug(f"Sidecar shape mismatch for {image_id}, reloading")
-                            elif not dtype_ok:
-                                self.logger.debug(f"Sidecar dtype mismatch for {image_id}: {img_t.dtype} != {self._sidecar_dtype}")
-                        monitor.l2_stale()  # Stale cache entry (loaded but invalid)
-                else:
-                    monitor.l2_miss()  # True cache miss (file not found or couldn't load)
-
-            # Cache miss: load from disk
+            # Load image from disk
             # Fully decode and correct EXIF while file is open
             with Image.open(img_path) as pil_img:
                 pil_img.load()
@@ -2639,6 +2555,10 @@ class SidecarJsonDataset(Dataset):
                 # (Padding is added by process_image_cpu and should remain at pad_color)
                 if self._color_jitter is not None:
                     pil = self._color_jitter(pil)
+
+                # Gaussian blur (PIL, pre-letterbox) — keeps padding regions sharp at pad_color
+                if self._blur is not None and random.random() < self._blur_p:
+                    pil = self._blur(pil)
 
                 canvas, pmask = process_image_cpu(pil, self.image_size, self.pad_color)
 
@@ -2719,45 +2639,7 @@ class SidecarJsonDataset(Dataset):
             # Encode labels (tags already account for flipping)
             tag_vec = self.vocab.encode_tags(tags_now)  # (V,)
 
-            # Save sidecar cache file BEFORE applying flip (stores canonical unflipped version)
-            if self._sidecar_enabled:
-                # Store the UNFLIPPED version directly - flip will be applied after caching
-                img_to_cache = img
-                mask_to_cache = pmask
-
-                # Use file locking to reduce redundant I/O from concurrent writes
-                # Skip locking for very long paths to avoid filesystem limits (Windows: 260 chars)
-                # Note: save_sidecar() uses atomic writes (UUID temp + os.replace), so multiple
-                # writes are safe even without locking - locking just reduces wasted work
-                use_locking = HAS_FILELOCK and len(sidecar_path) <= 240  # Leave room for .lock extension
-                if use_locking:
-                    lock_path = sidecar_path + ".lock"
-                    try:
-                        with filelock.FileLock(lock_path, timeout=0.1):  # Non-blocking attempt
-                            # Got lock - write the cache file
-                            # Skip existence check to avoid TOCTOU race; atomic write handles conflicts
-                            save_sidecar(
-                                sidecar_path,
-                                img_to_cache.to(self._sidecar_dtype),
-                                mask_to_cache,
-                                self._config_hash,
-                                image_size=self.image_size,
-                                source_mtime=source_mtime,
-                            )
-                    except filelock.Timeout:
-                        pass  # Another worker is writing, skip to avoid redundant work
-                else:
-                    # Without locking, still safe due to UUID-based temp files in save_sidecar
-                    save_sidecar(
-                        sidecar_path,
-                        img_to_cache.to(self._sidecar_dtype),
-                        mask_to_cache,
-                        self._config_hash,
-                        image_size=self.image_size,
-                        source_mtime=source_mtime,
-                    )
-
-            # Apply horizontal flip AFTER caching (ensures correct transform ordering)
+            # Apply horizontal flip after all other transforms complete
             # Flip is applied at tensor level after all other transforms complete
             if flip_bit:
                 # Performance optimization: Removed .contiguous() calls after flip.
@@ -2841,8 +2723,8 @@ class SidecarJsonDataset(Dataset):
         # This ensures error samples have the same shape as valid samples for batching
         sz = self.image_size  # Already int from __init__
         # Match image dtype to what cached/non-cached samples use to avoid batch collation issues
-        # Use _sidecar_dtype directly since that's what both paths now produce
-        img_dtype = self._sidecar_dtype
+        # Match image dtype to what _to_tensor_v2 produces
+        img_dtype = self._image_dtype
         resolved_image_id = str(image_id).strip() if image_id else ""
         if not resolved_image_id:
             resolved_image_id = f"error_{idx}"
@@ -2898,9 +2780,6 @@ def create_dataloaders(
     validation_config,
     vocab_path,
     active_data_path,
-    distributed=False,
-    rank=-1,
-    world_size=1,
     seed=42,
     debug_config=None,
     architecture_type: str = "vit",
@@ -2912,12 +2791,7 @@ def create_dataloaders(
 
     # Extract config once to avoid redundant processing
     config_cache = {
-        # Sidecar cache configuration (replaces L2 LMDB cache)
-        'sidecar_cache_enabled': bool(getattr(data_config, "sidecar_cache_enabled", True)),
-        'sidecar_extension': str(getattr(data_config, "sidecar_extension", ".safetensor")),
-        'sidecar_storage_dtype': str(getattr(data_config, "sidecar_storage_dtype", "bfloat16")),
         'preload_files': int(getattr(data_config, "preload_files", 0)),
-        'cpu_bf16_cache_pipeline': getattr(data_config, "cpu_bf16_cache_pipeline", None),
         # Image processing configuration
         'image_size': int(getattr(data_config, "image_size", 512)),
         'normalize_mean': tuple(getattr(data_config, "normalize_mean", [0.5, 0.5, 0.5])),
@@ -2960,6 +2834,12 @@ def create_dataloaders(
         'random_rotation_p': float(getattr(data_config, "random_rotation_p", 0.3)),
         'random_rotation_min_degrees': float(getattr(data_config, "random_rotation_min_degrees", 5.0)),
         'random_rotation_max_degrees': float(getattr(data_config, "random_rotation_max_degrees", 10.0)),
+        # Gaussian blur augmentation
+        'gaussian_blur_enabled': bool(getattr(data_config, "gaussian_blur_enabled", False)),
+        'gaussian_blur_p': float(getattr(data_config, "gaussian_blur_p", 0.15)),
+        'gaussian_blur_kernel_size': int(getattr(data_config, "gaussian_blur_kernel_size", 3)),
+        'gaussian_blur_sigma_min': float(getattr(data_config, "gaussian_blur_sigma_min", 0.1)),
+        'gaussian_blur_sigma_max': float(getattr(data_config, "gaussian_blur_sigma_max", 1.5)),
         # Architecture-aware cache key parameters
         # SwinV2 always uses patch_size=4 (hardcoded in timm); ViT uses configurable patch_size
         'architecture_type': str(architecture_type).lower(),
@@ -2998,15 +2878,6 @@ def create_dataloaders(
                 f"This check prevents late failures during model forward pass. "
                 f"Original error: {e}"
             ) from e
-
-    if config_cache['sidecar_cache_enabled']:
-        logger.info(
-            "Sidecar cache enabled (extension=%s, dtype=%s)",
-            config_cache['sidecar_extension'],
-            config_cache['sidecar_storage_dtype'],
-        )
-    else:
-        logger.info("Sidecar cache disabled")
 
     # Load vocabulary once (needed for sidecar mode and to determine num classes)
     vocab = load_vocabulary_for_training(Path(vocab_path))
@@ -3205,10 +3076,6 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
-            sidecar_cache_enabled=config_cache['sidecar_cache_enabled'],
-            sidecar_extension=config_cache['sidecar_extension'],
-            sidecar_storage_dtype=config_cache['sidecar_storage_dtype'],
-            cpu_bf16_cache_pipeline=config_cache['cpu_bf16_cache_pipeline'],
             random_flip_prob=random_flip_prob,
             orientation_handler=_handler,
             flip_overrides_path=flip_overrides_path,
@@ -3236,6 +3103,11 @@ def create_dataloaders(
             random_rotation_p=config_cache['random_rotation_p'],
             random_rotation_min_degrees=config_cache['random_rotation_min_degrees'],
             random_rotation_max_degrees=config_cache['random_rotation_max_degrees'],
+            gaussian_blur_enabled=config_cache['gaussian_blur_enabled'],
+            gaussian_blur_p=config_cache['gaussian_blur_p'],
+            gaussian_blur_kernel_size=config_cache['gaussian_blur_kernel_size'],
+            gaussian_blur_sigma_min=config_cache['gaussian_blur_sigma_min'],
+            gaussian_blur_sigma_max=config_cache['gaussian_blur_sigma_max'],
             # Architecture-aware cache key parameters
             architecture_type=config_cache['architecture_type'],
             patch_size=config_cache['patch_size'],
@@ -3250,10 +3122,6 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
-            sidecar_cache_enabled=config_cache['sidecar_cache_enabled'],
-            sidecar_extension=config_cache['sidecar_extension'],
-            sidecar_storage_dtype=config_cache['sidecar_storage_dtype'],
-            cpu_bf16_cache_pipeline=config_cache['cpu_bf16_cache_pipeline'],
             random_flip_prob=0.0,          # keep val deterministic
             orientation_handler=_handler,  # still needed to encode swapped tags if you ever TTA
             flip_overrides_path=None,
@@ -3273,31 +3141,19 @@ def create_dataloaders(
             patch_size=config_cache['patch_size'],
         )
 
-    # Samplers for distributed training
-    # Always use DistributedSampler (with world_size=1 if not distributed)
-    # This ensures deterministic shuffling per epoch that is independent of global RNG state,
-    # which is critical for correct mid-epoch resumption.
-    #
     # ResumableSampler extends DistributedSampler with O(1) mid-epoch resume support
     # by allowing direct offset into the shuffled indices instead of iterating through.
+    # Uses num_replicas=1, rank=0 for single-GPU training.
     train_sampler = ResumableSampler(
         train_ds,
-        num_replicas=int(world_size) if distributed else 1,
-        rank=int(rank) if distributed else 0,
+        num_replicas=1,
+        rank=0,
         shuffle=True,
         drop_last=config_cache['drop_last'],
         seed=int(seed) if seed is not None else 0,
     )
-    
+
     val_sampler = None
-    if distributed:
-        val_sampler = DistributedSampler(
-            val_ds,
-            num_replicas=int(world_size),
-            rank=int(rank),
-            shuffle=False,
-            drop_last=False,
-        )
     # --------------------------------------------------------------------
 
     # DataLoaders

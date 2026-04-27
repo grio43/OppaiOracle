@@ -32,7 +32,6 @@ torch>=2.9.1
 torchvision>=0.24.1
 tqdm>=4.66.4
 uvicorn>=0.35.0  # for API
-wandb>=0.16.4  # optional
 wordcloud>=1.9.3  # optional
 
 # Triton for torch.compile optimization (15-35% training speedup)
