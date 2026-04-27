@@ -17,7 +17,6 @@ This document outlines the core components of the training pipeline for the Oppa
     *   **`DataLoader`**: A custom wrapper around PyTorch's DataLoader to handle specific threading/worker edge cases.
     *   **`create_dataloaders`**: Factory for train/val loaders and vocab creation.
     *   **`AugmentationStats` / `validate_dataset`**: Augmentation counters and dataset sanity checks.
-*   **`cache_codec.py`**: Sidecar cache encoding/decoding and sidecar path helpers used by the loader.
 *   **`shared_vocabulary.py`**: Shared vocabulary manager to reduce memory duplication across workers.
 *   **`vocabulary.py`**: Manages the tag vocabulary.
     *   **`TagVocabulary`**: Handles bidirectional mapping between tag strings and integer indices.

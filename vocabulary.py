@@ -1172,24 +1172,6 @@ def verify_vocabulary_integrity(vocab: TagVocabulary, source_path: Optional[Path
 # Keep backward compatibility alias
 _verify_vocabulary_integrity = verify_vocabulary_integrity
 
-def create_dataset_config(vocab: TagVocabulary) -> Dict:
-    """Create a configuration dictionary for dataset initialization.
-    
-    This ensures ignored indices are properly passed to datasets when using
-    multiprocessing with DataLoader.
-    
-    Args:
-        vocab: TagVocabulary instance
-        
-    Returns:
-        Dictionary with configuration including ignored_indices
-    """
-    return {
-        'vocabulary': vocab,
-        'ignored_indices': vocab.get_ignored_indices(),
-        # Add other dataset configuration parameters as needed
-    }
-
 def create_vocabulary_from_datasets(
     dataset_path: Optional[List[Union[str, Path]]] = None,
     *,
@@ -1261,35 +1243,6 @@ def create_vocabulary_from_datasets(
     )
 
     return vocab
-
-
-def clear_vocabulary_build_cache(dataset_path: Optional[Path] = None) -> None:
-    """Clear the vocabulary build cache.
-
-    Args:
-        dataset_path: If provided, only clear cache for this dataset.
-                     If None, clear all vocabulary build caches.
-    """
-    if not VOCAB_CACHE_DIR.exists():
-        logger.info("No vocabulary cache directory found")
-        return
-
-    if dataset_path is not None:
-        # Clear cache for specific dataset
-        cache_key = _compute_dataset_hash(Path(dataset_path).resolve())
-        patterns = [
-            VOCAB_CACHE_DIR / f"{cache_key}.filelist.txt",
-            VOCAB_CACHE_DIR / f"{cache_key}.frequencies.json",
-        ]
-        for cache_file in patterns:
-            if cache_file.exists():
-                cache_file.unlink()
-                logger.info(f"Deleted cache: {cache_file}")
-    else:
-        # Clear all caches
-        import shutil
-        shutil.rmtree(VOCAB_CACHE_DIR)
-        logger.info(f"Deleted all vocabulary build caches at {VOCAB_CACHE_DIR}")
 
 
 def main():

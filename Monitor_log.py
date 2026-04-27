@@ -128,12 +128,6 @@ except ImportError:
     warnings.warn("GPUtil not available. GPU monitoring disabled.")
 
 try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    
-try:
     import pandas as pd
     PANDAS_AVAILABLE = True
 except ImportError:
@@ -159,14 +153,6 @@ MAX_FIELDS = 25
 MAX_FIELD_NAME = 256
 MAX_FIELD_VALUE = 1024
 
-def trim(s: str, n: int) -> str:
-    """Trim a string to a max length, adding an ellipsis if truncated."""
-    if s is None:
-        return None
-    s = str(s)
-    return s if len(s) <= n else s[:n-1] + '…'
-
-
 class ImageLogger:
     def __init__(self, writer=None, use_matplotlib: bool = False):
         self.writer = writer
@@ -186,50 +172,6 @@ class ImageLogger:
     def _create_composite_plot(self, images, predictions, labels):
         """Create composite plots offline or during validation only"""
         pass
-
-
-class GradientHistogramLogger:
-    def __init__(self, config, writer=None):
-        self.writer = writer
-        self.enabled = (
-            getattr(config, 'log_histograms', False)
-            or getattr(config, 'log_param_histograms', False)
-            or getattr(config, 'log_grad_histograms', False)
-        )
-        self.log_every_n_steps = getattr(
-            config,
-            'histogram_log_interval',
-            max(
-                getattr(config, 'param_hist_interval_steps', 500),
-                getattr(config, 'grad_hist_interval_steps', 500),
-            ),
-        )
-        self.param_whitelist = getattr(config, 'histogram_params', None)
-
-    def log_histograms(self, model, step):
-        """Conditionally log parameter/gradient histograms"""
-        if not self.enabled or self.writer is None:
-            return
-
-        if step % self.log_every_n_steps != 0:
-            return
-
-        for name, param in model.named_parameters():
-            if self.param_whitelist and name not in self.param_whitelist:
-                continue
-
-            if param.grad is not None:
-                self.writer.add_histogram(f'gradients/{name}', param.grad, step)
-                self.writer.add_histogram(f'parameters/{name}', param, step)
-
-    @staticmethod
-    def warn_performance():
-        """Warning for users about performance impact"""
-        print(
-            "WARNING: Histogram logging enabled. This may significantly impact "
-            "training performance on large models. Consider disabling or reducing "
-            "frequency via 'histogram_log_interval' config."
-        )
 
 
 class AlertSystem:
@@ -758,7 +700,6 @@ class SystemMonitor:
             'memory': {},
             'disk': {},
             'gpu': [],
-            'network': {}
         }
         
         try:
@@ -879,21 +820,6 @@ class SystemMonitor:
         except Exception as e:
             logger.debug(f"Failed to collect GPU metrics: {e}")
                     
-        try:
-            # Network metrics
-            if self.config.track_network_io:
-                if self._shutdown_event.is_set():
-                    return metrics                
-                net = psutil.net_io_counters()
-                metrics['network']['sent_mb'] = net.bytes_sent / (1024**2)
-                metrics['network']['recv_mb'] = net.bytes_recv / (1024**2)
-                metrics['network']['packets_sent'] = net.packets_sent
-                metrics['network']['packets_recv'] = net.packets_recv
-                metrics['network']['errors'] = net.errin + net.errout
-                metrics['network']['drops'] = net.dropin + net.dropout
-        except Exception as e:
-            logger.debug(f"Failed to collect network metrics: {e}")
-        
         return metrics
     
     def get_latest_metrics(self) -> Optional[Dict[str, Any]]:
@@ -975,8 +901,6 @@ class TrainingMonitor:
             'augmentation_times': []
         }
         self.last_aug_log_step = 0
-        self.wandb_run = None
-
         use_tb = bool(getattr(self.config, "use_tensorboard", False))
         if use_tb and self.is_primary:
             from datetime import datetime
@@ -1009,9 +933,6 @@ class TrainingMonitor:
                 pass
         # Initialize auxiliary loggers
         self.image_logger = ImageLogger(writer=self.writer, use_matplotlib=getattr(self.config, 'use_matplotlib', False))
-        self.grad_hist_logger = GradientHistogramLogger(self.config, writer=self.writer)
-        if self.grad_hist_logger.enabled:
-            self.grad_hist_logger.warn_performance()
 
         # Final setup
         self._setup_logging()
@@ -1108,13 +1029,6 @@ class TrainingMonitor:
             logger.info("Wrote model graph to TensorBoard")
         except Exception as e:
             logger.debug(f"Skipping add_graph: {e}")
-
-    def log_param_and_grad_histograms(self, model, step: int):
-        if getattr(self, "grad_hist_logger", None) is None:
-            return
-
-        self.grad_hist_logger.writer = self.writer
-        self.grad_hist_logger.log_histograms(model, step)
 
     def flush(self):
         if getattr(self, "writer", None):
@@ -1317,12 +1231,17 @@ class TrainingMonitor:
         max_images: int = 4,
         topk: int = 35,
         threshold: float = 0.4,
+        image_ids: Optional[List[str]] = None,
     ):
         """Log per-sample images with ground truth tags and predictions to TensorBoard.
 
         Shows ground truth tags + top predictions, sorted by probability (strongest first).
         Table format: tag | predicted_prob | expected (YES/no) | status (TP/FN/FP)
         Rating predictions appear naturally as rating:* tags in the tag list.
+
+        If image_ids is provided, the source filename for each sample is prepended
+        to the markdown as a `**file:** <id>` line so the reviewer can key
+        corrections by filename.
         """
         if getattr(self, "writer", None) is None:
             return
@@ -1372,7 +1291,11 @@ class TrainingMonitor:
             # Sort by probability (strongest to weakest)
             combined_indices = sorted(combined_indices, key=lambda idx: probs[idx].item(), reverse=True)
 
-            lines = ["| tag | prob | expected | status |", "| --- | --- | --- | --- |"]
+            lines: List[str] = []
+            if image_ids is not None and i < len(image_ids) and image_ids[i] is not None:
+                lines.append(f"**file:** {image_ids[i]}")
+                lines.append("")
+            lines.extend(["| tag | prob | expected | status |", "| --- | --- | --- | --- |"])
             for idx in combined_indices:
                 tag = tag_names[idx] if idx < len(tag_names) else str(idx)
                 prob = probs[idx].item()
@@ -1713,14 +1636,6 @@ class TrainingMonitor:
                     if getattr(self, "logger", None):
                         self.logger.warning(f"TensorBoard add_scalar failed for tag={tag}: {e}")
 
-            if self.wandb_run is not None:
-                try:
-                    # Note: include step so W&B aligns correctly
-                    self.wandb_run.log({**safe_metrics, "step": step})
-                except Exception as e:
-                    if self.logger:
-                        self.logger.warning(f"W&B log failed: {e}")
-    
     def _save_metrics_checkpoint(self, epoch: int):
         """Save metrics checkpoint to file"""
         try:
@@ -1839,15 +1754,6 @@ class TrainingMonitor:
                 logger.debug(f"Error closing TensorBoard writer: {e}")
                 cleanup_errors.append(('tensorboard', e))
 
-        # Close wandb run
-        wandb_run = getattr(self, 'wandb_run', None)
-        if wandb_run and WANDB_AVAILABLE:
-            try:
-                wandb.finish()
-            except Exception as e:
-                logger.debug(f"Error finishing wandb: {e}")
-                cleanup_errors.append(('wandb', e))
-
         # Mark as closed only after attempting all cleanup
         self._closed = True
 
@@ -1863,7 +1769,6 @@ if __name__ == "__main__":
     config = MonitorConfig(
         log_level="INFO",
         use_tensorboard=True,
-        use_wandb=False,
         track_gpu_metrics=True,
         enable_alerts=True,
         enable_profiling=False,

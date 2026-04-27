@@ -91,9 +91,14 @@ class MetricComputer:
         """Return macro/micro F1 and mAP metrics.
 
         If skip_indices was specified, those columns are filtered out before computing metrics.
+
+        Cast predictions to fp32 before computing metrics — bf16 has 7 mantissa bits,
+        which loses precision near the threshold and in PR-curve sums across many
+        rare classes.
         """
         # Accept probabilities or logits; TorchMetrics will sigmoid if logits are detected.
-        preds = predictions.detach()  # Keep native dtype (bfloat16)
+        # Cast to fp32 for stable thresholding and PR-curve accumulation.
+        preds = predictions.detach().float()
         # TorchMetrics (multilabel) requires integer {0,1} targets; binarize if floats.
         targs = targets.detach()
         if targs.dtype.is_floating_point:
@@ -111,9 +116,8 @@ class MetricComputer:
                 self._keep_mask_cached_device = preds.device
             preds = preds[:, self._keep_mask]
             targs = targs[:, self._keep_mask]
-            effective_labels = self._effective_num_labels
-        else:
-            effective_labels = self.num_labels
+
+        preds, targs, effective_labels = self._drop_zero_positive_classes(preds, targs)
 
         f1_macro = multilabel_f1_score(
             preds, targs, num_labels=effective_labels, average="macro", threshold=self.threshold
@@ -125,6 +129,27 @@ class MetricComputer:
             preds, targs, num_labels=effective_labels, average=self.mAP_average
         ).item()
         return {"f1_macro": f1_macro, "f1_micro": f1_micro, "mAP": mAP}
+
+    @staticmethod
+    def _drop_zero_positive_classes(
+        preds: torch.Tensor, targs: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Remove classes with zero positive targets in this draw.
+
+        torchmetrics returns AP=0 for any class with no positives, so under macro
+        averaging across an 18-24K-class long-tailed vocabulary, a 30k-sample
+        validation draw leaves thousands of unrepresented classes contributing
+        zeros. The macro score then reflects vocabulary sparsity rather than
+        model quality. Filtering keeps macro averaging meaningful.
+        """
+        if targs.numel() == 0:
+            return preds, targs, preds.size(1)
+        positive_per_class = targs.sum(dim=0)
+        keep = positive_per_class > 0
+        effective = int(keep.sum().item())
+        if effective == 0 or effective == preds.size(1):
+            return preds, targs, preds.size(1)
+        return preds[:, keep], targs[:, keep], effective
 
     def compute_all_metrics_at_threshold(
         self,
@@ -146,7 +171,7 @@ class MetricComputer:
         Returns:
             Dict with f1_macro, f1_micro, and mAP metrics
         """
-        preds = predictions.detach()
+        preds = predictions.detach().float()
         targs = targets.detach()
         if targs.dtype.is_floating_point:
             targs = (targs > 0.5).to(torch.long)
@@ -160,9 +185,8 @@ class MetricComputer:
                 self._keep_mask_cached_device = preds.device
             preds = preds[:, self._keep_mask]
             targs = targs[:, self._keep_mask]
-            effective_labels = self._effective_num_labels
-        else:
-            effective_labels = self.num_labels
+
+        preds, targs, effective_labels = self._drop_zero_positive_classes(preds, targs)
 
         f1_macro = multilabel_f1_score(
             preds, targs, num_labels=effective_labels, average="macro", threshold=threshold

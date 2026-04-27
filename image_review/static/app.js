@@ -7,6 +7,13 @@ class ImageReviewApp {
         this.allSamples = [];
         this.currentIndex = 0;  // Index within allSamples
 
+        // Corrections state for the currently-loaded sample
+        this.correctionKey = null;
+        this.addSet = new Set();
+        this.removeSet = new Set();
+        this._saveTimer = null;
+        this._savedFlashTimer = null;
+
         this.initElements();
         this.bindEvents();
         this.loadRuns();
@@ -47,6 +54,15 @@ class ImageReviewApp {
         this.ratingActual = document.getElementById('rating-actual');
         this.ratingStatus = document.getElementById('rating-status');
 
+        // Corrections
+        this.correctionKeyEl = document.getElementById('correction-key');
+        this.countAdd = document.getElementById('count-add');
+        this.countRemove = document.getElementById('count-remove');
+        this.correctionSaved = document.getElementById('correction-saved');
+        this.btnResetCorrections = document.getElementById('btn-reset-corrections');
+        this.addTagInput = document.getElementById('add-tag-input');
+        this.btnAddTag = document.getElementById('btn-add-tag');
+
         // Modal
         this.modal = document.getElementById('image-modal');
         this.modalImage = document.getElementById('modal-image');
@@ -60,13 +76,6 @@ class ImageReviewApp {
         this.mobileBtnNext = document.getElementById('mobile-btn-next');
         this.mobileCurrentNum = document.getElementById('mobile-current-num');
         this.mobileTotalNum = document.getElementById('mobile-total-num');
-        this.swipeHint = document.getElementById('swipe-hint');
-
-        // Touch state
-        this.touchStartX = 0;
-        this.touchStartY = 0;
-        this.touchEndX = 0;
-        this.isSwiping = false;
     }
 
     bindEvents() {
@@ -79,6 +88,15 @@ class ImageReviewApp {
         this.jumpInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') this.jumpToSample();
         });
+
+        this.btnAddTag.addEventListener('click', () => this.handleAddTagInput());
+        this.addTagInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                this.handleAddTagInput();
+            }
+        });
+        this.btnResetCorrections.addEventListener('click', () => this.resetCorrections());
 
         this.imageContainer.addEventListener('click', () => this.showModal());
         this.modal.addEventListener('click', (e) => {
@@ -105,76 +123,6 @@ class ImageReviewApp {
         if (this.mobileBtnNext) {
             this.mobileBtnNext.addEventListener('click', () => this.navigate('next'));
         }
-
-        // Touch/Swipe gestures
-        this.bindTouchEvents();
-    }
-
-    bindTouchEvents() {
-        const mainContent = document.querySelector('.main-content');
-        if (!mainContent) return;
-
-        mainContent.addEventListener('touchstart', (e) => {
-            this.touchStartX = e.changedTouches[0].screenX;
-            this.touchStartY = e.changedTouches[0].screenY;
-            this.isSwiping = false;
-        }, { passive: true });
-
-        mainContent.addEventListener('touchmove', (e) => {
-            const deltaX = Math.abs(e.changedTouches[0].screenX - this.touchStartX);
-            const deltaY = Math.abs(e.changedTouches[0].screenY - this.touchStartY);
-            // Consider horizontal swipe if X movement is greater than Y
-            if (deltaX > deltaY && deltaX > 30) {
-                this.isSwiping = true;
-            }
-        }, { passive: true });
-
-        mainContent.addEventListener('touchend', (e) => {
-            this.touchEndX = e.changedTouches[0].screenX;
-            this.handleSwipe();
-        }, { passive: true });
-
-        // Modal swipe support
-        this.modal.addEventListener('touchstart', (e) => {
-            this.touchStartX = e.changedTouches[0].screenX;
-        }, { passive: true });
-
-        this.modal.addEventListener('touchend', (e) => {
-            this.touchEndX = e.changedTouches[0].screenX;
-            this.handleSwipe();
-        }, { passive: true });
-    }
-
-    handleSwipe() {
-        const swipeThreshold = 50;
-        const diff = this.touchStartX - this.touchEndX;
-
-        if (Math.abs(diff) < swipeThreshold) return;
-        if (!this.isSwiping && !this.modal.classList.contains('visible')) return;
-
-        if (diff > 0) {
-            // Swipe left -> next
-            if (!this.btnNext.disabled) {
-                this.navigate('next');
-                if (this.modal.classList.contains('visible')) {
-                    setTimeout(() => {
-                        this.modalImage.src = this.sampleImage.src;
-                    }, 100);
-                }
-                this.hideSwipeHint();
-            }
-        } else {
-            // Swipe right -> prev
-            if (!this.btnPrev.disabled) {
-                this.navigate('prev');
-                if (this.modal.classList.contains('visible')) {
-                    setTimeout(() => {
-                        this.modalImage.src = this.sampleImage.src;
-                    }, 100);
-                }
-                this.hideSwipeHint();
-            }
-        }
     }
 
     toggleSidebar() {
@@ -192,16 +140,6 @@ class ImageReviewApp {
         }
         if (this.sidebarOverlay) {
             this.sidebarOverlay.classList.remove('visible');
-        }
-    }
-
-    hideSwipeHint() {
-        if (this.swipeHint && !this.swipeHintHidden) {
-            this.swipeHint.style.opacity = '0';
-            setTimeout(() => {
-                this.swipeHint.style.display = 'none';
-            }, 300);
-            this.swipeHintHidden = true;
         }
     }
 
@@ -314,6 +252,9 @@ class ImageReviewApp {
     async loadSampleByIndex(index) {
         if (index < 0 || index >= this.allSamples.length) return;
 
+        // Flush any pending save from the previous sample before switching
+        await this.flushPendingSave();
+
         const sampleInfo = this.allSamples[index];
         this.currentIndex = index;
 
@@ -322,11 +263,128 @@ class ImageReviewApp {
             const data = await response.json();
 
             this.currentSample = data.sample;
+            this.correctionKey = data.sample.correction_key;
+            this.addSet = new Set();
+            this.removeSet = new Set();
+            await this.fetchCorrections();
             this.renderSample();
             this.updateNavigation();
         } catch (error) {
             console.error('Failed to load sample:', error);
         }
+    }
+
+    async fetchCorrections() {
+        if (!this.correctionKey) return;
+        try {
+            const resp = await fetch(`/api/corrections/${encodeURIComponent(this.correctionKey)}`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            this.addSet = new Set(data.add || []);
+            this.removeSet = new Set(data.remove || []);
+        } catch (err) {
+            console.warn('Failed to fetch corrections:', err);
+        }
+    }
+
+    queueSave() {
+        if (this._saveTimer) clearTimeout(this._saveTimer);
+        this.flashSavedIndicator('saving…', 'pending');
+        this._saveTimer = setTimeout(() => {
+            this._saveTimer = null;
+            this.persistCorrections();
+        }, 300);
+    }
+
+    async flushPendingSave() {
+        if (this._saveTimer) {
+            clearTimeout(this._saveTimer);
+            this._saveTimer = null;
+            await this.persistCorrections();
+        }
+    }
+
+    async persistCorrections() {
+        if (!this.correctionKey) return;
+        try {
+            const resp = await fetch(`/api/corrections/${encodeURIComponent(this.correctionKey)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    add: Array.from(this.addSet),
+                    remove: Array.from(this.removeSet),
+                })
+            });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            this.flashSavedIndicator('saved ✓', 'saved');
+        } catch (err) {
+            console.error('Failed to save corrections:', err);
+            this.flashSavedIndicator('save failed', 'error');
+        }
+    }
+
+    flashSavedIndicator(text, kind) {
+        if (this._savedFlashTimer) clearTimeout(this._savedFlashTimer);
+        this.correctionSaved.textContent = text;
+        this.correctionSaved.className = `correction-saved ${kind}`;
+        if (kind === 'saved') {
+            this._savedFlashTimer = setTimeout(() => {
+                this.correctionSaved.textContent = ' ';
+                this.correctionSaved.className = 'correction-saved';
+            }, 1500);
+        }
+    }
+
+    handleAddTagInput() {
+        const raw = this.addTagInput.value.trim();
+        if (!raw) return;
+        this.toggleAdd(raw);
+        this.addTagInput.value = '';
+    }
+
+    /**
+     * Toggle a tag in the "add" set. If it's also in "remove" we drop it from
+     * remove first (an add overrides a pending removal of the same tag).
+     */
+    toggleAdd(tag) {
+        if (!tag) return;
+        if (this.addSet.has(tag)) {
+            this.addSet.delete(tag);
+        } else {
+            this.removeSet.delete(tag);
+            this.addSet.add(tag);
+        }
+        this.renderSample();
+        this.queueSave();
+    }
+
+    toggleRemove(tag) {
+        if (!tag) return;
+        if (this.removeSet.has(tag)) {
+            this.removeSet.delete(tag);
+        } else {
+            this.addSet.delete(tag);
+            this.removeSet.add(tag);
+        }
+        this.renderSample();
+        this.queueSave();
+    }
+
+    async resetCorrections() {
+        if (!this.correctionKey) return;
+        if (this._saveTimer) {
+            clearTimeout(this._saveTimer);
+            this._saveTimer = null;
+        }
+        this.addSet = new Set();
+        this.removeSet = new Set();
+        try {
+            await fetch(`/api/corrections/${encodeURIComponent(this.correctionKey)}`, { method: 'DELETE' });
+            this.flashSavedIndicator('cleared', 'saved');
+        } catch (err) {
+            console.error('Failed to reset:', err);
+        }
+        this.renderSample();
     }
 
     renderSample() {
@@ -379,29 +437,96 @@ class ImageReviewApp {
             this.ratingDisplay.style.display = 'none';
         }
 
-        // Render expected tags
-        if (sample.ground_truth_tags.length > 0) {
-            this.expectedTags.innerHTML = sample.ground_truth_tags
-                .map(tag => `<div class="tag-item">${this.escapeHtml(tag)}</div>`)
-                .join('');
-        } else {
+        // Update corrections panel header
+        const keyLabel = sample.image_id || this.correctionKey || '-';
+        this.correctionKeyEl.textContent = keyLabel;
+        this.correctionKeyEl.title = this.correctionKey || '';
+        this.countAdd.textContent = this.addSet.size;
+        this.countRemove.textContent = this.removeSet.size;
+
+        // Render expected tags. Includes:
+        //  1. Pending "added" tags (not part of the original GT) at the top
+        //  2. Original GT tags, struck through if queued for removal
+        const gtSet = new Set(sample.ground_truth_tags);
+        const orphanAdds = Array.from(this.addSet).filter(t => !gtSet.has(t));
+        const gtRows = sample.ground_truth_tags.map(tag => {
+            const queuedRemove = this.removeSet.has(tag);
+            return `
+                <div class="tag-item ${queuedRemove ? 'queued-remove' : ''}" data-tag="${this.escapeAttr(tag)}">
+                    <span class="tag-name">${this.escapeHtml(tag)}</span>
+                    <button class="tag-action remove" data-action="toggle-remove" data-tag="${this.escapeAttr(tag)}" title="Remove this tag from GT">&times;</button>
+                </div>
+            `;
+        });
+        const addedRows = orphanAdds.map(tag => `
+            <div class="tag-item queued-add" data-tag="${this.escapeAttr(tag)}">
+                <span class="tag-name">${this.escapeHtml(tag)}</span>
+                <span class="tag-badge">added</span>
+                <button class="tag-action add" data-action="toggle-add" data-tag="${this.escapeAttr(tag)}" title="Undo add">&times;</button>
+            </div>
+        `);
+
+        if (gtRows.length === 0 && addedRows.length === 0) {
             this.expectedTags.innerHTML = '<div class="empty-state">No ground truth tags</div>';
+        } else {
+            this.expectedTags.innerHTML = addedRows.concat(gtRows).join('');
         }
 
-        // Render predictions
+        // Render predictions: each row gets an action button
+        //  TP / FN  -> [×] queues a removal
+        //  FP       -> [+] queues an add (also clears any pending removal of same)
         if (sample.predictions.length > 0) {
             this.predictions.innerHTML = sample.predictions
-                .map(p => `
-                    <div class="prediction-item ${p.status.toLowerCase()}">
-                        <span class="tag-name">${this.escapeHtml(p.tag)}</span>
-                        <span class="prob">${p.probability.toFixed(4)}</span>
-                        <span class="status ${p.status.toLowerCase()}">${p.status}</span>
-                    </div>
-                `)
+                .map(p => {
+                    const status = p.status.toLowerCase();
+                    const queuedRemove = this.removeSet.has(p.tag);
+                    const queuedAdd = this.addSet.has(p.tag);
+                    let actionBtn;
+                    if (status === 'fp') {
+                        actionBtn = `<button class="tag-action ${queuedAdd ? 'add active' : 'add'}" data-action="toggle-add" data-tag="${this.escapeAttr(p.tag)}" title="${queuedAdd ? 'Undo add' : 'Add to GT'}">${queuedAdd ? '✓' : '+'}</button>`;
+                    } else {
+                        // TP or FN
+                        actionBtn = `<button class="tag-action ${queuedRemove ? 'remove active' : 'remove'}" data-action="toggle-remove" data-tag="${this.escapeAttr(p.tag)}" title="${queuedRemove ? 'Undo remove' : 'Remove from GT'}">${queuedRemove ? '✓' : '×'}</button>`;
+                    }
+                    const queuedClass = queuedRemove ? 'queued-remove' : (queuedAdd ? 'queued-add' : '');
+                    return `
+                        <div class="prediction-item ${status} ${queuedClass}">
+                            <span class="tag-name">${this.escapeHtml(p.tag)}</span>
+                            <span class="prob">${p.probability.toFixed(4)}</span>
+                            <span class="status ${status}">${p.status}</span>
+                            ${actionBtn}
+                        </div>
+                    `;
+                })
                 .join('');
         } else {
             this.predictions.innerHTML = '<div class="empty-state">No predictions</div>';
         }
+
+        // Wire up tag-action buttons (delegated)
+        this.expectedTags.querySelectorAll('.tag-action').forEach(btn => {
+            btn.addEventListener('click', (e) => this.handleTagAction(e));
+        });
+        this.predictions.querySelectorAll('.tag-action').forEach(btn => {
+            btn.addEventListener('click', (e) => this.handleTagAction(e));
+        });
+    }
+
+    handleTagAction(e) {
+        e.stopPropagation();
+        const btn = e.currentTarget;
+        const action = btn.dataset.action;
+        const tag = btn.dataset.tag;
+        if (!tag) return;
+        if (action === 'toggle-remove') this.toggleRemove(tag);
+        else if (action === 'toggle-add') this.toggleAdd(tag);
+    }
+
+    escapeAttr(text) {
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     updateNavigation() {

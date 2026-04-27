@@ -32,7 +32,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import _LRScheduler
 try:
     import bitsandbytes as bnb
@@ -766,109 +765,6 @@ class TrainingState:
         summary += f"Train Loss: {self.train_loss:.4f}, Val Loss: {self.val_loss:.4f}\n"
         summary += f"Patience: {self.patience_counter}, Should Stop: {self.should_stop}"
         return summary
-
-
-class DistributedTrainingHelper:
-    """Helper for distributed training setup and management"""
-    
-    def __init__(self, local_rank: int = -1, backend: str = 'nccl'):
-        self.local_rank = local_rank
-        self.backend = backend
-        self.is_distributed = False
-        self.world_size = 1
-        self.rank = 0
-        self.device = None
-        
-    def setup(self) -> torch.device:
-        """Set up distributed training and return device for this process.
-
-        Returns:
-            torch.device: The GPU or CPU assigned to the current process.
-        """
-        if 'WORLD_SIZE' in os.environ:
-            self.is_distributed = True
-            
-            # Get distributed parameters
-            self.world_size = int(os.environ['WORLD_SIZE'])
-            self.rank = int(os.environ['RANK'])
-            
-            if self.local_rank == -1:
-                self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
-            
-            # Initialize process group
-            if not dist.is_initialized():
-                dist.init_process_group(
-                    backend=self.backend,
-                    init_method='env://'
-                )
-            
-            # Setup device
-            torch.cuda.set_device(self.local_rank)
-            self.device = torch.device(f'cuda:{self.local_rank}')
-            
-            logger.info(f"Distributed training: Rank {self.rank}/{self.world_size}, "
-                       f"Local rank {self.local_rank}")
-        else:
-            # Single GPU or CPU training
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            logger.info(f"Single device training on {self.device}")
-        
-        return self.device
-    
-    def wrap_model(self, model: nn.Module, sync_bn: bool = True) -> nn.Module:
-        """Wrap model for distributed training"""
-        if self.is_distributed:
-            # Convert BatchNorm to SyncBatchNorm
-            if sync_bn and torch.cuda.is_available():
-                model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            
-            # Wrap with DDP
-            model = DDP(
-                model,
-                device_ids=[self.local_rank],
-                output_device=self.local_rank,
-                find_unused_parameters=False
-            )
-            logger.info("Model wrapped with DistributedDataParallel")
-        
-        return model
-    
-    def cleanup(self):
-        """Cleanup distributed training"""
-        if self.is_distributed:
-            dist.destroy_process_group()
-    
-    def is_main_process(self) -> bool:
-        """Check if this is the main process"""
-        return self.rank == 0
-    
-    def barrier(self):
-        """Synchronize all processes"""
-        if self.is_distributed:
-            dist.barrier()
-    
-    def reduce_tensor(self, tensor: torch.Tensor, average: bool = True) -> torch.Tensor:
-        """Reduce tensor across all processes"""
-        if not self.is_distributed:
-            return tensor
-        
-        rt = tensor.clone()
-        dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-        
-        if average:
-            rt /= self.world_size
-        
-        return rt
-    
-    def gather_tensors(self, tensor: torch.Tensor) -> List[torch.Tensor]:
-        """Gather tensors from all processes"""
-        if not self.is_distributed:
-            return [tensor]
-        
-        gathered = [torch.zeros_like(tensor) for _ in range(self.world_size)]
-        dist.all_gather(gathered, tensor)
-        
-        return gathered
 
 
 class CosineAnnealingWarmupRestarts(_LRScheduler):
@@ -1848,24 +1744,50 @@ class CheckpointManager:
         optimizer: Optional[optim.Optimizer] = None,
         scheduler: Optional[_LRScheduler] = None,
         device: torch.device = torch.device('cpu'),
-        scaler: Optional[GradScaler] = None
+        scaler: Optional[GradScaler] = None,
+        expected_vocab_sha256: Optional[str] = None,
     ) -> Dict:
-        """Load a checkpoint"""
-        
+        """Load a checkpoint.
+
+        Args:
+            expected_vocab_sha256: SHA256 of the vocabulary the caller is using right
+                now. If the checkpoint embeds a different ``vocab_sha256``, we refuse
+                to load — vocab indices would be misaligned and the model would train
+                against the wrong tags silently.
+        """
+
         if checkpoint_path is None:
             # Load latest checkpoint
             if self.checkpoints:
                 checkpoint_path = self.checkpoints[-1]
             else:
                 raise ValueError("No checkpoints found")
-        
+
         checkpoint_path = Path(checkpoint_path)
-        
+
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        
+
         logger.info(f"Loading checkpoint from {checkpoint_path}")
         state_dict, meta = self._safe_load_checkpoint(checkpoint_path)
+
+        # Refuse to resume into a model whose vocabulary has shifted under us.
+        # Without this guard, indices in the checkpoint's tag head silently
+        # address the wrong tags after any vocab regeneration.
+        if expected_vocab_sha256:
+            checkpoint_sha = meta.get('vocab_sha256')
+            if checkpoint_sha and checkpoint_sha != expected_vocab_sha256:
+                raise InvalidCheckpointError(
+                    f"Vocabulary SHA mismatch loading {checkpoint_path}: "
+                    f"checkpoint embeds {checkpoint_sha}, current vocab is "
+                    f"{expected_vocab_sha256}. Tag indices would be misaligned. "
+                    "Pin the matching vocabulary or retrain."
+                )
+            if not checkpoint_sha:
+                logger.warning(
+                    "Checkpoint at %s has no embedded vocab_sha256; cannot verify "
+                    "vocabulary compatibility on resume.", checkpoint_path,
+                )
 
         # Load model state (handles DDP and torch.compile key prefix mismatches)
         if model is not None:
@@ -2095,19 +2017,24 @@ class CheckpointManager:
                         f"To start fresh, set training.resume_from='none'."
                     )
 
-                # Warn on critical scheduler param changes (what state_dict doesn't capture)
+                # Check if scheduler config differs from checkpoint.
+                # Note: load_state_dict() restores ALL scheduler attributes from the
+                # checkpoint (including warmup_steps, first_cycle_steps, etc.), so
+                # the checkpoint's LR curve is preserved for training continuity.
+                # This info message alerts the user that their config would produce
+                # different values, but the checkpoint values take precedence.
                 saved_params = meta.get('scheduler_params', {})
                 if saved_params:
-                    param_warnings = []
+                    param_diffs = []
                     for key in ['total_steps', 'warmup_steps', 'first_cycle_steps']:
                         saved_val = saved_params.get(key)
                         current_val = getattr(scheduler, key, None)
                         if saved_val is not None and current_val is not None and saved_val != current_val:
-                            param_warnings.append(f"{key}: {saved_val} -> {current_val}")
-                    if param_warnings:
-                        logger.warning(
-                            f"Scheduler parameters changed since checkpoint: {', '.join(param_warnings)}. "
-                            f"LR schedule may not match original training run."
+                            param_diffs.append(f"{key}: config={current_val} vs checkpoint={saved_val}")
+                    if param_diffs:
+                        logger.info(
+                            f"Scheduler config differs from checkpoint: {', '.join(param_diffs)}. "
+                            f"Using checkpoint values for training continuity."
                         )
 
                 scheduler.load_state_dict(saved_sched_state)
@@ -2682,6 +2609,7 @@ class TrainingUtils:
                 betas=kwargs.get('betas', (0.9, 0.999)),
                 eps=kwargs.get('eps', 1e-8),
                 weight_decay=weight_decay,
+                block_wise=True,
             )
         
         elif optimizer_type.lower() == 'sgd':
@@ -2738,8 +2666,11 @@ class TrainingUtils:
     ) -> List[Dict]:
         """Get parameter groups with proper weight decay and layer-wise learning rate decay"""
         
-        # Parameters that should not have weight decay
-        no_decay = ['bias', 'norm']
+        # Parameters that should not have weight decay.
+        # ViT convention (DeiT/MAE/timm): exclude position embeddings, special tokens,
+        # and the patch projection in addition to bias/norm. Decaying pos_embed or
+        # cls_token degrades the only token the head reads from.
+        no_decay = ['bias', 'norm', 'pos_embed', 'cls_token', '_token', 'patch_embed']
         
         if layer_decay is None or layer_decay == 1.0:
             # Standard parameter groups
@@ -2871,12 +2802,6 @@ class TrainingUtils:
 if __name__ == "__main__":
     # Test the utilities
     print("Testing Training Utilities...")
-    
-    # Test distributed helper
-    dist_helper = DistributedTrainingHelper()
-    device = dist_helper.setup()
-    print(f"Device: {device}")
-    print(f"Is distributed: {dist_helper.is_distributed}")
     
     # Test training state
     state = TrainingState()

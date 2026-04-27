@@ -53,7 +53,7 @@ def ensure_pixel_padding_mask(
         pass
     elif mask_semantics == 'auto':
         # Legacy heuristic (unreliable, deprecated) - per-sample decision
-        frac_true = mask.flatten(2).to(torch.bfloat16).mean(dim=2)  # (B, 1)
+        frac_true = mask.flatten(2).to(torch.float16).mean(dim=2)  # (B, 1)
         should_invert = frac_true > 0.5  # (B, 1)
         mask = torch.where(should_invert.unsqueeze(-1).unsqueeze(-1), ~mask, mask)
         # Log warning in non-tracing mode
@@ -91,7 +91,7 @@ def pixel_to_token_ignore(mask_b1hw: torch.Tensor, patch: int, threshold: float 
             f"Image width {W} must be divisible by patch size {patch}"
 
     # pad_fraction per patch
-    pad_frac = F.avg_pool2d(mask_b1hw.to(torch.bfloat16), kernel_size=patch, stride=patch)  # (B,1,GH,GW)
+    pad_frac = F.avg_pool2d(mask_b1hw.to(torch.float16), kernel_size=patch, stride=patch)  # (B,1,GH,GW)
     ignore = (pad_frac.squeeze(1) >= threshold)                                   # (B,GH,GW)
     return ignore.flatten(1)                                                      # (B,L)
 
@@ -133,7 +133,7 @@ def pixel_to_swin_token_masks(
     stage_masks: List[torch.Tensor] = []
 
     # Convert to float for pooling operations
-    mask_float = mask_b1hw.to(torch.bfloat16)
+    mask_float = mask_b1hw.to(torch.float16)
 
     for stage_idx in range(num_stages):
         # Calculate effective downscale factor for this stage

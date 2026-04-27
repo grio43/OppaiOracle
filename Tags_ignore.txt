@@ -65,3 +65,14 @@ fan_request
 object_request
 parody_request
 commission
+decensored
+bad_drawr_id
+check_copyright
+typo
+bad_nicoseiga_id
+corrupted_twitter_file
+patreon_reward
+bad_nicoseiga_id
+bad_tumblr_id
+copyright_notice
+textless_version

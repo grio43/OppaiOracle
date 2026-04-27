@@ -4,6 +4,7 @@ Configuration System for Anime Image Tagger
 Centralized configuration management with validation and persistence
 """
 
+import copy
 import os
 import json
 import yaml
@@ -773,16 +774,10 @@ class ModelConfig(BaseConfig):
     image_size: int = 448
     patch_size: int = 16
     num_channels: int = 3
-    
-    # Special tokens
-    use_cls_token: bool = True
-    use_style_token: bool = True
-    use_line_token: bool = True
-    use_color_token: bool = True
-    num_special_tokens: int = 4
-    
+
     # Regularization
     hidden_dropout_prob: float = 0.1
+    pos_dropout: float = 0.0  # Position embedding dropout (0.0 = modern best practice)
     attention_dropout: float = 0.1
     drop_path_rate: float = 0.1
     
@@ -1106,7 +1101,6 @@ class DataConfig(BaseConfig):
     
     # Paths
     data_dir: str = "./data"
-    hdf5_dir: str = "/home/user/datasets/teacher_features"
     vocab_dir: str = "/home/user/datasets/vocabulary"
     output_dir: str = "./outputs"
     
@@ -1186,17 +1180,18 @@ class DataConfig(BaseConfig):
     random_rotation_min_degrees: float = field(default=5.0, metadata={"help": "Minimum rotation angle in degrees"})
     random_rotation_max_degrees: float = field(default=10.0, metadata={"help": "Maximum rotation angle in degrees"})
 
+    # Gaussian blur augmentation (DeiT III 3-Augment; Touvron et al. ECCV 2022)
+    gaussian_blur_enabled: bool = field(default=False, metadata={"help": "Enable Gaussian blur augmentation (DeiT III 3-Augment)"})
+    gaussian_blur_p: float = field(default=0.15, metadata={"help": "Probability of applying blur per sample"})
+    gaussian_blur_kernel_size: int = field(default=3, metadata={"help": "Gaussian blur kernel size (must be odd)"})
+    gaussian_blur_sigma_min: float = field(default=0.1, metadata={"help": "Minimum sigma for Gaussian blur"})
+    gaussian_blur_sigma_max: float = field(default=1.5, metadata={"help": "Maximum sigma for Gaussian blur"})
+
     # Orientation mapping (consolidated from augmentation.yaml)
     orientation_map_path: Optional[str] = None
     strict_orientation_validation: bool = True
     skip_unmapped: bool = True
     orientation_safety_mode: str = "conservative"
-
-    # Sidecar Cache Configuration
-    sidecar_cache_enabled: bool = field(default=True, metadata={"help": "Enable sidecar tensor caching"})
-    sidecar_extension: str = field(default='.safetensor', metadata={"help": "File extension for cached tensors"})
-    sidecar_storage_dtype: str = field(default='bfloat16', metadata={"help": "Storage dtype for sidecar cache ('float16','bfloat16','float32')"})
-    cpu_bf16_cache_pipeline: bool = field(default=True, metadata={"help": "Process normalization on CPU in bf16 when populating cache"})
 
     # Dtype Configuration for various components
     tag_vector_dtype: str = field(default='bfloat16', metadata={"help": "Dtype for tag/label vectors ('float16', 'bfloat16', 'float32')"})
@@ -1332,10 +1327,6 @@ class DataConfig(BaseConfig):
                     f"orientation_safety_mode must be one of {valid_modes}, got {self.orientation_safety_mode}"
                 )
 
-        valid_precisions = ["float16", "bfloat16", "float32"]
-        if self.sidecar_storage_dtype not in valid_precisions:
-            errors.append(f"Invalid sidecar_storage_dtype: {self.sidecar_storage_dtype}. Must be one of {valid_precisions}")
-
         # Validate additional dtype configurations
         valid_float_dtypes = ["float16", "bfloat16", "float32"]
         if self.tag_vector_dtype not in valid_float_dtypes:
@@ -1403,9 +1394,10 @@ class LossConfig(BaseConfig):
     label_smoothing: float = 0.0
     clip: float = 0.05
     class_weights: Optional[List[float]] = None  # Manual per-class weight override
-    class_weight_strategy: Optional[str] = None  # None | "inverse_sqrt" — auto-compute from tag frequencies
-    class_weight_clip_min: float = 0.1  # Floor for computed weights
-    class_weight_clip_max: float = 10.0  # Cap for computed weights
+    class_weight_strategy: Optional[str] = None  # None | "inverse_sqrt" | "effective_number"
+    class_weight_clip_min: float = 0.05  # Floor for computed weights
+    class_weight_clip_max: float = 5.0  # Cap for computed weights
+    class_weight_beta: float = 0.9999  # Beta for effective_number strategy (Cui et al. 2019)
 
     def validate(self):
         errors = []
@@ -1419,8 +1411,10 @@ class LossConfig(BaseConfig):
             )
         if not 0.0 <= self.clip < 1.0:
             errors.append(f"clip must be in [0, 1), got {self.clip}")
-        if self.class_weight_strategy is not None and self.class_weight_strategy not in ("inverse_sqrt",):
-            errors.append(f"class_weight_strategy must be null or 'inverse_sqrt', got '{self.class_weight_strategy}'")
+        if self.class_weight_strategy is not None and self.class_weight_strategy not in ("inverse_sqrt", "effective_number"):
+            errors.append(f"class_weight_strategy must be null, 'inverse_sqrt', or 'effective_number', got '{self.class_weight_strategy}'")
+        if not 0.0 < self.class_weight_beta < 1.0:
+            errors.append(f"class_weight_beta must be in (0, 1), got {self.class_weight_beta}")
         if self.class_weight_clip_min <= 0:
             errors.append(f"class_weight_clip_min must be > 0, got {self.class_weight_clip_min}")
         if self.class_weight_clip_max <= self.class_weight_clip_min:
@@ -1496,12 +1490,6 @@ class TrainingConfig(BaseConfig):
     tag_loss: LossConfig = field(default_factory=LossConfig)
     # Hardware
     device: str = "cuda"
-    distributed: bool = False
-    local_rank: int = -1
-    world_size: int = 1
-    ddp_backend: str = "nccl"
-    
-
     # torch.compile() Optimization (PyTorch 2.0+)
     use_compile: bool = True
     compile_mode: str = "max-autotune"  # Options: default, reduce-overhead, max-autotune
@@ -1509,11 +1497,6 @@ class TrainingConfig(BaseConfig):
     compile_dynamic: bool = True  # Support varying padding mask shapes
     # Tracking
     use_tensorboard: bool = True
-    use_wandb: bool = False
-    wandb_project: str = "anime-tagger"
-    wandb_run_name: Optional[str] = None
-    wandb_entity: Optional[str] = None
-    
     # Training stability
     seed: Optional[int] = None   # None => fresh, logged seed per run
     deterministic: bool = False  # turn on only when seed is set
@@ -1533,7 +1516,7 @@ class TrainingConfig(BaseConfig):
     use_distillation: bool = False
     distillation_alpha: float = 0.7
     distillation_temperature: float = 3.0
-    
+
     def validate(self):
         """Validate training configuration"""
         errors = []
@@ -1605,48 +1588,16 @@ class InferenceConfig(BaseConfig):
     # Model
     model_path: Optional[str] = None
     precision: str = "bf16"  # Options: "fp32", "fp16", "bf16"
-    compile_model: bool = False
-    
     # Prediction
     prediction_threshold: float = 0.2653
-    adaptive_threshold: bool = True  # NOTE: unused in codebase, superseded by threshold_calibration
-    min_predictions: int = 5
-    max_predictions: int = 50
     top_k: Optional[int] = None
-    
-    # Tag filtering
-    filter_nsfw: bool = False
-    nsfw_tags: List[str] = field(default_factory=lambda: ['explicit', 'questionable'])
-    blacklist_tags: List[str] = field(default_factory=list)
-    whitelist_tags: Optional[List[str]] = None
     eye_color_exclusive: bool = False  # Enforce mutual exclusivity for eye color tags
-    
-    # Post-processing
-    apply_implications: bool = True
-    resolve_aliases: bool = True
-    group_by_category: bool = False
-    remove_underscores: bool = True
-    
+
     # Performance
-    use_tensorrt: bool = False
-    optimize_for_speed: bool = True
-    batch_timeout_ms: int = 100
     max_batch_size: int = 32
     
     # Output
     output_format: str = "json"
-    include_scores: bool = True
-    score_decimal_places: int = 3
-    sort_by_score: bool = True
-    
-    # API Settings
-    enable_api: bool = False
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
-    api_workers: int = 4
-    api_max_image_size: int = 10 * 1024 * 1024  # 10MB
-    api_rate_limit: int = 100
-    api_cors_origins: List[str] = field(default_factory=lambda: ["*"])
     
     # Caching
     enable_cache: bool = True
@@ -1671,31 +1622,11 @@ class InferenceConfig(BaseConfig):
         """Validate inference configuration"""
         errors = []
 
-        # Security posture warnings if API is enabled
-        if self.enable_api:
-            if self.api_host == '0.0.0.0':
-                logger.warning("API is bound to 0.0.0.0; consider 127.0.0.1 or a firewall in production")
-            if self.api_cors_origins and ('*' in self.api_cors_origins):
-                logger.warning("API CORS origins allow '*'; require explicit origins for production")
-
         if self.model_path and not Path(self.model_path).exists():
-            # Only warn when API is enabled (actual inference mode), otherwise just debug
-            # During training, the checkpoint won't exist yet and this is expected
-            if self.enable_api:
-                logger.warning(f"Model path does not exist: {self.model_path}")
-            else:
-                logger.debug(f"Model path does not exist: {self.model_path} (expected during training)")
+            logger.debug(f"Model path does not exist: {self.model_path} (expected during training)")
 
         if not 0 <= self.prediction_threshold <= 1:
             errors.append(f"prediction_threshold must be in [0, 1], got {self.prediction_threshold}")
-
-        if self.min_predictions > self.max_predictions:
-            errors.append(
-                f"min_predictions ({self.min_predictions}) > max_predictions ({self.max_predictions})"
-            )
-
-        if self.min_predictions < 0:
-            errors.append(f"min_predictions must be non-negative, got {self.min_predictions}")
 
         valid_precisions = ["fp32", "fp16", "bf16"]
         if self.precision not in valid_precisions:
@@ -1705,25 +1636,12 @@ class InferenceConfig(BaseConfig):
         if self.output_format not in valid_formats:
             errors.append(f"Unknown output_format: {self.output_format}. Must be one of {valid_formats}")
 
-        if self.score_decimal_places < 0 or self.score_decimal_places > 10:
-            errors.append(f"score_decimal_places must be in [0, 10], got {self.score_decimal_places}")
-
-        if self.api_port < 1 or self.api_port > 65535:
-            errors.append(f"api_port must be in [1, 65535], got {self.api_port}")
-
-        # Additional field validations
         if self.top_k is not None and self.top_k <= 0:
             errors.append(f"top_k must be > 0 when set, got {self.top_k}")
-        if self.api_workers < 1:
-            errors.append(f"api_workers must be >= 1, got {self.api_workers}")
-        if self.api_rate_limit < 0:
-            errors.append(f"api_rate_limit must be >= 0, got {self.api_rate_limit}")
         if self.cache_ttl_seconds < 0:
             errors.append(f"cache_ttl_seconds must be >= 0, got {self.cache_ttl_seconds}")
         if self.max_batch_size <= 0:
             errors.append(f"max_batch_size must be >= 1, got {self.max_batch_size}")
-        if self.batch_timeout_ms < 0:
-            errors.append(f"batch_timeout_ms must be >= 0, got {self.batch_timeout_ms}")
 
         if errors:
             raise ConfigValidationError("Inference config validation failed:\n" + "\n".join(errors))
@@ -1735,23 +1653,20 @@ class ExportConfig(BaseConfig):
     # Export format
     export_format: str = "onnx"  # onnx, torchscript, tflite, coreml
     
-    # Use the latest available opset for transformer models with LayerNormalization
-    # Opset 19 aligns with ONNX Runtime 1.22 and CUDA 12.8
-    opset_version: int = 19  # default, will be clamped at export time
+    # Opset 21 for broader ORT fusion support (LayerNorm, attention, GELU).
+    # Opset 23+ has native Attention op but PyTorch doesn't map SDPA to it yet.
+    opset_version: int = 21  # default, will be clamped at export time
     export_params: bool = True
     do_constant_folding: bool = True
     
     # Dynamic axes
     dynamic_batch_size: bool = True
-    min_batch_size: int = 1
     max_batch_size: int = 128
-    
+
     # Optimization
     optimize: bool = True
-    optimize_for_mobile: bool = False
     quantize: bool = False
     quantization_type: str = "dynamic"  # dynamic, static, qat
-    calibration_dataset_size: int = 100
     
     # Validation
     validate_export: bool = True
@@ -1764,8 +1679,6 @@ class ExportConfig(BaseConfig):
     model_description: str = "Anime Image Tagger Model"
     model_author: str = "AnimeTaggers"
     model_version: str = "1.0.0"
-    model_license: str = "MIT"
-    
     # Output
     output_path: str = "./exported_model"
 
@@ -1783,8 +1696,8 @@ class ExportConfig(BaseConfig):
 
     # Dynamo-based ONNX export (PyTorch 2.5+)
     # Uses torch.onnx.export(dynamo=True) instead of the legacy TorchScript tracer.
-    # Better graph capture but less mature — off by default.
-    use_dynamo_export: bool = False
+    # Produces cleaner graphs with fewer redundant nodes and lower memory usage.
+    use_dynamo_export: bool = True
 
     def validate(self):
         """Validate export configuration"""
@@ -1802,56 +1715,11 @@ class ExportConfig(BaseConfig):
         if self.quantization_type not in valid_quantization:
             errors.append(f"Unknown quantization_type: {self.quantization_type}. Must be one of {valid_quantization}")
         
-        if self.min_batch_size <= 0:
-            errors.append(f"min_batch_size must be positive, got {self.min_batch_size}")
-        
-        if self.max_batch_size < self.min_batch_size:
-            errors.append(
-                f"max_batch_size ({self.max_batch_size}) must be >= min_batch_size ({self.min_batch_size})"
-            )
+        if self.max_batch_size <= 0:
+            errors.append(f"max_batch_size must be positive, got {self.max_batch_size}")
         
         if errors:
             raise ConfigValidationError("Export config validation failed:\n" + "\n".join(errors))
-
-
-# --- ONNX opset resolution helpers ---
-def resolve_opset(requested: int | None = None) -> int:
-    """Resolve the ONNX opset version based on installed PyTorch/ONNX support.
-
-    PyTorch’s ONNX exporter supports a limited range of opset versions.  As of
-    recent releases, ``torch.onnx._constants.ONNX_MIN_OPSET`` and
-    ``torch.onnx._constants.ONNX_MAX_OPSET`` describe the supported interval.
-    ``ONNX_TORCHSCRIPT_EXPORTER_MAX_OPSET`` may cap the TorchScript exporter at
-    a lower version (e.g., 20) than the global maximum【464953657985222†L4-L9】.  ONNX
-    Runtime, on the other hand, can run models up to opset 21 with version
-    1.20【598437280542461†L224-L248】.  To choose a safe default, clamp the requested
-    version into the supported range.  When the requested value is ``None``,
-    ``ExportConfig.opset_version`` is used as the target.
-
-    Args:
-        requested: desired opset version, or ``None`` to use the default on
-            ``ExportConfig``.
-
-    Returns:
-        A version within the exporter’s supported range.
-    """
-    try:
-        import torch.onnx._constants as _c  # type: ignore
-        min_o = getattr(_c, "ONNX_MIN_OPSET", 7)
-        # Prefer the TorchScript exporter max if available; fall back to ONNX_MAX_OPSET
-        max_o = getattr(_c, "ONNX_TORCHSCRIPT_EXPORTER_MAX_OPSET", None)
-        if max_o is None:
-            max_o = getattr(_c, "ONNX_MAX_OPSET", 17)
-    except (ImportError, AttributeError):
-        # Conservative defaults when constants are unavailable
-        min_o, max_o = 7, 21
-    # Use a sensible default (19 aligns with ExportConfig default) when requested is None
-    target = requested if requested is not None else 19
-    if target < min_o:
-        return min_o
-    if target > max_o:
-        return max_o
-    return target
 
 
 @dataclass
@@ -1915,15 +1783,9 @@ class MonitorConfig(BaseConfig):
     system_metrics_log_interval_steps: int = 3000  # Log system metrics to TensorBoard every N steps
     track_gpu_metrics: bool = True
     track_disk_io: bool = True
-    track_network_io: bool = False
-
     # Visualization
     use_tensorboard: bool = True
     tensorboard_dir: str = "./tensorboard"
-    use_wandb: bool = False
-    wandb_project: str = "anime-tagger"
-    wandb_entity: Optional[str] = None
-    wandb_run_name: Optional[str] = None
 
     # Alerts
     enable_alerts: bool = True
@@ -1951,18 +1813,6 @@ class MonitorConfig(BaseConfig):
     log_augmentation_histograms: bool = True
     log_augmentation_images: bool = False
     augmentation_image_interval: int = 500  # batches
-    # Parameter / gradient histogram logging
-    log_param_histograms: bool = True
-    log_grad_histograms: bool = True
-    # Log every N steps (set high if training is slow or memory-limited)
-    param_hist_interval_steps: int = 200
-    grad_hist_interval_steps: int = 200
-
-    # Unified histogram logging
-    log_histograms: bool = False
-    histogram_log_interval: int = 500
-    histogram_params: Optional[List[str]] = None
-
     # Remote monitoring
     enable_prometheus: bool = False
     prometheus_port: int = 8080
@@ -1978,11 +1828,6 @@ class MonitorConfig(BaseConfig):
     max_history_size: int = 1000
     history_save_interval: int = 100
     checkpoint_metrics: bool = True
-
-    # Distributed training
-    distributed: bool = False
-    rank: int = 0
-    world_size: int = 1
 
     # Safety
     auto_recovery: bool = True
@@ -2659,12 +2504,17 @@ class ConfigManager:
 
 
 def deep_update(target: Dict, source: Dict) -> Dict:
-    """Deep update target dictionary with source dictionary"""
+    """Deep update target dictionary with source dictionary.
+
+    Mutable values (lists, nested dicts/objects) from ``source`` are deep-copied
+    into ``target`` so later mutation of the merged config cannot alias back into
+    the source — merges must be non-destructive.
+    """
     for key, value in source.items():
         if isinstance(value, dict) and key in target and isinstance(target[key], dict):
             deep_update(target[key], value)
         else:
-            target[key] = value
+            target[key] = copy.deepcopy(value)
     return target
 
 
@@ -2703,7 +2553,6 @@ def create_config_parser(config_type: ConfigType = ConfigType.FULL) -> argparse.
         train_group.add_argument('--training.swinv2_learning_rate', type=float, help='SwinV2-specific learning rate (recommended: 5e-5 to 1e-4)')
         train_group.add_argument('--training.weight_decay', type=float, help='Weight decay')
         train_group.add_argument('--training.device', type=str, help='Device (cuda/cpu)')
-        train_group.add_argument('--training.distributed', action='store_true', default=None, help='Use distributed training')
         train_group.add_argument('--training.seed', type=int, help='Random seed')
         
         # Inference arguments
@@ -2711,8 +2560,6 @@ def create_config_parser(config_type: ConfigType = ConfigType.FULL) -> argparse.
         infer_group.add_argument('--inference.model_path', type=str, help='Path to model')
         infer_group.add_argument('--inference.prediction_threshold', type=float, help='Prediction threshold')
         infer_group.add_argument('--inference.top_k', type=int, help='Top-k predictions')
-        infer_group.add_argument('--inference.filter_nsfw', action='store_true', default=None, help='Filter NSFW tags')
-        
         # Export arguments
         export_group = parser.add_argument_group('export')
         export_group.add_argument('--export.export_format', type=str, help='Export format')
@@ -2803,10 +2650,6 @@ def generate_example_configs(output_dir: Path = Path("./config_examples")):
     # High performance inference config
     hp_inference = InferenceConfig(
         precision="bf16",
-        use_tensorrt=True,
-        optimize_for_speed=True,
-        compile_model=True,
-        batch_timeout_ms=50,
         max_batch_size=64,
     )
     hp_inference.to_yaml(output_dir / "high_performance_inference.yaml")
@@ -2815,7 +2658,6 @@ def generate_example_configs(output_dir: Path = Path("./config_examples")):
     mobile_export = ExportConfig(
         export_format="tflite",
         optimize=True,
-        optimize_for_mobile=True,
         quantize=True,
         quantization_type="static",
     )

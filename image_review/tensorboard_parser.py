@@ -33,6 +33,7 @@ class SampleData:
     predictions: List[PredictionEntry] = field(default_factory=list)
     ground_truth_tags: List[str] = field(default_factory=list)
     rating: Optional[RatingInfo] = None  # Rating info if available
+    image_id: Optional[str] = None  # Source filename if logged with the sample
 
     @property
     def tp_count(self) -> int:
@@ -107,11 +108,12 @@ class TensorBoardParser:
                 image_data = img_event.encoded_image_string
 
                 # Parse prediction table if available
-                predictions = []
-                ground_truth = []
+                predictions: List[PredictionEntry] = []
+                ground_truth: List[str] = []
+                rating_info: Optional[RatingInfo] = None
+                image_id: Optional[str] = None
 
                 # Try to get text data (stored as tensors in newer TensorBoard)
-                rating_info = None
                 try:
                     # First try tensors (newer format)
                     text_events = self._accumulator.Tensors(text_tag)
@@ -124,7 +126,7 @@ class TensorBoardParser:
                             else:
                                 # Try to decode from tensor content
                                 markdown = tensor_proto.tensor_content.decode('utf-8', errors='ignore')
-                            predictions, ground_truth, rating_info = self._parse_markdown_table(markdown)
+                            predictions, ground_truth, rating_info, image_id = self._parse_markdown_table(markdown)
                             break
                 except (KeyError, AttributeError, IndexError):
                     pass
@@ -136,7 +138,7 @@ class TensorBoardParser:
                         for text_event in text_events:
                             if text_event.step == step:
                                 markdown = text_event.value
-                                predictions, ground_truth, rating_info = self._parse_markdown_table(markdown)
+                                predictions, ground_truth, rating_info, image_id = self._parse_markdown_table(markdown)
                                 break
                     except (KeyError, AttributeError):
                         pass
@@ -147,21 +149,19 @@ class TensorBoardParser:
                     image_data=image_data,
                     predictions=predictions,
                     ground_truth_tags=ground_truth,
-                    rating=rating_info
+                    rating=rating_info,
+                    image_id=image_id,
                 )
                 self._samples[(step, sample_idx)] = sample
 
-    def _parse_markdown_table(self, markdown: str) -> Tuple[List[PredictionEntry], List[str], Optional[RatingInfo]]:
+    def _parse_markdown_table(self, markdown: str) -> Tuple[List[PredictionEntry], List[str], Optional[RatingInfo], Optional[str]]:
         """Parse markdown table from log_predictions.
 
-        Format (with rating):
+        Format (with rating and filename):
+        **file:** 1245001.jpg
+
         **Rating:** safe (95.2%) | Actual: explicit | WRONG
 
-        | tag | prob | expected | status |
-        | --- | --- | --- | --- |
-        | tag_name | 0.9876 | YES | TP |
-
-        Format (without rating):
         | tag | prob | expected | status |
         | --- | --- | --- | --- |
         | tag_name | 0.9876 | YES | TP |
@@ -169,8 +169,20 @@ class TensorBoardParser:
         predictions = []
         ground_truth = []
         rating_info = None
+        image_id: Optional[str] = None
 
         lines = markdown.strip().split('\n')
+
+        # Optional `**file:** <id>` prefix (added by Monitor_log when image_ids is provided)
+        cursor = 0
+        if cursor < len(lines) and lines[cursor].startswith('**file:**'):
+            image_id = lines[cursor][len('**file:**'):].strip() or None
+            cursor += 1
+            # Skip the blank separator line
+            if cursor < len(lines) and not lines[cursor].strip():
+                cursor += 1
+
+        lines = lines[cursor:]
 
         # Check for rating line at the start
         # Format: **Rating:** safe (95.2%) | Actual: explicit | WRONG
@@ -204,7 +216,7 @@ class TensorBoardParser:
                 break
 
         if header_idx is None:
-            return predictions, ground_truth, rating_info
+            return predictions, ground_truth, rating_info, image_id
 
         # Parse table rows (skip header and separator)
         for line in lines[header_idx + 2:]:
@@ -229,7 +241,7 @@ class TensorBoardParser:
                 if expected:
                     ground_truth.append(tag)
 
-        return predictions, ground_truth, rating_info
+        return predictions, ground_truth, rating_info, image_id
 
     def get_available_steps(self) -> List[int]:
         """Get all steps with validation data."""

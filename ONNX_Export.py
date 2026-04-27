@@ -97,16 +97,21 @@ class InferenceWrapper(nn.Module):
         if hasattr(inner_model, 'set_onnx_mode'):
             inner_model.set_onnx_mode(True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure entire wrapper is in eval mode for export
+        self.eval()
+
+    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
         """Forward pass on preprocessed input.
 
         Args:
             x: Preprocessed tensor (B, C, H, W) float32, already normalized.
+            padding_mask: (B, H, W) bool tensor. True = padding, False = valid pixel.
+                An all-False mask is equivalent to no masking.
 
         Returns:
             probabilities: (B, num_tags) sigmoid probabilities in [0, 1].
         """
-        outputs = self.model(x)
+        outputs = self.model(x, padding_mask=padding_mask)
         tag_logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs
         return torch.sigmoid(tag_logits)
 
@@ -212,7 +217,7 @@ class ONNXExporter:
                 f"Please use the correct vocabulary.json from training."
             )
         
-        logger.info(f"✓ Vocabulary verification passed")
+        logger.info(f"[OK] Vocabulary verification passed")
         logger.info(f"  Sample real tags: {real_tags_sample[:5]}")
         
 
@@ -245,10 +250,12 @@ class ONNXExporter:
 
         meta = checkpoint
 
-        # Store original config values for mismatch detection
+        # Store original config values for mismatch detection. image_size is owned
+        # by data (phase transitions write data.image_size); reading from model
+        # here would detect a mismatch the fix-up at line ~284 never corrects.
         config_mean = list(self.config.data.normalize_mean)
         config_std = list(self.config.data.normalize_std)
-        config_image_size = self.config.model.image_size
+        config_image_size = self.config.data.image_size
 
         if 'preprocessing_params' in meta:
             preprocessing = ModelMetadata.extract_preprocessing_params(meta)
@@ -374,11 +381,16 @@ class ONNXExporter:
             # Try to get config from various possible attributes
             if hasattr(base_model, 'config'):
                 model_cfg = base_model.config
-                if hasattr(model_cfg, 'num_heads'):
+                # Check both naming conventions (num_heads vs num_attention_heads)
+                if hasattr(model_cfg, 'num_attention_heads'):
+                    config['num_heads'] = model_cfg.num_attention_heads
+                elif hasattr(model_cfg, 'num_heads'):
                     config['num_heads'] = model_cfg.num_heads
                 if hasattr(model_cfg, 'hidden_size'):
                     config['hidden_size'] = model_cfg.hidden_size
-                if hasattr(model_cfg, 'num_layers'):
+                if hasattr(model_cfg, 'num_hidden_layers'):
+                    config['num_layers'] = model_cfg.num_hidden_layers
+                elif hasattr(model_cfg, 'num_layers'):
                     config['num_layers'] = model_cfg.num_layers
                 if hasattr(model_cfg, 'patch_size'):
                     config['patch_size'] = model_cfg.patch_size
@@ -417,7 +429,7 @@ class ONNXExporter:
                 )
         else:
             patch_size = config.get('patch_size', 16)
-        num_patches = (self.config.model.image_size // patch_size) ** 2
+        num_patches = (self.config.data.image_size // patch_size) ** 2
 
         if is_swin:
             # SwinV2 doesn't use CLS tokens - calculate final resolution after all stages
@@ -434,7 +446,7 @@ class ONNXExporter:
             
             # Total downsampling factor = initial_patch_size * 2^(num_stages-1)
             total_downsample = swin_patch_size * (2 ** (num_stages - 1))
-            final_resolution = self.config.model.image_size // total_downsample
+            final_resolution = self.config.data.image_size // total_downsample
             
             config['sequence_length'] = final_resolution ** 2
             logger.info(f"  SwinV2 sequence length: {config['sequence_length']} "
@@ -462,32 +474,39 @@ class ONNXExporter:
 
         state_dict = checkpoint.pop('state_dict')
         meta = checkpoint
-        
-        num_tags = self.num_tags
+
+        # Determine num_tags from checkpoint state_dict (authoritative source)
+        # The tag_head weight shape tells us exactly how many outputs the model has
+        checkpoint_num_tags = None
+        for k, v in state_dict.items():
+            if 'tag_head.weight' in k:
+                checkpoint_num_tags = v.shape[0]
+                break
+
+        if checkpoint_num_tags is not None and checkpoint_num_tags != self.num_tags:
+            logger.warning(
+                f"Checkpoint tag_head has {checkpoint_num_tags} outputs but vocabulary has "
+                f"{self.num_tags} tags. Using checkpoint size for model creation. "
+                f"Extra outputs beyond vocabulary size will be ignored during inference."
+            )
+            num_tags = checkpoint_num_tags
+        else:
+            num_tags = self.num_tags
 
         model_config = asdict(self.config.model)
-        model_config['num_labels'] = num_tags
-        
+        model_config['num_tags'] = num_tags
+
         logger.info(f"Creating model with {num_tags} tags")
         model = create_model(**model_config)
-
-        # Additional check: Verify the model's tag_head matches vocabulary
-        if hasattr(model, 'tag_head'):
-            tag_head_out_features = model.tag_head.out_features
-            if tag_head_out_features != num_tags:
-                raise RuntimeError(
-                    f"Model tag_head output size ({tag_head_out_features}) doesn't match "
-                    f"vocabulary size ({num_tags}). This checkpoint is incompatible with "
-                    f"the vocabulary file. Please use:\n"
-                    f"  1. The correct vocabulary that was used during training, OR\n"
-                    f"  2. A checkpoint that was trained with this vocabulary.\n"
-                    f"Cannot export model with mismatched vocabulary."
-                )
 
         
         # Handle DDP weights
         if any(k.startswith('module.') for k in state_dict.keys()):
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+        # Handle torch.compile weights (_orig_mod. prefix)
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
         # Filter out removed rating_head keys from old checkpoints
         state_dict = {k: v for k, v in state_dict.items() if 'rating_head' not in k}
@@ -573,16 +592,21 @@ class ONNXExporter:
                     "Thoroughly validate against PyTorch inference before any use."
                 )
 
-        logger.info(f"Export variants: {self.config.export_variants}")
-        
+        # Determine export variants: check config.export first, then top-level config
+        export_variants = getattr(self.config, 'export_variants',
+                                  getattr(self.export_config, 'export_variants', ['full']))
+        logger.info(f"Export variants: {export_variants}")
+
         results = {}
 
         # Export variants
-        for variant in self.config.export_variants:
+        for variant in export_variants:
             logger.info(f"\nExporting variant: {variant}")            
             try:
                 if variant == "full":
                     results[variant] = self._export_full_model()
+                elif variant == "fp16":
+                    results[variant] = self._export_fp16_model()
                 elif variant == "quantized":
                     results[variant] = self._export_quantized_model()
                 else:
@@ -597,13 +621,76 @@ class ONNXExporter:
         logger.info("="*60)
         for variant, path in results.items():
             if path:
-                logger.info(f"✓ {variant}: {path}")
+                logger.info(f"[OK] {variant}: {path}")
             else:
-                logger.info(f"✗ {variant}: Failed")
+                logger.info(f"[FAIL] {variant}: Failed")
         logger.info("="*60)
         
         return results
     
+    def _run_onnx_export(self, dummy_input: torch.Tensor, dummy_mask: torch.Tensor, output_path: Path):
+        """Run ONNX export using dynamo (default) or legacy TorchScript exporter."""
+        use_dynamo = getattr(self.export_config, 'use_dynamo_export', True)
+
+        if use_dynamo:
+            logger.info("Using Dynamo-based ONNX exporter")
+            try:
+                dynamic_shapes = None
+                if self.export_config.dynamic_batch_size:
+                    batch_dim = torch.export.Dim("batch_size", min=1, max=self.export_config.max_batch_size)
+                    dynamic_shapes = {"x": {0: batch_dim}, "padding_mask": {0: batch_dim}}
+
+                # Force UTF-8 for stdout/stderr during dynamo export to avoid
+                # cp932 encoding errors from PyTorch's internal emoji logging on Windows
+                import sys
+                old_enc_out = getattr(sys.stdout, 'encoding', 'utf-8')
+                old_enc_err = getattr(sys.stderr, 'encoding', 'utf-8')
+                try:
+                    if hasattr(sys.stdout, 'reconfigure'):
+                        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+                        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+                    export_output = torch.onnx.export(
+                        self.model,
+                        (dummy_input, dummy_mask),
+                        dynamo=True,
+                        dynamic_shapes=dynamic_shapes,
+                        input_names=["pixel_values", "padding_mask"],
+                        output_names=["probabilities"],
+                    )
+                finally:
+                    if hasattr(sys.stdout, 'reconfigure'):
+                        sys.stdout.reconfigure(encoding=old_enc_out)
+                        sys.stderr.reconfigure(encoding=old_enc_err)
+
+                export_output.save(str(output_path))
+                return
+            except Exception as e:
+                logger.warning(f"Dynamo export failed ({e}), falling back to legacy TorchScript exporter")
+
+        # Legacy TorchScript-based export (fallback)
+        logger.info("Using legacy TorchScript-based ONNX exporter")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="torch.onnx")
+            warnings.filterwarnings("ignore", message=".*TracerWarning.*")
+
+            torch.onnx.export(
+                self.model,
+                (dummy_input, dummy_mask),
+                str(output_path),
+                export_params=self.export_config.export_params,
+                opset_version=self.export_config.opset_version,
+                do_constant_folding=self.export_config.do_constant_folding,
+                input_names=["pixel_values", "padding_mask"],
+                output_names=["probabilities"],
+                dynamic_axes={
+                    "pixel_values": {0: "batch_size"},
+                    "padding_mask": {0: "batch_size"},
+                    "probabilities": {0: "batch_size"},
+                } if self.export_config.dynamic_batch_size else None,
+                verbose=False
+            )
+
     def _export_full_model(self) -> Optional[Path]:
         """Export full precision model"""
         output_path = Path(self.export_config.output_path)
@@ -617,6 +704,19 @@ class ONNXExporter:
                 dtype=torch.float32,
                 device=self.device,
             )
+            dummy_mask = torch.zeros(
+                1, image_size, image_size,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            # Use non-trivial mask for tracing: simulate letterboxed image with padding border.
+            # Ensures mask operations are traced with real values, catching silent mask-dropping
+            # during dynamo export (see pytorch/pytorch#152018).
+            pad_border = image_size // 8
+            dummy_mask[:, :pad_border, :] = True
+            dummy_mask[:, -pad_border:, :] = True
+            dummy_mask[:, :, :pad_border] = True
+            dummy_mask[:, :, -pad_border:] = True
             logger.debug(f"Using dummy input shape for export: (1, 3, {image_size}, {image_size})")
 
             logger.info("Ensuring model is in float32 for export")
@@ -625,46 +725,7 @@ class ONNXExporter:
             # Export
             logger.info(f"Exporting to {output_path}")
 
-            use_dynamo = getattr(self.export_config, 'use_dynamo_export', False)
-
-            if use_dynamo:
-                # Dynamo-based export (PyTorch 2.5+) — better graph capture
-                logger.info("Using Dynamo-based ONNX exporter")
-                dynamic_shapes = None
-                if self.export_config.dynamic_batch_size:
-                    batch_dim = torch.export.Dim("batch_size", min=1, max=self.export_config.max_batch_size)
-                    dynamic_shapes = {"x": {0: batch_dim}}
-
-                export_output = torch.onnx.export(
-                    self.model,
-                    (dummy_input,),
-                    dynamo=True,
-                    dynamic_shapes=dynamic_shapes,
-                    input_names=["pixel_values"],
-                    output_names=["probabilities"],
-                )
-                export_output.save(str(output_path))
-            else:
-                # Legacy TorchScript-based export
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=UserWarning, module="torch.onnx")
-                    warnings.filterwarnings("ignore", message=".*TracerWarning.*")
-
-                    torch.onnx.export(
-                        self.model,
-                        dummy_input,
-                        str(output_path),
-                        export_params=self.export_config.export_params,
-                        opset_version=self.export_config.opset_version,
-                        do_constant_folding=self.export_config.do_constant_folding,
-                        input_names=["pixel_values"],
-                        output_names=["probabilities"],
-                        dynamic_axes={
-                            "pixel_values": {0: "batch_size"},
-                            "probabilities": {0: "batch_size"},
-                        } if self.export_config.dynamic_batch_size else None,
-                        verbose=False
-                    )
+            self._run_onnx_export(dummy_input, dummy_mask, output_path)
             
             # Validate structure before optimization
             if self.export_config.validate_export:
@@ -674,29 +735,127 @@ class ONNXExporter:
             # the graph and strips metadata_props)
             if self.export_config.optimize:
                 self._optimize_model(output_path)
+                self._slim_model(output_path)
+
+            # Consolidate to single file if model fits under 2GB protobuf limit
+            self._consolidate_to_single_file(output_path)
 
             # Add metadata AFTER optimization so it persists in the final model
             if self.export_config.add_metadata:
                 self._add_metadata(output_path)
+
+            # Export selected_tags.csv for compatibility with tagger UIs
+            self._export_selected_tags_csv(output_path.parent)
 
             # Validate ORT inference on the final model
             if self.export_config.validate_export:
                 if not self._validate_ort_inference(output_path):
                     logger.error("Post-optimization inference validation failed! "
                                  "The exported model may produce incorrect outputs.")
-            
-            logger.info(f"✓ Full model exported to {output_path}")
-            
+
+            logger.info(f"[OK] Full model exported to {output_path}")
+
             # Print model info
             self._print_model_info(output_path)
-            
+
             return output_path
-            
+
         except Exception as e:
             logger.error(f"Failed to export full model: {e}")
             return None
-    
-    
+
+    def _export_fp16_model(self) -> Optional[Path]:
+        """Export float16 precision model"""
+        base_path = Path(self.export_config.output_path)
+        output_path = base_path.parent / f"{base_path.stem}_fp16.onnx"
+
+        try:
+            image_size = self.config.data.image_size
+            dummy_input = torch.randn(
+                1, 3, image_size, image_size,
+                dtype=torch.float16,
+                device=self.device,
+            )
+            dummy_mask = torch.zeros(
+                1, image_size, image_size,
+                dtype=torch.bool,
+                device=self.device,
+            )
+
+            logger.info("Converting model to float16 for export")
+            self.model.half()
+
+            logger.info(f"Exporting FP16 model to {output_path}")
+            self._run_onnx_export(dummy_input, dummy_mask, output_path)
+
+            # Restore model to float32
+            self.model.float()
+
+            # Validate structure
+            if self.export_config.validate_export:
+                self._validate_model(output_path)
+
+            # Optimize
+            if self.export_config.optimize:
+                self._optimize_model(output_path)
+                self._slim_model(output_path)
+
+            # Consolidate to single file (FP16 is ~468MB, well under 2GB limit)
+            self._consolidate_to_single_file(output_path)
+
+            # Add metadata AFTER optimization
+            if self.export_config.add_metadata:
+                self._add_metadata(output_path)
+
+            # Export selected_tags.csv for compatibility with tagger UIs
+            self._export_selected_tags_csv(output_path.parent)
+
+            # Validate ORT inference
+            if self.export_config.validate_export:
+                self._validate_ort_inference_fp16(output_path)
+
+            logger.info(f"FP16 model exported to {output_path}")
+            self._print_model_info(output_path)
+            return output_path
+
+        except Exception as e:
+            logger.error(f"Failed to export FP16 model: {e}")
+            # Restore model to float32 on failure
+            self.model.float()
+            return None
+
+    def _validate_ort_inference_fp16(self, model_path: Path):
+        """Validate FP16 model through ORT inference"""
+        logger.info("Validating FP16 model inference...")
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+        try:
+            session = ort.InferenceSession(str(model_path), providers=providers)
+            image_size = self.config.data.image_size
+            test_input = np.random.randn(1, 3, image_size, image_size).astype(np.float16)
+            test_mask = np.zeros((1, image_size, image_size), dtype=bool)
+
+            input_names = {i.name for i in session.get_inputs()}
+            feed = {session.get_inputs()[0].name: test_input}
+            if "padding_mask" in input_names:
+                feed["padding_mask"] = test_mask
+            onnx_outputs = session.run(None, feed)
+            onnx_probs = onnx_outputs[0]
+
+            # Sanity check: output should be in [0, 1] (sigmoid)
+            if onnx_probs.min() < -0.01 or onnx_probs.max() > 1.01:
+                logger.warning(
+                    f"FP16 output range [{onnx_probs.min():.4f}, {onnx_probs.max():.4f}] "
+                    f"outside expected [0, 1]"
+                )
+            else:
+                logger.info(f"FP16 inference validation passed "
+                           f"(output range: [{onnx_probs.min():.4f}, {onnx_probs.max():.4f}])")
+            return True
+        except Exception as e:
+            logger.error(f"FP16 inference validation failed: {e}")
+            return False
+
     def _export_quantized_model(self) -> Optional[Path]:
         """Export quantized model"""
         base_path = Path(self.export_config.output_path)
@@ -720,7 +879,7 @@ class ONNXExporter:
                 logger.warning(f"Unknown quantization type: {self.export_config.quantization_type}")
                 return None
             
-            logger.info(f"✓ Quantized model exported to {quantized_path}")
+            logger.info(f"[OK] Quantized model exported to {quantized_path}")
             return quantized_path
             
         except Exception as e:
@@ -802,19 +961,48 @@ class ONNXExporter:
                 # Note: float16 and input_int32 parameters removed - not supported in current API
             )
 
+            # Log fusion diagnostics to verify optimizer actually fused attention
+            from collections import Counter
+            pre_model = onnx.load(str(model_path))
+            pre_node_count = len(pre_model.graph.node)
+            post_node_count = len(optimized_model.model.graph.node)
+            node_types = Counter(n.op_type for n in optimized_model.model.graph.node)
+
+            attention_ops = [n for n in optimized_model.model.graph.node if 'Attention' in n.op_type]
+            layernorm_ops = [n for n in optimized_model.model.graph.node if 'LayerNorm' in n.op_type]
+
+            logger.info(f"Optimization: {pre_node_count} -> {post_node_count} nodes "
+                        f"({pre_node_count - post_node_count} eliminated)")
+            logger.info(f"Fused Attention ops: {len(attention_ops)}, "
+                        f"Fused LayerNorm ops: {len(layernorm_ops)}")
+
+            if len(attention_ops) == 0:
+                logger.warning(
+                    "[WARN] No fused Attention ops found! ORT's pattern matcher likely failed "
+                    "to recognize the SDPA export pattern. Consider setting "
+                    "use_dynamo_export=false or inspecting the graph with verbose=1."
+                )
+
+            # Log top node types for quick graph overview
+            top_types = node_types.most_common(15)
+            logger.info(f"Top node types: {dict(top_types)}")
+
+            del pre_model
+
             # Save the optimized model
             optimized_model.save_model_to_file(str(optimized_path))
 
             # Replace original with optimized
             shutil.move(str(optimized_path), str(model_path))
 
-            logger.info("✓ Model optimization complete")
+            logger.info("[OK] Model optimization complete")
 
         except (ImportError, AttributeError) as e:
             logger.warning(f"ONNX Runtime transformer optimizer not available ({e}), trying basic optimization")
             self._basic_optimize(model_path)
         except Exception as e:
-            logger.warning(f"Optimization failed: {e}, keeping original model")
+            logger.warning(f"Optimization failed: {type(e).__name__}: {e}", exc_info=True)
+            logger.warning("Keeping original model")
     
     def _basic_optimize(self, model_path: Path):
         """Basic ONNX optimization using onnx-simplifier"""
@@ -837,7 +1025,7 @@ class ONNXExporter:
 
             if check:
                 onnx.save(model_simp, str(model_path))
-                logger.info("✓ Basic optimization complete with onnx-simplifier")
+                logger.info("[OK] Basic optimization complete with onnx-simplifier")
             else:
                 logger.warning("Simplification check failed, keeping original model")
 
@@ -846,6 +1034,87 @@ class ONNXExporter:
             logger.info("Install with: pip install onnx-simplifier")
         except Exception as e:
             logger.warning(f"Basic optimization failed: {e}")
+
+    def _slim_model(self, model_path: Path):
+        """Run onnxslim for graph cleanup after ORT transformer optimizer."""
+        try:
+            import onnxslim
+        except ImportError:
+            logger.info("onnxslim not installed, skipping graph cleanup (pip install onnxslim)")
+            return
+
+        logger.info("Running onnxslim graph cleanup...")
+        try:
+            # Load with external data if .data file exists alongside
+            data_path = Path(str(model_path) + ".data")
+            load_external = data_path.exists()
+            model = onnx.load(str(model_path), load_external_data=load_external)
+            slimmed = onnxslim.slim(model)
+            # Save back — if external data existed, preserve that format for now
+            # (consolidation happens in a separate step)
+            if load_external:
+                # Remove old files before re-saving to avoid external data conflicts
+                if data_path.exists():
+                    data_path.unlink()
+                if model_path.exists():
+                    model_path.unlink()
+                onnx.save(slimmed, str(model_path),
+                          save_as_external_data=True,
+                          all_tensors_to_one_file=True,
+                          location=data_path.name,
+                          size_threshold=1024)
+            else:
+                onnx.save(slimmed, str(model_path))
+            logger.info("[OK] onnxslim graph cleanup complete")
+        except Exception as e:
+            logger.warning(f"onnxslim optimization failed: {e}, keeping previous model")
+
+    def _consolidate_to_single_file(self, model_path: Path):
+        """Consolidate external data back into a single .onnx file if under 2GB."""
+        data_path = Path(str(model_path) + ".data")
+        if not data_path.exists():
+            return  # Already a single file
+
+        total_size = model_path.stat().st_size + data_path.stat().st_size
+        limit_bytes = 2 * 1024 * 1024 * 1024  # 2GB protobuf limit
+
+        if total_size >= limit_bytes:
+            logger.info(f"Model total size ({total_size / (1024**3):.2f} GB) exceeds 2GB protobuf limit, "
+                        f"keeping external data file")
+            return
+
+        logger.info(f"Consolidating model into single .onnx file ({total_size / (1024**2):.0f} MB)...")
+        try:
+            model = onnx.load(str(model_path), load_external_data=True)
+            onnx.save(model, str(model_path),
+                      save_as_external_data=False)
+            # Remove leftover external data file
+            if data_path.exists():
+                data_path.unlink()
+            logger.info("[OK] Model consolidated into single file")
+        except Exception as e:
+            logger.warning(f"Failed to consolidate model: {e}, keeping external data format")
+
+    def _export_selected_tags_csv(self, output_dir: Path):
+        """Export selected_tags.csv for compatibility with tagger UIs/frontends."""
+        if not hasattr(self, 'vocab') or self.vocab is None:
+            logger.info("No vocabulary available, skipping selected_tags.csv export")
+            return
+
+        csv_path = output_dir / "selected_tags.csv"
+        try:
+            import csv
+            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['tag_id', 'name', 'category'])
+                for idx in sorted(self.vocab.index_to_tag.keys()):
+                    tag = self.vocab.index_to_tag[idx]
+                    # Default category to 0 (general) — matches SmilingWolf format
+                    category = 0
+                    writer.writerow([idx, tag, category])
+            logger.info(f"[OK] Exported {len(self.vocab.index_to_tag)} tags to {csv_path}")
+        except Exception as e:
+            logger.warning(f"Failed to export selected_tags.csv: {e}")
 
     def _validate_ort_inference(self, model_path: Path):
         """Validate model through ORT inference and compare with PyTorch outputs.
@@ -860,26 +1129,31 @@ class ONNXExporter:
             # Create ONNX Runtime session
             session = ort.InferenceSession(str(model_path), providers=providers)
 
-            # Test with preprocessed float32 input: (B, C, H, W)
+            # Test with preprocessed float32 input: (B, C, H, W) + padding mask
             image_size = self.config.data.image_size
             test_input = np.random.randn(1, 3, image_size, image_size).astype(np.float32)
+            test_mask = np.zeros((1, image_size, image_size), dtype=bool)
 
-            # Run ONNX inference — use actual input name from session
-            input_name = session.get_inputs()[0].name
-            onnx_outputs = session.run(None, {input_name: test_input})
+            # Run ONNX inference — use actual input names from session
+            input_names = {i.name for i in session.get_inputs()}
+            feed = {session.get_inputs()[0].name: test_input}
+            if "padding_mask" in input_names:
+                feed["padding_mask"] = test_mask
+            onnx_outputs = session.run(None, feed)
 
             if len(onnx_outputs) < 1:
                 logger.warning(f"Expected 1 output, got {len(onnx_outputs)}. Skipping comparison.")
-                logger.info("✓ Model inference validation passed (basic)")
+                logger.info("[OK] Model inference validation passed (basic)")
                 return True
 
             onnx_probs = onnx_outputs[0]
 
             # Run PyTorch inference for comparison
             torch_input = torch.from_numpy(test_input).to(self.device)
+            torch_mask = torch.from_numpy(test_mask).to(self.device)
             self.model.eval()
             with torch.no_grad():
-                torch_probs = self.model(torch_input)
+                torch_probs = self.model(torch_input, torch_mask)
                 torch_probs = torch_probs.cpu().numpy()
 
             # Compare outputs
@@ -901,13 +1175,35 @@ class ONNXExporter:
             ok = np.allclose(torch_probs, onnx_probs, rtol=rtol, atol=atol)
 
             if ok:
-                logger.info("✓ Model inference validation passed (outputs match)")
-                return True
+                logger.info("[OK] Model inference validation passed (outputs match)")
             else:
                 logger.warning(f"Outputs exceed tolerance (rtol={rtol}, atol={atol})")
                 logger.warning(f"  Max difference: {max_diff:.6f}, Mean difference: {mean_diff:.6f}")
                 logger.error("Model inference validation FAILED — outputs differ beyond acceptable tolerance")
                 return False
+
+            # Verify padding mask actually affects output (catch silent mask-dropping
+            # during dynamo export — see pytorch/pytorch#152018)
+            if "padding_mask" in input_names:
+                test_mask_padded = np.zeros((1, image_size, image_size), dtype=bool)
+                pad_border = image_size // 4  # Heavy padding to ensure measurable effect
+                test_mask_padded[:, :pad_border, :] = True
+                test_mask_padded[:, -pad_border:, :] = True
+
+                feed_padded = {session.get_inputs()[0].name: test_input}
+                feed_padded["padding_mask"] = test_mask_padded
+                onnx_padded = session.run(None, feed_padded)[0]
+
+                if np.allclose(onnx_probs, onnx_padded, atol=1e-5):
+                    logger.warning(
+                        "[WARN] Padding mask has NO effect on output — "
+                        "mask may have been dropped during export!"
+                    )
+                else:
+                    mask_diff = np.max(np.abs(onnx_probs - onnx_padded))
+                    logger.info(f"[OK] Padding mask correctly affects model output (max diff: {mask_diff:.6f})")
+
+            return True
 
         except Exception as e:
             logger.error(f"Inference validation failed: {e}")
@@ -931,7 +1227,7 @@ class ONNXExporter:
             if self.export_config.validate_export:
                 self._validate_model(output_path)
             
-            logger.info("✓ Dynamic quantization complete")
+            logger.info("[OK] Dynamic quantization complete")
             
         except Exception as e:
             logger.error(f"Dynamic quantization failed: {e}")
@@ -953,7 +1249,9 @@ class ONNXExporter:
     def _add_metadata(self, model_path: Path):
         """Add metadata to ONNX model"""
         try:
-            model = onnx.load(str(model_path))
+            data_path = Path(str(model_path) + ".data")
+            has_external_data = data_path.exists()
+            model = onnx.load(str(model_path), load_external_data=has_external_data)
 
             # Clear existing metadata
             del model.metadata_props[:]
@@ -1067,13 +1365,20 @@ class ONNXExporter:
                 meta.key = key
                 meta.value = value
             
-            # Save model
-            onnx.save(model, str(model_path))
+            # Save model (preserve external data format if present)
+            if has_external_data:
+                onnx.save(model, str(model_path),
+                          save_as_external_data=True,
+                          all_tensors_to_one_file=True,
+                          location=data_path.name,
+                          size_threshold=1024)
+            else:
+                onnx.save(model, str(model_path))
 
             if vocab_embedded_successfully:
-                logger.info("✓ Metadata added to model (including embedded vocabulary)")
+                logger.info("[OK] Metadata added to model (including embedded vocabulary)")
             else:
-                logger.info("✓ Metadata added to model (external vocabulary required for inference)")
+                logger.info("[OK] Metadata added to model (external vocabulary required for inference)")
 
         except Exception as e:
             logger.warning(f"Failed to add metadata: {e}")
@@ -1086,7 +1391,7 @@ class ONNXExporter:
             # Check model structure
             model = onnx.load(str(model_path))
             onnx.checker.check_model(model)
-            logger.info("✓ ONNX model structure is valid")
+            logger.info("[OK] ONNX model structure is valid")
             # Do NOT run inference validation here - save for after optimization
         except Exception as e:
             logger.error(f"Validation failed: {e}")
@@ -1180,24 +1485,28 @@ class ONNXExporter:
             # Log which provider is being used
             logger.info(f"Using providers: {session.get_providers()}")
 
-            # Prepare input matching export format: (B, C, H, W) float32
-            input_data = np.random.randn(
-                batch_size, 3, image_size, image_size
-            ).astype(np.float32)
+            # Prepare inputs matching export format
+            input_feed = {}
+            for inp in session.get_inputs():
+                shape = [d if isinstance(d, int) else batch_size for d in inp.shape]
+                if inp.type == 'tensor(bool)':
+                    input_feed[inp.name] = np.zeros(shape, dtype=np.bool_)
+                else:
+                    input_feed[inp.name] = np.random.randn(*shape).astype(np.float32)
 
-            input_name = session.get_inputs()[0].name
+            logger.info(f"Input feeds: {', '.join(f'{k}: {v.shape}' for k, v in input_feed.items())}")
 
             # Warmup runs
             logger.info("Warming up...")
             for _ in range(5):
-                _ = session.run(None, {input_name: input_data})
+                _ = session.run(None, input_feed)
 
             # Benchmark runs
             logger.info(f"Running {num_runs} inference iterations...")
             times = []
             for _ in tqdm(range(num_runs), desc="Benchmarking"):
                 start = time.perf_counter()
-                _ = session.run(None, {input_name: input_data})
+                _ = session.run(None, input_feed)
                 end = time.perf_counter()
                 times.append((end - start) * 1000)  # Convert to ms
 
@@ -1264,7 +1573,7 @@ def main():
         parser.add_argument('-b', '--batch-size', type=int, default=None, help='Batch size for export')
         parser.add_argument('-s', '--image-size', type=int, default=None, help=f'Input image size')
         parser.add_argument('--opset', type=int, default=None, help=f'ONNX opset version')
-        parser.add_argument('--variants', nargs='+', default=None, choices=['full', 'quantized'], help='Export variants to generate')
+        parser.add_argument('--variants', nargs='+', default=None, choices=['full', 'fp16', 'quantized'], help='Export variants to generate')
         parser.add_argument('--optimize', action='store_true', default=None, help='Optimize exported model')
         parser.add_argument('--no-optimize', action='store_true', default=None, help='Do not optimize exported model')
         parser.add_argument('--quantize', action='store_true', default=None, help='Enable quantization')
@@ -1287,6 +1596,9 @@ def main():
         if args.batch_size:
             unified_config.data.batch_size = args.batch_size
         if args.image_size:
+            # Write to both fields so either field is consistent regardless of which
+            # downstream consumer reads from `data` vs `model`.
+            unified_config.data.image_size = args.image_size
             unified_config.model.image_size = args.image_size
         if args.opset:
             unified_config.export.opset_version = args.opset
@@ -1302,7 +1614,7 @@ def main():
             unified_config.export.validate_export = not args.no_validate
         if args.force_swinv2:
             unified_config.export.force_swinv2_export = True
-        
+
         # Create exporter
         exporter = ONNXExporter(unified_config)
         
@@ -1319,7 +1631,7 @@ def main():
                 if path and path.exists():
                     exporter.benchmark(path, args.benchmark_runs)
 
-        logger.info("\n✓ Export complete!")
+        logger.info("\n[OK] Export complete!")
     finally:
         if listener:
             listener.stop()

@@ -67,6 +67,9 @@ class AsymmetricFocalLoss(nn.Module):
                     loss = alpha * pos_loss + (1 - alpha) * neg_loss
 
                 Value interpretation:
+                - alpha = 1.0: **Disabled** — no alpha weighting applied. Loss is
+                  simply pos_loss + neg_loss (pure ASL behavior). Use this when
+                  asymmetric gamma alone handles pos/neg balance.
                 - alpha = 0.5: Equal weighting of positive and negative contributions.
                 - alpha > 0.5: Favors positives (increases penalty for missing true
                   labels). Use when false negatives are more costly.
@@ -282,19 +285,20 @@ class AsymmetricFocalLoss(nn.Module):
         # Calculate probabilities for focal weighting
         probs = torch.sigmoid(logits)
 
-        # Apply probability clipping for asymmetric focusing on negatives.
-        # This shifts negative probabilities, reducing the contribution of easy negatives.
-        # For negatives, we compute (p + clip).clamp(max=1) which makes the model
-        # "think" it's less confident, reducing the focal weight for easy negatives.
+        # Apply probability shifting (margin) per Ridnik 2021. For negatives we
+        # subtract the margin from p and clamp at zero so confident-negative
+        # predictions (p <= clip) get exactly zero focal weight. Previous code
+        # used (p + clip), which inverts the asymmetry and amplifies easy-negative
+        # gradient instead of suppressing it.
         if self.clip > 0:
-            probs_neg = (probs + self.clip).clamp(max=1.0)
+            probs_neg = (probs - self.clip).clamp(min=0.0)
         else:
             probs_neg = probs
 
         # Calculate focal weights using log-space math for numerical stability and
         # gradient preservation (CR-008 fix)
         # For positives: use (1-p)^gamma_pos - down-weight easy positives
-        # For negatives: use p_clipped^gamma_neg - down-weight easy negatives (with clipping)
+        # For negatives: use (p - clip)_+^gamma_neg - down-weight easy negatives
         # Using log-space: exp(gamma * log(x)) = x^gamma
         # This avoids pow(0, gamma) numerically while maintaining gradients everywhere
 
@@ -304,7 +308,8 @@ class AsymmetricFocalLoss(nn.Module):
         _LOG_FLOOR = 1e-6
         # log(1-p) for positive focal weight
         log_one_minus_probs = torch.log((1 - probs).clamp(min=_LOG_FLOOR))
-        # log(p_clipped) for negative focal weight
+        # log(p_shifted) for negative focal weight; clamp gives zero weight where
+        # the shifted probability hit the floor (i.e. confident negatives).
         log_probs_neg = torch.log(probs_neg.clamp(min=_LOG_FLOOR))
 
         # Clamp the exponent to prevent overflow: exp(88) ≈ 2e38 (near float32 max)
@@ -317,7 +322,10 @@ class AsymmetricFocalLoss(nn.Module):
         # Apply focal weights with separate positive/negative weighting
         pos_loss = pos_weights * bce_loss
         neg_loss = neg_weights * bce_loss
-        focal_loss = self.alpha * pos_loss + (1 - self.alpha) * neg_loss
+        if self.alpha == 1.0:
+            focal_loss = pos_loss + neg_loss  # alpha disabled = pure ASL
+        else:
+            focal_loss = self.alpha * pos_loss + (1 - self.alpha) * neg_loss
 
         # Apply sample weights if provided (for frequency-based sampling)
         if sample_weights is not None:

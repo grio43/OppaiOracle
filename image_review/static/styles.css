@@ -166,6 +166,190 @@ body {
     opacity: 0.9;
 }
 
+/* Corrections sidebar panel */
+.corrections-panel .correction-key {
+    font-family: monospace;
+    font-size: 0.8em;
+    color: var(--text-secondary);
+    word-break: break-all;
+    background: var(--bg-dark);
+    padding: 6px 8px;
+    border-radius: 4px;
+    margin-bottom: 8px;
+    max-height: 4em;
+    overflow-y: auto;
+}
+
+.correction-counts {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+    font-size: 0.85em;
+}
+
+.correction-count {
+    flex: 0 0 auto;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-weight: bold;
+}
+
+.correction-count.add {
+    background: rgba(0, 255, 136, 0.15);
+    color: var(--tp-color);
+}
+
+.correction-count.remove {
+    background: rgba(255, 68, 68, 0.15);
+    color: var(--fp-color);
+}
+
+.correction-saved {
+    flex: 1;
+    text-align: right;
+    font-size: 0.8em;
+    color: var(--text-secondary);
+    transition: color 0.15s;
+}
+
+.correction-saved.saved { color: var(--tp-color); }
+.correction-saved.pending { color: var(--accent); }
+.correction-saved.error { color: var(--fp-color); }
+
+.reset-btn {
+    width: 100%;
+    background: var(--bg-dark);
+    border: 1px solid var(--fp-color);
+    color: var(--fp-color);
+    padding: 8px;
+    border-radius: var(--border-radius);
+    cursor: pointer;
+    font-size: 0.85em;
+    transition: background 0.2s;
+}
+
+.reset-btn:hover {
+    background: rgba(255, 68, 68, 0.15);
+}
+
+/* Add-tag controls in the GT column */
+.add-tag-controls {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+
+.add-tag-controls input {
+    flex: 1;
+    background: var(--bg-dark);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 8px;
+    border-radius: var(--border-radius);
+    font-size: 0.9em;
+}
+
+.add-tag-controls input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.add-tag-controls button {
+    background: var(--accent);
+    border: none;
+    color: var(--bg-dark);
+    padding: 8px 14px;
+    border-radius: var(--border-radius);
+    cursor: pointer;
+    font-weight: bold;
+}
+
+/* Per-tag action button (× / +) */
+.tag-action {
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    width: 24px;
+    height: 24px;
+    border-radius: 4px;
+    font-size: 1em;
+    line-height: 1;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    flex: 0 0 auto;
+    transition: all 0.15s;
+}
+
+.tag-action:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.tag-action.remove:hover { border-color: var(--fp-color); color: var(--fp-color); }
+.tag-action.add:hover { border-color: var(--tp-color); color: var(--tp-color); }
+
+.tag-action.remove.active {
+    border-color: var(--fp-color);
+    color: var(--bg-dark);
+    background: var(--fp-color);
+}
+
+.tag-action.add.active {
+    border-color: var(--tp-color);
+    color: var(--bg-dark);
+    background: var(--tp-color);
+}
+
+/* Tag rows: queued for remove / add */
+.tag-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.tag-item .tag-name {
+    flex: 1;
+}
+
+.tag-item.queued-remove {
+    border-left-color: var(--fp-color);
+    opacity: 0.7;
+}
+
+.tag-item.queued-remove .tag-name {
+    text-decoration: line-through;
+    color: var(--fp-color);
+}
+
+.tag-item.queued-add {
+    border-left-color: var(--tp-color);
+    background: rgba(0, 255, 136, 0.08);
+}
+
+.tag-badge {
+    font-size: 0.7em;
+    padding: 2px 6px;
+    border-radius: 3px;
+    background: var(--tp-color);
+    color: var(--bg-dark);
+    font-weight: bold;
+    text-transform: uppercase;
+}
+
+.prediction-item.queued-remove .tag-name {
+    text-decoration: line-through;
+    color: var(--fp-color);
+}
+
+.prediction-item.queued-add {
+    background: rgba(0, 255, 136, 0.1);
+}
+
 /* Shortcuts */
 .shortcuts {
     font-size: 0.85em;
@@ -236,15 +420,8 @@ kbd {
 }
 
 /* Expected Tags */
-.expected-tags {
-    max-height: calc(100vh - 40px);
-    overflow: hidden;
-}
-
 .expected-tags .tag-list {
     flex: 1;
-    overflow-y: auto;
-    max-height: calc(100vh - 140px);
 }
 
 .tag-list {
@@ -388,11 +565,6 @@ kbd {
 }
 
 /* Predictions */
-.predictions {
-    max-height: calc(100vh - 40px);
-    overflow: hidden;
-}
-
 .predictions h2 {
     margin-bottom: 10px;
 }
@@ -434,8 +606,6 @@ kbd {
     display: flex;
     flex-direction: column;
     gap: 6px;
-    overflow-y: auto;
-    max-height: calc(100vh - 220px);
 }
 
 .prediction-item {
@@ -687,10 +857,10 @@ kbd {
         display: block;
     }
 
-    /* Main content adjustments */
+    /* Main content adjustments — top padding reserves space for the floating image */
     .main-content {
         margin-left: 0;
-        padding: 70px 12px 12px 12px;
+        padding: calc(70px + 30vh + 16px) 12px 12px 12px;
     }
 
     /* Stacked layout for review container */
@@ -699,7 +869,7 @@ kbd {
         gap: 12px;
     }
 
-    /* Image view takes priority */
+    /* Metadata block (h2, rating-display, sample-info) stays in normal flow */
     .image-view {
         order: -1;
         position: relative;
@@ -707,13 +877,21 @@ kbd {
         max-height: none;
     }
 
+    /* Floating image — pinned below the mobile header, overlays scrolling content */
     .image-container {
-        min-height: 250px;
-        max-height: 50vh;
+        position: fixed;
+        top: 70px;
+        left: 12px;
+        right: 12px;
+        z-index: 50;
+        height: 30vh;
+        min-height: 180px;
+        max-height: 30vh;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
     }
 
     .image-container img {
-        max-height: 50vh;
+        max-height: 100%;
     }
 
     /* Mobile navigation bar (fixed at bottom) */
@@ -818,23 +996,6 @@ kbd {
         min-height: 44px;
     }
 
-    /* Swipe hint */
-    .swipe-hint {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 8px;
-        color: var(--text-secondary);
-        font-size: 0.8em;
-        padding: 8px;
-        opacity: 0.7;
-    }
-
-    .swipe-hint svg {
-        width: 20px;
-        height: 20px;
-    }
-
     /* Loading state */
     .loading-state {
         padding: 20px;
@@ -846,8 +1007,7 @@ kbd {
 @media (min-width: 769px) {
     .mobile-header,
     .mobile-nav-bar,
-    .sidebar-overlay,
-    .swipe-hint {
+    .sidebar-overlay {
         display: none !important;
     }
 }

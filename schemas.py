@@ -94,9 +94,36 @@ class PredictionOutput:
             json.dump(self.to_dict(), f, indent=2)
 
 
+def canonical_vocab_bytes(vocab_data: Dict) -> bytes:
+    """Produce the canonical byte representation of vocabulary data for hashing.
+
+    The same vocabulary content must hash identically regardless of how it was
+    serialized to disk (compact vs pretty-printed, CRLF vs LF, ensure_ascii vs
+    not) or whether dict keys are int or str in memory. This function defines
+    the single canonical form: UTF-8 JSON, sorted keys, compact separators,
+    string-coerced inner-dict keys.
+    """
+    normalized: Dict[str, Any] = {}
+    for section_name, section in vocab_data.items():
+        if isinstance(section, dict):
+            normalized[section_name] = {str(k): v for k, v in section.items()}
+        else:
+            normalized[section_name] = section
+    return json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def compute_vocab_sha256(vocab_path: Optional[Path] = None,
                         vocab_data: Optional[Dict] = None) -> str:
-    """Compute SHA256 hash of vocabulary.
+    """Compute SHA256 hash of vocabulary in its canonical form.
+
+    Hashing is content-canonical: a path argument is loaded as JSON and then
+    canonicalized via :func:`canonical_vocab_bytes`, so reformatting the file
+    on disk (indent, line endings) cannot change the hash.
 
     Args:
         vocab_path: Path to vocabulary file
@@ -113,35 +140,28 @@ def compute_vocab_sha256(vocab_path: Optional[Path] = None,
         raise ValueError("Must provide either vocab_path or vocab_data")
 
     try:
-        if vocab_data is not None:
-            # Hash the vocabulary data directly
-            try:
-                vocab_json = json.dumps(vocab_data, sort_keys=True)
-            except TypeError as e:
-                logger.error(f"Vocabulary data not JSON-serializable: {e}")
-                raise TypeError(f"Cannot hash non-serializable vocabulary: {e}") from e
-
-            return hashlib.sha256(vocab_json.encode()).hexdigest()
-
-        elif vocab_path is not None:
-            # Validate path exists before attempting to read
+        if vocab_data is None:
             if not vocab_path.exists():
                 logger.warning(f"Vocabulary file does not exist: {vocab_path}")
                 return "unknown"
-
-            # Hash the file contents
             try:
-                with open(vocab_path, 'rb') as f:
-                    content = f.read()
-                return hashlib.sha256(content).hexdigest()
-
+                with open(vocab_path, 'r', encoding='utf-8') as f:
+                    vocab_data = json.load(f)
             except PermissionError as e:
                 logger.warning(f"Permission denied reading vocabulary for hash: {vocab_path}: {e}")
                 return "unknown"
-
             except OSError as e:  # Covers IOError, file system errors
                 logger.error(f"OS error reading vocabulary for hash: {vocab_path}: {e}", exc_info=True)
                 return "unknown"
+            except json.JSONDecodeError as e:
+                logger.error(f"Vocabulary file is not valid JSON: {vocab_path}: {e}")
+                return "unknown"
+
+        try:
+            return hashlib.sha256(canonical_vocab_bytes(vocab_data)).hexdigest()
+        except TypeError as e:
+            logger.error(f"Vocabulary data not JSON-serializable: {e}")
+            raise TypeError(f"Cannot hash non-serializable vocabulary: {e}") from e
 
     except (TypeError, ValueError):
         # Re-raise expected exceptions

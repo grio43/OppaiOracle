@@ -14,6 +14,8 @@ from typing import Dict, Any, Optional, Tuple
 
 import torch
 
+from schemas import canonical_vocab_bytes
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,12 +81,16 @@ class ModelMetadata:
                     f"Will not embed corrupted vocabulary. Examples: {examples}"
                 )
 
-            # Compress vocabulary (expensive operation, worth caching)
+            # Compress vocabulary (expensive operation, worth caching). The
+            # embedded blob stays in compact form for storage efficiency, but
+            # vocab_sha256 is computed from the canonical form so it stays
+            # consistent with the on-disk file regardless of how that file was
+            # serialized (indent, line endings, key order).
             vocab_json = json.dumps(vocab_data, ensure_ascii=False)
             vocab_bytes = vocab_json.encode('utf-8')
             vocab_compressed = gzip.compress(vocab_bytes)
             vocab_b64 = base64.b64encode(vocab_compressed).decode('utf-8')
-            vocab_sha256 = hashlib.sha256(vocab_bytes).hexdigest()
+            vocab_sha256 = hashlib.sha256(canonical_vocab_bytes(vocab_data)).hexdigest()
 
             # Create metadata dict for caching
             compressed_metadata = {
@@ -132,16 +138,19 @@ class ModelMetadata:
             vocab_compressed = base64.b64decode(vocab_b64)
             vocab_bytes = gzip.decompress(vocab_compressed)
 
-            # Verify integrity
+            vocab_json = vocab_bytes.decode('utf-8')
+            vocab_data = json.loads(vocab_json)
+
+            # Verify integrity against the canonical SHA stored in the
+            # checkpoint. The embedded blob itself is compact JSON, but the
+            # SHA is canonical (sorted, normalized) so it can be matched
+            # against an on-disk vocabulary.json with arbitrary formatting.
             if 'vocab_sha256' in checkpoint:
                 expected_sha = checkpoint['vocab_sha256']
-                actual_sha = hashlib.sha256(vocab_bytes).hexdigest()
+                actual_sha = hashlib.sha256(canonical_vocab_bytes(vocab_data)).hexdigest()
                 if expected_sha != actual_sha:
                     logger.warning(f"Vocabulary SHA mismatch!")
                     return None
-
-            vocab_json = vocab_bytes.decode('utf-8')
-            vocab_data = json.loads(vocab_json)
 
             # Verify extracted vocabulary is valid
             placeholder_count = sum(

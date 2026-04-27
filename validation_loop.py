@@ -10,6 +10,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
+from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 from datetime import datetime
 import time
@@ -75,7 +76,6 @@ from Configuration_System import (
 )
 from training_utils import (
     CheckpointManager,
-    DistributedTrainingHelper,
     InvalidCheckpointError,
     detect_architecture_from_state_dict,
 )
@@ -118,7 +118,6 @@ class ValidationConfig:
     # Evaluation settings
     max_samples: Optional[int] = None  # Limit samples for fast validation
     prediction_threshold: float = 0.2653
-    adaptive_threshold: bool = True  # NOTE: unused in codebase, superseded by threshold_calibration
     save_predictions: bool = False
     save_per_image_results: bool = False
     
@@ -138,10 +137,6 @@ class ValidationConfig:
     # Performance analysis
     measure_inference_time: bool = True
     profile_memory: bool = False
-    
-    # Distributed
-    distributed: bool = False
-    local_rank: int = -1
     
     # Device
     device: str = "cuda"
@@ -721,7 +716,6 @@ class ValidationRunner:
             validation_config=val_cfg,
             vocab_path=Path(self.config.vocab_path),
             active_data_path=Path(self.config.json_dir),
-            distributed=self.config.distributed,
             log_queue=self._log_queue,
             frequency_sampling=False,
             architecture_type=getattr(self, '_architecture_type', 'vit'),
@@ -868,25 +862,33 @@ class ValidationRunner:
         timing_events = []  # List of (start_event, end_event, batch_size)
         use_cuda_timing = self.config.measure_inference_time and torch.cuda.is_available()
 
+        h2d_stream = torch.cuda.Stream() if self.device.type == 'cuda' else None
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validating")):
                 total_batches += 1
-                images = batch['images'].to(self.device, non_blocking=True)
                 tag_labels = batch['tag_labels']
                 # Validate tag_labels is on CPU (expected from dataloader for later cat())
                 if tag_labels is not None and tag_labels.device.type != 'cpu':
                     tag_labels = tag_labels.cpu()  # Ensure consistent device for concatenation
 
-                # Record start event (non-blocking)
+                # Transfer tensors to GPU on dedicated H2D stream (overlap with previous batch compute)
+                pmask = batch.get('padding_mask', None)
+                h2d_ctx = torch.cuda.stream(h2d_stream) if h2d_stream is not None else nullcontext()
+                with h2d_ctx:
+                    images = batch['images'].to(self.device, non_blocking=True)
+                    if pmask is not None:
+                        pmask = pmask.to(self.device, non_blocking=True)
+                # Sync H2D stream before compute
+                if h2d_stream is not None:
+                    torch.cuda.current_stream().wait_stream(h2d_stream)
+
+                # Record start event AFTER H2D sync (measures forward pass only, not transfer)
                 if use_cuda_timing:
                     start_event = torch.cuda.Event(enable_timing=True)
                     end_event = torch.cuda.Event(enable_timing=True)
                     start_event.record()
 
                 # Forward pass (propagate padding masks when available)
-                pmask = batch.get('padding_mask', None)
-                if pmask is not None:
-                    pmask = pmask.to(self.device, non_blocking=True)
                 with autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.amp_enabled):
                     outputs = self.model(images, padding_mask=pmask)
                     logits = outputs['tag_logits'] if isinstance(outputs, dict) else outputs

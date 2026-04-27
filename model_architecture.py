@@ -29,11 +29,6 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask,
 logger.info("Using PyTorch Flex Attention")
 
 
-def _check_flex_attention_available() -> bool:
-    """Check if Flex Attention is available (PyTorch 2.5+)."""
-    return hasattr(torch.nn.attention, 'flex_attention')
-
-
 def _check_triton_available() -> bool:
     """Check if Triton is available for compiled block mask creation."""
     try:
@@ -233,6 +228,7 @@ class VisionTransformerConfig:
     intermediate_size: int = 4096
     num_tags: int = 100000  # This should be overridden with actual vocab size (includes rating tags)
     dropout: float = 0.1
+    pos_dropout: float = 0.0  # Position embedding dropout (0.0 = modern standard; drop_path handles regularization)
     attention_dropout: float = 0.1
     layer_norm_eps: float = 1e-6
     use_flex_attention: bool = True  # Use Flex Attention (PyTorch 2.5+)
@@ -378,6 +374,15 @@ class TransformerBlock(nn.Module):
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
 
+        # flex_attention has no native attention-weight dropout, so apply V-dropout
+        # before the call. Zeroing random value tokens removes their contribution to
+        # all queries — a documented approximation of attention dropout used in T5
+        # and several BERT variants. Replaces the previous post-attention output
+        # dropout, which did not regularize attention weights as the config name
+        # suggested.
+        if self.training and self.attn_dropout > 0:
+            v = F.dropout(v, p=self.attn_dropout, training=True)
+
         # Flex Attention computation (block_mask is pre-computed and shared across layers)
         attn_out = flex_attention(
             q, k, v,
@@ -387,10 +392,6 @@ class TransformerBlock(nn.Module):
 
         # Reshape back to (B, L, D) - ensure contiguous for torch.compile compatibility
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D).contiguous()
-
-        # Apply attention dropout (post-attention, flex_attention doesn't have built-in dropout)
-        if self.training and self.attn_dropout > 0:
-            attn_out = F.dropout(attn_out, p=self.attn_dropout, training=True)
 
         # Residual connections
         x = x + self.drop_path(self.proj(attn_out))
@@ -406,8 +407,10 @@ class TransformerBlock(nn.Module):
 
         Args:
             x: Input tensor of shape (batch_size, seq_len, hidden_size)
-            attn_mask: Optional attention mask (B, L) with True=ATTEND, False=IGNORE.
-                      Will be converted to additive mask for SDPA.
+            attn_mask: Optional boolean attention mask (B, L) with True=ATTEND, False=IGNORE.
+                      Passed directly to SDPA as a boolean key-padding mask — avoids the
+                      additive float mask path that forces PyTorch off the Flash/efficient
+                      backends.
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, seq_len, hidden_size)
@@ -428,21 +431,17 @@ class TransformerBlock(nn.Module):
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
 
-        # Convert boolean mask to additive mask for SDPA if provided
-        # SDPA expects: 0 = attend, -inf = ignore
-        sdpa_mask = None
+        # Pass the boolean mask straight through. SDPA accepts a bool key-padding mask
+        # broadcastable to (B, num_heads, L_q, L_k); we broadcast (B, L) -> (B, 1, 1, L).
+        # Bool semantics for SDPA: True=ATTEND, False=IGNORE — already matches `attn_mask`.
+        sdpa_mask: Optional[torch.Tensor] = None
         if attn_mask is not None:
-            # Validate mask shape: must be (B, L) to match input (B, L, D)
             if attn_mask.ndim != 2 or attn_mask.shape[0] != B or attn_mask.shape[1] != L:
                 raise ValueError(
                     f"attn_mask shape {attn_mask.shape} mismatch. "
                     f"Expected ({B}, {L}) for input shape ({B}, {L}, {D})"
                 )
-
-            # attn_mask: (B, L) True=ATTEND -> need (B, 1, 1, L) or (B, 1, L, L)
-            # For key masking, we broadcast: (B, 1, 1, L)
-            sdpa_mask = torch.zeros(B, 1, 1, L, device=x.device, dtype=x.dtype)
-            sdpa_mask = sdpa_mask.masked_fill(~attn_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+            sdpa_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, L) bool
 
         # Scaled dot-product attention (ONNX-compatible)
         attn_out = F.scaled_dot_product_attention(
@@ -488,13 +487,10 @@ class SimplifiedTagger(BaseTagger):
         # Standard ViT initialization follows timm/HuggingFace convention.
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
-        self.pos_drop = nn.Dropout(p=config.dropout)
+        self.pos_drop = nn.Dropout(p=config.pos_dropout)
         # Transformer blocks
         rate = getattr(config, 'drop_path_rate', 0.0)
-        try:
-            dpr = torch.linspace(0.0, rate, config.num_hidden_layers, endpoint=False)
-        except TypeError:
-            dpr = torch.linspace(0.0, rate, config.num_hidden_layers + 1)[:-1]
+        dpr = torch.linspace(0.0, rate, config.num_hidden_layers)
         dpr = dpr.clamp_max(1.0 - 1e-6).tolist()
         self.blocks = nn.ModuleList([
             TransformerBlock(config, drop_path=float(p))
@@ -506,6 +502,14 @@ class SimplifiedTagger(BaseTagger):
         self.tag_head = nn.Linear(config.hidden_size, config.num_tags)
         # Weight initialization
         self.apply(self._init_weights)
+        # Override patch_embed init: standard ViT uses trunc_normal(std=0.02).
+        # The Conv2d branch in _init_weights sets std = sqrt(2/(k*k*out_channels))
+        # ≈ 0.0028 for our k=16, out_channels=1024 — ~7x smaller than ViT convention,
+        # which produces vanishing patch-embed activations early in from-scratch
+        # training. Re-init here so the apply() pass above doesn't overwrite us.
+        nn.init.trunc_normal_(self.patch_embed.weight, std=0.02)
+        if self.patch_embed.bias is not None:
+            nn.init.constant_(self.patch_embed.bias, 0)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -664,9 +668,10 @@ class SimplifiedTagger(BaseTagger):
         # STEP 3a: For ONNX/SDPA mode -> sdpa_attn_mask
         #   - We invert: sdpa_attn_mask = ~attn_kpm
         #   - Semantics: True = ATTEND to this token
-        #   - This is then converted to additive mask in forward_sdpa():
-        #     masked_fill(~attn_mask, -inf) means False positions get -inf
-        #     So: True=ATTEND positions keep 0, False=IGNORE positions get -inf
+        #   - forward_sdpa() passes this directly to F.scaled_dot_product_attention as
+        #     a boolean key-padding mask (broadcast to (B, 1, 1, L)). SDPA's bool-mask
+        #     contract matches: True=attend, False=ignore — so no additive conversion
+        #     is needed, and PyTorch can keep using the Flash/efficient backends.
         #
         # STEP 3b: For flex_attention mode -> block_mask
         #   - _create_block_mask inverts internally: attend_mask = ~key_padding_mask
@@ -690,7 +695,7 @@ class SimplifiedTagger(BaseTagger):
         if attn_kpm is not None:
             # Only validate in debug mode to avoid expensive GPU-CPU synchronization
             # (skip inside tracing to avoid control flow issues)
-            if self._config.check_numerical_stability and not torch.jit.is_tracing():
+            if self._config.check_numerical_stability and not torch.jit.is_tracing() and not self._onnx_mode:
                 if attn_kpm.all(dim=1).any().item():
                     raise RuntimeError("attn_kpm masks all keys for at least one sample.")
 
@@ -703,10 +708,13 @@ class SimplifiedTagger(BaseTagger):
             # ONNX mode: use SDPA with simple boolean mask
             # For ONNX export, images are padded to square by InferenceWrapper,
             # so typically no masking is needed. But support it for completeness.
-            if attn_kpm is not None and attn_kpm.any():
+            if attn_kpm is not None:
                 # Invert semantics: attn_kpm True=IGNORE -> sdpa_attn_mask True=ATTEND
                 # forward_sdpa() will then do: masked_fill(~attn_mask, -inf)
                 # which gives: True=ATTEND -> 0, False=IGNORE -> -inf (correct SDPA format)
+                # Always apply (no .any() guard) so the mask branch is captured during export.
+                # An all-False attn_kpm produces an all-True sdpa_attn_mask (all-attend),
+                # which is mathematically identical to no mask.
                 sdpa_attn_mask = ~attn_kpm
         else:
             # Normal mode: use flex_attention with BlockMask

@@ -205,10 +205,22 @@ class ImagePreprocessor:
             self.allowed_dirs.append(Path.cwd().resolve())
 
     def _build_transform(self):
-        """Build tensor + normalize transform (geometry handled manually to avoid stretching/upscale)."""
+        """Build tensor + normalize transform (geometry handled manually to avoid stretching/upscale).
+
+        Output dtype follows ``config.precision`` so the preprocessor emits the same
+        dtype the model is cast to in ``ModelWrapper.load_model()``. Hard-coding bf16
+        silently corrupted fp16/fp32 inference paths.
+        """
+        precision = str(getattr(self.config, "precision", "bf16")).lower()
+        if precision in {"bf16", "bfloat16"}:
+            target_dtype = torch.bfloat16
+        elif precision in {"fp16", "float16"}:
+            target_dtype = torch.float16
+        else:
+            target_dtype = torch.float32
         return transforms_v2.Compose([
             transforms_v2.ToImage(),
-            transforms_v2.ToDtype(torch.bfloat16, scale=True),
+            transforms_v2.ToDtype(target_dtype, scale=True),
             transforms_v2.Normalize(
                 mean=self.config.normalize_mean,
                 std=self.config.normalize_std
@@ -1221,7 +1233,6 @@ class InferenceEngine:
                     monitor_config = self.config.monitor_config or MonitorConfig(
                         log_level="INFO",
                         use_tensorboard=False,
-                        use_wandb=False,
                         track_gpu_metrics=True,
                         enable_alerts=False,
                         alert_webhook_url=None  # Ensure webhook is not used by default

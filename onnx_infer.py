@@ -121,14 +121,15 @@ def _preprocess_for_model(
     mean: list[float],
     std: list[float],
     pad_color: tuple[int, int, int] = (114, 114, 114),
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Letterbox, normalize, and format an image for the ONNX model.
 
     Matches the training pipeline preprocessing:
     1. Scale to fit inside image_size x image_size (no upscaling)
     2. Center on a pad_color canvas
     3. Normalize with mean/std
-    4. Return (1, 3, H, W) float32
+    4. Generate padding mask (True=padding, False=valid)
+    5. Return (1, 3, H, W) float32 and (1, H, W) bool mask
 
     Args:
         image: (H, W, 3) uint8 RGB numpy array.
@@ -138,7 +139,9 @@ def _preprocess_for_model(
         pad_color: RGB fill for letterbox padding.
 
     Returns:
-        (1, 3, image_size, image_size) float32 numpy array, normalized.
+        Tuple of:
+          - (1, 3, image_size, image_size) float32 numpy array, normalized.
+          - (1, image_size, image_size) bool numpy array, True=padding.
     """
     h, w = image.shape[:2]
     target = image_size
@@ -160,6 +163,10 @@ def _preprocess_for_model(
     left = (target - new_w) // 2
     canvas[top:top + new_h, left:left + new_w] = image
 
+    # Generate padding mask: True = padding pixel, False = valid image pixel
+    mask = np.ones((target, target), dtype=bool)
+    mask[top:top + new_h, left:left + new_w] = False
+
     # Convert to float32 [0, 1], normalize, transpose to (C, H, W)
     x = canvas.astype(np.float32) / 255.0
     mean_arr = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
@@ -167,7 +174,7 @@ def _preprocess_for_model(
     x = (x - mean_arr) / std_arr
     x = x.transpose(2, 0, 1)  # (H, W, C) -> (C, H, W)
 
-    return np.expand_dims(x, axis=0)  # (1, C, H, W)
+    return np.expand_dims(x, axis=0), np.expand_dims(mask, axis=0)  # (1,C,H,W), (1,H,W)
 
 
 def _preprocess_legacy(image_path: str, pad_color: tuple[int, int, int] = (114, 114, 114)) -> tuple[np.ndarray, bool]:
@@ -277,7 +284,11 @@ def main():
 
         input_name = session.get_inputs()[0].name
         input_info = session.get_inputs()[0]
+        model_input_names = {i.name for i in session.get_inputs()}
+        has_mask_input = "padding_mask" in model_input_names
         logger.info(f"Model expects input '{input_name}' with type: {input_info.type}")
+        if has_mask_input:
+            logger.info("Model accepts padding_mask input")
 
         # Detect model format: new models have preprocessing=external in metadata
         is_new_format = meta.get('preprocessing', '') == 'external'
@@ -294,7 +305,7 @@ def main():
                 if is_new_format:
                     # New format: load image, preprocess externally, feed (1, C, H, W) float32
                     raw_image, was_composited = _load_image(path, pad_color)
-                    inp = _preprocess_for_model(raw_image, image_size, mean, std, pad_color)
+                    inp, padding_mask = _preprocess_for_model(raw_image, image_size, mean, std, pad_color)
                 else:
                     # Legacy format: model expects (1, H, W, 3) uint8
                     inp, was_composited = _preprocess_legacy(path, pad_color)
@@ -309,7 +320,10 @@ def main():
                 continue
 
             try:
-                outputs = session.run(None, {input_name: inp})
+                feed = {input_name: inp}
+                if has_mask_input and is_new_format:
+                    feed["padding_mask"] = padding_mask
+                outputs = session.run(None, feed)
 
                 # Single output: probabilities (new) or raw logits (legacy)
                 tag_scores = outputs[0][0]

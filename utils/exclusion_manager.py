@@ -444,25 +444,3 @@ class ExclusionManager:
             pass  # Ignore unlock errors
 
 
-# Standalone function for backward compatibility with l2_cache_warmup.py
-def write_exclusions_deduplicated(
-    exclusion_path: Path,
-    new_ids: List[str],
-    max_retries: int = 3
-) -> int:
-    """
-    Write exclusions with deduplication and cross-platform file locking.
-
-    This is a standalone function for backward compatibility.
-    For new code, prefer using ExclusionManager class.
-
-    Args:
-        exclusion_path: Path to the exclusion file
-        new_ids: List of new image IDs to add
-        max_retries: Maximum number of retry attempts for locking
-
-    Returns:
-        Count of new entries actually added (excludes duplicates)
-    """
-    mgr = ExclusionManager(exclusion_path, max_lock_retries=max_retries)
-    return mgr.add_exclusions(new_ids)
