@@ -40,7 +40,6 @@ from model_metadata import ModelMetadata
 from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
 from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
 from Configuration_System import load_config, InferenceConfig as BaseInferenceConfig, MonitorConfig, FullConfig
-from orientation_handler import OrientationHandler  # orientation-aware TTA mapping
 
 # Make cv2 optional - not needed for basic inference
 try:
@@ -532,24 +531,9 @@ class ModelWrapper:
             # Validate vocabulary contains real tags, not placeholders
             self._verify_vocabulary()
 
-            # Precompute left↔right index map once for TTA if enabled
+            # Vocabulary has no orientation-sensitive tags, so TTA flip predictions
+            # are averaged elementwise — no index remapping needed.
             self._tta_index_map = None
-            if getattr(self.config, "tta_flip", False) and self.tag_names:
-                try:
-                    orientation_path = getattr(getattr(config, 'data', None), 'orientation_map_path', None)
-                    map_path = Path(orientation_path) if orientation_path else None
-                    if map_path and map_path.exists():
-                        oh = OrientationHandler(mapping_file=map_path)
-                        mapping = oh.precompute_all_mappings(set(self.tag_names))
-                        index_map: List[int] = []
-                        for tag in self.tag_names:
-                            swapped = mapping.get(tag, tag)
-                            index_map.append(self.vocabulary.tag_to_index.get(swapped, self.vocabulary.tag_to_index[tag]))
-                        self._tta_index_map = torch.as_tensor(index_map, dtype=torch.long, device=self.device)
-                    else:
-                        logger.warning("TTA flip enabled but orientation_map_path not configured; left/right remap disabled.")
-                except Exception as e:
-                    logger.warning(f"Failed to build TTA left↔right index map: {e}")
 
             # Load preprocessing parameters from checkpoint
             # Store original config values for mismatch detection

@@ -35,7 +35,6 @@ HISTORY:
 
 WHY JSON-BASED IS BETTER:
 - On-the-fly loading allows dynamic augmentation (flips, crops, etc.)
-- Orientation-aware tag swapping during training
 - No preprocessing step required
 - Sidecar cache provides similar performance to HDF5
 - More flexible for iterative dataset refinement
@@ -128,13 +127,6 @@ from shared_vocabulary import (
     is_shared_memory_available,
     populate_vocab_from_shared
 )
-
-# Orientation-aware flipping (optional; keeps file usable in legacy setups)
-try:
-    from orientation_handler import OrientationHandler, SwapResult  # noqa: F401
-except (ImportError, ModuleNotFoundError):  # pragma: no cover
-    OrientationHandler = None  # type: ignore
-    SwapResult = None  # type: ignore
 
 # SwinV2 image size validation (optional; allows early validation at dataset creation)
 try:
@@ -1596,7 +1588,6 @@ class DatasetLoader(Dataset):
             "cached": False,
             "flip_applied": False,
             "flip_mode": "none",
-            "has_tag_mismatch": False,
             "error": True,
             "error_reason": reason,
         }
@@ -1840,9 +1831,8 @@ class SidecarJsonDataset(Dataset):
         pad_color: Tuple[int, int, int] = (114, 114, 114),
         normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
-        # --- Orientation / flipping ---
+        # --- Horizontal flipping ---
         random_flip_prob: float = 0.0,
-        orientation_handler: Optional["OrientationHandler"] = None,
         flip_overrides_path: Optional[str] = None,   # JSON with {"force_flip":[ids], "never_flip":[ids]} (also accepts {"flip":[...]} or a bare list)
         respect_flip_list: bool = True,
         stats_queue: Optional[mp.Queue] = None,
@@ -1924,9 +1914,8 @@ class SidecarJsonDataset(Dataset):
         # Tag vector dtype
         self._tag_vector_dtype = _canon_dtype(str(tag_vector_dtype).lower())
 
-        # --- Orientation / flipping state ---
+        # --- Horizontal flipping state ---
         self.random_flip_prob = float(random_flip_prob or 0.0)
-        self.orientation_handler = orientation_handler
         self.respect_flip_list = bool(respect_flip_list)
         self._force_flip_ids: Set[str] = set()
         self._never_flip_ids: Set[str] = set()
@@ -1945,9 +1934,8 @@ class SidecarJsonDataset(Dataset):
             except Exception as e:
                 self.logger.warning(f"Failed to load flip_overrides from {flip_overrides_path}: {e}")
 
-        # Telemetry (optional): push orientation stats periodically
+        # Telemetry queue retained for compatibility (no orientation stats are pushed)
         self._stats_queue = stats_queue
-        self._samples_seen = 0
 
         # --- Shared vocabulary flag (for worker_init_fn) ---
         self._shared_vocab_loaded = False
@@ -1959,16 +1947,6 @@ class SidecarJsonDataset(Dataset):
         self._current_epoch = mp.Value('i', 0, lock=False)
         self._epoch_was_set = False  # Track if set_epoch() was ever called
         self._epoch_warning_issued = False  # Avoid spamming warnings
-
-        # --- Mismatch tracking for orientation tag-image consistency ---
-        # Tracks when flip is applied but some orientation tags couldn't be swapped
-        self._mismatch_stats: dict = {
-            'force_flip_mismatches': 0,
-            'random_flip_mismatches': 0,
-            'mismatch_samples': [],  # Store (image_id, unmapped_tags) for debugging
-        }
-        self._mismatch_warning_threshold = 100  # Warn after this many mismatches
-        self._mismatch_warned = False
 
         # --- Pre-created transforms for performance (avoid recreating per sample) ---
         # Use v2 API to avoid deprecation warning (ToTensor is deprecated)
@@ -2162,7 +2140,6 @@ class SidecarJsonDataset(Dataset):
         """
         state = self.__dict__.copy()
         # Remove unpicklable objects before sending to worker
-        state['orientation_handler'] = None  # May contain unpicklable state
         state['_stats_queue'] = None         # multiprocessing.Queue (cannot be pickled on Windows spawn)
         state['_exclusion_manager'] = None   # Contains threading lock (will be recreated)
         # Snapshot exclusions for lock-free worker startup
@@ -2179,7 +2156,6 @@ class SidecarJsonDataset(Dataset):
         """Restore from pickle in worker process."""
         self.__dict__.update(state)
         # These will be lazily recreated when needed:
-        # - orientation_handler if needed
         # - _stats_queue stays None in workers (telemetry only from main process)
         # - ArrowMetadataAccessor re-opens the memory-mapped file automatically
 
@@ -2283,7 +2259,7 @@ class SidecarJsonDataset(Dataset):
     def _decide_flip_mode(self, image_id: str, tags: List[str]) -> str:
         """
         Decide flipping policy: 'none' | 'random' | 'force'
-        Respects flip list first; then applies safety veto; then p-coin.
+        Respects flip list first; then applies the per-image deterministic coin.
         """
         if self.respect_flip_list:
             if image_id in self._never_flip_ids:
@@ -2292,92 +2268,7 @@ class SidecarJsonDataset(Dataset):
                 return "force"
         if self.random_flip_prob <= 0:
             return "none"
-        if self.orientation_handler is not None:
-            try:
-                if self.orientation_handler.should_skip_flip(tags):
-                    return "none"
-            except Exception:
-                pass
         return "random" if self._deterministic_coin(image_id) else "none"
-
-    def _track_flip_mismatch(
-        self,
-        image_id: str,
-        mode: str,
-        unmapped_tags: List[str]
-    ) -> None:
-        """Track and optionally warn about tag-image flip mismatches.
-
-        Called when a flip is applied but some orientation-sensitive tags
-        couldn't be swapped, creating a potential tag-image mismatch.
-
-        Args:
-            image_id: Image identifier for debugging
-            mode: Flip mode ("force" or "random")
-            unmapped_tags: Tags that needed mapping but had none
-        """
-        if mode == "force":
-            self._mismatch_stats['force_flip_mismatches'] += 1
-        else:
-            self._mismatch_stats['random_flip_mismatches'] += 1
-
-        # Store sample info for debugging (bounded list)
-        if len(self._mismatch_stats['mismatch_samples']) < 50:
-            self._mismatch_stats['mismatch_samples'].append({
-                'image_id': image_id,
-                'mode': mode,
-                'unmapped_tags': unmapped_tags[:5],  # Limit stored tags
-            })
-
-        # Warn once when threshold exceeded
-        total_mismatches = (
-            self._mismatch_stats['force_flip_mismatches'] +
-            self._mismatch_stats['random_flip_mismatches']
-        )
-        if not self._mismatch_warned and total_mismatches >= self._mismatch_warning_threshold:
-            self._mismatch_warned = True
-            sample_tags = [s['unmapped_tags'] for s in self._mismatch_stats['mismatch_samples'][:3]]
-            self.logger.warning(
-                f"Detected {total_mismatches} tag-image flip mismatches. "
-                f"Force mode: {self._mismatch_stats['force_flip_mismatches']}, "
-                f"Random mode: {self._mismatch_stats['random_flip_mismatches']}. "
-                f"Sample unmapped tags: {sample_tags}. "
-                f"Consider adding mappings to orientation_map.json"
-            )
-
-    def get_flip_mismatch_statistics(self) -> Dict[str, Any]:
-        """Return statistics about flip-related tag mismatches.
-
-        Useful for monitoring training quality and identifying tags
-        that need orientation mappings.
-
-        Returns:
-            Dictionary with mismatch statistics including:
-                - force_flip_mismatches: Count of force mode mismatches
-                - random_flip_mismatches: Count of random mode mismatches
-                - mismatch_samples: Sample of affected images/tags
-                - total_mismatches: Total mismatch count
-                - mismatch_rate: Ratio of mismatches to total flips (if available)
-        """
-        total_mismatches = (
-            self._mismatch_stats['force_flip_mismatches'] +
-            self._mismatch_stats['random_flip_mismatches']
-        )
-
-        # Calculate mismatch rate if orientation handler has flip stats
-        total_flips = 0
-        if self.orientation_handler is not None:
-            stats = self.orientation_handler.stats
-            total_flips = stats.get('total_flips', 0)
-
-        mismatch_rate = total_mismatches / max(1, total_flips) if total_flips > 0 else 0.0
-
-        return {
-            **self._mismatch_stats,
-            'total_mismatches': total_mismatches,
-            'total_flips': total_flips,
-            'mismatch_rate': mismatch_rate,
-        }
 
     def _build_sample_dict(
         self,
@@ -2389,7 +2280,6 @@ class SidecarJsonDataset(Dataset):
         cached: bool = False,
         flip_applied: bool = False,
         flip_mode: str = "none",
-        has_tag_mismatch: bool = False,
     ) -> Dict[str, Any]:
         """Build the sample dictionary returned by __getitem__.
 
@@ -2402,7 +2292,6 @@ class SidecarJsonDataset(Dataset):
             cached: Whether data came from cache
             flip_applied: Whether horizontal flip was applied
             flip_mode: Flip mode used ("none", "force", "random")
-            has_tag_mismatch: Whether unmapped orientation tags exist (tag-image mismatch)
 
         Returns:
             Sample dict for training
@@ -2430,7 +2319,6 @@ class SidecarJsonDataset(Dataset):
             "cached": cached,
             "flip_applied": flip_applied,
             "flip_mode": flip_mode,
-            "has_tag_mismatch": has_tag_mismatch,
             "error": False,
             "error_reason": "",
         }
@@ -2506,26 +2394,11 @@ class SidecarJsonDataset(Dataset):
                 )
                 return self._error_sample(idx, reason, image_id=image_id)
 
-            # Decide whether to flip and adjust tags accordingly
+            # Decide whether to flip; vocabulary has no orientation-sensitive tags,
+            # so tags pass through unchanged.
             mode = self._decide_flip_mode(image_id, original_tags)
-            flip_bit = False
-            has_tag_mismatch = False
-            tags_now = original_tags  # Default: use original (no copy needed)
-            if mode != "none" and self.orientation_handler is not None:
-                # Use swap_tags_with_info() to detect potential tag-image mismatches
-                # This creates a NEW list for swapped_tags, so no need to copy original
-                swap_result = self.orientation_handler.swap_tags_with_info(
-                    original_tags,
-                    skip_safety_check=True,  # Safety already checked in _decide_flip_mode
-                    record_stats=True
-                )
-                tags_now = swap_result.swapped_tags  # New list from swap operation
-                flip_bit = swap_result.flip_applied if mode == "random" else True
-                has_tag_mismatch = swap_result.has_mismatch
-
-                # Track mismatches for monitoring and debugging
-                if has_tag_mismatch:
-                    self._track_flip_mismatch(image_id, mode, swap_result.unmapped_orientation_tags)
+            flip_bit = mode != "none"
+            tags_now = original_tags
 
             # Resolve image path first (needed for both cache lookup and loading)
             img_root = ann.get("dir", self.root)
@@ -2654,7 +2527,6 @@ class SidecarJsonDataset(Dataset):
                 cached=False,
                 flip_applied=flip_bit,
                 flip_mode=mode,
-                has_tag_mismatch=has_tag_mismatch,
             )
 
         except Exception as e:
@@ -2700,23 +2572,6 @@ class SidecarJsonDataset(Dataset):
                 )
                 return self._error_sample(idx, str(e), image_id=image_id)
             return self._error_sample(idx, f"Temporary failure: {e}", image_id=image_id)
-        finally:
-            # Opportunistic telemetry: push orientation stats every 128 samples
-            try:
-                if self._stats_queue is not None and self.orientation_handler is not None:
-                    self._samples_seen += 1
-                    if (self._samples_seen & 127) == 0:
-                        stats = self.orientation_handler.get_statistics()
-                        payload = {
-                            "flip_total": int(stats.get("total_flips", 0)),
-                            "flip_safe": int(stats.get("safe_flips", 0)),
-                            "flip_skipped_text": int(stats.get("blocked_by_text", 0)),
-                            "flip_skipped_unmapped": int(stats.get("skipped_flips", 0)),
-                            "flip_blocked_safety": int(stats.get("blocked_by_safety", 0)),
-                        }
-                        self._stats_queue.put_nowait(payload)
-            except Exception:
-                pass
 
     def _error_sample(self, idx: int, reason: str, image_id: Optional[str] = None) -> Dict[str, Any]:
         # Always use self.image_size for consistency with actual samples
@@ -2736,7 +2591,6 @@ class SidecarJsonDataset(Dataset):
             "cached": False,
             "flip_applied": False,
             "flip_mode": "none",
-            "has_tag_mismatch": False,
             "error": True,
             "error_reason": reason,
         }
@@ -2797,13 +2651,9 @@ def create_dataloaders(
         'normalize_mean': tuple(getattr(data_config, "normalize_mean", [0.5, 0.5, 0.5])),
         'normalize_std': tuple(getattr(data_config, "normalize_std", [0.5, 0.5, 0.5])),
         'pad_color': tuple(getattr(data_config, "pad_color", [114, 114, 114])),
-        # Orientation/flip configuration
+        # Horizontal flip configuration
         'random_flip_prob': float(getattr(data_config, "random_flip_prob", 0.0)),
-        'orientation_map_path': getattr(data_config, "orientation_map_path", None),
         'flip_overrides_path': getattr(data_config, "flip_overrides_path", None),
-        'strict_orientation_validation': bool(getattr(data_config, "strict_orientation_validation", False)),
-        'orientation_safety_mode': str(getattr(data_config, "orientation_safety_mode", "conservative")),
-        'skip_unmapped': bool(getattr(data_config, "skip_unmapped", False)),
         'stats_queue': getattr(data_config, "stats_queue", None),
         # DataLoader configuration
         'drop_last': bool(getattr(data_config, "drop_last", False)),
@@ -2930,31 +2780,16 @@ def create_dataloaders(
     manifest_val = root / "val.json"
     images_dir = root / "images"
 
-    # Orientation handler / flip list wiring
+    # Flip configuration
     random_flip_prob = config_cache['random_flip_prob']
-    orientation_map_path = config_cache['orientation_map_path']
-    if isinstance(orientation_map_path, str) and orientation_map_path:
-        orientation_map_path = Path(orientation_map_path)
     flip_overrides_path = config_cache['flip_overrides_path']
-    _handler = None
-    try:
-        if random_flip_prob > 0 and OrientationHandler is not None:
-            _handler = OrientationHandler(
-                mapping_file=orientation_map_path if orientation_map_path else None,
-                random_flip_prob=random_flip_prob,
-                strict_mode=config_cache['strict_orientation_validation'],
-                safety_mode=config_cache['orientation_safety_mode'],
-                skip_unmapped=config_cache['skip_unmapped'],
-            )
-    except Exception as e:
-        logger.warning(f"OrientationHandler init failed; flips disabled: {e}")
 
     if manifest_train.exists() and manifest_val.exists() and images_dir.exists():
-        # Manifest mode (back-compat)
-        # Manifest datasets are not orientation-aware. If flips are enabled, warn and disable them.
+        # Manifest mode (back-compat); legacy DatasetLoader does not support flips.
         if float(getattr(data_config, "random_flip_prob", 0.0) or 0.0) > 0.0:
             logger.warning(
-                "random_flip_prob > 0 with manifest dataset; disabling orientation-aware flips (manifest is non-orientation-aware)."
+                "random_flip_prob > 0 with manifest dataset; legacy DatasetLoader does not "
+                "support flips, disabling."
             )
             try:
                 setattr(data_config, "random_flip_prob", 0.0)
@@ -3077,7 +2912,6 @@ def create_dataloaders(
             normalize_mean=mean,
             normalize_std=std,
             random_flip_prob=random_flip_prob,
-            orientation_handler=_handler,
             flip_overrides_path=flip_overrides_path,
             stats_queue=config_cache['stats_queue'],
             metadata_cache_enabled=config_cache['metadata_cache_enabled'],
@@ -3123,7 +2957,6 @@ def create_dataloaders(
             normalize_mean=mean,
             normalize_std=std,
             random_flip_prob=0.0,          # keep val deterministic
-            orientation_handler=_handler,  # still needed to encode swapped tags if you ever TTA
             flip_overrides_path=None,
             stats_queue=config_cache['stats_queue'],
             # Now sharing prebuilt cache properly - no file count mismatch
