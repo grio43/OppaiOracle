@@ -1155,7 +1155,7 @@ class DataConfig(BaseConfig):
     # Augmentation
     # Only random_flip_prob is implemented. With large datasets (5-6M images),
     # additional augmentation is generally unnecessary.
-    random_flip_prob: float = 0.0  # Horizontal flipping with orientation tag swapping (disabled by default)
+    random_flip_prob: float = 0.0  # Horizontal flip probability (disabled by default)
 
     # Color jitter augmentation
     color_jitter_enabled: bool = field(default=False, metadata={"help": "Enable color jitter augmentation"})
@@ -1186,12 +1186,6 @@ class DataConfig(BaseConfig):
     gaussian_blur_kernel_size: int = field(default=3, metadata={"help": "Gaussian blur kernel size (must be odd)"})
     gaussian_blur_sigma_min: float = field(default=0.1, metadata={"help": "Minimum sigma for Gaussian blur"})
     gaussian_blur_sigma_max: float = field(default=1.5, metadata={"help": "Maximum sigma for Gaussian blur"})
-
-    # Orientation mapping (consolidated from augmentation.yaml)
-    orientation_map_path: Optional[str] = None
-    strict_orientation_validation: bool = True
-    skip_unmapped: bool = True
-    orientation_safety_mode: str = "conservative"
 
     # Dtype Configuration for various components
     tag_vector_dtype: str = field(default='bfloat16', metadata={"help": "Dtype for tag/label vectors ('float16', 'bfloat16', 'float32')"})
@@ -1304,29 +1298,6 @@ class DataConfig(BaseConfig):
         if self.random_rotation_max_degrees > 45:
             errors.append(f"random_rotation_max_degrees must be <= 45, got {self.random_rotation_max_degrees}")
 
-        if self.orientation_safety_mode not in {"conservative", "balanced", "permissive"}:
-            errors.append(
-                f"orientation_safety_mode must be one of 'conservative', 'balanced', 'permissive', got {self.orientation_safety_mode}"
-            )
-
-        # Orientation mapping checks (strict mode only, and only if flips enabled)
-        # Only validate config values, not actual orientation mappings
-        try:
-            rfp = getattr(self, "random_flip_prob", 0.0) or 0.0
-            rfp = float(rfp)
-        except (TypeError, ValueError):
-            rfp = 0.0
-
-        if bool(getattr(self, "strict_orientation_validation", False)) and rfp > 0:
-            if self.orientation_map_path and not Path(self.orientation_map_path).exists():
-                errors.append(f"orientation_map_path does not exist: {self.orientation_map_path}")
-
-            valid_modes = {"conservative", "balanced", "permissive"}
-            if self.orientation_safety_mode not in valid_modes:
-                errors.append(
-                    f"orientation_safety_mode must be one of {valid_modes}, got {self.orientation_safety_mode}"
-                )
-
         # Validate additional dtype configurations
         valid_float_dtypes = ["float16", "bfloat16", "float32"]
         if self.tag_vector_dtype not in valid_float_dtypes:
@@ -1338,44 +1309,6 @@ class DataConfig(BaseConfig):
 
         if errors:
             raise ConfigValidationError("Data config validation failed:\n" + "\n".join(errors))
-
-    def validate_orientation_mappings(self) -> List[str]:
-        """Perform deep validation of orientation mappings.
-
-        This requires importing and initializing the OrientationHandler.
-        Call this separately from validate() if you need to verify the actual
-        mapping file contents.
-
-        Returns:
-            List of validation error messages, empty if valid
-        """
-        errors = []
-        try:
-            rfp = float(getattr(self, "random_flip_prob", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return ["random_flip_prob must be a valid float"]
-
-        if not (bool(getattr(self, "strict_orientation_validation", False)) and rfp > 0):
-            return []  # Validation not needed
-
-        try:
-            from orientation_handler import OrientationHandler
-            handler = OrientationHandler(
-                mapping_file=Path(self.orientation_map_path) if self.orientation_map_path else None,
-                random_flip_prob=rfp,
-                strict_mode=True,
-                safety_mode=self.orientation_safety_mode,
-                skip_unmapped=bool(getattr(self, "skip_unmapped", False)),
-            )
-            mapping_issues = handler.validate_mappings()
-            if mapping_issues:
-                errors.append(f"orientation_mapping issues: {mapping_issues}")
-        except ImportError as e:
-            errors.append(f"Cannot import orientation_handler: {e}")
-        except (TypeError, ValueError, AttributeError, RuntimeError) as e:
-            errors.append(f"orientation_handler initialization error: {e}")
-
-        return errors
 
 
 @dataclass
@@ -2201,7 +2134,6 @@ class ConfigManager:
             "runtime.yaml",
             "logging.yaml",
             "vocabulary.yaml",
-            "orientation_map.json"
         }
 
         if path.name in legacy_configs:

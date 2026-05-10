@@ -51,16 +51,16 @@ model:
     num_hidden_layers: 18  # Phase 1: SoViT-150m validated 18L at 880-width (Alabdulmohsin et al., NeurIPS 2023)
     num_attention_heads: 16
     intermediate_size: 4096
-    image_size: 320  # Auto-synced from data.image_size at startup — change data.image_size instead
+    image_size: 448  # Auto-synced from data.image_size at startup — change data.image_size instead
     patch_size: 16  # ViT uses patch_size=16 (SwinV2 uses 4)
     num_channels: 3
-    hidden_dropout_prob: 0.1
+    hidden_dropout_prob: 0.10  # Phase 2 (revised): held at Phase 1 value. Phase 1 stopped at 33/40 (under-converged) — FixRes/DeiT III aug-reduction recipe assumes a fully-converged base; EfficientNetV2 (Tan & Le ICML 2021) regime applies instead (regularization scales UP with resolution in from-scratch progressive training).
     pos_dropout: 0.0  # Position embedding dropout (0.0 = modern best practice; drop_path handles regularization)
-    attention_dropout: 0.05  # Dropout on attention weights (complementary to drop_path for attention pattern regularization)
+    attention_dropout: 0.05  # Phase 2 (revised): held at Phase 1 value. Same rationale as hidden_dropout_prob — under-converged Phase 1 + EfficientNetV2 regime.
     # Drop path rate for ViT architectures (stochastic depth regularization)
     # NOTE: This value is ONLY used when architecture_type == "vit" or "vit_wide_shallow"
     # For SwinV2 architecture, see swin_config.drop_path_rate above (currently 0.2)
-    drop_path_rate: 0.2   # recommended range 0.08–0.3 (must be < 1.0)
+    drop_path_rate: 0.20   # Phase 2 (revised): held at Phase 1 value. DeiT III ViT-L pretraining uses 0.4; AugReg (Steiner TMLR 2022) uses up to 0.5 for ViT-L from-scratch — 0.10 (planned) was below any literature recipe given Phase 1 stopped at 33/40 (under-converged base).
     initializer_range: 0.02
     layer_norm_eps: 1.0e-6
     use_flex_attention: true
@@ -98,8 +98,8 @@ data:
   # Image processing
   # >>> SINGLE SOURCE OF TRUTH for resolution. model.image_size and
   # >>> validation.preprocessing.image_size are auto-synced from this value.
-  # Phase 1: 320 (from-scratch, 40 epochs). Phase 2: 448 (fine-tune, 15 epochs).
-  image_size: 320
+  # Phase 2 ACTIVE: 448 (fine-tune, 15 epochs). Phase 1 used 320 (from-scratch, 40 epochs).
+  image_size: 448
   # IMPORTANT: Normalization values depend on training approach!
   #   - Training from scratch (current): [0.5, 0.5, 0.5] is fine (anime-optimized)
   #   - Pretrained SwinV2/ViT from ImageNet: Use ImageNet normalization:
@@ -123,7 +123,7 @@ data:
   #     Use gradient_accumulation_steps to maintain effective batch size.
   #   - 24GB GPU: SwinV2 can use batch_size=12 with 512px images
   #   - See training_config.py:check_swinv2_batch_size() for memory guidance58
-  batch_size: 102  # Phase 1 (320px, 18 layers): 102 with 9 grad-accum -> effective 918. Phase 2 (448px): drop to 58.
+  batch_size: 48  # Phase 2 (448px, 18 layers): 48 with 9 grad-accum -> effective 432. Phase 1 used 96.
   num_workers: 6  # Arrow mmap shares metadata (~500MB/worker overhead), 32-core system
   pin_memory: true   # Enables async DMA transfer for PCIe 4.0/5.0
   prefetch_factor: 3  # 8 workers × 3 batches × 128 = 3072 samples prefetched 
@@ -161,16 +161,7 @@ data:
   cache_count_tolerance_min: 100  # Minimum absolute tolerance
 
   # Augmentation
-  # Only random_flip_prob is implemented. With large datasets, additional augmentation is unnecessary.
-  random_flip_prob: 0.5  # Horizontal flipping with orientation tag swapping
-
-  # Orientation mapping (from augmentation.yaml)
-  orientation_map_path: "./configs/orientation_map.json"
-  strict_orientation_validation: true
-  skip_unmapped: true
-  # Orientation flip safety policy.
-  # Legacy mapping: strict → conservative, balanced → balanced, lenient → permissive
-  orientation_safety_mode: "conservative"
+  random_flip_prob: 0.5  # Horizontal flip probability per sample
 
   # Color jitter augmentation (applied before normalization)
   # Phase 1 values raised toward DeiT III's validated from-scratch ViT recipe,
@@ -181,13 +172,18 @@ data:
   #   saturation 0.08 — derived from BYOL's asymmetry (NeurIPS 2020): saturation ≈ ¼ of brightness/contrast
   #                     when color identity must be preserved. Kirichenko et al. (NeurIPS 2023, arXiv:2401.01764)
   #                     confirms color jitter preferentially harms color-distinguished class pairs.
-  # Phase 2 halves these: brightness 0.15, contrast 0.10, saturation 0.04.
+  # Phase 2 ACTIVE (revised): brightness 0.22, contrast 0.15, saturation 0.06 (~¼ reduction
+  # from Phase 1, not the originally-planned ½ halving). Phase 1 stopped at 33/40 epochs
+  # (~82.5%, under-converged); FixRes/DeiT III ½-reduction assumes fully-converged base.
+  # EfficientNetV2 (Tan & Le ICML 2021) regime applies instead — regularization scales UP
+  # with resolution in from-scratch progressive training (V2-L: RandAugment 5→25, Dropout
+  # 0.1→0.5 across resolution stages). Conservative ¼ reduction balances the two regimes.
   color_jitter_enabled: true
-  color_jitter_brightness: 0.30
+  color_jitter_brightness: 0.22
   color_jitter_brightness_p: 0.5
-  color_jitter_contrast: 0.20
+  color_jitter_contrast: 0.15
   color_jitter_contrast_p: 0.5
-  color_jitter_saturation: 0.08
+  color_jitter_saturation: 0.06
   color_jitter_saturation_p: 0.5
 
   # Random erasing augmentation (applied after normalization)
@@ -215,10 +211,15 @@ data:
   # Effective range is ±[min, max] (sampled in [min,max] then sign flipped 50%): so [-8°,-2°] ∪ [+2°,+8°].
   # min=2.0 ensures every fired event is perceptibly rotated — sub-2° rotations are
   # nearly invisible and waste an augmentation event behind the p=0.50 gate.
+  # Phase 2 ACTIVE (revised): KEPT, narrower range and lower frequency (±[2°,5°] @ p=0.30).
+  # Originally planned to disable (FixRes-style spatial-precision argument), but Phase 1
+  # stopped at 33/40 — under-converged base + reduced aug raises overfitting risk
+  # (Steiner TMLR 2022 §4.4: AugReg helps when training is incomplete). Narrower max angle
+  # (5° vs 8°) preserves spatial precision at 448px while retaining rotational invariance signal.
   random_rotation_enabled: true
-  random_rotation_p: 0.50
+  random_rotation_p: 0.30
   random_rotation_min_degrees: 2.0
-  random_rotation_max_degrees: 8.0
+  random_rotation_max_degrees: 5.0
 
   # Gaussian blur augmentation (applied to PIL before letterboxing)
   # Scholarly basis: DeiT III 3-Augment (Touvron et al., ECCV 2022) showed Gaussian blur
@@ -230,29 +231,35 @@ data:
   # raising intensity widens fine-grained class-pair confusion; raising frequency of a
   # weak transform does not. BYOL's asymmetric blur (p=1.0/0.1 across views) further
   # supports keeping unblurred samples in the mix.
+  # Phase 2 ACTIVE (revised): KEPT at reduced strength (p=0.15, σ∈[0.1,1.0]).
+  # Originally planned to disable, but Phase 1 stopped at 33/40 (under-converged) — the
+  # DeiT III "drop blur at higher res" recipe assumes a fully-converged base. With reduced
+  # color jitter and rotation, removing blur entirely strips too much input-space variability.
+  # Halved frequency (0.30 → 0.15) and tighter sigma cap (1.5 → 1.0) preserve fine-grained
+  # features while keeping a residual blur signal for regularization.
   gaussian_blur_enabled: true
-  gaussian_blur_p: 0.30
+  gaussian_blur_p: 0.15
   gaussian_blur_kernel_size: 3
   gaussian_blur_sigma_min: 0.1
-  gaussian_blur_sigma_max: 1.5
+  gaussian_blur_sigma_max: 1.0
 
 # Training Configuration (from training_config.yaml)
 training:
     memory_format: "channels_last"
-    num_epochs: 40
+    num_epochs: 15
     # IMPORTANT: learning_rate is the BASE rate (tuned for lr_base_batch_size=256).
     # It is automatically scaled at runtime based on effective batch size and lr_scaling_mode.
     #
-    # Current setup (Phase 1, 320px from-scratch):
+    # Current setup (Phase 2, 448px fine-tune):
     #   - Architecture: ViT-L/16, 18 layers
-    #   - Effective batch size: batch_size (102) * gradient_accumulation_steps (9) = 918 samples/step
-    #   - Dataset: 5.4M images, 40 epochs
-    #   - Scaling: sqrt(918/256) = 1.894x → effective LR ≈ 2.5e-4 * 1.894 = 4.73e-4 peak
+    #   - Effective batch size: batch_size (48) * gradient_accumulation_steps (9) = 432 samples/step
+    #   - Dataset: 5.4M images, 15 epochs
+    #   - Scaling: sqrt(432/256) ≈ 1.299x → effective LR ≈ 1.0e-5 * 1.299 ≈ 1.30e-5 peak
     #
     # ViT-L specific: Dosovitskiy (2021) used 4e-4 for ViT-L vs 8e-4 for ViT-B at batch 4096.
     # muP theory (Wortsman 2024) confirms LR decreases with model width.
-    # Phase 2 (448px fine-tune) drops to ~1.0e-5.
-    learning_rate: 2.5e-4  # Phase 1 base rate (sqrt-scales to ~4.73e-4 peak at effective batch 918)
+    # Phase 1 used 2.5e-4 base (from-scratch).
+    learning_rate: 1.0e-5  # Phase 2 base rate (sqrt-scales to ~1.30e-5 peak at effective batch 432)
     lr_scaling_mode: "sqrt"  # "sqrt" (recommended for AdamW), "linear", or "none"
     lr_base_batch_size: 256  # Reference batch size that learning_rate was tuned for
 
@@ -270,8 +277,8 @@ training:
     # Current value 8e-5 is conservative for training from scratch with large dataset.
     swinv2_learning_rate: null
 
-    weight_decay: 0.1
-    gradient_accumulation_steps: 9  # Phase 1 effective batch: 114 * 9 = 1026 samples/step
+    weight_decay: 0.05  # Phase 2 (revised): ¼ reduction from Phase 1 (0.10), not the originally-planned 10× cut. The 0.01 value followed DeiT III's converged-base resolution-FT recipe; Phase 1 stopped at 33/40 (under-converged), so EfficientNetV2 regime applies (regularization scales up with resolution). DeiT III ViT-L pretraining itself uses WD 0.02 — the 0.01 plan was below pretraining-regime norms.
+    gradient_accumulation_steps: 9  # Phase 2 effective batch: 48 * 9 = 432
 
     # Optimizer
     # NOTE: Using "adamw8bit" for memory-efficient 8-bit quantized optimizer states
@@ -287,8 +294,8 @@ training:
     adam_epsilon: 1.0e-7  # 1e-7 is safer for bfloat16 (coarser dynamic range than fp32)
 
     # Scheduler
-    scheduler: "cosine"  # Phase 1: cosine decay. Phase 2 re-warmup handles transition.
-    warmup_epochs: 4  # Phase 1: 10% of 40 epochs (DeiT range 1.7-17%)
+    scheduler: "cosine"  # Phase 2: cosine decay to lr_end after 2-epoch re-warmup (FixRes).
+    warmup_epochs: 2  # Phase 2: 2-epoch re-warmup at resolution switch (FixRes recommendation).
     num_cycles: 1  # Single cosine decay (no restarts)
     lr_end: 1.0e-6
 
@@ -314,7 +321,7 @@ training:
     # or point to an exact checkpoint to branch experiments safely.
     resume_from: "latest"
 
-    eval_steps: 10526  # Phase 1: 2 epochs (5263 steps/epoch × 2). Validation is blocking on the train rank; halving cadence saves wall-clock without quality risk on a smooth val curve. First epoch always validates regardless.
+    eval_steps: 11538  # Phase 2: ~0.92 epoch at effective batch 432 (full epoch ≈ 12499 steps). Tighter cadence justified by shorter 15-epoch fine-tune and re-enabled early stopping.
     logging_steps: 10000  # Reduced TensorBoard overhead (was 3000)
     # Resume-aware reseeding: avoid replaying the same early-epoch order after resume
     resume_reseed: true
@@ -322,7 +329,7 @@ training:
     # Loss configuration
     tag_loss:
       alpha: 1.0            # 1.0 = disabled (pure ASL, no alpha weighting: pos_loss + neg_loss)
-      gamma_neg: 4.0        # Phase 1: curriculum value. From-scratch broader gradient signal. Phase 2: raise to 7.0 (matches Open Images sparsity regime per ASL paper).
+      gamma_neg: 7.0        # Phase 2: hard-negative focus, matches Open Images sparsity regime per ASL paper (9,605 classes, ~0.5% positive rate). Phase 1 used 4.0.
       gamma_pos: 0.0        # ASL paper optimal: no focal suppression on positives (preserves scarce positive gradient)
       label_smoothing: 0.0   # Disabled — label smoothing + focal loss corrupts focal weights on sparse multi-label targets
       clip: 0.2             # Focal-based ASL needs higher margin than CE-based (ASL paper: m=0.2 default for focal variant on MS-COCO)
@@ -351,11 +358,11 @@ training:
     benchmark: true
 
     # Early stopping
-    # Phase 1: effectively disabled (will transition to Phase 2 regardless). Phase 2: tighten to patience=4, burn_in=2.
-    early_stopping_patience: 8
+    # Phase 2: re-enabled with patience=4, burn_in=2 (mature fine-tune phase). Phase 1 used patience=8, burn_in=8.
+    early_stopping_patience: 4
     early_stopping_threshold: 0.0000005
     # Ignore first N epochs for early-stopping to avoid initial instability
-    early_stopping_burn_in_epochs: 8
+    early_stopping_burn_in_epochs: 2
     # One of: median, mean, last, max
     early_stopping_burn_in_strategy: median
 
@@ -413,15 +420,15 @@ export:
 validation:
   max_samples: 30000  # Subsample validation set (30K of 280K) for faster epochs
   dataloader:
-    batch_size: 58  # Balanced for validation throughput
+    batch_size: 48  # Matches training batch_size — val has lower per-step VRAM (no_grad, no optimizer state, no grad-ckpt recompute)
     num_workers: 6  # Increased for smoother validation throughput
     pin_memory: true  # Enables async DMA transfer for faster CPU-GPU transfer
-    prefetch_factor: 3  # 6 workers × 3 batches × 128 = 2304 samples prefetched
+    prefetch_factor: 3  # 6 workers × 3 batches × 102 = 1836 samples prefetched
     persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   preprocessing:
     # Uses data.normalize_mean/std by default; keep in sync with
     # training/inference unless intentionally different.
-    image_size: 320  # Auto-synced from data.image_size at startup
+    image_size: 448  # Auto-synced from data.image_size at startup
     patch_size: 16   # Auto-synced from model.patch_size at startup
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -487,7 +494,7 @@ debug:
 
   # If true, log the gradient norm of the model's parameters to TensorBoard.
   # This is useful for monitoring training stability.
-  log_gradient_norm: false
+  log_gradient_norm: true
 
   # If true, perform a pre-training validation step to check the integrity
   # of the input data. This can help catch issues early.
@@ -501,7 +508,7 @@ debug:
   log_input_stats: false
 
   # If true, log statistics (min/mean/max) of model activations such as logits.
-  log_activation_stats: false
+  log_activation_stats: true
 
   # Directory to save the visualized augmentation images.
   augmentation_visualization_path: "./aug_visualizations"

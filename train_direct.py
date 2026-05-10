@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced training script with comprehensive orientation handling for anime image tagger.
-Demonstrates integration of the orientation handler with fail-fast behavior and statistics tracking.
+Training script for the anime image tagger.
 """
 
 import gc
@@ -11,8 +10,8 @@ import re
 
 # Set CUDA allocator config to reduce memory fragmentation
 # Must be set BEFORE any torch/CUDA imports
-if 'PYTORCH_ALLOC_CONF' not in os.environ:
-    os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
+if 'PYTORCH_CUDA_ALLOC_CONF' not in os.environ:
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import hashlib
 import json
@@ -69,9 +68,6 @@ from utils.logging_setup import setup_logging
 
 # Paths will be loaded from the unified config in the main function.
 logger = logging.getLogger(__name__)
-
-# Import the orientation handler
-from orientation_handler import OrientationHandler, OrientationMonitor
 
 # Periodic NaN/Inf check interval (steps). Configurable via NAN_CHECK_INTERVAL_STEPS env var.
 # Default: 50 steps - balances early detection with minimal GPU sync overhead.
@@ -273,89 +269,8 @@ def _compute_class_weights(
     return weights
 
 
-def setup_orientation_aware_training(
-    data_dir: Path,
-    json_dir: Path,
-    vocab_path: Path,
-    orientation_map_path: Optional[Path] = None,
-    random_flip_prob: float = 0.35,
-    strict_orientation: bool = True,
-    safety_mode: str = "conservative",
-    skip_unmapped: bool = False
-) -> Dict[str, Any]:
-    """
-    Setup training with enhanced orientation handling.
-    
-    Args:
-        data_dir: Directory containing images
-        json_dir: Directory containing annotation JSONs
-        vocab_path: Path to vocabulary file
-        orientation_map_path: Path to orientation mapping JSON
-        random_flip_prob: Probability of horizontal flips
-        strict_orientation: If True, fail if flips enabled without proper mapping
-        skip_unmapped: If True, skip flipping images with unmapped orientation tags
-    
-    Returns:
-        Configuration dictionary with validated orientation settings
-    """
-    
-    # Validate orientation setup
-    if random_flip_prob > 0:
-        if orientation_map_path is None:
-            # Try to find default orientation map
-            default_paths = [
-                Path("configs/orientation_map.json"),
-                Path("orientation_map.json"),
-                Path("config/orientation_map.json")
-            ]
-            
-            for path in default_paths:
-                if path.exists():
-                    orientation_map_path = path
-                    logging.info(f"Found orientation map at: {path}")
-                    break
-            
-            if orientation_map_path is None:
-                if strict_orientation:
-                    raise FileNotFoundError(
-                        f"Horizontal flips enabled (prob={random_flip_prob}) but no orientation_map.json found. "
-                        f"Searched in: {[str(p) for p in default_paths]}. "
-                        f"Please provide orientation mapping or set random_flip_prob=0"
-                    )
-                else:
-                    logging.warning(
-                        f"Horizontal flips enabled (prob={random_flip_prob}) but no orientation map found. "
-                        f"Using minimal defaults. This may cause incorrect orientation labels!"
-                    )
-        
-        # Validate orientation map if provided
-        if orientation_map_path and orientation_map_path.exists():
-            handler = OrientationHandler(
-                mapping_file=orientation_map_path,
-                random_flip_prob=random_flip_prob,
-                strict_mode=strict_orientation,
-                safety_mode=safety_mode,
-                skip_unmapped=skip_unmapped
-            )
-            
-            # Validate mappings
-            issues = handler.validate_mappings()
-            if issues:
-                logging.warning(f"Orientation mapping validation issues: {issues}")
-                if strict_orientation and any(issues.values()):
-                    raise ValueError(f"Critical orientation mapping issues found: {issues}")
-    
-    # Return only validated orientation settings; loader reads from config.data directly.
-    return {
-        "orientation": {
-            "safety_mode": safety_mode,
-            "skip_unmapped": skip_unmapped,
-        }
-    }
-
-
 def train_with_orientation_tracking(config: FullConfig):
-    """Training loop with orientation handling and statistics tracking."""
+    """Main training loop."""
 
     import tempfile
     from utils.memory_monitor import MemoryMonitor
@@ -612,28 +527,12 @@ def train_with_orientation_tracking(config: FullConfig):
         logger.info("Using existing vocabulary at %s", check_path)
     # -------------------------------------------------------------------------------
 
-    # Setup orientation handling
-    orientation_config = setup_orientation_aware_training(
-        data_dir=active_data_path,
-        json_dir=active_data_path,
-        vocab_path=Path(config.vocab_path),
-        orientation_map_path=Path(config.data.orientation_map_path) if config.data.orientation_map_path else None,
-        random_flip_prob=config.data.random_flip_prob,
-        strict_orientation=config.data.strict_orientation_validation,
-        safety_mode=config.data.orientation_safety_mode,
-        skip_unmapped=config.data.skip_unmapped
-    )
-
     stats_queue = mp.Queue(maxsize=1000) if config.training.use_tensorboard else None
     device = torch.device(config.training.device)
     device_type = device.type
 
     # Expose stats queue to dataloaders for optional telemetry
     config.data.stats_queue = stats_queue
-
-    # Note: Orientation mapping validation is now done in setup_orientation_aware_training()
-    # which is called earlier. That function handles strict mode and raises if needed.
-    # No duplicate validation here to avoid inconsistent error handling.
 
     train_loader, val_loader, vocab = create_dataloaders(
         data_config=config.data,
@@ -698,17 +597,6 @@ def train_with_orientation_tracking(config: FullConfig):
         train_loader.dataset.set_epoch(0)
     if val_loader is not None and hasattr(val_loader.dataset, 'set_epoch'):
         val_loader.dataset.set_epoch(0)
-
-    # --- Orientation diagnostics (enabled by default) -----------------------
-    # Create an OrientationMonitor to write/update unmapped_orientation_tags.txt
-    # in the configured log directory and to surface suggestions.
-    orientation_monitor = None
-    oh = None
-    try:
-        oh = getattr(getattr(train_loader, "dataset", None), "orientation_handler", None)
-        orientation_monitor = OrientationMonitor(out_dir=Path(config.log_dir))
-    except Exception as e:
-        logger.debug(f"OrientationMonitor init skipped: {e}")
 
     # Pre-training validation
     if getattr(config.debug, 'validate_input_data', False):
@@ -2020,14 +1908,6 @@ def train_with_orientation_tracking(config: FullConfig):
                     except Exception as e:
                         logger.debug(f"Memory monitoring failed: {e}")
 
-                # Orientation health check (throttled to every 1000 steps)
-                if global_step % 1000 == 0:
-                    try:
-                        if orientation_monitor is not None and oh is not None:
-                            orientation_monitor.check_health(oh)
-                    except Exception:
-                        pass
-
                 # Step-based training image logging for TensorBoard
                 # Also supports manual trigger via 'i' hotkey (creates LOG_IMAGES_NOW sentinel)
                 # Sentinel check throttled to every 10 steps to reduce syscall overhead
@@ -2556,14 +2436,6 @@ def train_with_orientation_tracking(config: FullConfig):
         monitor.log_hyperparameters(hparams, final_metrics if final_metrics else {"final/placeholder": 1})
     except Exception:
         pass
-
-    # Final orientation safety report with recommendations
-    try:
-        if oh is not None:
-            report_path = Path(config.log_dir) / "orientation_safety_report.json"
-            oh.generate_safety_report(report_path)
-    except Exception as e:
-        logger.debug(f"Failed to write orientation_safety_report.json: {e}")
 
     # Guaranteed resource cleanup on all exit paths
     logger.debug("Cleaning up training resources...")
