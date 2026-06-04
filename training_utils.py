@@ -5,10 +5,7 @@ Comprehensive training helpers including schedulers, checkpointing, and distribu
 """
 
 import os
-import sys
 import json
-import gzip
-import base64
 import logging
 import math
 import shutil
@@ -20,7 +17,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 from dataclasses import dataclass, field, asdict
 from contextlib import nullcontext
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict, deque
 import warnings
 import random
@@ -285,7 +282,6 @@ def _pack_np_state(np_state: tuple) -> tuple:
     when loading with safe checkpoints.
     """
     try:
-        import numpy as _np  # local import
         if isinstance(np_state, tuple) and len(np_state) >= 5:
             bitgen = np_state[0]
             state_arr = np_state[1]
@@ -364,7 +360,6 @@ def detect_architecture_from_state_dict(state_dict_keys: list[str]) -> Optional[
         state_dict_keys: List of keys from the model state dict.
 
     Returns:
-        'swinv2' if SwinV2 architecture detected,
         'vit' if ViT architecture detected,
         None if architecture cannot be determined.
     """
@@ -378,14 +373,6 @@ def detect_architecture_from_state_dict(state_dict_keys: list[str]) -> Optional[
             k = k[10:]  # len('_orig_mod.') = 10
         normalized_keys.append(k)
 
-    # SwinV2 architecture indicators (from timm SwinTransformerV2)
-    # SwinV2 models have 'backbone.layers...' structure
-    swinv2_indicators = [
-        'backbone.layers.',
-        'backbone.patch_embed.',
-        'backbone.norm.',
-    ]
-
     # ViT architecture indicators (SimplifiedTagger)
     # ViT models have 'patch_embed', 'blocks', 'cls_token', 'pos_embed' at top level
     vit_indicators = [
@@ -395,30 +382,12 @@ def detect_architecture_from_state_dict(state_dict_keys: list[str]) -> Optional[
         'pos_embed',
     ]
 
-    has_swinv2_keys = any(
-        any(key.startswith(indicator) for indicator in swinv2_indicators)
-        for key in normalized_keys
-    )
-
     has_vit_keys = any(
         any(key.startswith(indicator) for indicator in vit_indicators)
         for key in normalized_keys
     )
 
-    # Determine architecture based on key patterns
-    if has_swinv2_keys and not has_vit_keys:
-        return 'swinv2'
-    elif has_vit_keys and not has_swinv2_keys:
-        return 'vit'
-    elif has_swinv2_keys and has_vit_keys:
-        # Both patterns present - this is unexpected, prefer explicit indicators
-        # backbone.layers is very specific to SwinV2
-        if any('backbone.layers.' in k for k in normalized_keys):
-            return 'swinv2'
-        return 'vit'
-
-    # Cannot determine architecture
-    return None
+    return 'vit' if has_vit_keys else None
 
 
 def validate_config_compatibility(
@@ -465,7 +434,7 @@ def validate_config_compatibility(
         ('model.num_labels', 'Vocabulary size', 'Model head size mismatch will cause crashes'),
         ('data.image_size', 'Image size', 'Images will be wrong size for model'),
         ('data.patch_size', 'Patch size', 'Patch embedding size mismatch'),
-        ('model.architecture_type', 'Architecture type', 'Cannot resume ViT checkpoint with SwinV2 or vice versa'),
+        ('model.architecture_type', 'Architecture type', 'Architecture mismatch will cause crashes'),
     ]
 
     # Important parameters that SHOULD match (may cause subtle issues)
@@ -508,7 +477,7 @@ def validate_config_compatibility(
     if checkpoint_arch is not None and current_arch is not None:
         if checkpoint_arch != current_arch:
             msg = (f"CRITICAL: Architecture type mismatch - checkpoint: {checkpoint_arch}, "
-                   f"current: {current_arch}. Cannot resume ViT checkpoint with SwinV2 or vice versa")
+                   f"current: {current_arch}. Cannot resume a checkpoint trained with a different architecture")
             errors.append(msg)
     elif checkpoint_arch is None and current_arch is not None and state_dict_keys:
         # Could not detect architecture from state dict - this is suspicious
@@ -519,16 +488,8 @@ def validate_config_compatibility(
         )
 
     def _get_norm_params(cfg, arch):
-        if arch == 'swinv2':
-            mean_val = _get_nested_value(cfg, 'data.swinv2_normalize_mean')
-            std_val = _get_nested_value(cfg, 'data.swinv2_normalize_std')
-            if mean_val is None:
-                mean_val = _get_nested_value(cfg, 'data.normalize_mean')
-            if std_val is None:
-                std_val = _get_nested_value(cfg, 'data.normalize_std')
-        else:
-            mean_val = _get_nested_value(cfg, 'data.normalize_mean')
-            std_val = _get_nested_value(cfg, 'data.normalize_std')
+        mean_val = _get_nested_value(cfg, 'data.normalize_mean')
+        std_val = _get_nested_value(cfg, 'data.normalize_std')
         return mean_val, std_val
 
     if checkpoint_arch is not None and current_arch is not None:
@@ -557,25 +518,15 @@ def validate_config_compatibility(
                     f"current: {curr_std}. Input normalization differs"
                 )
 
-    # Check SwinV2-specific parameters when both configs use SwinV2
-    if checkpoint_arch == 'swinv2' and current_arch == 'swinv2':
-        critical_swin_params = ['embed_dim', 'depths', 'num_heads', 'window_size', 'mlp_ratio', 'drop_path_rate', 'pretrained_name']
-        for param in critical_swin_params:
-            ckpt_val = _get_nested_value(checkpoint_config, f'model.swin_config.{param}')
-            curr_val = _get_nested_value(current_config, f'model.swin_config.{param}')
-
-            if ckpt_val is None or curr_val is None:
-                continue
-
-            # Handle list/tuple comparison
-            if isinstance(ckpt_val, (list, tuple)):
-                ckpt_val = tuple(ckpt_val)
-            if isinstance(curr_val, (list, tuple)):
-                curr_val = tuple(curr_val)
-
-            if ckpt_val != curr_val:
-                msg = f"CRITICAL: SwinV2 {param} mismatch - checkpoint: {ckpt_val}, current: {curr_val}. Model architecture incompatible"
-                errors.append(msg)
+        # Channel order mismatch is significant: legacy checkpoints predate
+        # the field so a missing value is treated as RGB.
+        ckpt_color = _get_nested_value(checkpoint_config, 'data.color_order') or 'RGB'
+        curr_color = _get_nested_value(current_config, 'data.color_order') or 'RGB'
+        if str(ckpt_color).upper() != str(curr_color).upper():
+            warning_messages.append(
+                f"WARNING: color_order changed - checkpoint: {ckpt_color}, "
+                f"current: {curr_color}. Input channel order differs"
+            )
 
     # Check important parameters
     for key_path, name, impact in important_params:
@@ -911,7 +862,12 @@ class EarlyStopping:
         return self.early_stop
     
     def save_checkpoint(self, val_score: float, model: nn.Module = None):
-        """Saves model when validation score improves"""
+        """Record a new best validation score.
+
+        Despite the name this does NOT write a checkpoint — it only logs the
+        improvement and updates ``self.val_score_min`` (the tracked best). Actual
+        checkpoint writing is handled by ``CheckpointManager.save_checkpoint``.
+        """
         if self.verbose:
             if self.mode == 'min':
                 delta = self.val_score_min - val_score
@@ -1290,19 +1246,17 @@ class CheckpointManager:
 
         # Validate preprocessing parameter types and values
         try:
-            if architecture_type == 'swinv2':
-                swinv2_mean = get_param(config, 'swinv2_normalize_mean')
-                swinv2_std = get_param(config, 'swinv2_normalize_std')
-                if swinv2_mean is None or swinv2_std is None:
-                    logger.warning(
-                        "SwinV2 architecture detected but swinv2_normalize_mean/std missing; "
-                        "falling back to normalize_mean/std for checkpoint preprocessing."
-                    )
-                normalize_mean = tuple(swinv2_mean or get_param(config, 'normalize_mean'))
-                normalize_std = tuple(swinv2_std or get_param(config, 'normalize_std'))
-            else:
-                normalize_mean = tuple(get_param(config, 'normalize_mean'))
-                normalize_std = tuple(get_param(config, 'normalize_std'))
+            # Extract color_order from config (defaults to RGB, the project
+            # default and how legacy artifacts read back elsewhere).
+            color_order_raw = get_param(config, 'color_order') or 'RGB'
+            color_order = str(color_order_raw).upper()
+            if color_order not in {'RGB', 'BGR'}:
+                raise ValueError(
+                    f"color_order must be 'RGB' or 'BGR', got {color_order_raw!r}"
+                )
+
+            normalize_mean = tuple(get_param(config, 'normalize_mean'))
+            normalize_std = tuple(get_param(config, 'normalize_std'))
             if len(normalize_mean) != 3 or len(normalize_std) != 3:
                 raise ValueError("normalize_mean and normalize_std must have exactly 3 values")
 
@@ -1311,12 +1265,6 @@ class CheckpointManager:
 
             if image_size <= 0 or patch_size <= 0:
                 raise ValueError("image_size and patch_size must be positive")
-            if architecture_type == 'swinv2' and patch_size != 4:
-                logger.warning(
-                    "SwinV2 uses patch_size=4. Overriding checkpoint patch_size from %s to 4.",
-                    patch_size
-                )
-                patch_size = 4
             if image_size % patch_size != 0:
                 raise ValueError(f"image_size ({image_size}) must be divisible by patch_size ({patch_size})")
 
@@ -1444,6 +1392,7 @@ class CheckpointManager:
             normalize_std=normalize_std,
             image_size=image_size,
             patch_size=patch_size,
+            color_order=color_order,
         )
 
         # Backwards compatibility info
@@ -1854,7 +1803,9 @@ class CheckpointManager:
                     hidden_size = saved_pos_embed.shape[2]
                     # Determine number of non-patch (special) tokens by comparing with known grid sizes
                     saved_grid = int(math.isqrt(saved_len - 1))
-                    # Try common special token counts (1 for CLS, up to 4 for CLS+style+line+color)
+                    # Special-token count is derived from the checkpoint, not hardcoded:
+                    # the current model has only cls_token, but older checkpoints may carry
+                    # more, so num_special = saved_len - saved_grid**2 stays generic.
                     num_special = saved_len - saved_grid * saved_grid
                     model_grid = int(math.isqrt(model_len - num_special))
                     if saved_grid * saved_grid + num_special == saved_len and model_grid * model_grid + num_special == model_len:
@@ -1889,12 +1840,12 @@ class CheckpointManager:
                 msg = str(e)
                 if "Missing key(s)" in msg or "Unexpected key(s)" in msg or "size mismatch" in msg:
                     # Heuristic: if massive mismatch, it's likely an architecture change
-                    # e.g. ViT -> SwinV2 or vocab size change
+                    # e.g. architecture change or vocab size change
                     logger.error("=" * 60)
                     logger.error("CRITICAL: Model architecture mismatch during checkpoint loading!")
                     logger.error("The checkpoint architecture does not match the current model.")
                     logger.error("This often happens when:")
-                    logger.error("  1. Switching architectures (e.g. ViT -> SwinV2)")
+                    logger.error("  1. Switching architectures")
                     logger.error("  2. Changing model size/dimensions (e.g. hidden_size, image_size)")
                     logger.error("  3. Changing vocabulary size without rebuilding the head")
                     logger.error("  4. Loading an old checkpoint into a modified model")
@@ -2703,7 +2654,7 @@ class TrainingUtils:
         
         # Get depth of model
         def get_layer_id(name):
-            if 'blocks' in name or 'layers' in name:
+            if 'blocks' in name:
                 # Extract layer number
                 import re
                 match = re.search(r'\.(\d+)\.', name)

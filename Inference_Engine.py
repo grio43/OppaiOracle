@@ -12,42 +12,27 @@ import time
 import logging
 from pathlib import Path
 import yaml
-from typing import Dict, List, Optional, Tuple, Union, Any, Callable, TYPE_CHECKING, NamedTuple
+from typing import Dict, List, Optional, Tuple, Union, Any, TYPE_CHECKING, NamedTuple
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 import warnings
-import traceback
 from contextlib import contextmanager
-from collections import defaultdict, deque, OrderedDict
+from collections import OrderedDict
 import threading
-import queue
 import argparse
 
-import gzip
-import base64
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from training_utils import CheckpointManager
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
 from torchvision.transforms import v2 as transforms_v2
-from PIL import Image, ImageOps, ImageFile
+from PIL import Image, ImageOps
 
 # Vocabulary utilities
 from model_metadata import ModelMetadata
-from vocabulary import TagVocabulary, load_vocabulary_for_training, verify_vocabulary_integrity
+from vocabulary import TagVocabulary, verify_vocabulary_integrity
 from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
 from Configuration_System import load_config, InferenceConfig as BaseInferenceConfig, MonitorConfig, FullConfig
-
-# Make cv2 optional - not needed for basic inference
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional dependency
-    CV2_AVAILABLE = False
-    warnings.warn("OpenCV (cv2) not available. Some image loading features may be limited.")
 
 # Import monitoring system from Monitor_log (optional)
 try:
@@ -65,22 +50,15 @@ if TYPE_CHECKING:
 
 # Import the actual model architecture
 try:
-    from model_architecture import SimplifiedTagger, SwinV2Tagger, VisionTransformerConfig
+    from model_architecture import SimplifiedTagger, VisionTransformerConfig
 except ImportError:
     raise ImportError("model_architecture.py not found. Cannot load model architectures.")
-
-# Import SwinV2 config for architecture detection
-try:
-    from Configuration_System import SwinV2ModelConfig
-except ImportError:
-    SwinV2ModelConfig = None  # type: ignore[assignment, misc]   
 
 logger = logging.getLogger(__name__)
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_VOCAB_PATH = PROJECT_ROOT / "vocabulary.json"
-ORIENTATION_MAP_PATH = PROJECT_ROOT / "configs" / "orientation_map.json"
 
 # Legacy image size constant - older models used 448x448 images.
 # If config specifies this size, we assume it's a legacy config and default to 512.
@@ -189,6 +167,26 @@ class ImagePreprocessor:
 
     def __init__(self, config: InferenceConfig):
         self.config = config
+        # Resolve channel order for preprocessing. Configs/checkpoints without
+        # `color_order` default to RGB (and an info log is emitted at
+        # checkpoint-load time when that path is exercised). RGB is the project
+        # default in configs/unified_config.yaml.
+        raw_color_order = getattr(config, "color_order", None)
+        if raw_color_order is None:
+            # Config-level default: log only once at engine construction.
+            self.color_order = "RGB"
+            logger.info(
+                "InferenceConfig has no color_order; defaulting to legacy 'RGB' "
+                "(BGR-trained models will set this explicitly from checkpoint metadata)."
+            )
+        else:
+            co = str(raw_color_order).upper()
+            if co not in ("RGB", "BGR"):
+                logger.warning(
+                    f"Unknown color_order '{raw_color_order}' in InferenceConfig; using 'RGB'."
+                )
+                co = "RGB"
+            self.color_order = co
         self.transform = self._build_transform()
         # Define allowed base directories for path validation
         # Use current working directory if input_dir not specified
@@ -362,16 +360,33 @@ class ImagePreprocessor:
             image = Image.fromarray(image)
 
         # Geometry: letterbox to target without upscaling, no stretching
+        # NOTE: all PIL ops above and the letterbox below stay in RGB-space.
+        # The channel flip to BGR (if configured) happens exactly once after
+        # the PIL->numpy materialization below, before normalization runs.
         if return_mask:
             lb, pmask = self._letterbox_downscale_only(
                 image, int(self.config.image_size), return_mask=True
             )
-            # Apply tensor + normalize
-            return self.transform(lb), pmask
+            # Apply tensor + normalize (channel flip handled inside)
+            return self._apply_transform(lb), pmask
         else:
             lb = self._letterbox_downscale_only(image, int(self.config.image_size))
-            # Apply tensor + normalize
-            return self.transform(lb)
+            # Apply tensor + normalize (channel flip handled inside)
+            return self._apply_transform(lb)
+
+    def _apply_transform(self, pil_img: Image.Image) -> torch.Tensor:
+        """Convert PIL->numpy, apply BGR flip if configured, then run the
+        torchvision transform (ToImage + ToDtype + Normalize).
+
+        The flip is applied exactly once here, immediately after the PIL image
+        is materialized as a numpy array. `normalize_mean`/`normalize_std` are
+        interpreted in the same channel order as the resulting array — no
+        silent reordering.
+        """
+        arr = np.asarray(pil_img)
+        if self.color_order == "BGR":
+            arr = arr[..., ::-1].copy()
+        return self.transform(arr)
     
     def preprocess_batch(
         self,
@@ -481,6 +496,9 @@ class ModelWrapper:
         self.tag_names = []
         self.vocabulary = None  # Loaded vocabulary
         self.normalization_params = None
+        # Channel order of the model's expected input. Populated from the
+        # checkpoint at load_model() time; legacy checkpoints default to 'RGB'.
+        self.color_order = str(getattr(config, "color_order", "RGB")).upper()
         self.vocab_sha256 = "unknown"  # Will be computed when vocabulary is loaded
         self.patch_size = 16  # Default, will be updated from model config
 
@@ -547,6 +565,22 @@ class ModelWrapper:
                     checkpoint_mean = preprocessing.get('normalize_mean', [0.5, 0.5, 0.5])
                     checkpoint_std = preprocessing.get('normalize_std', [0.5, 0.5, 0.5])
                     checkpoint_image_size = preprocessing.get('image_size', 512)
+                    # Legacy checkpoints (pre-BGR migration) don't carry a
+                    # color_order key. Default to 'RGB' to match how they were
+                    # trained, and log so the user sees the legacy path.
+                    if 'color_order' in preprocessing:
+                        checkpoint_color_order = str(preprocessing['color_order']).upper()
+                        if checkpoint_color_order not in ("RGB", "BGR"):
+                            logger.warning(
+                                f"Unknown color_order '{preprocessing['color_order']}' in checkpoint; falling back to 'RGB'."
+                            )
+                            checkpoint_color_order = "RGB"
+                    else:
+                        checkpoint_color_order = "RGB"
+                        logger.info(
+                            "Checkpoint preprocessing_params missing 'color_order' - "
+                            "defaulting to legacy 'RGB' interpretation."
+                        )
 
                     # Warn if user config differs from checkpoint (potential accuracy issue)
                     if config_mean != list(checkpoint_mean):
@@ -568,16 +602,30 @@ class ModelWrapper:
                     self.config.normalize_mean = checkpoint_mean
                     self.config.normalize_std = checkpoint_std
                     self.config.image_size = checkpoint_image_size
+                    # Persist color_order on config so the preprocessor can pick it up
+                    # when the engine rebuilds it (InferenceEngine._setup syncs this).
+                    self.config.color_order = checkpoint_color_order
+                    self.color_order = checkpoint_color_order
                     self.normalization_params = preprocessing
-                    logger.info(f"Loaded preprocessing params from checkpoint: {preprocessing}")
+                    logger.info(
+                        f"Loaded preprocessing params from checkpoint: {preprocessing} "
+                        f"(resolved color_order={checkpoint_color_order})"
+                    )
             elif 'normalization_params' in meta:
                 # Legacy format
                 self.normalization_params = meta['normalization_params']
                 self.config.normalize_mean = self.normalization_params['mean']
                 self.config.normalize_std = self.normalization_params['std']
-                logger.info("Loaded normalization params from checkpoint (legacy format)")
+                # Legacy format predates the BGR migration entirely.
+                self.config.color_order = "RGB"
+                self.color_order = "RGB"
+                logger.info(
+                    "Loaded normalization params from checkpoint (legacy format); "
+                    "color_order defaulted to 'RGB'."
+                )
             else:
                 logger.warning("Preprocessing params not found in checkpoint. Using config defaults.")
+                self.color_order = str(getattr(self.config, "color_order", "RGB")).upper()
 
             # Load model config
             vit_config_dict = asdict(config.model)
@@ -628,7 +676,7 @@ class ModelWrapper:
                                         vit_config_dict.get('architecture_type', 'vit'))
 
             # Validate architecture type
-            valid_architectures = ('vit', 'swinv2')
+            valid_architectures = ('vit',)
             if architecture_type not in valid_architectures:
                 logger.error(
                     f"Invalid architecture_type '{architecture_type}' detected. "
@@ -640,65 +688,21 @@ class ModelWrapper:
                     f"Must be one of: {valid_architectures}"
                 )
 
-            # Create model with correct architecture
-            if architecture_type == 'swinv2':
-                # SwinV2 architecture
-                logger.info("Detected SwinV2 architecture from checkpoint")
+            # Create model (ViT / SimplifiedTagger)
+            logger.info("Using ViT (SimplifiedTagger) architecture")
 
-                # Build SwinV2-specific config from checkpoint or config
-                swin_config_data = meta.get('swin_config') or vit_config_dict.get('swin_config')
+            # Filter config dict to only VisionTransformerConfig fields
+            vit_fields = {'image_size', 'patch_size', 'num_channels', 'hidden_size',
+                         'num_hidden_layers', 'num_attention_heads', 'intermediate_size',
+                         'num_tags', 'dropout', 'attention_dropout',
+                         'layer_norm_eps', 'use_flex_attention', 'flex_block_size',
+                         'attention_bias', 'token_ignore_threshold', 'gradient_checkpointing',
+                         'checkpoint_every_n_layers', 'drop_path_rate',
+                         'check_numerical_stability', 'logit_clamp_value', 'use_fp32_layernorm'}
+            filtered_vit_config = {k: v for k, v in vit_config_dict.items() if k in vit_fields}
 
-                if swin_config_data and SwinV2ModelConfig is not None:
-                    # Convert dict to SwinV2ModelConfig if needed
-                    if isinstance(swin_config_data, dict):
-                        # Convert list depths/num_heads to tuples as expected by SwinV2ModelConfig
-                        if 'depths' in swin_config_data and isinstance(swin_config_data['depths'], list):
-                            swin_config_data['depths'] = tuple(swin_config_data['depths'])
-                        if 'num_heads' in swin_config_data and isinstance(swin_config_data['num_heads'], list):
-                            swin_config_data['num_heads'] = tuple(swin_config_data['num_heads'])
-                        swin_config = SwinV2ModelConfig(**swin_config_data)
-                    else:
-                        swin_config = swin_config_data
-                elif SwinV2ModelConfig is not None:
-                    # Use default SwinV2 config
-                    logger.warning("No swin_config found in checkpoint, using defaults")
-                    swin_config = SwinV2ModelConfig()
-                else:
-                    raise ImportError(
-                        "SwinV2ModelConfig not available from Configuration_System. "
-                        "Cannot load SwinV2 model."
-                    )
-
-                # Filter vit_config_dict to only VisionTransformerConfig fields
-                vit_fields = {'image_size', 'patch_size', 'num_channels', 'hidden_size',
-                             'num_hidden_layers', 'num_attention_heads', 'intermediate_size',
-                             'num_tags', 'dropout', 'attention_dropout',
-                             'layer_norm_eps', 'use_flex_attention', 'flex_block_size',
-                             'attention_bias', 'token_ignore_threshold', 'gradient_checkpointing',
-                             'checkpoint_every_n_layers', 'drop_path_rate',
-                             'check_numerical_stability', 'logit_clamp_value', 'use_fp32_layernorm'}
-                filtered_vit_config = {k: v for k, v in vit_config_dict.items() if k in vit_fields}
-
-                vit_config = VisionTransformerConfig(**filtered_vit_config)
-                self.model = SwinV2Tagger(vit_config, swin_config)
-                # SwinV2 always uses patch_size=4 (hardcoded in timm)
-                self.patch_size = 4
-            else:
-                # Default: ViT architecture (SimplifiedTagger)
-                logger.info("Using ViT (SimplifiedTagger) architecture")
-
-                # Filter config dict to only VisionTransformerConfig fields
-                vit_fields = {'image_size', 'patch_size', 'num_channels', 'hidden_size',
-                             'num_hidden_layers', 'num_attention_heads', 'intermediate_size',
-                             'num_tags', 'dropout', 'attention_dropout',
-                             'layer_norm_eps', 'use_flex_attention', 'flex_block_size',
-                             'attention_bias', 'token_ignore_threshold', 'gradient_checkpointing',
-                             'checkpoint_every_n_layers', 'drop_path_rate',
-                             'check_numerical_stability', 'logit_clamp_value', 'use_fp32_layernorm'}
-                filtered_vit_config = {k: v for k, v in vit_config_dict.items() if k in vit_fields}
-
-                vit_config = VisionTransformerConfig(**filtered_vit_config)
-                self.model = SimplifiedTagger(vit_config)
+            vit_config = VisionTransformerConfig(**filtered_vit_config)
+            self.model = SimplifiedTagger(vit_config)
 
             # Filter out removed rating_head keys from old checkpoints
             rating_head_keys = [k for k in state_dict if 'rating_head' in k]
@@ -755,7 +759,7 @@ class ModelWrapper:
                 logger.warning(f"Unknown precision '{precision}', defaulting to bf16")
                 self.model = self.model.to(torch.bfloat16)
             
-            model_type = "SwinV2Tagger" if architecture_type == 'swinv2' else "SimplifiedTagger"
+            model_type = "SimplifiedTagger"
             logger.info(f"{model_type} model loaded successfully:")
             logger.info(f"  - Architecture: {architecture_type}")
             logger.info(f"  - Image size: {vit_config.image_size}")
@@ -850,7 +854,7 @@ class ModelWrapper:
             # Flip the padding mask horizontally for TTA (if provided)
             padding_mask_flipped = torch.flip(padding_mask, dims=[-1]) if padding_mask is not None else None
             outputs_flipped = self.model(images_flipped, padding_mask=padding_mask_flipped)
-            # Orientation-aware averaging if we have a mapping
+            # TTA averaging (elementwise; vocabulary has no orientation-sensitive tags)
             if isinstance(outputs, dict):
                 if 'tag_logits' in outputs and self._tta_index_map is not None:
                     # Use advanced indexing to reorder flipped outputs
@@ -1191,12 +1195,20 @@ class InferenceEngine:
                 self.config.normalize_mean = self.model_wrapper.config.normalize_mean
                 self.config.normalize_std = self.model_wrapper.config.normalize_std
                 self.config.image_size = self.model_wrapper.config.image_size
+                # Sync color_order so the rebuilt preprocessor honors the
+                # checkpoint's training-time channel ordering. Legacy
+                # checkpoints (no key) are resolved to 'RGB' inside load_model.
+                resolved_color_order = getattr(
+                    self.model_wrapper.config, "color_order",
+                    getattr(self.model_wrapper, "color_order", "RGB"),
+                )
+                self.config.color_order = resolved_color_order
                 # Rebuild preprocessor with updated config
                 self.preprocessor = ImagePreprocessor(self.config)
                 logger.info(
                     f"Rebuilt preprocessor with checkpoint normalization: "
                     f"mean={self.config.normalize_mean}, std={self.config.normalize_std}, "
-                    f"image_size={self.config.image_size}"
+                    f"image_size={self.config.image_size}, color_order={resolved_color_order}"
                 )
 
             # Setup monitoring
@@ -1594,52 +1606,6 @@ if __name__ == "__main__":
     config.vocab_path = args.vocab
     config.config_path = args.config
 
-    # Example of what should be saved during training (add to training script):
-    # When saving checkpoint in training script, include normalization params:
-    """
-    # In your training script when saving checkpoint:
-    checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'model_config': vit_config_dict,
-        'normalization_params': {
-            'mean': [0.5, 0.5, 0.5],  # From SimplifiedDataConfig
-            'std': [0.5, 0.5, 0.5]     # From SimplifiedDataConfig
-        },
-        'tag_names': vocab.tag_names,
-        # ... other checkpoint data
-    }
-    torch.save(checkpoint, 'best_model.pt')  # Standardize to .pt
-    """
-
-    # Example of saving model config during training (should be done in training script)
-    # This shows what the config file should contain:
-    example_model_config = {
-        "tag_names": ["tag1", "tag2", "..."],  # List of all tag names
-        "normalization_params": {
-            "mean": [0.5, 0.5, 0.5],  # Must match training config
-            "std": [0.5, 0.5, 0.5]    # Must match training config  
-        },
-        "vit_config": {
-            "image_size": 512,
-            "patch_size": 16,
-            "num_channels": 3,
-            "hidden_size": 1280,
-            "num_hidden_layers": 24,
-            "num_attention_heads": 16,
-            "intermediate_size": 5120,
-            "num_tags": 100000,  # Should match len(tag_names) including rating tags
-            "dropout": 0.1,
-            "attention_dropout": 0.1,
-            "layer_norm_eps": 1e-6,
-            "use_flex_attention": True,
-            "flex_block_size": 128,
-            "attention_bias": True,
-            "token_ignore_threshold": 0.9,
-            "use_fp32_layernorm": False,
-            "gradient_checkpointing": False  # Disabled for inference
-        }
-    }
-       
     # Create inference engine
     engine = InferenceEngine(config)
     

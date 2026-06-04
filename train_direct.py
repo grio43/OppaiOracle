@@ -13,30 +13,23 @@ import re
 if 'PYTORCH_CUDA_ALLOC_CONF' not in os.environ:
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-import hashlib
-import json
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 import multiprocessing as mp
 import sys
-import platform
-import random
 import queue
 from datetime import datetime
-from dataclasses import dataclass, fields
 from contextlib import nullcontext
 import signal
 import threading
 
-import shutil
 import torch
 from torch.amp import GradScaler, autocast
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader, Subset
 from torchmetrics.classification import MultilabelF1Score, MultilabelAveragePrecision
 import numpy as np
-from typing import TYPE_CHECKING
 
 
 def _shutdown_dataloader_workers(loader: "Optional[DataLoader]") -> None:
@@ -86,7 +79,7 @@ Import error: {e}"""
     raise ImportError(error_msg)
 
 try:
-    from model_architecture import create_model, VisionTransformerConfig, initialize_tag_head_bias
+    from model_architecture import create_model, initialize_tag_head_bias
 except ImportError as e:
     error_msg = (
         f"""MISSING REQUIRED FILE: model_architecture.py
@@ -101,19 +94,12 @@ from training_utils import (
     LAST_CKPT_NAME,
     TrainingState,
     setup_seed,
-    log_sample_order_hash,
     CosineAnnealingWarmupRestarts,
     validate_config_compatibility,
 )
 from training_utils import VOCAB_PATH as DEFAULT_VOCAB_PATH
 from vocabulary import create_vocabulary_from_datasets  # NEW: rebuild vocab each run
-from dataset_loader import AugmentationStats, validate_dataset
-from utils.logging_sanitize import ensure_finite_tensor
-
-# Add after other imports
-
-# Alias to match usage below; avoids NameError and keeps intent clear.
-amp_autocast = autocast
+from dataset_loader import validate_dataset
 
 try:
     from loss_functions import MultiTaskLoss, AsymmetricFocalLoss
@@ -281,9 +267,9 @@ def train_with_orientation_tracking(config: FullConfig):
         if not name:
             return arch, False
         tokens = [t for t in re.split(r"[_-]+", name) if t]
-        had_arch_token = any(t.lower() in ("vit", "swinv2") for t in tokens)
+        had_arch_token = any(t.lower() == "vit" for t in tokens)
         sep = "-" if "-" in name and "_" not in name else "_"
-        base_tokens = [t for t in tokens if t.lower() not in ("vit", "swinv2")]
+        base_tokens = [t for t in tokens if t.lower() != "vit"]
         base = sep.join(base_tokens)
         resolved = arch if not base else f"{base}{sep}{arch}"
         return resolved, had_arch_token
@@ -543,7 +529,6 @@ def train_with_orientation_tracking(config: FullConfig):
         debug_config=config.debug,
         architecture_type=config.model.architecture_type,
         patch_size=getattr(config.model, 'patch_size', None),
-        swin_config=getattr(config.model, 'swin_config', None),
     )
 
     # Apply validation max_samples subsampling if configured
@@ -627,59 +612,25 @@ def train_with_orientation_tracking(config: FullConfig):
         skip_indices=[0, 1],  # Skip <PAD> (0) and <UNK> (1) in metric computation
     )
 
-    # Determine architecture type
+    # Determine architecture type (only ViT is supported)
     architecture_type = getattr(config.model, 'architecture_type', 'vit')
     logger.info(f"Creating model with architecture: {architecture_type}")
 
-    # Handle gradient_checkpointing for SwinV2 - automatically apply to swin_config.use_checkpoint
-    if architecture_type == 'swinv2' and getattr(config.model, 'gradient_checkpointing', False):
-        swin_config = getattr(config.model, 'swin_config', None)
-        if swin_config is not None:
-            if not swin_config.use_checkpoint:
-                # Auto-apply gradient_checkpointing to swin_config.use_checkpoint
-                swin_config.use_checkpoint = True
-                logger.info(
-                    "gradient_checkpointing=True detected for SwinV2: automatically enabled "
-                    "swin_config.use_checkpoint=True. For SwinV2 models, gradient checkpointing "
-                    "is controlled via swin_config.use_checkpoint (not model.gradient_checkpointing)."
-                )
-            else:
-                logger.info(
-                    "Note: For SwinV2, gradient checkpointing is controlled via swin_config.use_checkpoint "
-                    "(currently enabled). The model.gradient_checkpointing setting is for ViT models only."
-                )
+    model_config = config.model.to_dict()
+    model_config["num_tags"] = num_tags
 
-    if architecture_type == 'swinv2':
-        # Get SwinV2-specific config
-        swin_config = getattr(config.model, 'swin_config', None)
+    # Filter out config keys that are in unified_config.yaml but not used by VisionTransformerConfig.
+    # These remain in the YAML purely for legacy reasons (grouped-prediction prototype was
+    # never shipped, and architecture_type is kept as a forward-compat selector); strip them
+    # so create_model() doesn't choke on unknown kwargs.
+    _unused_config_keys = {
+        'architecture_type',
+        'hidden_dropout_prob', 'initializer_range', 'num_groups', 'num_labels',
+        'tags_per_group', 'swin_config'
+    }
+    model_config = {k: v for k, v in model_config.items() if k not in _unused_config_keys}
 
-        model_config = config.model.to_dict()
-        model_config["num_tags"] = num_tags
-        vit_fields = {field_obj.name for field_obj in fields(VisionTransformerConfig)}
-        filtered_model_config = {k: v for k, v in model_config.items() if k in vit_fields}
-
-        model = create_model(
-            architecture_type='swinv2',
-            swin_config=swin_config,
-            **filtered_model_config,
-        )
-        logger.info(f"Created SwinV2 model with {sum(p.numel() for p in model.parameters()):,} parameters")
-    else:
-        # Existing ViT model creation
-        model_config = config.model.to_dict()
-        model_config["num_tags"] = num_tags
-
-        # Filter out config keys that are in unified_config.yaml but not used by VisionTransformerConfig.
-        # These remain in the YAML purely for legacy reasons (grouped-prediction prototype was
-        # never shipped); strip them so create_model() doesn't choke on unknown kwargs.
-        _unused_config_keys = {
-            'architecture_type',
-            'hidden_dropout_prob', 'initializer_range', 'num_groups', 'num_labels',
-            'tags_per_group', 'swin_config'
-        }
-        model_config = {k: v for k, v in model_config.items() if k not in _unused_config_keys}
-
-        model = create_model(**model_config)
+    model = create_model(**model_config)
 
     # Initialize tag_head bias with log-prior (RetinaNet technique).
     # Checkpoint resume will overwrite this via load_state_dict.
@@ -694,19 +645,6 @@ def train_with_orientation_tracking(config: FullConfig):
     # NOTE: channels_last memory format is applied LATER (after checkpoint loading and dtype conversion)
     # to ensure it's not lost during transformations. See the channels_last application block below.
     model.to(device)
-
-    # Resolve AMP dtype for autocast. Parameters stay in fp32 even when AMP is bf16 —
-    # bf16 has only 7 mantissa bits, so storing master weights in bf16 makes the
-    # smallest representable update at |w|=1 ≈ 2^-7 (~7.8e-3). With lr~5e-4 and
-    # typical gradients, optimizer updates of ~5e-7 silently round to zero. Autocast
-    # handles bf16 forward/backward without requiring bf16 storage.
-    amp_dtype_cfg = str(getattr(config.training, "amp_dtype", "bfloat16")).lower()
-    if amp_dtype_cfg in ("bfloat16", "bf16"):
-        amp_dtype = torch.bfloat16
-    elif amp_dtype_cfg == "float16":
-        amp_dtype = torch.float16
-    else:
-        amp_dtype = torch.float32
 
     # Sync monitor config from training config (training.* is the single source of truth)
     if not hasattr(config, 'monitor'):
@@ -749,13 +687,8 @@ def train_with_orientation_tracking(config: FullConfig):
     # NOTE: TensorBoard model graph logging is deferred until AFTER torch.compile()
     # to avoid stride mismatch issues. See the model graph logging block below.
 
-    # Detect and log Flex Attention configuration (only for custom ViT, SwinV2 uses timm's attention)
-    if config.model.use_flex_attention and architecture_type == 'swinv2':
-        logger.info(
-            "use_flex_attention is set but SwinV2 uses shifted window attention (built into timm). "
-            "Flex Attention setting is ignored for SwinV2."
-        )
-    elif config.model.use_flex_attention and architecture_type != 'swinv2':
+    # Detect and log Flex Attention configuration
+    if config.model.use_flex_attention:
         logger.info("=" * 70)
         logger.info("Flex Attention Configuration:")
         logger.info(f"  PyTorch version: {torch.__version__}")
@@ -836,22 +769,7 @@ def train_with_orientation_tracking(config: FullConfig):
         beta3 = getattr(config.training, 'adan_beta3', 0.99)
         betas = betas + (beta3,)
 
-    # Determine base learning rate based on architecture type
-    swinv2_lr = getattr(config.training, 'swinv2_learning_rate', None)
-    if architecture_type == 'swinv2' and swinv2_lr is not None:
-        base_lr = swinv2_lr
-        logger.info(
-            f"Using SwinV2-specific base learning rate: {base_lr:.2e} "
-            f"(swinv2_learning_rate config)"
-        )
-    else:
-        base_lr = config.training.learning_rate
-        if architecture_type == 'swinv2':
-            logger.info(
-                f"Using learning_rate={base_lr:.2e} for SwinV2. "
-                f"Consider setting swinv2_learning_rate (recommended: 5e-5 to 1e-4) "
-                f"for architecture-specific tuning."
-            )
+    base_lr = config.training.learning_rate
 
     # Scale learning rate based on effective batch size
     from training_config import scale_learning_rate
@@ -939,7 +857,7 @@ def train_with_orientation_tracking(config: FullConfig):
         optimizer,
         first_cycle_steps=first_cycle_steps,
         cycle_mult=1.0,  # Equal cycle lengths
-        max_lr=effective_learning_rate,  # Use architecture-specific LR (swinv2_learning_rate if SwinV2)
+        max_lr=effective_learning_rate,  # Scaled base learning rate
         min_lr=getattr(config.training, "lr_end", 1e-6),
         warmup_steps=warmup_steps,
         gamma=cycle_decay,  # Decay max_lr by this factor after each restart
@@ -960,6 +878,11 @@ def train_with_orientation_tracking(config: FullConfig):
             raise ValueError(f"Only bfloat16 AMP is supported, got '{amp_dtype_name}'.")
         if not torch.cuda.is_bf16_supported():
             raise RuntimeError("bfloat16 AMP requested but CUDA device does not support bf16.")
+    # Master weights stay in fp32 even though AMP runs bf16 — bf16 has only 7 mantissa
+    # bits, so storing master weights in bf16 makes the smallest representable update at
+    # |w|=1 ≈ 2^-7 (~7.8e-3); with lr~5e-4 and typical gradients, optimizer updates of
+    # ~5e-7 would silently round to zero. Autocast handles bf16 forward/backward without
+    # requiring bf16 storage.
     amp_dtype = torch.bfloat16
 
     # Provide an autocast wrapper compatible with both torch.amp and torch.cuda.amp
@@ -1596,7 +1519,7 @@ def train_with_orientation_tracking(config: FullConfig):
                     # Only sync when strictly necessary (logging or periodic NaN check)
                     # Use anticipated post-increment step: losses dict is deleted before
                     # global_step increments, so we predict the final step value here
-                    # to align extraction with the logging check at line ~2075.
+                    # to align extraction with the logging check below.
                     anticipated_step = (global_step + 1) if (accum_count + 1 >= accum) else global_step
                     should_log = (anticipated_step == 1 or anticipated_step % config.training.logging_steps == 0)
                     should_check_nan = (NAN_CHECK_EVERY_STEPS > 0 and anticipated_step % NAN_CHECK_EVERY_STEPS == 0)

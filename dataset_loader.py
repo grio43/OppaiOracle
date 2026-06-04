@@ -23,26 +23,6 @@ VOCABULARY:
 - Scans all JSON files, counts tag frequencies, saves to vocabulary.json
 - See vocabulary.py for details
 
-⚠️ IMPORTANT - OBSOLETE CODE WARNING:
-======================================
-The file `dataset_preprocessor.py` (formerly `tag_vocabulary.py`) creates HDF5 files
-(training_data.h5, tag_indices.json, splits.json) that are NOT used by this system.
-
-HISTORY:
-- August 27, 2025 (commit 6727128): Removed HDF5_loader.py (2530 lines)
-- Replaced with this JSON-based loader for better flexibility
-- dataset_preprocessor.py became orphaned code (no consumer)
-
-WHY JSON-BASED IS BETTER:
-- On-the-fly loading allows dynamic augmentation (flips, crops, etc.)
-- No preprocessing step required
-- Sidecar cache provides similar performance to HDF5
-- More flexible for iterative dataset refinement
-
-DO NOT USE dataset_preprocessor.py - it is dead code maintained only for
-historical reference. If you need to rebuild data, just point train_direct.py
-at your JSON files and it will handle everything automatically.
-
 USAGE:
     from dataset_loader import create_dataloaders
     train_loader, val_loader, vocab = create_dataloaders(
@@ -99,7 +79,7 @@ from typing import Optional, List, Dict, Any, Tuple, Set
 # Third-party imports
 import torch
 from PIL import Image, ImageOps, ImageFile
-from torch.utils.data import Dataset, get_worker_info, DataLoader as _TorchDataLoader
+from torch.utils.data import Dataset, DataLoader as _TorchDataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 # Make torchvision optional at import time; raise only when actually used.
@@ -119,20 +99,13 @@ except (ImportError, ModuleNotFoundError, AttributeError):  # keep backward comp
 # Local imports
 from utils.metadata_ingestion import parse_tags_field
 # Safetensors fallback removed - Arrow is now the only metadata cache format
-from utils.path_utils import sanitize_identifier, validate_image_path, resolve_and_confine
+from utils.path_utils import sanitize_identifier, validate_image_path
 from utils.exclusion_manager import ExclusionManager
 from vocabulary import load_vocabulary_for_training, TagVocabulary
 from shared_vocabulary import (
     SharedVocabularyManager,
     is_shared_memory_available,
-    populate_vocab_from_shared
 )
-
-# SwinV2 image size validation (optional; allows early validation at dataset creation)
-try:
-    from model_architecture import validate_image_size_for_swinv2
-except (ImportError, ModuleNotFoundError):  # pragma: no cover
-    validate_image_size_for_swinv2 = None  # type: ignore
 
 
 class IndependentColorJitter:
@@ -158,9 +131,6 @@ class IndependentColorJitter:
     ):
         # Store probabilities as tuple for batch random comparison
         self._probs = (brightness_p, contrast_p, saturation_p)
-        # Store parameters for dynamic combined transform creation
-        self._params = (brightness, contrast, saturation)
-
         # Pre-create individual transforms for efficiency
         # Store as tuple for indexed access (faster than dict)
         if T is not None:
@@ -295,12 +265,17 @@ def process_image_cpu(
     Process PIL image on CPU: resizing, letterboxing, and padding mask generation.
 
     Args:
-        img: Source PIL Image (RGB)
+        img: Source PIL Image (RGB). Letterboxing happens in RGB-space; the
+            caller is responsible for any subsequent channel reordering to
+            match the configured ``color_order`` before normalization.
         target_size: Target dimension (square)
-        pad_color: RGB tuple for padding
+        pad_color: Symmetric (114,114,114) tuple for padding (channel-order
+            agnostic).
 
     Returns:
-        (canvas, pmask): Processed PIL Image and boolean padding mask
+        (canvas, pmask): Processed PIL Image (still RGB) and boolean padding
+        mask. The output channel order downstream is determined by the
+        dataset's ``color_order`` setting.
     """
     w, h = img.size
     # Downscale-only letterbox: preserve aspect, never upscale
@@ -452,7 +427,7 @@ def _try_load_cached_split(root: Path, seed: int = 42) -> Optional[tuple[list[Pa
         seed: Random seed to validate against cached seed
 
     Optimizations:
-      - Lazy validation: only check first 10 paths instead of 100 (10x faster)
+      - Stratified validation: sample 50 paths (25 train + 25 val) from beginning/end/middle instead of the full list
       - Parallel existence checks using ThreadPoolExecutor
       - Early return on cache hit without full validation
 
@@ -967,6 +942,7 @@ class DatasetLoader(Dataset):
         pad_color: Tuple[int, int, int] = (114, 114, 114),
         normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+        color_order: str = "RGB",
         preload_files: int = 0,
         # Background validator control
         enable_background_validator: Optional[bool] = None,
@@ -1038,6 +1014,10 @@ class DatasetLoader(Dataset):
         ) if isinstance(pad_color, (list, tuple)) else (114, 114, 114)
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
+        _co = str(color_order or "RGB").upper()
+        if _co not in ("RGB", "BGR"):
+            raise ValueError(f"color_order must be 'RGB' or 'BGR', got {color_order!r}")
+        self.color_order: str = _co
 
         # Tag vector dtype
         self._tag_vector_dtype = _canon_dtype(str(tag_vector_dtype).lower())
@@ -1064,8 +1044,6 @@ class DatasetLoader(Dataset):
         # Backed by shared memory so DataLoader workers (spawned at first iter()) observe
         # set_epoch() updates from the main process; a plain int would be frozen at fork/spawn time.
         self._current_epoch = mp.Value('i', 0, lock=False)
-
-        self._preload_n = int(preload_files or 0)
 
         # --- Shared vocabulary flag (for worker_init_fn) ---
         self._shared_vocab_loaded = False
@@ -1199,13 +1177,6 @@ class DatasetLoader(Dataset):
             "error_reason": "",
         }
 
-    def preload_first_n(self, n: int):
-        n = int(max(0, n))
-        if n == 0 or len(self) == 0:
-            return
-        for i in range(min(n, len(self))):
-            _ = self[i]
-
     def _load_annotations(self, path):
         """Load annotation JSON file with validation and binary caching.
 
@@ -1309,7 +1280,7 @@ class DatasetLoader(Dataset):
 
         self.logger.info(f"Loaded {len(annotations)} annotations from {path}")
 
-        # Save to binary cache for faster future loads (async to avoid blocking)
+        # Save to binary cache for faster future loads
         # Note: cache write failures are logged but don't fail the operation
         _save_manifest_cache(path_obj, annotations)
 
@@ -1430,6 +1401,9 @@ class DatasetLoader(Dataset):
                 # Pre-norm 0..1 tensor for L1; then normalize for model
                 # _to_tensor_v2 already converts to bfloat16 via ToDtype
                 img_01 = self._to_tensor_v2(img_tv)  # 0..1 bfloat16
+                # BGR channel flip (CHW) immediately before normalization
+                if self.color_order == "BGR":
+                    img_01 = img_01.flip(0)
                 t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
                 pmask = mask_tv.to(torch.bool)
             else:
@@ -1442,6 +1416,8 @@ class DatasetLoader(Dataset):
                         # Ensure we can derive 0..1 image for L1 regardless of transform type
                         # _to_tensor already converts to bfloat16 (aliased to _to_tensor_v2)
                         img_01 = transformed if isinstance(transformed, torch.Tensor) else self._to_tensor(transformed)
+                        if self.color_order == "BGR":
+                            img_01 = img_01.flip(0)
                         t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
                     except Exception as e:
                         if self.logger.isEnabledFor(logging.DEBUG):
@@ -1449,11 +1425,15 @@ class DatasetLoader(Dataset):
                         if self._to_tensor is None:
                             raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                         img_01 = self._to_tensor(canvas)
+                        if self.color_order == "BGR":
+                            img_01 = img_01.flip(0)
                         t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
                 else:
                     if self._to_tensor is None:
                         raise ImportError("torchvision is required for DatasetLoader transforms. Please install torchvision.")
                     img_01 = self._to_tensor(canvas)
+                    if self.color_order == "BGR":
+                        img_01 = img_01.flip(0)
                     t = _normalize_preserve_dtype(img_01, self.normalize_mean, self.normalize_std)
 
             # Reset retry count on success
@@ -1590,27 +1570,6 @@ class DatasetLoader(Dataset):
             "flip_mode": "none",
             "error": True,
             "error_reason": reason,
-        }
-
-    def get_failure_statistics(self):
-        """Return statistics about failed samples for logging."""
-        # Calculate per-tag error rates
-        tag_error_summary = {}
-        for tag_idx, stats in self.error_stats.items():
-            total = stats['total']
-            if total > 0:
-                tag_error_summary[tag_idx] = {
-                    'total_errors': total,
-                    'load_failed': stats.get('load_failed', 0),
-                    'decode_failed': stats.get('decode_failed', 0),
-                    'error_rate': total / len(self.annotations) if len(self.annotations) > 0 else 0,
-                }
-
-        return {
-            "total_failed": len(self.failed_samples),
-            "failed_indices": list(self.failed_samples),
-            "retry_counts": self.retry_counts,
-            "tag_error_distribution": tag_error_summary,
         }
 
     def close(self):
@@ -1831,6 +1790,7 @@ class SidecarJsonDataset(Dataset):
         pad_color: Tuple[int, int, int] = (114, 114, 114),
         normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+        color_order: str = "RGB",
         # --- Horizontal flipping ---
         random_flip_prob: float = 0.0,
         flip_overrides_path: Optional[str] = None,   # JSON with {"force_flip":[ids], "never_flip":[ids]} (also accepts {"flip":[...]} or a bare list)
@@ -1870,9 +1830,6 @@ class SidecarJsonDataset(Dataset):
         gaussian_blur_kernel_size: int = 3,
         gaussian_blur_sigma_min: float = 0.1,
         gaussian_blur_sigma_max: float = 1.5,
-        # Architecture-aware cache key parameters
-        architecture_type: str = "vit",
-        patch_size: Optional[int] = None,
     ):
         self.root = Path(root_dir)
         self.json_files = list(json_files)
@@ -1907,6 +1864,10 @@ class SidecarJsonDataset(Dataset):
         ) if isinstance(pad_color, (list, tuple)) else (114, 114, 114)
         self.normalize_mean: Tuple[float, float, float] = tuple(normalize_mean)
         self.normalize_std: Tuple[float, float, float] = tuple(normalize_std)
+        _co = str(color_order or "RGB").upper()
+        if _co not in ("RGB", "BGR"):
+            raise ValueError(f"color_order must be 'RGB' or 'BGR', got {color_order!r}")
+        self.color_order: str = _co
 
         # Image tensor dtype (matches _to_tensor_v2 output)
         self._image_dtype = torch.bfloat16
@@ -2459,6 +2420,9 @@ class SidecarJsonDataset(Dataset):
                 if self._random_erasing is not None:
                     img = self._random_erasing(img)
 
+                # BGR channel flip (CHW) immediately before normalization
+                if self.color_order == "BGR":
+                    img = img.flip(0)
                 img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
 
                 pmask = mask_tv.to(torch.bool)
@@ -2479,6 +2443,8 @@ class SidecarJsonDataset(Dataset):
                         if self._random_erasing is not None:
                             img = self._random_erasing(img)
 
+                        if self.color_order == "BGR":
+                            img = img.flip(0)
                         img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
                     except Exception as e:
                         if self.logger.isEnabledFor(logging.DEBUG):
@@ -2494,6 +2460,8 @@ class SidecarJsonDataset(Dataset):
                         if self._random_erasing is not None:
                             img = self._random_erasing(img)
 
+                        if self.color_order == "BGR":
+                            img = img.flip(0)
                         img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
                 else:
                     if self._to_tensor is None:
@@ -2507,6 +2475,8 @@ class SidecarJsonDataset(Dataset):
                     if self._random_erasing is not None:
                         img = self._random_erasing(img)
 
+                    if self.color_order == "BGR":
+                        img = img.flip(0)
                     img = _normalize_preserve_dtype(img, self.normalize_mean, self.normalize_std)
 
             # Encode labels (tags already account for flipping)
@@ -2638,7 +2608,6 @@ def create_dataloaders(
     debug_config=None,
     architecture_type: str = "vit",
     patch_size: Optional[int] = None,
-    swin_config: Optional[Any] = None,
     **kwargs,
 ):
     logger = logging.getLogger(__name__)
@@ -2651,6 +2620,7 @@ def create_dataloaders(
         'normalize_mean': tuple(getattr(data_config, "normalize_mean", [0.5, 0.5, 0.5])),
         'normalize_std': tuple(getattr(data_config, "normalize_std", [0.5, 0.5, 0.5])),
         'pad_color': tuple(getattr(data_config, "pad_color", [114, 114, 114])),
+        'color_order': str(getattr(data_config, "color_order", "RGB")).upper(),
         # Horizontal flip configuration
         'random_flip_prob': float(getattr(data_config, "random_flip_prob", 0.0)),
         'flip_overrides_path': getattr(data_config, "flip_overrides_path", None),
@@ -2690,44 +2660,7 @@ def create_dataloaders(
         'gaussian_blur_kernel_size': int(getattr(data_config, "gaussian_blur_kernel_size", 3)),
         'gaussian_blur_sigma_min': float(getattr(data_config, "gaussian_blur_sigma_min", 0.1)),
         'gaussian_blur_sigma_max': float(getattr(data_config, "gaussian_blur_sigma_max", 1.5)),
-        # Architecture-aware cache key parameters
-        # SwinV2 always uses patch_size=4 (hardcoded in timm); ViT uses configurable patch_size
-        'architecture_type': str(architecture_type).lower(),
-        'patch_size': int(patch_size) if patch_size is not None else None,
     }
-
-    # Early validation of image size for SwinV2 architecture
-    # This catches incompatible image_size/window_size before training starts,
-    # rather than failing late during model forward pass
-    if architecture_type == 'swinv2' and validate_image_size_for_swinv2 is not None:
-        _image_size = config_cache['image_size']
-        # Extract window_size from swin_config if provided, otherwise use default
-        _window_size = 16  # SwinV2 default
-        _num_stages = 4    # SwinV2 default (4 stages)
-        if swin_config is not None:
-            _window_size = getattr(swin_config, 'window_size', None) or _window_size
-            _depths = getattr(swin_config, 'depths', None)
-            if _depths is not None:
-                _num_stages = len(_depths) if hasattr(_depths, '__len__') else 4
-
-        try:
-            validate_image_size_for_swinv2(
-                image_size=_image_size,
-                window_size=_window_size,
-                num_stages=_num_stages,
-                initial_patch_size=4,  # Always 4 for SwinV2
-            )
-            logger.info(
-                f"SwinV2 image size validation passed: image_size={_image_size}, "
-                f"window_size={_window_size}, num_stages={_num_stages}"
-            )
-        except ValueError as e:
-            # Re-raise with additional context about when this validation happens
-            raise ValueError(
-                f"SwinV2 image size validation failed at dataset creation time. "
-                f"This check prevents late failures during model forward pass. "
-                f"Original error: {e}"
-            ) from e
 
     # Load vocabulary once (needed for sidecar mode and to determine num classes)
     vocab = load_vocabulary_for_training(Path(vocab_path))
@@ -2756,23 +2689,15 @@ def create_dataloaders(
     pad_color = config_cache['pad_color']
     transform = None
 
-    # Select normalization based on architecture type:
-    # - ViT: inception-style normalization (0.5/0.5/0.5 mean/std)
-    # - SwinV2: ImageNet normalization required for pretrained weights
-    if architecture_type == "swinv2":
-        # SwinV2 pretrained weights expect ImageNet normalization
-        mean = tuple(getattr(data_config, "swinv2_normalize_mean", (0.485, 0.456, 0.406)))
-        std = tuple(getattr(data_config, "swinv2_normalize_std", (0.229, 0.224, 0.225)))
-        logger.info(
-            f"Using SwinV2 (ImageNet) normalization: mean={mean}, std={std}"
-        )
-    else:
-        # ViT and other architectures use inception-style normalization
-        mean = config_cache['normalize_mean']
-        std = config_cache['normalize_std']
-        logger.info(
-            f"Using ViT (inception-style) normalization: mean={mean}, std={std}"
-        )
+    # ViT uses inception-style normalization (typically 0.5/0.5/0.5 mean/std).
+    # Stats are taken AS-IS from config; they are interpreted in the same
+    # channel order as the image (see data.color_order).
+    mean = config_cache['normalize_mean']
+    std = config_cache['normalize_std']
+    logger.info(
+        f"Using ViT (inception-style) normalization: mean={mean}, std={std} "
+        f"(color_order={config_cache['color_order']})"
+    )
 
     # Determine dataset mode
     root = Path(active_data_path)
@@ -2811,6 +2736,7 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
+            color_order=config_cache['color_order'],
             preload_files=config_cache['preload_files'],
         )
 
@@ -2824,6 +2750,7 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
+            color_order=config_cache['color_order'],
             preload_files=config_cache['preload_files'],
         )
     else:
@@ -2911,6 +2838,7 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
+            color_order=config_cache['color_order'],
             random_flip_prob=random_flip_prob,
             flip_overrides_path=flip_overrides_path,
             stats_queue=config_cache['stats_queue'],
@@ -2942,9 +2870,6 @@ def create_dataloaders(
             gaussian_blur_kernel_size=config_cache['gaussian_blur_kernel_size'],
             gaussian_blur_sigma_min=config_cache['gaussian_blur_sigma_min'],
             gaussian_blur_sigma_max=config_cache['gaussian_blur_sigma_max'],
-            # Architecture-aware cache key parameters
-            architecture_type=config_cache['architecture_type'],
-            patch_size=config_cache['patch_size'],
         )
 
         val_ds = SidecarJsonDataset(
@@ -2956,6 +2881,7 @@ def create_dataloaders(
             pad_color=pad_color,
             normalize_mean=mean,
             normalize_std=std,
+            color_order=config_cache['color_order'],
             random_flip_prob=0.0,          # keep val deterministic
             flip_overrides_path=None,
             stats_queue=config_cache['stats_queue'],
@@ -2969,9 +2895,6 @@ def create_dataloaders(
             color_jitter_enabled=False,
             random_erasing_enabled=False,
             random_rotation_enabled=False,
-            # Architecture-aware cache key parameters
-            architecture_type=config_cache['architecture_type'],
-            patch_size=config_cache['patch_size'],
         )
 
     # ResumableSampler extends DistributedSampler with O(1) mid-epoch resume support

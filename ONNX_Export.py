@@ -6,15 +6,13 @@ Export trained model to ONNX format for deployment
 
 import os
 import json
-import pathlib
 from packaging.version import Version
 import logging
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any
-from dataclasses import dataclass, asdict, field
+from typing import Dict, Optional, Any
+from dataclasses import asdict
 from collections import defaultdict
-import yaml
 import base64
 import gzip
 import hashlib
@@ -26,7 +24,6 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from training_utils import CheckpointManager
 
 try:
@@ -34,9 +31,7 @@ try:
     import onnx
     import onnxruntime as ort
     from onnxruntime.quantization import quantize_dynamic, QuantType
-    from onnx import shape_inference
     import onnx.checker
-    import onnx.helper
     import onnx.numpy_helper
     from Configuration_System import ConfigManager, ConfigType, FullConfig
 except ImportError as e:
@@ -52,8 +47,8 @@ except ImportError:
         return iterable
 
 # Import our modules
-from model_architecture import create_model, VisionTransformerConfig, SwinV2Tagger
-from vocabulary import load_vocabulary_for_training, TagVocabulary
+from model_architecture import create_model
+from vocabulary import TagVocabulary
 
 
 # Configure logging
@@ -91,7 +86,7 @@ class InferenceWrapper(nn.Module):
         self.model = model
 
         # Enable ONNX-compatible attention mode (uses SDPA instead of flex_attention)
-        # The actual tagger (SimplifiedTagger/SwinV2Tagger) may be directly in self.model
+        # The actual tagger (SimplifiedTagger) may be directly in self.model
         # or nested inside a wrapper at self.model.model
         inner_model = self.model.model if hasattr(self.model, 'model') else self.model
         if hasattr(inner_model, 'set_onnx_mode'):
@@ -263,6 +258,21 @@ class ONNXExporter:
                 checkpoint_mean = preprocessing.get('normalize_mean', [0.5, 0.5, 0.5])
                 checkpoint_std = preprocessing.get('normalize_std', [0.5, 0.5, 0.5])
                 checkpoint_image_size = preprocessing.get('image_size', 512)
+                # Resolve color_order from checkpoint. Legacy checkpoints
+                # (pre-BGR migration) have no key -> 'RGB'.
+                if 'color_order' in preprocessing:
+                    checkpoint_color_order = str(preprocessing['color_order']).upper()
+                    if checkpoint_color_order not in ("RGB", "BGR"):
+                        logger.warning(
+                            f"Unknown color_order '{preprocessing['color_order']}' in checkpoint; falling back to 'RGB'."
+                        )
+                        checkpoint_color_order = "RGB"
+                else:
+                    checkpoint_color_order = "RGB"
+                    logger.info(
+                        "Checkpoint preprocessing_params missing 'color_order' - "
+                        "defaulting to legacy 'RGB' for ONNX export metadata."
+                    )
 
                 # Warn if user config differs from checkpoint (potential accuracy issue)
                 if config_mean != list(checkpoint_mean):
@@ -284,13 +294,31 @@ class ONNXExporter:
                 self.config.data.normalize_mean = checkpoint_mean
                 self.config.data.normalize_std = checkpoint_std
                 self.config.data.image_size = checkpoint_image_size
-                logger.info(f"Loaded preprocessing params from checkpoint: mean={checkpoint_mean}, std={checkpoint_std}, image_size={checkpoint_image_size}")
+                # Propagate color_order so the metadata-writing path below
+                # records what the checkpoint was trained with.
+                try:
+                    self.config.data.color_order = checkpoint_color_order
+                except Exception:
+                    setattr(self.config.data, "color_order", checkpoint_color_order)
+                logger.info(
+                    f"Loaded preprocessing params from checkpoint: mean={checkpoint_mean}, "
+                    f"std={checkpoint_std}, image_size={checkpoint_image_size}, "
+                    f"color_order={checkpoint_color_order}"
+                )
         elif 'normalization_params' in meta:
             # Legacy format
             normalization_params = meta['normalization_params']
             self.config.data.normalize_mean = normalization_params.get('mean', [0.5, 0.5, 0.5])
             self.config.data.normalize_std = normalization_params.get('std', [0.5, 0.5, 0.5])
-            logger.info(f"Loaded normalization params from checkpoint (legacy format): mean={self.config.data.normalize_mean}, std={self.config.data.normalize_std}")
+            try:
+                self.config.data.color_order = "RGB"
+            except Exception:
+                setattr(self.config.data, "color_order", "RGB")
+            logger.info(
+                f"Loaded normalization params from checkpoint (legacy format): "
+                f"mean={self.config.data.normalize_mean}, std={self.config.data.normalize_std}; "
+                f"color_order defaulted to 'RGB' (legacy)."
+            )
         else:
             logger.warning("Preprocessing params not found in checkpoint. Using config defaults.")
             logger.info(f"Using config preprocessing params: mean={self.config.data.normalize_mean}, std={self.config.data.normalize_std}")
@@ -301,78 +329,8 @@ class ONNXExporter:
             'num_heads': 12,  # Default values
             'hidden_size': 768,
             'num_layers': 12,
-            'patch_size': 16,  # Default to 16 (standard for ViT). Note: SwinV2 always uses 4.
+            'patch_size': 16,  # Default to 16 (standard for ViT).
         }
-
-        # SwinV2 models have different architecture - extract actual config values
-        if hasattr(self.model, 'model') and isinstance(self.model.model, SwinV2Tagger):
-            logger.info("SwinV2Tagger detected, extracting config for ONNX export")
-            swin_model = self.model.model
-
-            # Extract from _swin_config if available
-            if hasattr(swin_model, '_swin_config') and swin_model._swin_config is not None:
-                swin_cfg = swin_model._swin_config
-
-                # num_heads is typically a tuple (e.g., (8, 16, 32, 64)) - use first stage for optimization
-                if hasattr(swin_cfg, 'num_heads'):
-                    num_heads = swin_cfg.num_heads
-                    config['num_heads'] = num_heads[0] if isinstance(num_heads, (list, tuple)) else num_heads
-
-                # embed_dim is the base embedding dimension
-                if hasattr(swin_cfg, 'embed_dim'):
-                    config['embed_dim'] = swin_cfg.embed_dim
-                    # hidden_size for SwinV2 scales with stages, use embed_dim as base
-                    # NOTE: This will be overridden by feature_dim below if available
-                    config['hidden_size'] = swin_cfg.embed_dim
-
-                # depths gives number of transformer blocks per stage
-                if hasattr(swin_cfg, 'depths'):
-                    depths = swin_cfg.depths
-                    config['num_layers'] = sum(depths) if isinstance(depths, (list, tuple)) else depths
-                    config['depths'] = depths
-                
-                # Extract patch_size if available in swin_config
-                if hasattr(swin_cfg, 'patch_size'):
-                    config['patch_size'] = swin_cfg.patch_size
-
-                # Additional SwinV2-specific parameters that may be useful
-                if hasattr(swin_cfg, 'window_size'):
-                    config['window_size'] = swin_cfg.window_size
-                if hasattr(swin_cfg, 'mlp_ratio'):
-                    config['mlp_ratio'] = swin_cfg.mlp_ratio
-
-                logger.info(f"  Extracted SwinV2 config: num_heads={config.get('num_heads')}, "
-                           f"embed_dim={config.get('embed_dim')}, num_layers={config.get('num_layers')}, "
-                           f"window_size={config.get('window_size')}, patch_size={config.get('patch_size')}")
-
-            # Extract feature_dim from the model itself (this is the correct final dimension)
-            # For SwinV2, feature_dim = embed_dim * 2^(num_stages-1), NOT embed_dim
-            if hasattr(swin_model, 'feature_dim'):
-                config['feature_dim'] = swin_model.feature_dim
-                # Use feature_dim as hidden_size for SwinV2 (it's the actual output dimension)
-                config['hidden_size'] = swin_model.feature_dim
-                logger.info(f"  Feature dimension: {config['feature_dim']}")
-            elif 'embed_dim' in config and 'depths' in config:
-                # Fallback: calculate feature_dim from embed_dim and num_stages
-                num_stages = len(config['depths']) if isinstance(config['depths'], (list, tuple)) else 4
-                config['feature_dim'] = config['embed_dim'] * (2 ** (num_stages - 1))
-                config['hidden_size'] = config['feature_dim']
-                logger.info(f"  Calculated feature dimension: {config['feature_dim']} (embed_dim * 2^{num_stages-1})")
-
-            # Extract from backbone if available (fallback)
-            if hasattr(swin_model, 'backbone'):
-                backbone = swin_model.backbone
-                if hasattr(backbone, 'num_features'):
-                    config['hidden_size'] = backbone.num_features
-                if hasattr(backbone, 'embed_dim'):
-                    config['embed_dim'] = backbone.embed_dim
-                # Try to get patch_size from backbone
-                if hasattr(backbone, 'patch_embed') and hasattr(backbone.patch_embed, 'patch_size'):
-                    # patch_size might be a tuple
-                    ps = backbone.patch_embed.patch_size
-                    config['patch_size'] = ps[0] if isinstance(ps, (tuple, list)) else ps
-
-            return config
 
         # Try to extract from model
         if hasattr(self.model, 'model'):
@@ -408,53 +366,12 @@ class ONNXExporter:
                             if hasattr(layer.self_attn, 'embed_dim'):
                                 config['hidden_size'] = layer.self_attn.embed_dim
         
-        # Calculate sequence length based on architecture
-        # Check if this is a SwinV2 model first to set correct patch_size
-        is_swin = hasattr(self.model, 'model') and isinstance(self.model.model, SwinV2Tagger)
-
-        # Extract patch_size from config if available, otherwise use architecture defaults
-        if is_swin:
-            # Try to use patch_size extracted from model config (set earlier in this method)
-            if 'patch_size' in config and config['patch_size'] is not None:
-                patch_size = config['patch_size']
-                logger.debug(f"Using SwinV2 patch_size from model config: {patch_size}")
-            else:
-                # Fallback: SwinV2 typically uses patch_size=4 in timm implementations
-                patch_size = 4
-                config['patch_size'] = patch_size
-                logger.warning(
-                    f"Could not extract patch_size from SwinV2 model config, "
-                    f"using fallback value: {patch_size}. This may cause incorrect "
-                    f"sequence length calculations if the model uses a different patch size."
-                )
-        else:
-            patch_size = config.get('patch_size', 16)
+        # Calculate sequence length (ViT)
+        patch_size = config.get('patch_size', 16)
         num_patches = (self.config.data.image_size // patch_size) ** 2
 
-        if is_swin:
-            # SwinV2 doesn't use CLS tokens - calculate final resolution after all stages
-            # Each stage (except first) reduces spatial dimensions by 2x via patch merging
-            # Final resolution = image_size / (patch_size * 2^(num_stages-1))
-            depths = config.get('depths', [2, 2, 6, 2])  # Default SwinV2 depths
-            num_stages = len(depths) if isinstance(depths, (list, tuple)) else 4
-            
-            # Use initial_patch_size=4 for SwinV2 (standard from timm implementation)
-            # If we extracted patch_size=4 from config, use it; otherwise assume standard SwinV2 patch size
-            swin_patch_size = 4
-            if patch_size == 4:
-                swin_patch_size = 4
-            
-            # Total downsampling factor = initial_patch_size * 2^(num_stages-1)
-            total_downsample = swin_patch_size * (2 ** (num_stages - 1))
-            final_resolution = self.config.data.image_size // total_downsample
-            
-            config['sequence_length'] = final_resolution ** 2
-            logger.info(f"  SwinV2 sequence length: {config['sequence_length']} "
-                       f"(resolution: {final_resolution}x{final_resolution}, "
-                       f"downsample: {total_downsample}x)")
-        else:
-            # ViT uses CLS token(s), add +2 for special tokens
-            config['sequence_length'] = num_patches + 2  # +2 for special tokens (CLS, etc.)
+        # ViT uses CLS token(s), add +2 for special tokens
+        config['sequence_length'] = num_patches + 2  # +2 for special tokens (CLS, etc.)
 
         return config
         
@@ -541,57 +458,6 @@ class ONNXExporter:
                 f"This appears to be an invalid vocabulary."
             )
 
-        # SwinV2 ONNX export - BLOCKED BY DEFAULT due to torch.roll tracing limitations
-        architecture_type = getattr(self.config.model, 'architecture_type', 'vit')
-        if architecture_type == 'swinv2':
-            # Check if user explicitly wants to force SwinV2 ONNX export (not recommended)
-            force_swinv2_export = getattr(self.export_config, 'force_swinv2_export', False)
-
-            error_message = (
-                "\n" + "=" * 70 + "\n"
-                "ERROR: SwinV2 ONNX EXPORT IS NOT SUPPORTED\n"
-                "=" * 70 + "\n"
-                "SwinV2's shifted window attention mechanism uses torch.roll() for\n"
-                "cyclic shifts, which cannot be properly exported to ONNX.\n\n"
-                "TECHNICAL REASON:\n"
-                "  torch.roll() performs cyclic tensor shifts that ONNX cannot represent.\n"
-                "  The ONNX exporter traces a single execution path, but torch.roll()\n"
-                "  behavior depends on runtime tensor values. This causes:\n"
-                "  - Incorrect attention patterns in exported model\n"
-                "  - Shifted window positions become static/wrong\n"
-                "  - Model outputs differ significantly from PyTorch\n\n"
-                "RECOMMENDED SOLUTIONS:\n"
-                "  1. Use ViT architecture for ONNX export (model.architecture_type='vit')\n"
-                "     ViT uses standard attention that exports cleanly to ONNX\n"
-                "  2. Use TorchScript export instead of ONNX for SwinV2 models\n"
-                "  3. Deploy SwinV2 directly with PyTorch for production\n\n"
-                "TO FORCE EXPORT (NOT RECOMMENDED - may produce broken models):\n"
-                "  Set export.force_swinv2_export=True in config or via CLI\n"
-                "  WARNING: Exported model will likely produce incorrect predictions!\n"
-                + "=" * 70
-            )
-
-            if not force_swinv2_export:
-                logger.error(error_message)
-                raise RuntimeError(
-                    "SwinV2 ONNX export is blocked by default.\n\n"
-                    "REASON: SwinV2's shifted window attention uses torch.roll() which cannot\n"
-                    "be properly traced to ONNX. The resulting model will have incorrect\n"
-                    "attention patterns and produce wrong predictions.\n\n"
-                    "OPTIONS:\n"
-                    "  1. Use ViT architecture instead (recommended for ONNX)\n"
-                    "  2. Use TorchScript export for SwinV2\n"
-                    "  3. Set export.force_swinv2_export=True to override (NOT RECOMMENDED)\n\n"
-                    "See https://github.com/microsoft/Swin-Transformer/issues/104 for details."
-                )
-            else:
-                logger.warning(error_message)
-                logger.warning(
-                    "PROCEEDING WITH SwinV2 ONNX EXPORT (force_swinv2_export=True)\n"
-                    "The exported model may produce INCORRECT PREDICTIONS!\n"
-                    "Thoroughly validate against PyTorch inference before any use."
-                )
-
         # Determine export variants: check config.export first, then top-level config
         export_variants = getattr(self.config, 'export_variants',
                                   getattr(self.export_config, 'export_variants', ['full']))
@@ -642,7 +508,6 @@ class ONNXExporter:
 
                 # Force UTF-8 for stdout/stderr during dynamo export to avoid
                 # cp932 encoding errors from PyTorch's internal emoji logging on Windows
-                import sys
                 old_enc_out = getattr(sys.stdout, 'encoding', 'utf-8')
                 old_enc_err = getattr(sys.stderr, 'encoding', 'utf-8')
                 try:
@@ -736,6 +601,7 @@ class ONNXExporter:
             if self.export_config.optimize:
                 self._optimize_model(output_path)
                 self._slim_model(output_path)
+                self._repair_dynamic_batch(output_path)
 
             # Consolidate to single file if model fits under 2GB protobuf limit
             self._consolidate_to_single_file(output_path)
@@ -799,6 +665,7 @@ class ONNXExporter:
             if self.export_config.optimize:
                 self._optimize_model(output_path)
                 self._slim_model(output_path)
+                self._repair_dynamic_batch(output_path)
 
             # Consolidate to single file (FP16 is ~468MB, well under 2GB limit)
             self._consolidate_to_single_file(output_path)
@@ -851,6 +718,35 @@ class ONNXExporter:
             else:
                 logger.info(f"FP16 inference validation passed "
                            f"(output range: [{onnx_probs.min():.4f}, {onnx_probs.max():.4f}])")
+
+            # Dynamic-batch sanity (same rationale as the float32 path).
+            if self.export_config.dynamic_batch_size:
+                for test_batch in (2, 4):
+                    try:
+                        multi_input = np.random.randn(
+                            test_batch, 3, image_size, image_size,
+                        ).astype(np.float16)
+                        multi_feed = {session.get_inputs()[0].name: multi_input}
+                        if "padding_mask" in input_names:
+                            multi_feed["padding_mask"] = np.zeros(
+                                (test_batch, image_size, image_size), dtype=bool,
+                            )
+                        multi_out = session.run(None, multi_feed)[0]
+                    except Exception as e:
+                        logger.error(
+                            f"FP16 dynamic-batch validation failed at batch={test_batch}: {e}"
+                        )
+                        return False
+                    if multi_out.shape[0] != test_batch:
+                        logger.error(
+                            f"FP16 dynamic-batch validation: batch={test_batch} produced "
+                            f"output shape {multi_out.shape}; expected first dim {test_batch}"
+                        )
+                        return False
+                    logger.info(
+                        f"[OK] FP16 dynamic-batch validation: batch={test_batch} -> {multi_out.shape}"
+                    )
+
             return True
         except Exception as e:
             logger.error(f"FP16 inference validation failed: {e}")
@@ -889,13 +785,6 @@ class ONNXExporter:
     def _optimize_model(self, model_path: Path):
         """Optimize ONNX model"""
         logger.info("Optimizing ONNX model...")
-
-        # SwinV2 models are not compatible with BERT/ViT transformer optimizer
-        # Use basic optimization with onnx-simplifier instead
-        if hasattr(self.model, 'model') and isinstance(self.model.model, SwinV2Tagger):
-            logger.info("SwinV2Tagger detected, using basic optimization (BERT/ViT optimizer not compatible)")
-            self._basic_optimize(model_path)
-            return
 
         # Check opset version to determine optimization strategy
         try:
@@ -1069,6 +958,118 @@ class ONNXExporter:
         except Exception as e:
             logger.warning(f"onnxslim optimization failed: {e}, keeping previous model")
 
+    def _repair_dynamic_batch(self, model_path: Path):
+        """Repair dynamic-batch annotations that upstream tooling concretized to 1.
+
+        `onnxruntime.transformers.optimizer.optimize_model` re-runs shape
+        inference using the dummy export batch (=1), and stamps every
+        intermediate `value_info` entry with concrete `[1, ...]` and the graph
+        outputs with `[1, ...]` too. When ORT later loads the model for
+        inference its EXTENDED-level optimizer trusts those annotations and
+        rewrites MatMul/Gemm patterns into a runtime Reshape (named
+        `gemm_input_reshape`) whose target shape bakes in batch=1 -> any
+        inference at batch>1 fails with an `input_shape_size ==
+        requested_shape_size` Reshape error.
+
+        Three repairs, all keyed off `dynamic_batch_size: true`:
+
+          1. Clear all `value_info` entries so ORT re-infers intermediate
+             shapes from the (correctly symbolic) graph inputs at session
+             load. Loses no information that can't be recomputed.
+
+          2. Rewrite leading `dim_value=1` on each graph output to
+             `dim_param='batch_size'` so downstream consumers see the
+             output batch dim as dynamic too.
+
+          3. Defensive: rewrite any 4-D Reshape target with leading literal
+             `1` (and no other `1`/`-1`) to lead with `-1`. This is the
+             head-split fingerprint; the optimizer normally produces `-1`
+             but occasionally leaves one stuck at `1`. Safe because `-1`
+             still resolves to 1 at batch=1.
+
+        ONNX symbolic shape inference is intentionally NOT re-run before
+        saving: re-running with poisoned upstream state can repopulate the
+        same bad values. ORT's own shape propagation at session load is the
+        right tool, and it operates from the symbolic inputs.
+        """
+        if not self.export_config.dynamic_batch_size:
+            return
+
+        data_path = Path(str(model_path) + ".data")
+        has_external_data = data_path.exists()
+        model = onnx.load(str(model_path), load_external_data=has_external_data)
+
+        # (1) Strip poisoned value_info — ORT re-infers at session load.
+        stripped_value_info = len(model.graph.value_info)
+        del model.graph.value_info[:]
+
+        # (2) Rewrite literal-1 first-dim on graph outputs to symbolic batch.
+        fixed_outputs = []
+        for out in model.graph.output:
+            dims = out.type.tensor_type.shape.dim
+            if dims and dims[0].dim_value == 1 and not dims[0].dim_param:
+                dims[0].Clear()
+                dims[0].dim_param = 'batch_size'
+                fixed_outputs.append(out.name)
+
+        # (3) Defensive Reshape head-split fingerprint repair.
+        initializers = {init.name: init for init in model.graph.initializer}
+        patched_reshapes = []
+        for node in model.graph.node:
+            if node.op_type != 'Reshape' or len(node.input) < 2:
+                continue
+            init = initializers.get(node.input[1])
+            if init is None:
+                continue
+            arr = onnx.numpy_helper.to_array(init)
+            if arr.ndim != 1 or arr.size != 4:
+                continue
+            vals = arr.tolist()
+            if vals[0] != 1 or any(v == -1 or v == 1 for v in vals[1:]):
+                continue
+            new_vals = arr.copy()
+            new_vals[0] = -1
+            new_init = onnx.numpy_helper.from_array(new_vals.astype(arr.dtype), name=init.name)
+            init.CopyFrom(new_init)
+            patched_reshapes.append((node.name, vals, new_vals.tolist()))
+
+        # Only save (and log) if we actually changed something.
+        changed = stripped_value_info or fixed_outputs or patched_reshapes
+        if not changed:
+            logger.info("Dynamic-batch repair: no shape annotations to fix")
+            return
+
+        if stripped_value_info:
+            logger.warning(
+                f"Dynamic-batch repair: stripped {stripped_value_info} stale "
+                f"value_info entries (upstream optimizer concretized batch=1)."
+            )
+        if fixed_outputs:
+            logger.warning(
+                f"Dynamic-batch repair: rewrote leading dim_value=1 -> "
+                f"dim_param='batch_size' on outputs: {fixed_outputs}"
+            )
+        if patched_reshapes:
+            logger.warning(
+                f"Dynamic-batch repair: rewrote {len(patched_reshapes)} 4-D "
+                f"Reshape targets from [1, ...] to [-1, ...] (head-split fingerprint)."
+            )
+            for name, before, after in patched_reshapes:
+                logger.info(f"  {name}: {before} -> {after}")
+
+        if has_external_data:
+            if data_path.exists():
+                data_path.unlink()
+            if model_path.exists():
+                model_path.unlink()
+            onnx.save(model, str(model_path),
+                      save_as_external_data=True,
+                      all_tensors_to_one_file=True,
+                      location=data_path.name,
+                      size_threshold=1024)
+        else:
+            onnx.save(model, str(model_path))
+
     def _consolidate_to_single_file(self, model_path: Path):
         """Consolidate external data back into a single .onnx file if under 2GB."""
         data_path = Path(str(model_path) + ".data")
@@ -1203,6 +1204,36 @@ class ONNXExporter:
                     mask_diff = np.max(np.abs(onnx_probs - onnx_padded))
                     logger.info(f"[OK] Padding mask correctly affects model output (max diff: {mask_diff:.6f})")
 
+            # Dynamic-batch sanity: a single batch=1 run masks bugs where the
+            # optimizer collapsed the batch dim to a literal 1 (post-attention
+            # Reshape targets bake-in batch=1). Run batches > 1 to catch this.
+            if self.export_config.dynamic_batch_size:
+                for test_batch in (2, 4):
+                    try:
+                        multi_input = np.random.randn(
+                            test_batch, 3, image_size, image_size,
+                        ).astype(np.float32)
+                        multi_feed = {session.get_inputs()[0].name: multi_input}
+                        if "padding_mask" in input_names:
+                            multi_feed["padding_mask"] = np.zeros(
+                                (test_batch, image_size, image_size), dtype=bool,
+                            )
+                        multi_out = session.run(None, multi_feed)[0]
+                    except Exception as e:
+                        logger.error(
+                            f"Dynamic-batch validation failed at batch={test_batch}: {e}"
+                        )
+                        return False
+                    if multi_out.shape[0] != test_batch:
+                        logger.error(
+                            f"Dynamic-batch validation: batch={test_batch} produced "
+                            f"output shape {multi_out.shape}; expected first dim {test_batch}"
+                        )
+                        return False
+                    logger.info(
+                        f"[OK] Dynamic-batch validation: batch={test_batch} -> {multi_out.shape}"
+                    )
+
             return True
 
         except Exception as e:
@@ -1331,6 +1362,17 @@ class ONNXExporter:
                         "Inference will require external vocabulary file!"
                     )
 
+            # Resolve color_order for metadata. RGB is the project default;
+            # fall back defensively if the attribute is missing on exotic
+            # config objects.
+            _color_order = getattr(self.config.data, "color_order", "RGB")
+            _color_order = str(_color_order).upper() if _color_order else "RGB"
+            if _color_order not in ("RGB", "BGR"):
+                logger.warning(
+                    f"Unrecognized color_order '{_color_order}' on config; recording as 'RGB'."
+                )
+                _color_order = "RGB"
+
             # Add metadata
             metadata = {
                 'model_description': self.export_config.model_description,
@@ -1343,6 +1385,7 @@ class ONNXExporter:
                 'normalize_mean': json.dumps(self.config.data.normalize_mean),
                 'normalize_std': json.dumps(self.config.data.normalize_std),
                 'pad_color': json.dumps(list(self.config.data.pad_color)),
+                'color_order': _color_order,
                 'output_activation': 'sigmoid',
                 'input_format': 'BCHW_float32_normalized',
                 'preprocessing': 'external',
@@ -1580,8 +1623,6 @@ def main():
         parser.add_argument('--quantization-type', type=str, default=None, choices=['dynamic', 'static'], help=f'Quantization type')
         parser.add_argument('--no-validate', action='store_true', default=None, help='Skip validation')
         parser.add_argument('--benchmark', action='store_true', help='Run benchmark after export')
-        parser.add_argument('--force-rebuild-head', action='store_true', help='Recreate tag head if its out_features does not match the vocabulary size')
-        parser.add_argument('--force-swinv2', action='store_true', help='Force SwinV2 export despite torch.roll limitations')
         parser.add_argument('--benchmark-runs', type=int, default=100, help='Number of benchmark iterations')
 
         args = parser.parse_args()
@@ -1612,8 +1653,6 @@ def main():
             unified_config.export.quantization_type = args.quantization_type
         if args.no_validate is not None:
             unified_config.export.validate_export = not args.no_validate
-        if args.force_swinv2:
-            unified_config.export.force_swinv2_export = True
 
         # Create exporter
         exporter = ONNXExporter(unified_config)
