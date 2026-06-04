@@ -5,7 +5,6 @@ Validation Loop for Anime Image Tagger
 Comprehensive validation pipeline with multiple evaluation modes
 """
 
-import os
 import json
 import logging
 from pathlib import Path
@@ -13,7 +12,6 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 from datetime import datetime
-import time
 from collections import defaultdict
 import gc
 import multiprocessing as mp
@@ -23,7 +21,6 @@ import csv
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 import torch.distributed as dist
 from torch.amp import autocast
@@ -49,20 +46,12 @@ def _shutdown_dataloader_workers(loader: Optional[DataLoader]) -> None:
 from sklearn.metrics import (
     average_precision_score,
     precision_recall_curve,
-    roc_auc_score,
-    confusion_matrix
 )
 # Headless/optional plotting setup
 import matplotlib as mpl
 # Use a non-interactive backend so validation can run headless (e.g., on CI)
 mpl.use("Agg")
 import matplotlib.pyplot as plt
-try:
-    import seaborn as sns  # optional
-    _HAVE_SEABORN = True
-except ImportError:  # pragma: no cover
-    sns = None     # type: ignore
-    _HAVE_SEABORN = False
 
 # Import our modules
 from evaluation_metrics import MetricComputer
@@ -72,14 +61,13 @@ from Configuration_System import (
     DataConfig as CSDataConfig,
     ValidationConfig as CSValConfig,
     ValidationDataloaderConfig as CSDataloaderConfig,
-    SwinV2ModelConfig,
 )
 from training_utils import (
     CheckpointManager,
     InvalidCheckpointError,
     detect_architecture_from_state_dict,
 )
-from model_architecture import create_model, VisionTransformerConfig, SwinV2Tagger
+from model_architecture import create_model, VisionTransformerConfig
 from model_metadata import ModelMetadata
 from schemas import TagPrediction, ImagePrediction, RunMetadata, PredictionOutput, compute_vocab_sha256
 
@@ -173,8 +161,6 @@ class ValidationRunner:
         # Load validation overrides from unified_config.yaml
         self._val_mean: Optional[Tuple[float, float, float]] = None
         self._val_std: Optional[Tuple[float, float, float]] = None
-        self._val_swin_mean: Optional[Tuple[float, float, float]] = None
-        self._val_swin_std: Optional[Tuple[float, float, float]] = None
         self._val_architecture_type = "vit"
         self._val_image_size = _DEFAULT_VAL_IMAGE_SIZE
         self._val_patch_size = 16
@@ -260,33 +246,15 @@ class ValidationRunner:
                     f"Error: {e}"
                 ) from e
 
-        self._val_swin_mean = _parse_triplet(
-            "swinv2_normalize_mean", data_section.get("swinv2_normalize_mean")
-        )
-        self._val_swin_std = _parse_triplet(
-            "swinv2_normalize_std", data_section.get("swinv2_normalize_std")
-        )
-
         # Get normalization parameters (preprocessing overrides data)
         mean = preprocessing_cfg.get("normalize_mean")
-        if mean is None and self._val_architecture_type == "swinv2":
-            mean = self._val_swin_mean
         if mean is None:
             mean = data_section.get("normalize_mean")
         std = preprocessing_cfg.get("normalize_std")
-        if std is None and self._val_architecture_type == "swinv2":
-            std = self._val_swin_std
         if std is None:
             std = data_section.get("normalize_std")
 
         if mean is None:
-            if self._val_architecture_type == "swinv2":
-                raise ValueError(
-                    f"Missing normalization mean in {UNIFIED_CONFIG_PATH}.\n"
-                    f"Add 'data.swinv2_normalize_mean' (preferred) or "
-                    f"'validation.preprocessing.normalize_mean'.\n"
-                    f"Example: swinv2_normalize_mean: [0.485, 0.456, 0.406]"
-                )
             raise ValueError(
                 f"Missing 'normalize_mean' in {UNIFIED_CONFIG_PATH}.\n"
                 f"Add to either 'data.normalize_mean' or 'validation.preprocessing.normalize_mean'.\n"
@@ -294,13 +262,6 @@ class ValidationRunner:
             )
 
         if std is None:
-            if self._val_architecture_type == "swinv2":
-                raise ValueError(
-                    f"Missing normalization std in {UNIFIED_CONFIG_PATH}.\n"
-                    f"Add 'data.swinv2_normalize_std' (preferred) or "
-                    f"'validation.preprocessing.normalize_std'.\n"
-                    f"Example: swinv2_normalize_std: [0.229, 0.224, 0.225]"
-                )
             raise ValueError(
                 f"Missing 'normalize_std' in {UNIFIED_CONFIG_PATH}.\n"
                 f"Add to either 'data.normalize_std' or 'validation.preprocessing.normalize_std'.\n"
@@ -309,6 +270,20 @@ class ValidationRunner:
 
         self._val_mean = _parse_triplet("normalize_mean", mean)
         self._val_std = _parse_triplet("normalize_std", std)
+
+        # Channel order (RGB by default, the project default; legacy
+        # checkpoints/configs without this field are likewise treated as RGB).
+        color_order_raw = (
+            preprocessing_cfg.get("color_order")
+            or data_section.get("color_order")
+            or "RGB"
+        )
+        self._val_color_order = str(color_order_raw).upper()
+        if self._val_color_order not in {"RGB", "BGR"}:
+            raise ValueError(
+                f"Invalid 'color_order': {color_order_raw!r}. Must be 'RGB' or 'BGR'.\n"
+                f"Check 'data.color_order' or 'validation.preprocessing.color_order' in {UNIFIED_CONFIG_PATH}"
+            )
 
         # Get image and patch sizes with defaults
         self._val_image_size = int(
@@ -584,29 +559,6 @@ class ValidationRunner:
                     architecture_type = detected_arch
             architecture_type = str(architecture_type).lower() if architecture_type else 'vit'
 
-            # Build SwinV2 config if needed
-            swin_config = None
-            if architecture_type == 'swinv2':
-                swin_config_data = model_config.get('swin_config')
-                if isinstance(swin_config_data, dict):
-                    if 'depths' in swin_config_data and isinstance(swin_config_data['depths'], list):
-                        swin_config_data['depths'] = tuple(swin_config_data['depths'])
-                    if 'num_heads' in swin_config_data and isinstance(swin_config_data['num_heads'], list):
-                        swin_config_data['num_heads'] = tuple(swin_config_data['num_heads'])
-                    try:
-                        swin_config = SwinV2ModelConfig(**swin_config_data)
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to parse swin_config from checkpoint (%s). Using defaults.",
-                            e
-                        )
-                        swin_config = SwinV2ModelConfig()
-                elif swin_config_data is not None:
-                    swin_config = swin_config_data
-                else:
-                    swin_config = SwinV2ModelConfig()
-            self._swin_config = swin_config if architecture_type == 'swinv2' else None
-
             # Ensure num_tags is defined before creating the model
             # (self.num_tags may not be set yet the first time we get here)
             if not hasattr(self, "num_tags") or not isinstance(getattr(self, "num_tags", None), int):
@@ -621,7 +573,6 @@ class ValidationRunner:
             model = create_model(
                 **model_config,
                 architecture_type=architecture_type,
-                swin_config=swin_config
             )
             
             # Load weights
@@ -646,34 +597,25 @@ class ValidationRunner:
             if not preprocessing:
                 # Always prefer config-loaded values (_val_mean/_val_std) which match training.
                 # Only fall back to hardcoded defaults if config values are somehow missing.
-                if architecture_type == "swinv2":
-                    mean = self._val_swin_mean or self._val_mean or (0.485, 0.456, 0.406)
-                    std = self._val_swin_std or self._val_std or (0.229, 0.224, 0.225)
-                else:
-                    mean = self._val_mean or (0.5, 0.5, 0.5)
-                    std = self._val_std or (0.5, 0.5, 0.5)
+                mean = self._val_mean or (0.5, 0.5, 0.5)
+                std = self._val_std or (0.5, 0.5, 0.5)
                 preprocessing = {
                     "normalize_mean": list(mean),
                     "normalize_std": list(std),
                     "image_size": int(self._val_image_size),
                     "patch_size": int(self._val_patch_size),
+                    "color_order": self._val_color_order,
                 }
                 logger.info("No preprocessing in checkpoint; using unified_config.yaml / defaults.")
+            else:
+                # Legacy checkpoints (extracted via extract_preprocessing_params)
+                # default to RGB; respect that and don't silently overwrite.
+                preprocessing.setdefault("color_order", "RGB")
             self.preprocessing_params = preprocessing
 
-            # Determine correct patch_size and architecture type
-            # SwinV2 always uses patch_size=4 internally (via timm), regardless of config
-            is_swinv2 = (
-                architecture_type == 'swinv2' or
-                isinstance(model, SwinV2Tagger)
-            )
             # Store architecture type for dataloader creation
-            self._architecture_type = 'swinv2' if is_swinv2 else architecture_type
-            if is_swinv2:
-                self.patch_size = 4  # SwinV2 hardcodes initial_patch_size=4 in timm
-                logger.info("SwinV2 architecture detected: using patch_size=4")
-            else:
-                self.patch_size = int(self.preprocessing_params.get("patch_size", self._val_patch_size))
+            self._architecture_type = architecture_type
+            self.patch_size = int(self.preprocessing_params.get("patch_size", self._val_patch_size))
             self._patch_size = self.patch_size
 
         elif self.config.model_path:
@@ -701,6 +643,7 @@ class ValidationRunner:
             image_size=self.preprocessing_params.get('image_size', 512),
             normalize_mean=tuple(self.preprocessing_params.get('normalize_mean', [0.5, 0.5, 0.5])),
             normalize_std=tuple(self.preprocessing_params.get('normalize_std', [0.5, 0.5, 0.5])),
+            color_order=str(self.preprocessing_params.get('color_order', 'RGB')).upper(),
             random_flip_prob=0.0,
             pin_memory=True,
             batch_size=8,  # ignored by val loader below
@@ -720,7 +663,6 @@ class ValidationRunner:
             frequency_sampling=False,
             architecture_type=getattr(self, '_architecture_type', 'vit'),
             patch_size=getattr(self, 'patch_size', None),
-            swin_config=getattr(self, '_swin_config', None),
         )
         
         # Limit samples if requested (use seeded RNG for deterministic selection)
@@ -1530,7 +1472,8 @@ class ValidationRunner:
             image_size=int(self.preprocessing_params.get('image_size', 512)),
             patch_size=int(self.patch_size),
             model_path=str(self.config.checkpoint_path or self.config.model_path),
-            num_tags=int(self.num_tags)
+            num_tags=int(self.num_tags),
+            color_order=str(self.preprocessing_params.get('color_order', 'RGB')).upper(),
         )
 
         # Create image predictions
@@ -1576,31 +1519,6 @@ class ValidationRunner:
         output.save(save_path)
 
         logger.info(f"Saved standardized predictions to {save_path}")
-    
-    def _save_predictions(self, predictions: torch.Tensor, targets: torch.Tensor, metadata: List):
-        """Save raw predictions to file using safe NPZ + JSON format"""
-        logger.info("Saving predictions...")
-
-        # Save arrays with NumPy (safe)
-        npz_path = self.output_dir / 'predictions.npz'
-        np.savez_compressed(
-            npz_path,
-            predictions=predictions.numpy(),
-            targets=targets.numpy(),
-            threshold=np.array(self.config.prediction_threshold),
-        )
-
-        # Save metadata as JSON (safe)
-        metadata_path = self.output_dir / 'predictions_metadata.json'
-        with open(metadata_path, 'w') as f:
-            json.dump({
-                'metadata': metadata,
-                'tag_names': [self.vocab.get_tag_from_index(i)
-                             for i in range(len(self.vocab.tag_to_index))],
-                'threshold': self.config.prediction_threshold,
-            }, f, indent=2)
-
-        logger.info(f"Saved predictions to {npz_path} and {metadata_path}")
     
     def _save_per_image_results(self, predictions: torch.Tensor, targets: torch.Tensor, metadata: List):
         """Save per-image results to CSV"""

@@ -399,10 +399,6 @@ def get_recommended_batch_size(
             - "small": ~85M params (ViT-Base variants)
             - "medium": ~150M params (ViT-Large variants)
             - "large": ~300M params (ViT-Huge variants)
-            - "swinv2" or "swinv2_xlarge": ~350M params SwinV2-XLarge
-              (embed_dim=256, depths=[2,2,18,2], num_heads=[8,16,32,64])
-              Assumes gradient checkpointing enabled. Conservative estimates
-              due to higher memory overhead from shifted window attention.
 
     Returns:
         Tuple of (batch_size, gradient_accumulation_steps)
@@ -418,52 +414,20 @@ def get_recommended_batch_size(
     #   - "small": ~85M params (ViT-Base variants)
     #   - "medium": ~150M params (ViT-Large variants)
     #   - "large": ~300M params (ViT-Huge variants)
-    #   - "swinv2_xlarge": ~350M params (SwinV2-XLarge with embed_dim=256, depths=[2,2,18,2])
-    #     Note: SwinV2 with gradient checkpointing (use_checkpoint: true) enabled
-    #     Conservative estimates to avoid OOM - SwinV2 has higher memory overhead
-    #     due to shifted window attention and hierarchical features
     memory_recommendations = {
         (512, "small"): {8: 12, 12: 20, 16: 28, 24: 40, 32: 56, 40: 72, 48: 96},
         (512, "medium"): {8: 8, 12: 16, 16: 24, 24: 32, 32: 48, 40: 64, 48: 80},
         (512, "large"): {8: 4, 12: 8, 16: 12, 24: 20, 32: 32, 40: 48, 48: 64},
         (768, "medium"): {8: 4, 12: 8, 16: 12, 24: 20, 32: 32, 40: 40, 48: 56},
         (1024, "medium"): {8: 2, 12: 4, 16: 8, 24: 12, 32: 20, 40: 28, 48: 36},
-        # SwinV2-XLarge (~350M params) - conservative batch sizes with gradient checkpointing
-        # Higher memory overhead than ViT due to shifted window attention mechanisms
-        (384, "swinv2_xlarge"): {8: 4, 12: 8, 16: 12, 24: 20, 32: 28, 40: 36, 48: 48},
-        (512, "swinv2_xlarge"): {8: 2, 12: 4, 16: 8, 24: 12, 32: 20, 40: 28, 48: 36},
-        (768, "swinv2_xlarge"): {8: 1, 12: 2, 16: 4, 24: 8, 32: 12, 40: 16, 48: 24},
-        # Alias for simpler usage
-        (384, "swinv2"): {8: 4, 12: 8, 16: 12, 24: 20, 32: 28, 40: 36, 48: 48},
-        (512, "swinv2"): {8: 2, 12: 4, 16: 8, 24: 12, 32: 20, 40: 28, 48: 36},
-        (768, "swinv2"): {8: 1, 12: 2, 16: 4, 24: 8, 32: 12, 40: 16, 48: 24},
     }
 
     # Find closest match for image size and model size
     key = (image_size, model_size)
     if key not in memory_recommendations:
-        # Try to find a fallback for the model size with a different image size
-        fallback_key = None
-
-        # For SwinV2 variants, try to find closest image size
-        if model_size in ("swinv2", "swinv2_xlarge"):
-            # Find available image sizes for this model
-            available_sizes = [k[0] for k in memory_recommendations.keys() if k[1] == model_size]
-            if available_sizes:
-                # Use closest available size, preferring smaller (more conservative)
-                closest = min(available_sizes, key=lambda x: (x < image_size, abs(x - image_size)))
-                fallback_key = (closest, model_size)
-                logger.warning(
-                    f"No recommendation for image_size={image_size} with {model_size}, "
-                    f"using {closest}px profile (conservative)"
-                )
-
-        # Default fallback to 512/medium for ViT variants
-        if fallback_key is None:
-            logger.warning(f"No recommendation for image_size={image_size}, model={model_size}, using defaults")
-            fallback_key = (512, "medium")
-
-        key = fallback_key
+        # No exact match; fall back to the 512/medium profile.
+        logger.warning(f"No recommendation for image_size={image_size}, model={model_size}, using defaults")
+        key = (512, "medium")
 
     memory_to_batch = memory_recommendations[key]
 
@@ -507,167 +471,6 @@ def get_recommended_batch_size(
 
     return max_batch_size, grad_accum
 
-
-def check_swinv2_batch_size(
-    batch_size: int,
-    available_memory_gb: Optional[float] = None,
-    image_size: int = 512,
-    gradient_checkpointing: bool = True
-) -> Tuple[bool, str]:
-    """Check if batch_size is appropriate for SwinV2 on the given GPU memory.
-
-    SwinV2 has significantly higher memory overhead than ViT due to:
-    - Shifted window attention mechanisms
-    - Hierarchical feature maps at multiple resolutions
-    - Relative position bias tables
-
-    This function warns users when their batch_size may cause OOM errors.
-
-    Args:
-        batch_size: The configured batch size
-        available_memory_gb: Available GPU memory in GB (None = auto-detect)
-        image_size: Input image size (default: 512)
-        gradient_checkpointing: Whether gradient checkpointing is enabled
-
-    Returns:
-        Tuple of (is_safe, warning_message)
-        - is_safe: True if batch_size is likely safe, False if OOM risk
-        - warning_message: Empty string if safe, warning details if not
-
-    Example:
-        >>> is_safe, warning = check_swinv2_batch_size(32, 16.0, 512)
-        >>> if not is_safe:
-        ...     print(warning)
-        WARNING: batch_size=32 may cause OOM for SwinV2 on 16GB GPU...
-    """
-    # Auto-detect GPU memory if not provided
-    if available_memory_gb is None:
-        available_memory_gb = detect_gpu_memory()
-
-    # SwinV2 memory recommendations with gradient checkpointing enabled
-    # Format: {image_size: {memory_gb: max_safe_batch_size}}
-    swinv2_safe_batch_sizes = {
-        384: {8: 4, 12: 8, 16: 12, 24: 20, 32: 28, 40: 36, 48: 48},
-        512: {8: 2, 12: 4, 16: 8, 24: 12, 32: 20, 40: 28, 48: 36},
-        768: {8: 1, 12: 2, 16: 4, 24: 8, 32: 12, 40: 16, 48: 24},
-    }
-
-    # Without gradient checkpointing, reduce safe batch sizes by ~40%
-    if not gradient_checkpointing:
-        for img_size in swinv2_safe_batch_sizes:
-            for mem in swinv2_safe_batch_sizes[img_size]:
-                swinv2_safe_batch_sizes[img_size][mem] = max(
-                    1, int(swinv2_safe_batch_sizes[img_size][mem] * 0.6)
-                )
-
-    # Find the closest image size
-    available_img_sizes = sorted(swinv2_safe_batch_sizes.keys())
-    closest_img_size = min(available_img_sizes, key=lambda x: abs(x - image_size))
-
-    if image_size not in swinv2_safe_batch_sizes:
-        logger.debug(
-            f"No exact SwinV2 profile for image_size={image_size}, "
-            f"using {closest_img_size}px profile"
-        )
-
-    mem_to_batch = swinv2_safe_batch_sizes[closest_img_size]
-
-    # Find the max safe batch size for the available memory
-    max_safe_batch = 1
-    for mem_threshold, safe_batch in sorted(mem_to_batch.items()):
-        if available_memory_gb >= mem_threshold:
-            max_safe_batch = safe_batch
-
-    # Check if configured batch size exceeds safe limit
-    if batch_size > max_safe_batch:
-        checkpoint_note = ""
-        if not gradient_checkpointing:
-            checkpoint_note = (
-                "\n  - Consider enabling gradient checkpointing (use_checkpoint: true) "
-                "to increase batch size headroom"
-            )
-
-        warning = (
-            f"WARNING: batch_size={batch_size} may cause OOM for SwinV2 on "
-            f"{available_memory_gb:.1f}GB GPU with {image_size}px images.\n"
-            f"  - Recommended max batch_size: {max_safe_batch}\n"
-            f"  - SwinV2 needs ~2-3x more memory than ViT due to shifted window attention\n"
-            f"  - For 16GB GPU with 512px images: "
-            f"{checkpoint_note}\n"
-            f"  - Use gradient_accumulation_steps to maintain effective batch size"
-        )
-        logger.warning(warning)
-        return False, warning
-
-    return True, ""
-
-
-def validate_swinv2_config(
-    batch_size: int,
-    learning_rate: float,
-    image_size: int = 512,
-    available_memory_gb: Optional[float] = None,
-    gradient_checkpointing: bool = True,
-    normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)
-) -> List[str]:
-    """Validate configuration for SwinV2 training and return warnings.
-
-    This is a comprehensive check for common SwinV2 configuration issues.
-
-    Args:
-        batch_size: Configured batch size
-        learning_rate: Configured learning rate
-        image_size: Input image size
-        available_memory_gb: GPU memory in GB (None = auto-detect)
-        gradient_checkpointing: Whether checkpointing is enabled
-        normalize_mean: Image normalization mean values
-
-    Returns:
-        List of warning messages (empty list if all checks pass)
-
-    Example:
-        >>> warnings = validate_swinv2_config(
-        ...     batch_size=32, learning_rate=2.5e-4, image_size=512
-        ... )
-        >>> for w in warnings:
-        ...     print(w)
-    """
-    warnings_list = []
-
-    # Check batch size
-    is_safe, batch_warning = check_swinv2_batch_size(
-        batch_size, available_memory_gb, image_size, gradient_checkpointing
-    )
-    if not is_safe:
-        warnings_list.append(batch_warning)
-
-    # Check learning rate (SwinV2 typically needs ~50% lower LR than ViT)
-    # Default ViT LR is 2.5e-4, so SwinV2 should be around 1.25e-4 or lower
-    if learning_rate > 1.5e-4:
-        warnings_list.append(
-            f"WARNING: learning_rate={learning_rate:.2e} may be too high for SwinV2.\n"
-            f"  - Recommended: 1.25e-4 (50% of typical ViT rate of 2.5e-4)\n"
-            f"  - SwinV2's shifted window attention has different gradient dynamics\n"
-            f"  - High LR can cause training instability or divergence"
-        )
-
-    # Check normalization (ImageNet pretrained SwinV2 expects ImageNet stats)
-    imagenet_mean = (0.485, 0.456, 0.406)
-    if normalize_mean != imagenet_mean and normalize_mean == (0.5, 0.5, 0.5):
-        warnings_list.append(
-            f"NOTE: Using normalize_mean={normalize_mean} (anime-optimized).\n"
-            f"  - Pretrained SwinV2 models expect ImageNet normalization:\n"
-            f"    mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]\n"
-            f"  - Current [0.5, 0.5, 0.5] is fine for training from scratch\n"
-            f"  - If using pretrained weights, consider ImageNet normalization"
-        )
-
-    return warnings_list
-
-
-# =============================================================================
-# SECTION 2: SCHEDULER CONFIGURATION
-# =============================================================================
 
 class SchedulerType(Enum):
     """Available learning rate scheduler types"""
@@ -1058,77 +861,3 @@ def create_scheduler_from_config(
             min_lr=min_lr,
             warmup_steps=warmup_steps,
         )
-
-
-def get_scheduler_recommendation_summary() -> str:
-    """Get a summary of when to use each scheduler type."""
-    return """
-Learning Rate Scheduler Recommendations
-========================================
-
-COSINE (Simple Cosine Decay)
-----------------------------
-When to use:
-  - Standard training runs (10k-100k steps)
-  - Large datasets (>100k samples)
-  - When you want stable, predictable convergence
-  - Fine-tuning pretrained models
-  - Production training (less experimental)
-
-Pros: Stable, well-tested, smooth decay
-Cons: May not find best solution for complex tasks
-
-COSINE_RESTARTS (Cosine Annealing with Warm Restarts / SGDR)
--------------------------------------------------------------
-When to use:
-  - Long training runs (>50k steps)
-  - Smaller datasets (<100k samples) with many epochs
-  - When you want to explore solution space
-  - Training from scratch (not fine-tuning)
-  - When you can save checkpoints at cycle ends
-
-Pros: Can escape local minima, ensemble-like behavior
-Cons: More hyperparameters, requires longer training
-
-Recommended cycles:
-  - Short runs (<20k steps): 2 cycles
-  - Medium runs (20k-100k): 3 cycles
-  - Long runs (>100k): 4-5 cycles
-
-ONE_CYCLE (One-Cycle Policy)
-----------------------------
-When to use:
-  - Fast convergence needed
-  - Medium-length training (10k-50k steps)
-  - When you have good learning rate estimates
-  - Classification tasks
-
-Pros: Fast convergence, good for time-limited training
-Cons: Sensitive to hyperparameters, less exploration
-
-LINEAR (Linear Decay)
---------------------
-When to use:
-  - Short fine-tuning runs (<10k steps)
-  - Simple, interpretable schedule needed
-  - Conservative training
-
-Pros: Simple, predictable
-Cons: Less effective than cosine for long runs
-
-For Your Anime Tagger Project:
-==============================
-Recommended: COSINE or COSINE_RESTARTS
-
-Use COSINE if:
-  - Dataset > 100k images
-  - Training for convergence (not exploration)
-  - Want stable, predictable training
-
-Use COSINE_RESTARTS if:
-  - Dataset < 100k images
-  - Training for many epochs (>50)
-  - Want to find best possible solution
-  - Can train longer
-  - Save checkpoints at cycle ends for ensemble
-"""

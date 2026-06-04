@@ -38,7 +38,7 @@ def _is_union_origin(origin: _typing.Any) -> bool:
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Type, TypeVar, get_type_hints, get_origin, get_args
-from dataclasses import dataclass, field, asdict, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 
 # Type alias for JSON-serializable values
@@ -46,16 +46,14 @@ JsonSerializable = Union[None, bool, int, float, str, List['JsonSerializable'], 
 import argparse
 import sys
 from datetime import datetime
-import copy
 import time
 from collections import defaultdict
-import re
 import warnings
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-# Import sensitive defaults
+# Allowlist of trusted webhook domains for alert URLs
 ALLOWED_WEBHOOK_DOMAINS = [
     'hooks.slack.com',
     'discord.com',
@@ -216,11 +214,6 @@ class BaseConfig:
     # Config versioning
     _config_version: str = field(default=CONFIG_VERSION, init=False, repr=False)
 
-    # Class-level cache for type introspection (fields() and get_type_hints() are expensive)
-    # Cache is keyed by class to support inheritance
-    _fields_cache: Dict[type, Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
-    _type_hints_cache: Dict[type, Dict[str, type]] = field(default_factory=dict, init=False, repr=False)
-
     # Class-level static caches (shared across all instances)
     # Using class attributes with setdefault for thread-safe initialization
     _fields_cache_static: _typing.ClassVar[Dict[type, Dict[str, Any]]] = {}
@@ -229,7 +222,7 @@ class BaseConfig:
     @classmethod
     def _get_cached_fields(cls) -> Dict[str, Any]:
         """Get fields dict with caching to avoid repeated introspection."""
-        # Use setdefault for atomic get-or-create operation (thread-safe for dict)
+        # Cache fields() result per class to avoid repeated dataclass introspection.
         cache = BaseConfig._fields_cache_static
         if cls not in cache:
             cache[cls] = {f.name: f for f in fields(cls)}
@@ -238,7 +231,7 @@ class BaseConfig:
     @classmethod
     def _get_cached_type_hints(cls) -> Dict[str, type]:
         """Get type hints dict with caching to avoid repeated introspection."""
-        # Use setdefault for atomic get-or-create operation (thread-safe for dict)
+        # Cache get_type_hints() result per class to avoid repeated introspection.
         cache = BaseConfig._type_hints_cache_static
         if cls not in cache:
             cache[cls] = get_type_hints(cls)
@@ -750,21 +743,11 @@ class BaseConfig:
 class ModelConfig(BaseConfig):
     """Model architecture configuration.
 
-    Architecture-Specific Learning Rate Guidance:
-    ---------------------------------------------
-    SwinV2 typically requires ~50% lower learning rate than ViT due to:
-    - Shifted window attention having different gradient dynamics
-    - Hierarchical feature extraction being more sensitive to large LR
-    - Pretrained SwinV2 weights expecting conservative fine-tuning rates
-
-    Recommended learning rates (base values, scale with batch size):
-    - ViT:    2.5e-4 (default)
-    - SwinV2: 1.25e-4 (50% of ViT rate)
-
-    Use get_recommended_learning_rate() method to get architecture-appropriate LR.
+    Recommended ViT learning rate (base value, scales with batch size): 2.5e-4.
+    Use get_recommended_learning_rate() to get the batch-scaled LR.
     """
     # Architecture
-    architecture_type: str = "vit"  # "vit" or "swinv2"
+    architecture_type: str = "vit"  # Must be "vit" — the only supported architecture (hard-asserted in validate())
     hidden_size: int = 1024
     num_hidden_layers: int = 17
     num_attention_heads: int = 16
@@ -802,17 +785,8 @@ class ModelConfig(BaseConfig):
     tags_per_group: int = 10000
 
     # Efficiency
-    # NOTE: For SwinV2 models, gradient checkpointing is controlled via swin_config.use_checkpoint.
-    # Setting gradient_checkpointing=True here will automatically enable swin_config.use_checkpoint
-    # during training, but for clarity it's recommended to use swin_config.use_checkpoint directly.
-    # For ViT models, use this setting (gradient_checkpointing) directly.
     gradient_checkpointing: bool = False
-    # For SwinV2, this controls per-block checkpoint interval when use_checkpoint is enabled.
-    checkpoint_every_n_layers: int = 1  # 1=all layers/blocks, 2=every 2nd, 4=every 4th, etc.
-
-    # SwinV2-specific configuration (only used when architecture_type="swinv2")
-    # For SwinV2, gradient checkpointing is controlled via swin_config.use_checkpoint
-    swin_config: Optional['SwinV2ModelConfig'] = None
+    checkpoint_every_n_layers: int = 1  # 1=all layers, 2=every 2nd, 4=every 4th, etc.
 
     def validate(self):
         """Validate model configuration"""
@@ -861,68 +835,33 @@ class ModelConfig(BaseConfig):
                 "values between 0.08 and 0.3 are typical for ViT."
             )
 
-        # Validate swin_config is provided when using SwinV2 architecture
-        if self.architecture_type == 'swinv2' and self.swin_config is None:
+        # Only the ViT architecture is supported.
+        if self.architecture_type != "vit":
             errors.append(
-                "swin_config must be provided when architecture_type='swinv2'. "
-                "Add a [model.swin_config] section to your configuration file."
+                f"architecture_type must be 'vit' (the only supported architecture), "
+                f"got '{self.architecture_type}'"
             )
-        if self.architecture_type == 'swinv2' and self.swin_config is not None:
-            custom_name = getattr(self.swin_config, 'custom_name', None)
-            if custom_name:
-                if getattr(self.swin_config, 'pretrained_name', None):
-                    errors.append(
-                        "swin_config.custom_name cannot be used with pretrained_name. "
-                        "Custom SwinV2 architectures do not support pretrained weights."
-                    )
-                if getattr(self.swin_config, 'model_name', None):
-                    errors.append(
-                        "swin_config.custom_name cannot be used with model_name. "
-                        "Use either a timm preset (model_name) or a custom architecture (custom_name)."
-                    )
 
         if errors:
             raise ConfigValidationError("Model config validation failed:\n" + "\n".join(errors))
 
-        # Validate SwinV2 window_size vs image_size compatibility at config load time
-        # This runs after basic validation so we can assume swin_config exists if architecture_type is swinv2
-        if self.architecture_type == 'swinv2' and self.swin_config is not None:
-            self.swin_config.validate_window_size_for_image(self.image_size)
-
     def get_recommended_learning_rate(self, base_lr: float = 2.5e-4) -> float:
         """Get architecture-appropriate learning rate recommendation.
-
-        SwinV2 typically needs ~50% lower learning rate than ViT due to:
-        - Shifted window attention having different gradient dynamics
-        - Hierarchical feature extraction being more sensitive to large LR
-        - Pretrained SwinV2 weights expecting conservative fine-tuning rates
 
         Args:
             base_lr: Base learning rate tuned for ViT (default: 2.5e-4)
 
         Returns:
             Recommended learning rate for the current architecture
-
-        Example:
-            >>> model_config = ModelConfig(architecture_type="swinv2")
-            >>> lr = model_config.get_recommended_learning_rate(2.5e-4)
-            >>> print(lr)  # 1.25e-4
         """
         # Architecture-specific learning rate multipliers
         lr_multipliers = {
             "vit": 1.0,
             "vit_wide_shallow": 1.0,
-            "swinv2": 0.5,  # SwinV2 needs ~50% lower LR
         }
 
         multiplier = lr_multipliers.get(self.architecture_type, 1.0)
         recommended_lr = base_lr * multiplier
-
-        if self.architecture_type == "swinv2":
-            logger.info(
-                f"SwinV2 architecture detected: reducing learning rate from {base_lr:.2e} "
-                f"to {recommended_lr:.2e} (50% reduction recommended for SwinV2)"
-            )
 
         return recommended_lr
 
@@ -932,144 +871,12 @@ class ModelConfig(BaseConfig):
         Returns:
             Human-readable guidance string for learning rate selection.
         """
-        if self.architecture_type == "swinv2":
-            return (
-                "SwinV2 Learning Rate Guidance:\n"
-                "  - Recommended base LR: 1.25e-4 (vs 2.5e-4 for ViT)\n"
-                "  - SwinV2 needs ~50% lower LR than ViT due to:\n"
-                "    * Shifted window attention has different gradient dynamics\n"
-                "    * Hierarchical features are more sensitive to large LR\n"
-                "    * Pretrained weights expect conservative fine-tuning\n"
-                "  - If using pretrained weights, consider starting even lower (1e-4)\n"
-                "  - Scale LR with sqrt(batch_size) as usual\n"
-            )
-        else:
-            return (
-                f"{self.architecture_type.upper()} Learning Rate Guidance:\n"
-                "  - Recommended base LR: 2.5e-4\n"
-                "  - Scale with sqrt(effective_batch_size / 256)\n"
-                "  - Use warmup for stable training start\n"
-            )
-
-
-@dataclass
-class SwinV2ModelConfig(BaseConfig):
-    """SwinV2-specific architecture configuration.
-
-    Custom "XLarge" config targeting ~350M params (between Large 197M and Huge 658M).
-    """
-    # Embedding dimension (192 for Large, 352 for Huge, 256 for custom XLarge)
-    embed_dim: int = 256
-
-    # Depths per stage - standard 4-stage structure
-    depths: Tuple[int, ...] = (2, 2, 18, 2)
-
-    # Number of attention heads per stage - scale with embed_dim
-    num_heads: Tuple[int, ...] = (8, 16, 32, 64)
-
-    # Window size for attention (16 for 512 input)
-    window_size: int = 16
-
-    # MLP expansion ratio
-    mlp_ratio: float = 4.0
-
-    # Stochastic depth rate
-    drop_path_rate: float = 0.2
-
-    # Pretrained model name (None for training from scratch)
-    pretrained_name: Optional[str] = None
-
-    # Enable gradient checkpointing
-    use_checkpoint: bool = True
-
-    # timm model name to use as backbone (e.g., 'swinv2_base_window12_192',
-    # 'swinv2_large_window12to16_192to256_22kft1k', etc.)
-    # If None, defaults to 'swinv2_base_window12_192' as the architecture template.
-    # The embed_dim, depths, num_heads, window_size, etc. will override the template's defaults.
-    model_name: Optional[str] = None
-
-    # Custom architecture label (enables custom SwinV2 backbone when set).
-    # Use this when you want a non-timm preset model (e.g., "OppaiOracleV01").
-    custom_name: Optional[str] = None
-
-    def validate_window_size_for_image(self, image_size: int) -> None:
-        """Validate that window_size is compatible with image_size for SwinV2.
-
-        SwinV2 uses hierarchical feature maps where each stage halves the spatial resolution.
-        For window-based attention to work correctly:
-        1. image_size must be divisible by (patch_size * 2^(num_stages-1)) for the final stage
-        2. All intermediate feature map sizes must be divisible by window_size
-        3. Final stage feature size must be >= window_size
-
-        This validation runs at config load time to fail early with clear error messages
-        instead of cryptic errors during model creation.
-
-        Args:
-            image_size: Input image size (assumes square images)
-
-        Raises:
-            ConfigValidationError: If image_size is incompatible with window_size
-        """
-        num_stages = len(self.depths)
-        initial_patch_size = 4  # SwinV2 always uses patch_size=4
-        window_size = self.window_size
-
-        # Calculate the total downsampling factor for the final stage
-        # SwinV2 downsamples by patch_size initially, then by 2 at each stage transition
-        # Final resolution = image_size / (patch_size * 2^(num_stages-1))
-        total_downsample = initial_patch_size * (2 ** (num_stages - 1))
-
-        # Check 1: image_size must produce integer feature sizes
-        if image_size % total_downsample != 0:
-            final_res = image_size / total_downsample
-            valid_sizes = [
-                s for s in [192, 224, 256, 384, 448, 512, 640, 768, 896, 1024]
-                if s % total_downsample == 0
-            ]
-            raise ConfigValidationError(
-                f"SwinV2 image_size ({image_size}) must be divisible by {total_downsample} "
-                f"(patch_size={initial_patch_size} * 2^{num_stages-1}) with {num_stages} stages. "
-                f"Current final resolution would be {final_res:.2f} (must be integer). "
-                f"Suggested valid image sizes: {valid_sizes}"
-            )
-
-        # Check 2: window_size divisibility at each stage
-        invalid_stages = []
-        for stage in range(num_stages):
-            downsample_at_stage = initial_patch_size * (2 ** stage)
-            feature_size = image_size // downsample_at_stage
-
-            if feature_size % window_size != 0:
-                invalid_stages.append(
-                    f"stage {stage}: feature_size={feature_size}, "
-                    f"feature_size % window_size = {feature_size % window_size}"
-                )
-
-        if invalid_stages:
-            required_multiple = total_downsample * window_size
-            valid_sizes = [
-                s for s in range(required_multiple, 1025, required_multiple)
-                if s <= 1024
-            ]
-            raise ConfigValidationError(
-                f"SwinV2 image_size ({image_size}) is incompatible with window_size ({window_size}) "
-                f"with {num_stages} stages. "
-                f"Feature map sizes must be divisible by window_size at all stages. "
-                f"Invalid stages: {'; '.join(invalid_stages)}. "
-                f"Suggested valid image sizes (divisible by {required_multiple}): {valid_sizes}"
-            )
-
-        # Check 3: final stage feature size >= window_size
-        final_feature_size = image_size // total_downsample
-        if final_feature_size < window_size:
-            raise ConfigValidationError(
-                f"SwinV2 final stage feature size ({final_feature_size}) is smaller than "
-                f"window_size ({window_size}). SwinV2 requires the feature map at each stage "
-                f"to be at least as large as the window size. "
-                f"Either increase image_size (current: {image_size}) or decrease window_size. "
-                f"Minimum image_size for window_size={window_size} with {num_stages} stages: "
-                f"{window_size * total_downsample}"
-            )
+        return (
+            f"{self.architecture_type.upper()} Learning Rate Guidance:\n"
+            "  - Recommended base LR: 2.5e-4\n"
+            "  - Scale with sqrt(effective_batch_size / 256)\n"
+            "  - Use warmup for stable training start\n"
+        )
 
 
 @dataclass
@@ -1106,17 +913,19 @@ class DataConfig(BaseConfig):
     
     # Image processing
     image_size: int = 512
+    # Channel ordering of image tensors emitted by the dataloader. RGB is the
+    # project default (and how legacy checkpoints/configs are interpreted). All
+    # other per-channel parameters in this block (normalize_mean, normalize_std,
+    # pad_color) are interpreted in this same channel order with no implicit
+    # reordering anywhere in the pipeline.
+    color_order: str = "RGB"
     # Default normalization for ViT: inception-style (0.5/0.5/0.5) expects pixel values in
     # [0, 1] range. Using 0.5/0.5/0.5 keeps training, validation and inference
-    # in sync unless explicitly overridden in the unified config.
+    # in sync unless explicitly overridden in the unified config. Values are
+    # interpreted in the channel order specified by ``color_order`` (channel-
+    # symmetric here, so identical for RGB and BGR).
     normalize_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5)
     normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5)
-
-    # SwinV2-specific normalization: ImageNet mean/std required for pretrained weights.
-    # These values match timm's default preprocessing for SwinV2 models.
-    # When architecture_type="swinv2", these values are used instead of normalize_mean/std.
-    swinv2_normalize_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
-    swinv2_normalize_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
     pad_color: Tuple[int, int, int] = (114, 114, 114)
     
@@ -1269,13 +1078,18 @@ class DataConfig(BaseConfig):
         if self.preload_files < 0:
             errors.append(f"preload_files must be >= 0, got {self.preload_files}")
 
-        # Validate normalization parameters (ViT defaults and SwinV2 ImageNet values)
+        # Validate normalization parameters
         for param_name, param_value in [('normalize_mean', self.normalize_mean),
-                                        ('normalize_std', self.normalize_std),
-                                        ('swinv2_normalize_mean', self.swinv2_normalize_mean),
-                                        ('swinv2_normalize_std', self.swinv2_normalize_std)]:
+                                        ('normalize_std', self.normalize_std)]:
             if len(param_value) != 3:
                 errors.append(f"{param_name} must have 3 values, got {len(param_value)}")
+
+        # Validate color_order
+        valid_color_orders = {"RGB", "BGR"}
+        if self.color_order not in valid_color_orders:
+            errors.append(
+                f"color_order must be one of {sorted(valid_color_orders)}, got {self.color_order!r}"
+            )
 
         # Validate pad_color
         if len(self.pad_color) != 3:
@@ -1369,14 +1183,6 @@ class TrainingConfig(BaseConfig):
     # Modes: "sqrt" (recommended for AdamW), "linear", or "none" (use learning_rate as-is).
     lr_scaling_mode: str = "sqrt"
     lr_base_batch_size: int = 256
-    # SwinV2-specific learning rate (used when model.architecture_type == 'swinv2')
-    # SwinV2 typically needs ~50% lower learning rate than ViT due to:
-    #   - Shifted window attention has different gradient dynamics
-    #   - Hierarchical feature extraction is more sensitive to large LR
-    #   - Higher memory overhead means smaller effective batches
-    # Recommended range: 5e-5 to 1e-4 (vs 1e-4 to 2.5e-4 for ViT)
-    # If None, falls back to learning_rate (for backward compatibility)
-    swinv2_learning_rate: Optional[float] = None
     weight_decay: float = 0.01
     gradient_accumulation_steps: int = 4
 
@@ -1465,10 +1271,6 @@ class TrainingConfig(BaseConfig):
         
         if self.learning_rate <= 0:
             errors.append(f"learning_rate must be positive, got {self.learning_rate}")
-
-        # Validate swinv2_learning_rate if provided
-        if self.swinv2_learning_rate is not None and self.swinv2_learning_rate <= 0:
-            errors.append(f"swinv2_learning_rate must be positive, got {self.swinv2_learning_rate}")
 
         if self.num_epochs <= 0:
             errors.append(f"num_epochs must be positive, got {self.num_epochs}")
@@ -1615,17 +1417,13 @@ class ExportConfig(BaseConfig):
     # Output
     output_path: str = "./exported_model"
 
+    # Which variant(s) to produce. Default is float16 since the model is trained
+    # in bf16 — keeping inference at 16-bit roughly halves the file size and is
+    # natively supported by ORT's CUDA EP. Supported: 'full' (fp32), 'fp16', 'quantized'.
+    export_variants: List[str] = field(default_factory=lambda: ['fp16'])
+
     # Vocabulary embedding
     require_embedded_vocabulary: bool = True  # Require vocabulary to be embedded in ONNX model
-
-    # Architecture-specific export controls
-    # SwinV2 ONNX Export Behavior:
-    # - By default, SwinV2 ONNX export is BLOCKED because shifted window attention
-    #   uses torch.roll() which cannot be properly traced to ONNX. The resulting
-    #   models may have incorrect attention patterns or fail at runtime.
-    # - Set force_swinv2_export=True to override this block (NOT RECOMMENDED for production)
-    # - For production ONNX deployments, use ViT or SimplifiedTagger architectures instead
-    force_swinv2_export: bool = False  # Override to allow SwinV2 ONNX export (not recommended)
 
     # Dynamo-based ONNX export (PyTorch 2.5+)
     # Uses torch.onnx.export(dynamo=True) instead of the legacy TorchScript tracer.
@@ -2481,8 +2279,7 @@ def create_config_parser(config_type: ConfigType = ConfigType.FULL) -> argparse.
         # Training arguments
         train_group = parser.add_argument_group('training')
         train_group.add_argument('--training.num_epochs', type=int, help='Number of epochs')
-        train_group.add_argument('--training.learning_rate', type=float, help='Learning rate (used for ViT)')
-        train_group.add_argument('--training.swinv2_learning_rate', type=float, help='SwinV2-specific learning rate (recommended: 5e-5 to 1e-4)')
+        train_group.add_argument('--training.learning_rate', type=float, help='Learning rate')
         train_group.add_argument('--training.weight_decay', type=float, help='Weight decay')
         train_group.add_argument('--training.device', type=str, help='Device (cuda/cpu)')
         train_group.add_argument('--training.seed', type=int, help='Random seed')
@@ -2614,9 +2411,9 @@ if __name__ == "__main__":
         try:
             manager = ConfigManager(ConfigType.FULL)
             _ = manager.load_from_file(sys.argv[2])
-            print(f"✓ Config file '{sys.argv[2]}' is valid")
+            print(f"[OK] Config file '{sys.argv[2]}' is valid")
         except Exception as e:
-            print(f"✗ Config validation failed: {e}")
+            print(f"[FAIL] Config validation failed: {e}")
             sys.exit(1)
     else:
         # Full logging for other commands and interactive tests
@@ -2636,9 +2433,9 @@ if __name__ == "__main__":
                     try:
                         manager = ConfigManager(ConfigType.FULL)
                         _ = manager.load_from_file(sys.argv[2])
-                        print(f"✓ Config file '{sys.argv[2]}' is valid")
+                        print(f"[OK] Config file '{sys.argv[2]}' is valid")
                     except Exception as e:
-                        print(f"✗ Config validation failed: {e}")
+                        print(f"[FAIL] Config validation failed: {e}")
                         sys.exit(1)
                 else:
                     print("Unknown command. Use 'generate' or 'validate'")
@@ -2653,9 +2450,9 @@ if __name__ == "__main__":
                 config = FullConfig()
                 try:
                     config.validate()
-                    print("   ✓ Default config is valid")
+                    print("   [OK] Default config is valid")
                 except Exception as e:
-                    print(f"   ✗ Validation failed: {e}")
+                    print(f"   [FAIL] Validation failed: {e}")
 
                 # Test 2: Save and load config
                 print("\n2. Testing save/load functionality...")
@@ -2666,9 +2463,9 @@ if __name__ == "__main__":
                 loaded = manager.load_from_file(test_file)
 
                 if config == loaded:
-                    print("   ✓ Config saved and loaded correctly")
+                    print("   [OK] Config saved and loaded correctly")
                 else:
-                    print("   ✗ Loaded config doesn't match original")
+                    print("   [FAIL] Loaded config doesn't match original")
 
                 # Test 3: Environment variable override
                 print("\n3. Testing environment variable override...")
@@ -2681,7 +2478,7 @@ if __name__ == "__main__":
                 assert manager.config.training.learning_rate == 0.0005
                 assert manager.config.model.num_groups == 20
                 assert manager.config.data.batch_size == 64
-                print("   ✓ Environment overrides work correctly")
+                print("   [OK] Environment overrides work correctly")
 
                 # Test 4: Config diff
                 print("\n4. Testing config diff functionality...")
@@ -2707,9 +2504,9 @@ if __name__ == "__main__":
 
                 success = manager.restore_checkpoint("before_changes")
                 if success and manager.config.training.num_epochs != 500:
-                    print("   ✓ Checkpoint restore successful")
+                    print("   [OK] Checkpoint restore successful")
                 else:
-                    print("   ✗ Checkpoint restore failed")
+                    print("   [FAIL] Checkpoint restore failed")
 
                 # Clean up
                 test_file.unlink()
