@@ -15,7 +15,6 @@ from datetime import datetime
 from collections import defaultdict
 import gc
 import multiprocessing as mp
-import yaml
 import csv
 
 import numpy as np
@@ -61,6 +60,7 @@ from Configuration_System import (
     DataConfig as CSDataConfig,
     ValidationConfig as CSValConfig,
     ValidationDataloaderConfig as CSDataloaderConfig,
+    load_config,
 )
 from training_utils import (
     CheckpointManager,
@@ -99,13 +99,17 @@ class ValidationConfig:
     mode: str = "full"  # "full", "fast", "tags", "hierarchical"
     specific_tags: Optional[List[str]] = None  # For "tags" mode
     
-    # Batch settings
+    # Batch settings (filled from unified_config.yaml validation.dataloader)
     batch_size: int = 64
     num_workers: int = 8
-    
+    pin_memory: bool = True
+
     # Evaluation settings
+    # max_samples: None = use unified_config.yaml validation.max_samples
     max_samples: Optional[int] = None  # Limit samples for fast validation
-    prediction_threshold: float = 0.2653
+    # prediction_threshold: None = use unified_config.yaml inference.prediction_threshold
+    # (single source of truth for the prediction threshold)
+    prediction_threshold: Optional[float] = None
     save_predictions: bool = False
     save_per_image_results: bool = False
     
@@ -158,7 +162,12 @@ class ValidationRunner:
         self._log_queue: Optional[mp.Queue] = mp.Queue()
         self._listener = None  # Initialize listener attribute
 
-        # Load validation overrides from unified_config.yaml
+        # Load validation settings from unified_config.yaml via the SAME loader
+        # as training (Configuration_System.load_config). This runs
+        # FullConfig.validate(), which syncs validation.preprocessing.image_size
+        # and patch_size from data.image_size / model.patch_size — so editing
+        # data.image_size (the documented single source of truth) is honored
+        # here exactly as it is in training.
         self._val_mean: Optional[Tuple[float, float, float]] = None
         self._val_std: Optional[Tuple[float, float, float]] = None
         self._val_architecture_type = "vit"
@@ -169,155 +178,60 @@ class ValidationRunner:
             raise FileNotFoundError(
                 f"Unified configuration file not found at: {UNIFIED_CONFIG_PATH}\n"
                 f"\n"
-                f"This file is required for validation preprocessing settings.\n"
-                f"Please create it with the following structure:\n"
-                f"\n"
-                f"data:\n"
-                f"  normalize_mean: [0.485, 0.456, 0.406]\n"
-                f"  normalize_std: [0.229, 0.224, 0.225]\n"
-                f"  image_size: 512\n"
-                f"  patch_size: 16\n"
-                f"\n"
-                f"validation:\n"
-                f"  dataloader:\n"
-                f"    batch_size: 64\n"
-                f"    num_workers: 8\n"
-                f"  preprocessing:\n"
-                f"    # Optional overrides for data section\n"
+                f"This file is required for validation settings (data.image_size,\n"
+                f"data.normalize_mean/std, validation.dataloader, validation.max_samples,\n"
+                f"inference.prediction_threshold). It is the project's single\n"
+                f"configuration source."
             )
 
-        # Load and validate config
         try:
-            config_text = UNIFIED_CONFIG_PATH.read_text(encoding="utf-8")
-            unified = yaml.safe_load(config_text)
-        except yaml.YAMLError as e:
-            raise RuntimeError(
-                f"Failed to parse YAML in {UNIFIED_CONFIG_PATH}:\n{e}\n"
-                f"Please check for syntax errors in the configuration file."
-            ) from e
+            unified = load_config(str(UNIFIED_CONFIG_PATH))
         except Exception as e:
-            raise RuntimeError(f"Failed to read {UNIFIED_CONFIG_PATH}: {e}") from e
+            raise RuntimeError(
+                f"Failed to load {UNIFIED_CONFIG_PATH}: {e}\n"
+                f"Please check the configuration file."
+            ) from e
 
-        if unified is None:
-            unified = {}
-            logger.warning(f"{UNIFIED_CONFIG_PATH} is empty, using defaults where possible")
+        self._val_architecture_type = str(unified.model.architecture_type or "vit").lower()
 
-        # Extract sections with type validation
-        validation_section = unified.get("validation", {})
-        data_section = unified.get("data", {})
-        model_section = unified.get("model", {})
+        # Dataloader settings come from validation.dataloader (YAML is the only
+        # configuration source for these values — no CLI overrides).
+        self.config.batch_size = int(unified.validation.dataloader.batch_size)
+        self.config.num_workers = int(unified.validation.dataloader.num_workers)
+        self.config.pin_memory = bool(unified.validation.dataloader.pin_memory)
+        self._val_prefetch_factor = int(unified.validation.dataloader.prefetch_factor)
+        self._val_persistent_workers = bool(unified.validation.dataloader.persistent_workers)
 
-        if not isinstance(validation_section, dict):
-            raise ValueError(
-                f"'validation' section in config must be a dict, got {type(validation_section)}"
-            )
-        if not isinstance(data_section, dict):
-            raise ValueError(
-                f"'data' section in config must be a dict, got {type(data_section)}"
-            )
-        if not isinstance(model_section, dict):
-            model_section = {}
+        # validation.max_samples applies to this standalone runner (the
+        # in-training validation split is capped separately by data.max_val_samples).
+        if self.config.max_samples is None and unified.validation.max_samples:
+            self.config.max_samples = int(unified.validation.max_samples)
 
-        arch_raw = model_section.get("architecture_type", "vit")
-        self._val_architecture_type = str(arch_raw).lower() if arch_raw else "vit"
+        # Prediction threshold: inference.prediction_threshold is the single
+        # source of truth (FullConfig.validate() enforces equality with
+        # threshold_calibration.default_threshold).
+        if self.config.prediction_threshold is None:
+            self.config.prediction_threshold = float(unified.inference.prediction_threshold)
 
-        # Extract dataloader settings
-        dataloader_cfg = validation_section.get("dataloader", {})
-        if dataloader_cfg:
-            self.config.batch_size = int(dataloader_cfg.get("batch_size", self.config.batch_size))
-            self.config.num_workers = int(dataloader_cfg.get("num_workers", self.config.num_workers))
+        # Preprocessing uses the same priority as training: data.image_size is the
+        # single source of truth (validate() synced the validation.preprocessing
+        # section from it), and normalization / channel order / pad color come
+        # from the data section.
+        self._val_mean = tuple(float(x) for x in unified.data.normalize_mean)
+        self._val_std = tuple(float(x) for x in unified.data.normalize_std)
+        self._val_color_order = str(unified.data.color_order).upper()
+        self._val_pad_color = tuple(int(c) for c in unified.data.pad_color)
+        self._val_image_size = int(unified.data.image_size)
+        self._val_patch_size = int(unified.model.patch_size)
 
-        # Extract preprocessing settings
-        preprocessing_cfg = validation_section.get("preprocessing", {})
-
-        def _parse_triplet(name: str, value):
-            if value is None:
-                return None
-            if not isinstance(value, (list, tuple)) or len(value) != 3:
-                raise ValueError(
-                    f"'{name}' must be a list/tuple of 3 floats, got: {value} (type: {type(value)})\n"
-                    f"Example: {name}: [0.485, 0.456, 0.406]"
-                )
-            try:
-                return tuple(float(x) for x in value)
-            except (ValueError, TypeError) as e:
-                raise ValueError(
-                    f"'{name}' values must be convertible to float, got: {value}\n"
-                    f"Error: {e}"
-                ) from e
-
-        # Get normalization parameters (preprocessing overrides data)
-        mean = preprocessing_cfg.get("normalize_mean")
-        if mean is None:
-            mean = data_section.get("normalize_mean")
-        std = preprocessing_cfg.get("normalize_std")
-        if std is None:
-            std = data_section.get("normalize_std")
-
-        if mean is None:
-            raise ValueError(
-                f"Missing 'normalize_mean' in {UNIFIED_CONFIG_PATH}.\n"
-                f"Add to either 'data.normalize_mean' or 'validation.preprocessing.normalize_mean'.\n"
-                f"Example: normalize_mean: [0.485, 0.456, 0.406]"
-            )
-
-        if std is None:
-            raise ValueError(
-                f"Missing 'normalize_std' in {UNIFIED_CONFIG_PATH}.\n"
-                f"Add to either 'data.normalize_std' or 'validation.preprocessing.normalize_std'.\n"
-                f"Example: normalize_std: [0.229, 0.224, 0.225]"
-            )
-
-        self._val_mean = _parse_triplet("normalize_mean", mean)
-        self._val_std = _parse_triplet("normalize_std", std)
-
-        # Channel order (RGB by default, the project default; legacy
-        # checkpoints/configs without this field are likewise treated as RGB).
-        color_order_raw = (
-            preprocessing_cfg.get("color_order")
-            or data_section.get("color_order")
-            or "RGB"
-        )
-        self._val_color_order = str(color_order_raw).upper()
-        if self._val_color_order not in {"RGB", "BGR"}:
-            raise ValueError(
-                f"Invalid 'color_order': {color_order_raw!r}. Must be 'RGB' or 'BGR'.\n"
-                f"Check 'data.color_order' or 'validation.preprocessing.color_order' in {UNIFIED_CONFIG_PATH}"
-            )
-
-        # Get image and patch sizes with defaults
-        self._val_image_size = int(
-            preprocessing_cfg.get("image_size") or
-            data_section.get("image_size") or
-            self._val_image_size
-        )
-        self._val_patch_size = int(
-            preprocessing_cfg.get("patch_size") or
-            data_section.get("patch_size") or
-            self._val_patch_size
-        )
-
-        # Validate image_size and patch_size
-        if self._val_image_size <= 0:
-            raise ValueError(
-                f"Invalid 'image_size': {self._val_image_size}. Must be a positive integer.\n"
-                f"Check 'data.image_size' or 'validation.preprocessing.image_size' in {UNIFIED_CONFIG_PATH}"
-            )
-        if self._val_patch_size <= 0:
-            raise ValueError(
-                f"Invalid 'patch_size': {self._val_patch_size}. Must be a positive integer.\n"
-                f"Check 'data.patch_size' or 'validation.preprocessing.patch_size' in {UNIFIED_CONFIG_PATH}"
-            )
-        if self._val_image_size % self._val_patch_size != 0:
-            raise ValueError(
-                f"image_size ({self._val_image_size}) must be divisible by patch_size ({self._val_patch_size}).\n"
-                f"Current remainder: {self._val_image_size % self._val_patch_size}\n"
-                f"Consider adjusting image_size to {(self._val_image_size // self._val_patch_size) * self._val_patch_size}"
-            )
+        # Frequency bins for by-frequency analysis (optional YAML knob)
+        if self.config.frequency_bins is None and unified.validation.frequency_bins:
+            self.config.frequency_bins = list(unified.validation.frequency_bins)
 
         logger.info(
             f"Loaded validation config: image_size={self._val_image_size}, "
-            f"patch_size={self._val_patch_size}, mean={self._val_mean}, std={self._val_std}"
+            f"patch_size={self._val_patch_size}, mean={self._val_mean}, std={self._val_std}, "
+            f"pad_color={self._val_pad_color}, threshold={self.config.prediction_threshold}"
         )
 
         # Warn if legacy validation_config.yaml still exists (migration)
@@ -488,11 +402,17 @@ class ValidationRunner:
         """Setup validation-specific logging"""
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-        # Always have a console handler
-        sh = logging.StreamHandler()
-        sh.setFormatter(formatter)
-        sh.setLevel(logging.INFO)
-        logger.addHandler(sh)
+        # Console handler — guard against stacking duplicates when multiple
+        # ValidationRunner instances are constructed (e.g. a sweep loop) on this
+        # shared module logger.
+        if not any(
+            isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+            for h in logger.handlers
+        ):
+            sh = logging.StreamHandler()
+            sh.setFormatter(formatter)
+            sh.setLevel(logging.INFO)
+            logger.addHandler(sh)
 
         # Only primary process writes files
         is_primary = True
@@ -644,6 +564,7 @@ class ValidationRunner:
             normalize_mean=tuple(self.preprocessing_params.get('normalize_mean', [0.5, 0.5, 0.5])),
             normalize_std=tuple(self.preprocessing_params.get('normalize_std', [0.5, 0.5, 0.5])),
             color_order=str(self.preprocessing_params.get('color_order', 'RGB')).upper(),
+            pad_color=getattr(self, '_val_pad_color', (114, 114, 114)),
             random_flip_prob=0.0,
             pin_memory=True,
             batch_size=8,  # ignored by val loader below
@@ -652,6 +573,9 @@ class ValidationRunner:
             dataloader=CSDataloaderConfig(
                 batch_size=self.config.batch_size,
                 num_workers=self.config.num_workers,
+                prefetch_factor=getattr(self, '_val_prefetch_factor', 2),
+                persistent_workers=getattr(self, '_val_persistent_workers', True),
+                pin_memory=getattr(self.config, 'pin_memory', True),
             )
         )
         _, val_loader, _ = create_dataloaders(
@@ -671,15 +595,22 @@ class ValidationRunner:
             indices = val_rng.choice(len(val_loader.dataset), self.config.max_samples, replace=False)
             indices = np.sort(indices)  # Sort to maintain consistent dataset ordering
             subset = Subset(val_loader.dataset, indices)
-            # Shutdown old loader's workers before creating new one to prevent orphaned processes
-            _shutdown_dataloader_workers(val_loader)
-            val_loader = DataLoader(
-                subset,
+            # Preserve the source loader's multiprocessing settings so the subset
+            # loader behaves identically (prefetch depth, persistent workers, and
+            # worker_init_fn — which wires up worker logging/exclusions).
+            rebuild_kwargs = dict(
                 batch_size=self.config.batch_size,
                 shuffle=False,
                 num_workers=self.config.num_workers,
                 pin_memory=getattr(self.config, "pin_memory", True),
             )
+            if self.config.num_workers > 0:
+                rebuild_kwargs["prefetch_factor"] = val_loader.prefetch_factor
+                rebuild_kwargs["persistent_workers"] = val_loader.persistent_workers
+                rebuild_kwargs["worker_init_fn"] = val_loader.worker_init_fn
+            # Shutdown old loader's workers before creating new one to prevent orphaned processes
+            _shutdown_dataloader_workers(val_loader)
+            val_loader = DataLoader(subset, **rebuild_kwargs)
             logger.info(f"Limited validation to {self.config.max_samples} samples")
         
         return val_loader
@@ -1054,12 +985,24 @@ class ValidationRunner:
         # Limit samples for speed
         max_batches = 50
         limited_data = []
-        
-        for i, batch in enumerate(dataloader):
-            if i >= max_batches:
+
+        # Harvest the first max_batches, then deterministically tear down the
+        # source loader's workers BEFORE spinning up fast_loader. Abandoning the
+        # iterator on `break` leaves spawn workers to be reclaimed only at GC,
+        # which on Windows is non-deterministic and lets two worker pools coexist.
+        it = iter(dataloader)
+        for _ in range(max_batches):
+            try:
+                limited_data.append(next(it))
+            except StopIteration:
                 break
-            limited_data.append(batch)
-        
+        if hasattr(it, "_shutdown_workers"):
+            try:
+                it._shutdown_workers()
+            except Exception:
+                pass
+        del it
+
         # Create temporary dataloader
         class ListDataset(torch.utils.data.Dataset):
             def __init__(self, data):
@@ -1088,12 +1031,18 @@ class ValidationRunner:
         
         logger.info(f"Validating specific tags: {self.config.specific_tags}")
         
-        # Get tag indices
+        # Get tag indices. Track the names that were actually found, in the SAME
+        # order indices are appended, so prediction/target columns (built from
+        # tag_indices) stay aligned with their tag names below. Iterating over
+        # self.config.specific_tags directly would mispair every metric whenever
+        # any requested tag is missing from the vocabulary.
         tag_indices = []
+        found_tag_names = []
         for tag in self.config.specific_tags:
             idx = self.vocab.get_tag_index(tag)
             if idx != self.vocab.unk_index:
                 tag_indices.append(idx)
+                found_tag_names.append(tag)
             else:
                 logger.warning(f"Tag '{tag}' not found in vocabulary")
         
@@ -1158,7 +1107,7 @@ class ValidationRunner:
         # Compute per-tag metrics (now on CPU - eliminates 4x GPU syncs per tag)
         results = {'specific_tags': {}}
         
-        for i, (tag, tag_idx) in enumerate(zip(self.config.specific_tags, tag_indices_cpu.tolist())):
+        for i, tag in enumerate(found_tag_names):
             tag_preds = all_predictions[:, i]
             tag_targets = all_targets[:, i]
             
@@ -1631,12 +1580,14 @@ def main():
     parser.add_argument('--vocab-path', type=str, default=str(DEFAULT_VOCAB_PATH))
     
     # Validation arguments
-    parser.add_argument('--mode', type=str, default='full', 
+    parser.add_argument('--mode', type=str, default='full',
                        choices=['full', 'fast', 'tags', 'hierarchical'])
     parser.add_argument('--specific-tags', nargs='+', help='Tags to validate (for tags mode)')
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--max-samples', type=int, help='Maximum samples to validate')
-    
+    # NOTE: batch size, worker count, max_samples and the prediction threshold are
+    # NOT CLI flags — they come from configs/unified_config.yaml
+    # (validation.dataloader.*, validation.max_samples, inference.prediction_threshold).
+    # The unified YAML is the project's only configuration source.
+
     # Output arguments
     parser.add_argument('--output-dir', type=str, default='./validation_results')
     parser.add_argument('--save-predictions', action='store_true')
@@ -1661,8 +1612,6 @@ def main():
         vocab_path=args.vocab_path,
         mode=args.mode,
         specific_tags=args.specific_tags,
-        batch_size=args.batch_size,
-        max_samples=args.max_samples,
         output_dir=args.output_dir,
         save_predictions=args.save_predictions,
         save_per_image_results=args.save_per_image,

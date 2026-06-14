@@ -35,11 +35,6 @@ class AsymmetricFocalLoss(nn.Module):
     _keep_mask_cache: Dict[Tuple[int, str, int, Tuple[int, ...]], torch.Tensor] = {}
     _KEEP_MASK_CACHE_MAX_SIZE: ClassVar[int] = 100
 
-    @classmethod
-    def clear_keep_mask_cache(cls) -> None:
-        """Clear the keep mask cache. Useful for memory management or device changes."""
-        cls._keep_mask_cache.clear()
-
     def __init__(
         self,
         gamma_pos: float = 1.0,
@@ -285,6 +280,11 @@ class AsymmetricFocalLoss(nn.Module):
         # Calculate probabilities for focal weighting
         probs = torch.sigmoid(logits)
 
+        # Use 1e-6 as minimum to avoid gradient underflow with high gamma values.
+        # With 1e-7 and gamma=3: log(1e-7)^3 ≈ (-16.1)^3 ≈ -4160, exp(-4160) underflows to 0.
+        # Using 1e-6: log(1e-6)^3 ≈ (-13.8)^3 ≈ -2628, more stable while still preventing log(0).
+        _LOG_FLOOR = 1e-6
+
         # Apply probability shifting (margin) per Ridnik 2021. For negatives we
         # subtract the margin from p and clamp at zero so confident-negative
         # predictions (p <= clip) get exactly zero focal weight. Previous code
@@ -292,8 +292,18 @@ class AsymmetricFocalLoss(nn.Module):
         # gradient instead of suppressing it.
         if self.clip > 0:
             probs_neg = (probs - self.clip).clamp(min=0.0)
+            # Official ASL also shifts the negative *log* term: log(1 - p + m),
+            # not log(1 - p). xs_neg = (1 - p + m).clamp(max=1) makes confident
+            # negatives (p <= m) contribute exactly zero loss and softens hard
+            # negatives (p -> 1) to ~log(m) instead of diverging. Smoothed
+            # targets keep their (small) positive component, computed on the
+            # unshifted probability with the same eps floor as the focal weights.
+            xs_neg = (1.0 - probs + self.clip).clamp(max=1.0)
+            bce_neg = -(targets * torch.log(probs.clamp(min=_LOG_FLOOR))
+                        + (1.0 - targets) * torch.log(xs_neg.clamp(min=_LOG_FLOOR)))
         else:
             probs_neg = probs
+            bce_neg = bce_loss
 
         # Calculate focal weights using log-space math for numerical stability and
         # gradient preservation (CR-008 fix)
@@ -302,26 +312,27 @@ class AsymmetricFocalLoss(nn.Module):
         # Using log-space: exp(gamma * log(x)) = x^gamma
         # This avoids pow(0, gamma) numerically while maintaining gradients everywhere
 
-        # Use 1e-6 as minimum to avoid gradient underflow with high gamma values.
-        # With 1e-7 and gamma=3: log(1e-7)^3 ≈ (-16.1)^3 ≈ -4160, exp(-4160) underflows to 0.
-        # Using 1e-6: log(1e-6)^3 ≈ (-13.8)^3 ≈ -2628, more stable while still preventing log(0).
-        _LOG_FLOOR = 1e-6
-        # log(1-p) for positive focal weight
-        log_one_minus_probs = torch.log((1 - probs).clamp(min=_LOG_FLOOR))
+        # Clamp the exponent to prevent overflow: exp(88) ≈ 2e38 (near float32 max)
+        MAX_EXP = 88.0
+        if self.gamma_pos == 0:
+            # (1-p)^0 == 1 identically; skip the full-tensor log/exp work.
+            pos_weights = targets_for_focal
+        else:
+            # log(1-p) for positive focal weight
+            log_one_minus_probs = torch.log((1 - probs).clamp(min=_LOG_FLOOR))
+            pos_exp = torch.clamp(self.gamma_pos * log_one_minus_probs, min=-MAX_EXP, max=MAX_EXP)
+            pos_weights = targets_for_focal * torch.exp(pos_exp)
         # log(p_shifted) for negative focal weight; clamp gives zero weight where
         # the shifted probability hit the floor (i.e. confident negatives).
         log_probs_neg = torch.log(probs_neg.clamp(min=_LOG_FLOOR))
-
-        # Clamp the exponent to prevent overflow: exp(88) ≈ 2e38 (near float32 max)
-        MAX_EXP = 88.0
-        pos_exp = torch.clamp(self.gamma_pos * log_one_minus_probs, min=-MAX_EXP, max=MAX_EXP)
         neg_exp = torch.clamp(self.gamma_neg * log_probs_neg, min=-MAX_EXP, max=MAX_EXP)
-        pos_weights = targets_for_focal * torch.exp(pos_exp)
         neg_weights = (1 - targets_for_focal) * torch.exp(neg_exp)
 
-        # Apply focal weights with separate positive/negative weighting
+        # Apply focal weights with separate positive/negative weighting.
+        # Negatives use the clip-shifted log term (bce_neg); positives keep the
+        # stable BCE-with-logits value (the clip does not apply to positives).
         pos_loss = pos_weights * bce_loss
-        neg_loss = neg_weights * bce_loss
+        neg_loss = neg_weights * bce_neg
         if self.alpha == 1.0:
             focal_loss = pos_loss + neg_loss  # alpha disabled = pure ASL
         else:
@@ -365,8 +376,8 @@ class AsymmetricFocalLoss(nn.Module):
         # Reduction
         if self.reduction == 'mean':
             # When sample_weights are provided, focal_loss already contains loss * weight
-            # from line 320. We take the regular mean to preserve relative weighting
-            # without double-dividing by weights.
+            # from the sample-weight multiplication above. We take the regular mean to
+            # preserve relative weighting
             # This gives: mean(loss * weight), not sum(loss * weight) / sum(weight)
             return focal_loss.mean()
         elif self.reduction == 'sum':

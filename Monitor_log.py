@@ -17,17 +17,13 @@ import queue
 import concurrent.futures
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any, Callable
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from datetime import datetime
 from collections import defaultdict, deque
 import warnings
-import traceback
 import socket
-import subprocess
 from contextlib import contextmanager
 import atexit
-import signal
 
 import numpy as np
 import torch
@@ -36,15 +32,12 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision
 import matplotlib.pyplot as plt
 from utils.logging_sanitize import sanitize_metrics, _to_safe_float
-import seaborn as sns
-from tqdm import tqdm
 
 # Load sensitive configuration values
 try:
     from sensitive_config import ALERT_WEBHOOK_URL as _DEFAULT_WEBHOOK
 except ImportError:  # pragma: no cover - fallback when file missing
     _DEFAULT_WEBHOOK = None
-import os
 from urllib.parse import urlparse
 
 
@@ -89,9 +82,17 @@ def _validate_webhook_url(url: Optional[str]) -> Optional[str]:
         # Add other trusted webhook services as needed
     ]
 
-    hostname = parsed.netloc.lower()
-    # Remove port if present
-    hostname = hostname.split(':')[0]
+    # Reject embedded credentials and derive the real connection host from
+    # parsed.hostname (NOT parsed.netloc, which includes user:pass@host:port and
+    # would let "https://hooks.slack.com:x@evil.com" pass the allowlist while the
+    # request actually goes to evil.com).
+    if parsed.username or parsed.password:
+        logger.error("Webhook URL must not contain embedded credentials")
+        return None
+    hostname = (parsed.hostname or '').lower()
+    if not hostname:
+        logger.error("Webhook URL missing hostname")
+        return None
 
     # Check if domain or subdomain is allowed
     is_allowed = False
@@ -121,21 +122,7 @@ def _resolve_webhook_url(cfg_value: Optional[str]) -> Optional[str]:
 
 # Optional imports with proper handling
 try:
-    import GPUtil
-    GPUTIL_AVAILABLE = True
-except ImportError:
-    GPUTIL_AVAILABLE = False
-    warnings.warn("GPUtil not available. GPU monitoring disabled.")
-
-try:
-    import pandas as pd
-    PANDAS_AVAILABLE = True
-except ImportError:
-    PANDAS_AVAILABLE = False
-    pd = None 
-
-try:
-    from prometheus_client import Counter, Gauge, Histogram, Summary, start_http_server
+    from prometheus_client import Counter, Gauge, Histogram
     PROMETHEUS_AVAILABLE = True
 except ImportError:
     PROMETHEUS_AVAILABLE = False
@@ -272,8 +259,12 @@ class AlertSystem:
         content = re.sub(r'[A-Za-z]:\\[^\\:\*\?"<>\|]+', '[REDACTED_PATH]', content)
         content = re.sub(r'/[/\w\-\.]+/[/\w\-\.]+', '[REDACTED_PATH]', content)
 
-        # Redact potential API keys or tokens
-        content = re.sub(r'[A-Za-z0-9]{32,}', '[REDACTED_TOKEN]', content)
+        # Redact potential API keys or tokens. Structured tokens first (Slack bot
+        # tokens, JWTs — which contain '-'/'_'/'.' the generic rule would miss),
+        # then any long opaque secret including base64url chars.
+        content = re.sub(r'xox[baprs]-[A-Za-z0-9-]{10,}', '[REDACTED_TOKEN]', content)
+        content = re.sub(r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', '[REDACTED_TOKEN]', content)
+        content = re.sub(r'[A-Za-z0-9_\-]{32,}', '[REDACTED_TOKEN]', content)
 
         # Remove control characters that could break JSON
         content = ''.join(char for char in content if ord(char) >= 32 or char in '\n\t')
@@ -331,7 +322,9 @@ class AlertSystem:
                 "embeds": [embed],
             }
 
-            response = requests.post(webhook_url, json=payload, timeout=10)
+            # allow_redirects=False: an allowlisted webhook host must not be able to
+            # 3xx-redirect the alert POST (with its payload) to an internal endpoint.
+            response = requests.post(webhook_url, json=payload, timeout=10, allow_redirects=False)
             response.raise_for_status()
         except Exception as e:
             logger.error(f"Failed to send webhook alert for '{alert['title']}': {e}")
@@ -408,13 +401,13 @@ class ThreadSafeMetricsTracker:
         # holding the graph in history
         safe_value = _to_safe_float(value)
         if safe_value is None:
-            # If conversion failed (e.g. non-scalar tensor), try to keep as is but detached
-            if hasattr(value, 'detach'):
-                value = value.detach().cpu()
-                if value.numel() == 1:
-                    value = value.item()
-        else:
-            value = safe_value
+            # _to_safe_float returns None only for empty / non-finite (NaN/Inf) /
+            # non-convertible inputs. Keeping the raw value here would append a
+            # NaN/Inf to history and push it to Prometheus, poisoning
+            # get_metric_stats' np.mean. Drop the sample instead.
+            logger.debug(f"Dropping non-finite/non-scalar metric '{name}'")
+            return
+        value = safe_value
 
         with self.lock:
             timestamp = time.time()
@@ -477,13 +470,15 @@ class ThreadSafeMetricsTracker:
                 return {}
             
             values = [m['value'] for m in self.metrics[name]]
+            # Cast numpy scalars to native float so json.dump (default=str) emits
+            # numbers, not stringified np.float64.
             return {
-                'current': values[-1],
-                'mean': np.mean(values),
-                'std': np.std(values),
-                'min': np.min(values),
-                'max': np.max(values),
-                'count': len(values)
+                'current': float(values[-1]),
+                'mean': float(np.mean(values)),
+                'std': float(np.std(values)),
+                'min': float(np.min(values)),
+                'max': float(np.max(values)),
+                'count': int(len(values))
             }
     
     def get_timer_stats(self, name: str) -> Dict[str, float]:
@@ -492,14 +487,16 @@ class ThreadSafeMetricsTracker:
             if name not in self.timers or len(self.timers[name]) == 0:
                 return {}
             
-            durations = self.timers[name][-100:]  # Last 100 for efficiency
+            durations = list(self.timers[name])[-100:]  # Last 100 for efficiency (deque has no slice support)
+            # Cast numpy scalars to native float so json.dump (default=str) emits
+            # numbers, not stringified np.float64.
             return {
-                'mean': np.mean(durations),
-                'std': np.std(durations),
-                'min': np.min(durations),
-                'max': np.max(durations),
-                'total': np.sum(self.timers[name]),
-                'count': len(self.timers[name])
+                'mean': float(np.mean(durations)),
+                'std': float(np.std(durations)),
+                'min': float(np.min(durations)),
+                'max': float(np.max(durations)),
+                'total': float(np.sum(self.timers[name])),
+                'count': int(len(self.timers[name]))
             }
     
     def save_metrics(self, filepath: str):
@@ -748,7 +745,15 @@ class SystemMonitor:
             if self.config.track_disk_io:
                 if self._shutdown_event.is_set():
                     return metrics                
-                disk = psutil.disk_usage('/')
+                # Monitor the volume that actually holds our outputs. On Windows
+                # psutil.disk_usage('/') reports the CWD's drive root (often C:),
+                # not the data/checkpoint volume (e.g. L:). Derive the path from
+                # the configured log_dir and walk up to an existing ancestor.
+                disk_path = getattr(self.config, 'log_dir', None) or os.getcwd()
+                disk_path = Path(disk_path).resolve()
+                while not disk_path.exists() and disk_path != disk_path.parent:
+                    disk_path = disk_path.parent
+                disk = psutil.disk_usage(str(disk_path))
                 metrics['disk']['total_gb'] = disk.total / (1024**3)
                 metrics['disk']['used_gb'] = disk.used / (1024**3)
                 metrics['disk']['free_gb'] = disk.free / (1024**3)
@@ -842,6 +847,10 @@ class TrainingMonitor:
         # Normalization params for inverting preprocessing before TensorBoard display
         self._norm_mean = tuple(getattr(config, 'normalize_mean', (0.5, 0.5, 0.5)))
         self._norm_std = tuple(getattr(config, 'normalize_std', (0.5, 0.5, 0.5)))
+        # Color order the training pipeline produces (RGB or BGR). TensorBoard
+        # expects RGB for add_image(dataformats="HWC"); if training is BGR we
+        # flip channels back to RGB at the end of denormalization.
+        self._color_order = str(getattr(config, 'color_order', 'RGB')).upper()
 
         # Core state
         self.start_time = time.time()
@@ -850,7 +859,10 @@ class TrainingMonitor:
         self.last_logged_step = 0
         self.last_loss = None
         self.steps_without_improvement = 0
-        self.best_val_metric = float('inf')
+        # Higher-is-better, matching the checkpoint/early-stopping criterion
+        # (val/f1_macro). Was float('inf') with a lower-is-better loss compare,
+        # which inverted the monitor's "best" vs the real selection metric.
+        self.best_val_metric = float('-inf')
         self._graph_logged = False
 
         # Determine primary rank with proper error handling
@@ -943,6 +955,18 @@ class TrainingMonitor:
     def _setup_logging(self):
         """Setup logging configuration"""
         module_logger = logging.getLogger(__name__)
+        # Close/remove handlers from any prior construction (Phase1->Phase2,
+        # resume, re-init) so we don't stack duplicate handlers or leak the
+        # timestamped FileHandler's descriptor.
+        for h in module_logger.handlers[:]:
+            try:
+                h.close()
+            finally:
+                module_logger.removeHandler(h)
+        # This module owns its sinks below; don't also propagate to the root
+        # logger (which setup_logging() wires to a QueueHandler), or every line
+        # is emitted twice / to two files.
+        module_logger.propagate = False
         # Always console
         ch = logging.StreamHandler(sys.stdout)
         ch.setFormatter(logging.Formatter(self.config.log_format))
@@ -1123,13 +1147,14 @@ class TrainingMonitor:
         for name, value in metrics.items():
             self.metrics.add_metric(f'val_{name}', value, step)
         
-        # Track best model
-        if 'loss' in metrics and metrics['loss'] < self.best_val_metric:
-            self.best_val_metric = metrics['loss']
+        # Track best model on the same higher-is-better metric used for
+        # checkpoint selection / early stopping (val/f1_macro).
+        if 'f1_macro' in metrics and metrics['f1_macro'] > self.best_val_metric:
+            self.best_val_metric = metrics['f1_macro']
             if self.alerts:
                 self.alerts.send_alert(
                     "New Best Model",
-                    f"Validation loss improved to {metrics['loss']:.4f}",
+                    f"Validation F1(macro) improved to {metrics['f1_macro']:.4f}",
                     severity="success"
                 )
         
@@ -1154,7 +1179,9 @@ class TrainingMonitor:
             **{f'epoch/val_{k}': v for k, v in val_metrics.items()},
             'epoch/duration': duration
         }
-        self._log_to_backends(epoch, epoch_metrics, use_epoch=True)
+        # Keys already carry the 'epoch/' namespace; don't also append '/epoch'
+        # (use_epoch=True) or tags become 'epoch/train_loss/epoch'.
+        self._log_to_backends(epoch, epoch_metrics)
         
         # Save metrics checkpoint
         if self.config.checkpoint_metrics:
@@ -1212,12 +1239,22 @@ class TrainingMonitor:
             images[:num_images], predictions=predictions, labels=targets, step=step
         )
 
-    def _denormalize_img(self, img: torch.Tensor) -> torch.Tensor:
+    def _denormalize_img(self, img: torch.Tensor, color_order: Optional[str] = None) -> torch.Tensor:
         """Inverse of Normalize(mean, std) so images display correctly in TensorBoard.
-        Maps normalized tensors (e.g. [-1, 1] with mean=0.5/std=0.5) back to [0, 1]."""
+
+        Maps normalized tensors (e.g. [-1, 1] with mean=0.5/std=0.5) back to [0, 1].
+        If the active ``color_order`` is BGR, channels are flipped back to RGB
+        at the end so TensorBoard's add_image(dataformats="HWC") displays
+        correctly.
+        """
         mean = torch.tensor(self._norm_mean, dtype=torch.float32).view(-1, 1, 1)
         std = torch.tensor(self._norm_std, dtype=torch.float32).view(-1, 1, 1)
-        return img.float() * std + mean
+        out = img.float() * std + mean
+        co = (color_order if color_order is not None else getattr(self, "_color_order", "RGB"))
+        if str(co).upper() == "BGR":
+            # CHW tensor: flip channel dim back to RGB for TensorBoard display
+            out = out.flip(0)
+        return out
 
     def log_predictions(
         self,

@@ -20,8 +20,8 @@ Design rationale and live status live in [todos/progressive-training-plan.md](to
 ### Config
 
 - [configs/unified_config.yaml](configs/unified_config.yaml) — **canonical** config (model/data/training/inference/threshold_calibration/export/validation/monitor/debug). Values here override dataclass defaults.
-- [Configuration_System.py](Configuration_System.py) — dataclass config schema + loader. `FullConfig` aggregates `ModelConfig`, `DataConfig`, `GradientClippingConfig`, `LossConfig`, `TrainingConfig`, `InferenceConfig`, `ExportConfig`, `ValidationConfig`, `ThresholdCalibrationConfig`, `MonitorConfig`, `DebugConfig`, etc. Provides env-override (`update_from_env`), CLI parser (`create_config_parser`), `validate`/`generate` subcommands.
-- [training_config.py](training_config.py) — standalone optimizer/scheduler helpers: `AdamW8bitConfig`, dataset-aware scaling (`compute_effective_batch_size`, `scale_learning_rate`, `scale_weight_decay`, `adjust_beta2_for_long_training`), `get_recommended_batch_size` (ViT memory profiles), `SchedulerType`/`SchedulerConfig`/`recommend_scheduler`.
+- [Configuration_System.py](Configuration_System.py) — dataclass config schema + loader. `FullConfig` aggregates `ModelConfig`, `DataConfig`, `GradientClippingConfig`, `LossConfig`, `TrainingConfig`, `InferenceConfig`, `ExportConfig`, `ValidationConfig`, `ThresholdCalibrationConfig`, `MonitorConfig`, `DebugConfig`, etc. Provides env-override (`update_from_env`), a minimal CLI parser (`create_config_parser`: only `--config` and `--validate-only` — **configuration is YAML-only; there are no per-field CLI overrides**), `validate`/`generate` subcommands.
+- [training_config.py](training_config.py) — single live helper: `scale_learning_rate` (batch-size LR scaling used by train_direct). The old dataset-aware "auto-config" helpers (weight-decay scaling, warmup/beta2 computation, batch-size/scheduler recommendation) were removed — weight decay is fixed at `training.weight_decay` and the scheduler is exactly `training.scheduler`.
 - [schemas.py](schemas.py) — prediction output schemas (`TagPrediction`, `ImagePrediction`, `RunMetadata`, `PredictionOutput`) plus `canonical_vocab_bytes` / `compute_vocab_sha256`. Not a config module.
 
 ### Training
@@ -60,7 +60,7 @@ Design rationale and live status live in [todos/progressive-training-plan.md](to
 
 ### Tooling (`tools/`, scripts)
 
-- [validation_loop.py](validation_loop.py) — standalone eval CLI (no compile/scheduler/train loader). Args: `--checkpoint`/`--model`, `--data-dir`, `--json-dir`, `--vocab-path`, `--mode` (full/fast/tags/hierarchical), `--batch-size`, `--max-samples`, `--output-dir`, `--save-predictions`, `--create-plots`, `--no-amp`, `--device`.
+- [validation_loop.py](validation_loop.py) — standalone eval CLI (no compile/scheduler/train loader). Args: `--checkpoint`/`--model`, `--data-dir`, `--json-dir`, `--vocab-path`, `--mode` (full/fast/tags/hierarchical), `--output-dir`, `--save-predictions`, `--create-plots`, `--no-amp`, `--device`. Batch size/workers, `max_samples`, and the prediction threshold come from unified_config.yaml (`validation.dataloader.*`, `validation.max_samples`, `inference.prediction_threshold`) — not CLI flags.
 - [Monitor_log.py](Monitor_log.py) — `MetricMonitor`, TensorBoard integration, webhook alerts (via optional `sensitive_config.py`), psutil system monitoring; used by training and inference.
 - [test_flip_pipeline.py](test_flip_pipeline.py) — integration test for horizontal-flip augmentation in DataLoader workers (distribution/determinism, pickle round-trip, end-to-end pixel correctness).
 - [tools/prepare_phase2.py](tools/prepare_phase2.py) — Phase 1→2 checkpoint conversion (`--image-size` required; resets optimizer/scheduler/scaler/epoch/step; updates image_size across config; pos-embed interpolation happens on load).
@@ -96,9 +96,10 @@ python Configuration_System.py generate ./config_examples
 .\Start_AI_Training.ps1
 .\Start_AI_Training.ps1 -ConfigPath configs/unified_config.yaml
 
-# Train (direct), with nested overrides
+# Train (direct). Configuration is YAML-only: edit configs/unified_config.yaml
+# (or use ANIME_TAGGER_* env overrides) — there are NO per-field CLI overrides.
 python train_direct.py --config configs/unified_config.yaml
-python train_direct.py --config configs/unified_config.yaml --training.num_epochs 15 --training.learning_rate 1.4e-5
+python train_direct.py --config configs/unified_config.yaml --validate-only
 
 # Generate vocabulary (do not hand-edit vocabulary.json)
 python vocabulary.py <dataset_root1> [<dataset_root2> ...]
@@ -112,8 +113,8 @@ python ONNX_Export.py <checkpoint> --output ./artifacts/model.onnx
 python ONNX_Export.py <checkpoint> -o model.onnx --variants full fp16 --image-size 448 --opset 19
 python onnx_infer.py model.onnx image1.jpg image2.jpg --output predictions.json --threshold 0.3 --top_k 20
 
-# Standalone validation
-python validation_loop.py --checkpoint <path> --mode full --batch-size 64 --output-dir ./validation_results
+# Standalone validation (batch size / max_samples / threshold come from unified_config.yaml)
+python validation_loop.py --checkpoint <path> --mode full --output-dir ./validation_results
 
 # Flip-augmentation test
 python test_flip_pipeline.py
@@ -146,7 +147,7 @@ $env:ANIME_TAGGER_DATA__IMAGE_SIZE = "448"; python train_direct.py --config conf
 - **Color order:** `data.color_order` is `RGB` (default) or `BGR`. All per-channel values (`normalize_mean`, `normalize_std`, `pad_color`) are interpreted in this order; a single channel flip is applied after PIL→numpy materialization for BGR.
 - **Effective batch size:** `batch_size (48) * gradient_accumulation_steps (9) [* world_size]` = **432** samples/optimizer step on a single GPU. Note: `FullConfig.compute_effective_batch_size()` multiplies by `self.training.world_size`, which is **not currently a field on `TrainingConfig`** — that method will raise on a single-GPU run; compute 432 directly, or add a `world_size` field (default 1) before calling it.
 - **LR scaling:** base `learning_rate=1.0e-5`, `lr_scaling_mode='sqrt'` → `sqrt(effective_batch/256)` ≈ 1.3× → ~1.4e-5 peak (Phase 2). Modes: `sqrt`/`linear`/`none`.
-- **Weight decay:** base `0.05`, inverse-sqrt scaled by dataset size.
+- **Weight decay:** fixed at `0.05` (`training.weight_decay`) — no dataset-size scaling, by design.
 - **Loss (Phase 2):** `AsymmetricFocalLoss` with `gamma_pos=0.0`, `gamma_neg=7.0` (hard-negative focus), `clip=0.2`, `label_smoothing=0.0`, `ignore_indices=[0]`. Phase 1 used `gamma_neg=4.0`, `clip=0.05`. Static class weights are removed as redundant with ASL asymmetry. `MetricComputer` default threshold is `0.2653`.
 - **AMP:** `amp_dtype = bfloat16` (required on CUDA; float16 not supported). `GradScaler` is disabled for bfloat16.
 - **Optimizers:** `adam`, `adamw`, `adamw8bit`, `sgd`, `rmsprop`, `adan`.

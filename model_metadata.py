@@ -173,15 +173,24 @@ class ModelMetadata:
         normalize_mean: Tuple[float, float, float],
         normalize_std: Tuple[float, float, float],
         image_size: int,
-        patch_size: int
+        patch_size: int,
+        color_order: str = "RGB",
     ) -> Dict:
-        """Embed preprocessing parameters into checkpoint"""
+        """Embed preprocessing parameters into checkpoint.
+
+        ``color_order`` is the channel order of the image tensor seen by the
+        model at training time and the order in which ``normalize_mean``/
+        ``normalize_std`` are interpreted. It is persisted so that downstream
+        consumers (inference, ONNX export, release tooling) can reproduce the
+        exact preprocessing.
+        """
 
         preprocessing_params = {
             'normalize_mean': list(normalize_mean),
             'normalize_std': list(normalize_std),
             'image_size': image_size,
             'patch_size': patch_size,
+            'color_order': str(color_order).upper(),
         }
 
         checkpoint['preprocessing_params'] = preprocessing_params
@@ -191,10 +200,15 @@ class ModelMetadata:
 
     @staticmethod
     def extract_preprocessing_params(checkpoint: Dict) -> Optional[Dict]:
-        """Extract preprocessing parameters from checkpoint"""
+        """Extract preprocessing parameters from checkpoint.
+
+        Legacy checkpoints without ``color_order`` are treated as ``"RGB"``.
+        """
 
         if 'preprocessing_params' in checkpoint:
-            return checkpoint['preprocessing_params']
+            params = dict(checkpoint['preprocessing_params'])
+            params.setdefault('color_order', 'RGB')
+            return params
 
         # Try legacy format
         if 'normalization_params' in checkpoint:
@@ -204,6 +218,7 @@ class ModelMetadata:
                 'normalize_std': legacy.get('std', [0.5, 0.5, 0.5]),
                 'image_size': checkpoint.get('image_size', 512),
                 'patch_size': checkpoint.get('patch_size', 16),
+                'color_order': 'RGB',
             }
 
         return None

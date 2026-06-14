@@ -55,6 +55,7 @@ def validate_image_path(
     allowed_exts: Sequence[str] = (".jpg", ".jpeg", ".png", ".webp"),
     *,
     allowed_external_roots: Optional[Sequence[Path]] = None,
+    filename: Optional[str] = None,
 ) -> Path:
     """
     Find an image by sanitized stem under a directory, allowing symlink targets
@@ -64,6 +65,9 @@ def validate_image_path(
     - stem: filename without extension; only [A-Za-z0-9_.-] allowed
     - allowed_external_roots: optional additional roots within which a symlink
       target may resolve. If None, targets must resolve under 'root'.
+    - filename: optional exact image filename (e.g., from sidecar metadata).
+      When given, it is tried first — skipping per-extension existence probing —
+      and falls back to probing if missing or invalid.
     """
     stem = sanitize_identifier(Path(stem).stem)
     roots: list[Path] = [root.resolve()]
@@ -93,6 +97,21 @@ def validate_image_path(
             raise PathTraversalError(f"Path escapes dataset root: {target}")
         return p
 
+    # Fast path: exact filename known (e.g., stored in the metadata cache).
+    # Avoids up to len(allowed_exts) exists() probes per sample per epoch.
+    if filename:
+        name = Path(filename).name  # strip any directory components
+        if Path(name).suffix.lower() in allowed_exts:
+            try:
+                # Stem must satisfy the same allowlist as probed candidates
+                sanitize_identifier(Path(name).stem)
+            except ValueError:
+                pass  # fall back to probing below
+            else:
+                out = _check_and_return(root / name)
+                if out is not None:
+                    return out
+
     # direct matches
     for ext in allowed_exts:
         cand = root / f"{stem}{ext}"
@@ -116,7 +135,7 @@ def validate_image_path(
 
 def resolve_and_confine(root: Path, candidate: str | Path) -> Path:
     """
-    Spec-named helper: resolve candidate under root and ensure it does not escape.
-    Mirrors safe_join semantics to satisfy 'resolve_and_confine(root, candidate)' deliverable.
+    Resolve candidate under root and ensure it does not escape.
+    Thin wrapper around safe_join with a (root, candidate) signature.
     """
     return safe_join(Path(root), str(candidate))

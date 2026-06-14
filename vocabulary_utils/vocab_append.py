@@ -32,7 +32,6 @@ from Configuration_System import load_config
 from vocabulary import TagVocabulary, verify_vocabulary_integrity
 from utils.metadata_ingestion import parse_tags_field
 from vocab_utils import compute_vocab_hash
-from pathlib import Path as _PathAlias
 
 logger = logging.getLogger("vocab_append")
 
@@ -376,7 +375,6 @@ def main() -> None:
 
     # Check for duplicate indices (would cause data corruption)
     if len(existing_indices) != len(existing):
-        from collections import Counter
         idx_counts = Counter(existing.values())
         duplicates = {idx: count for idx, count in idx_counts.items() if count > 1}
         raise ValueError(f"Vocabulary contains duplicate indices: {duplicates}")

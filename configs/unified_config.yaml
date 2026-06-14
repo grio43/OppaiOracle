@@ -21,45 +21,21 @@ default_output_dir: "./outputs"
 
 # Model Configuration
 model:
-    # Architecture type: "vit" (default), "vit_wide_shallow", or "swinv2"
+    # Architecture type: only "vit" is supported (hard-asserted in validate()).
     architecture_type: "vit"
 
-    # SwinV2-specific configuration (used when architecture_type == "swinv2")
-    swin_config:
-      # Custom "XLarge" targeting ~350M params
-      embed_dim: 256
-      depths: [2, 2, 18, 2]
-      num_heads: [8, 16, 32, 64]
-      window_size: 16
-      mlp_ratio: 4.0
-      # Drop path rate for SwinV2 architecture (stochastic depth regularization)
-      # NOTE: This value is ONLY used when architecture_type == "swinv2"
-      # For ViT architectures, see model.drop_path_rate below
-      drop_path_rate: 0.2
-      pretrained_name: null  # Train from scratch
-      # custom_name enables a fully custom SwinV2 backbone (non-timm preset).
-      custom_name: "OppaiOracleV01"
-      # Gradient checkpointing for SwinV2 - reduces VRAM usage at cost of ~20% slower training.
-      # NOTE: This is the SwinV2-specific setting. For ViT models, use model.gradient_checkpointing below.
-      # If you set model.gradient_checkpointing=true for SwinV2, it will automatically enable this.
-      # Interval is controlled by model.checkpoint_every_n_layers (1=every block).
-      use_checkpoint: true
-
-    # ViT-specific parameters (used when architecture_type == "vit" or "vit_wide_shallow")
-    # These are ignored when using SwinV2, which uses swin_config above instead.
+    # ViT parameters
     hidden_size: 1024
     num_hidden_layers: 18  # Phase 1: SoViT-150m validated 18L at 880-width (Alabdulmohsin et al., NeurIPS 2023)
     num_attention_heads: 16
     intermediate_size: 4096
     image_size: 448  # Auto-synced from data.image_size at startup — change data.image_size instead
-    patch_size: 16  # ViT uses patch_size=16 (SwinV2 uses 4)
+    patch_size: 16  # ViT uses patch_size=16
     num_channels: 3
     hidden_dropout_prob: 0.10  # Phase 2 (revised): held at Phase 1 value. Phase 1 stopped at 33/40 (under-converged) — FixRes/DeiT III aug-reduction recipe assumes a fully-converged base; EfficientNetV2 (Tan & Le ICML 2021) regime applies instead (regularization scales UP with resolution in from-scratch progressive training).
     pos_dropout: 0.0  # Position embedding dropout (0.0 = modern best practice; drop_path handles regularization)
     attention_dropout: 0.05  # Phase 2 (revised): held at Phase 1 value. Same rationale as hidden_dropout_prob — under-converged Phase 1 + EfficientNetV2 regime.
-    # Drop path rate for ViT architectures (stochastic depth regularization)
-    # NOTE: This value is ONLY used when architecture_type == "vit" or "vit_wide_shallow"
-    # For SwinV2 architecture, see swin_config.drop_path_rate above (currently 0.2)
+    # Drop path rate for ViT (stochastic depth regularization)
     drop_path_rate: 0.20   # Phase 2 (revised): held at Phase 1 value. DeiT III ViT-L pretraining uses 0.4; AugReg (Steiner TMLR 2022) uses up to 0.5 for ViT-L from-scratch — 0.10 (planned) was below any literature recipe given Phase 1 stopped at 33/40 (under-converged base).
     initializer_range: 0.02
     layer_norm_eps: 1.0e-6
@@ -70,11 +46,8 @@ model:
     num_labels: 0  # Auto-detect from vocabulary
     num_groups: 20
     tags_per_group: 10000
-    # IMPORTANT: For SwinV2 models, gradient checkpointing is controlled via swin_config.use_checkpoint above.
-    # This setting (gradient_checkpointing) is primarily for ViT models. If you set it to true for SwinV2,
-    # it will automatically enable swin_config.use_checkpoint during training.
     gradient_checkpointing: true
-    checkpoint_every_n_layers: 4   # Checkpoint every layer/block - max memory savings (ViT + SwinV2)
+    checkpoint_every_n_layers: 4   # Checkpoint every 4th layer/block (1 = every layer = max memory savings)
     # End of ViT-specific parameters
 
 # Data Configuration (consolidates dataloader.yaml, train_config.yaml, augmentation.yaml)
@@ -100,33 +73,30 @@ data:
   # >>> validation.preprocessing.image_size are auto-synced from this value.
   # Phase 2 ACTIVE: 448 (fine-tune, 15 epochs). Phase 1 used 320 (from-scratch, 40 epochs).
   image_size: 448
+  # Channel order of the image tensor produced by the dataloader and consumed
+  # by the model. All per-channel values below (normalize_mean, normalize_std)
+  # are interpreted in this same order. RGB is the project default (matches the
+  # V1.x releases); set to "BGR" only if you deliberately train a BGR pipeline.
+  color_order: "RGB"
   # IMPORTANT: Normalization values depend on training approach!
   #   - Training from scratch (current): [0.5, 0.5, 0.5] is fine (anime-optimized)
-  #   - Pretrained SwinV2/ViT from ImageNet: Use ImageNet normalization:
-  #       normalize_mean: [0.485, 0.456, 0.406]
-  #       normalize_std: [0.229, 0.224, 0.225]
+  #   - Pretrained ViT from ImageNet: Use ImageNet normalization
+  #     (channel order matches ``color_order``):
+  #       BGR: normalize_mean: [0.406, 0.456, 0.485]; std: [0.225, 0.224, 0.229]
+  #       RGB: normalize_mean: [0.485, 0.456, 0.406]; std: [0.229, 0.224, 0.225]
   #     Pretrained weights were trained with ImageNet stats; using different
   #     normalization can degrade pretrained feature quality.
-  normalize_mean: [0.5, 0.5, 0.5]  # Anime-optimized (from inference_config.yaml)
-  normalize_std: [0.5, 0.5, 0.5]   # Anime-optimized
-  # SwinV2-specific normalization (used when model.architecture_type == "swinv2")
-  # Set these to ImageNet stats for pretrained SwinV2 weights.
-  swinv2_normalize_mean: [0.485, 0.456, 0.406]
-  swinv2_normalize_std: [0.229, 0.224, 0.225]
+  normalize_mean: [0.5, 0.5, 0.5]  # Anime-optimized; channel-symmetric so RGB/BGR identical
+  normalize_std: [0.5, 0.5, 0.5]   # Anime-optimized; channel-symmetric so RGB/BGR identical
   pad_color: [114, 114, 114]
 
   # Data loading (from dataloader.yaml)
-  # IMPORTANT: batch_size depends on architecture and GPU memory!
+  # IMPORTANT: batch_size depends on GPU memory!
   #   - ViT (vit, vit_wide_shallow): batch_size=32 is safe on 16GB GPU
-  #   - SwinV2: batch_size=8 recommended for 16GB GPU (512px images)
-  #     SwinV2 needs ~2-3x more memory than ViT due to shifted window attention.
-  #     Use gradient_accumulation_steps to maintain effective batch size.
-  #   - 24GB GPU: SwinV2 can use batch_size=12 with 512px images
-  #   - See training_config.py:check_swinv2_batch_size() for memory guidance58
   batch_size: 48  # Phase 2 (448px, 18 layers): 48 with 9 grad-accum -> effective 432. Phase 1 used 96.
   num_workers: 6  # Arrow mmap shares metadata (~500MB/worker overhead), 32-core system
   pin_memory: true   # Enables async DMA transfer for PCIe 4.0/5.0
-  prefetch_factor: 3  # 8 workers × 3 batches × 128 = 3072 samples prefetched 
+  prefetch_factor: 3  # 6 workers × 3 batches × 48 = 864 samples prefetched
   persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   drop_last: false
   worker_log_level: WARNING  # Worker log level: WARNING allows debugging, CRITICAL minimizes overhead
@@ -134,8 +104,11 @@ data:
   # Vocabulary
   vocab_min_frequency: 500
 
-  # Validation split limiting
-  # Limits validation set size at split time (before Arrow cache loading).
+  # Validation split limiting — this is the IN-TRAINING validation cap.
+  # Limits validation set size at split time (before Arrow cache loading), so it
+  # is what bounds the validation pass inside train_direct.py. The separate
+  # validation.max_samples key below applies only to the standalone
+  # validation_loop.py runner.
   # Set to null to use the full 5% validation split (~276k for 5.5M dataset).
   max_val_samples: 30000
 
@@ -263,30 +236,16 @@ training:
     lr_scaling_mode: "sqrt"  # "sqrt" (recommended for AdamW), "linear", or "none"
     lr_base_batch_size: 256  # Reference batch size that learning_rate was tuned for
 
-    # SwinV2-specific learning rate (used when model.architecture_type == 'swinv2')
-    # -------------------------------------------------------------------------
-    # SwinV2 typically needs ~50% lower learning rate than ViT due to:
-    #   - Shifted window attention has different gradient dynamics
-    #   - Hierarchical feature extraction is more sensitive to large LR
-    #   - Higher memory overhead means smaller effective batches
-    #
-    # When architecture_type is 'swinv2', this value is used instead of learning_rate.
-    # If set to null, falls back to learning_rate for backward compatibility.
-    #
-    # Recommended range: 5e-5 to 1e-4 (vs 1e-4 to 2.5e-4 for ViT)
-    # Current value 8e-5 is conservative for training from scratch with large dataset.
-    swinv2_learning_rate: null
-
     weight_decay: 0.05  # Phase 2 (revised): ¼ reduction from Phase 1 (0.10), not the originally-planned 10× cut. The 0.01 value followed DeiT III's converged-base resolution-FT recipe; Phase 1 stopped at 33/40 (under-converged), so EfficientNetV2 regime applies (regularization scales up with resolution). DeiT III ViT-L pretraining itself uses WD 0.02 — the 0.01 plan was below pretraining-regime norms.
     gradient_accumulation_steps: 9  # Phase 2 effective batch: 48 * 9 = 432
 
     # Optimizer
     # NOTE: Using "adamw8bit" for memory-efficient 8-bit quantized optimizer states
-    # The auto-config system (training_config.py) will automatically:
-    #   - Scale learning rate based on effective batch size
-    #   - Adjust weight decay based on dataset size
-    #   - Select optimal scheduler (cosine/cosine_restarts)
-    #   - Save memory with 8-bit quantized optimizer states (~3 GB savings vs standard adamw)
+    # (~3 GB savings vs standard adamw). What actually happens at runtime:
+    #   - learning_rate IS scaled by effective batch size per lr_scaling_mode above
+    #     (training_config.scale_learning_rate, the only live auto-scaling helper)
+    #   - weight_decay is FIXED at the value above — no dataset-size scaling
+    #   - the scheduler is exactly what training.scheduler below says — no auto-selection
     optimizer: "adamw8bit"
     adam_beta1: 0.9
     adam_beta2: 0.999  # DeiT convention; standard AdamW for ViT
@@ -297,6 +256,7 @@ training:
     scheduler: "cosine"  # Phase 2: cosine decay to lr_end after 2-epoch re-warmup (FixRes).
     warmup_epochs: 2  # Phase 2: 2-epoch re-warmup at resolution switch (FixRes recommendation).
     num_cycles: 1  # Single cosine decay (no restarts)
+    cycle_decay: 0.9  # SGDR per-restart LR decay (gamma); inert at num_cycles=1
     lr_end: 1.0e-6
 
     # Mixed precision
@@ -325,6 +285,11 @@ training:
     logging_steps: 10000  # Reduced TensorBoard overhead (was 3000)
     # Resume-aware reseeding: avoid replaying the same early-epoch order after resume
     resume_reseed: true
+    # Vocab-resume safety: refuse to resume unless the current vocabulary's SHA256
+    # can be verified against the checkpoint's embedded SHA (a mismatch silently
+    # scrambles every label index). Set true ONLY to load a legacy checkpoint that
+    # predates embedded vocab SHAs.
+    allow_unverified_vocab_resume: false
 
     # Loss configuration
     tag_loss:
@@ -412,18 +377,28 @@ export:
   model_author: "AnimeTaggers"
   model_version: "1.0.0"
   output_path: "./exported_model"
+  # 16-bit by default (model is trained in bf16; fp16 is the well-tested ORT path).
+  # Choices: 'full' (fp32), 'fp16', 'quantized'. List multiple to produce multiple files.
+  export_variants: ['fp16']
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Validation (migrated from configs/validation_config.yaml)
 # Centralized knobs for validation dataloader & preprocessing.
 # These are read by validation_loop.py at runtime.
 validation:
-  max_samples: 30000  # Subsample validation set (30K of 280K) for faster epochs
+  # Sample cap for the STANDALONE validation_loop.py runner only. The in-training
+  # validation pass is capped by data.max_val_samples (which trims the split
+  # before the Arrow cache is built), so this key never affects train_direct.py.
+  max_samples: 30000
+  # Frequency-bin edges for bucketed validation metrics (val_bucketed/* in
+  # TensorBoard and validation_loop's by-frequency analysis). Uncomment to
+  # override; default shown below (.inf = open-ended top bucket).
+  # frequency_bins: [300, 500, 1000, 5000, 10000, .inf]
   dataloader:
     batch_size: 48  # Matches training batch_size — val has lower per-step VRAM (no_grad, no optimizer state, no grad-ckpt recompute)
     num_workers: 6  # Increased for smoother validation throughput
     pin_memory: true  # Enables async DMA transfer for faster CPU-GPU transfer
-    prefetch_factor: 3  # 6 workers × 3 batches × 102 = 1836 samples prefetched
+    prefetch_factor: 3  # 6 workers × 3 batches × 48 = 864 samples prefetched
     persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
   preprocessing:
     # Uses data.normalize_mean/std by default; keep in sync with

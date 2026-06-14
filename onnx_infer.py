@@ -6,7 +6,6 @@ import base64
 import gzip
 import hashlib
 import logging
-from logging.handlers import RotatingFileHandler
 import time
 import sys
 from pathlib import Path
@@ -14,7 +13,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps, ImageFile
 import onnxruntime as ort
-import yaml
 from Configuration_System import ConfigManager, ConfigType
 
 from vocabulary import TagVocabulary, verify_vocabulary_integrity
@@ -22,8 +20,6 @@ from schemas import RunMetadata, TagPrediction, ImagePrediction, PredictionOutpu
 
 
 logger = logging.getLogger('onnx_infer')
-
-# _setup_logging and _load_infer_cfg are removed, their logic is now in main()
 
 
 def _load_metadata(session: ort.InferenceSession):
@@ -43,7 +39,7 @@ def _load_metadata(session: ort.InferenceSession):
             RuntimeWarning
         )
         # Return None to signal external vocab needed
-        return None, None, None, None, None, None, meta
+        return None, None, None, None, None, None, None, meta
 
     # Try to decode and decompress the vocabulary with robust error handling
     try:
@@ -76,28 +72,56 @@ def _load_metadata(session: ort.InferenceSession):
             "(--mean, --std, --image-size, --patch-size) for inference.",
             RuntimeWarning
         )
-        return None, None, None, None, None, None, meta
+        return None, None, None, None, None, None, None, meta
 
     mean = json.loads(meta.get('normalize_mean', '[0.5, 0.5, 0.5]'))
     std = json.loads(meta.get('normalize_std', '[0.5, 0.5, 0.5]'))
     image_size = int(meta.get('image_size', 512))
     patch_size = int(meta.get('patch_size', 16))
     pad_color = tuple(json.loads(meta.get('pad_color', '[114, 114, 114]')))
-    return vocab, mean, std, image_size, patch_size, pad_color, meta
+    # color_order: legacy artifacts (no metadata key) used RGB; new exports persist 'BGR'.
+    color_order = meta.get('color_order')
+    if not color_order:
+        color_order = "RGB"
+        logger.info(
+            "ONNX metadata missing 'color_order' - defaulting to legacy 'RGB' interpretation."
+        )
+    color_order = str(color_order).upper()
+    if color_order not in ("RGB", "BGR"):
+        logger.warning(
+            f"Unknown color_order '{color_order}' in ONNX metadata; falling back to 'RGB'."
+        )
+        color_order = "RGB"
+    return vocab, mean, std, image_size, patch_size, pad_color, color_order, meta
 
 
-def _load_image(image_path: str, pad_color: tuple[int, int, int] = (114, 114, 114)) -> tuple[np.ndarray, bool]:
+def _load_image(
+    image_path: str,
+    pad_color: tuple[int, int, int] = (114, 114, 114),
+    color_order: str = "RGB",
+) -> tuple[np.ndarray, bool]:
     """Load an image from disk, handling EXIF rotation and transparency.
 
+    All PIL operations happen in RGB-space; the channel flip (RGB->BGR) is
+    applied to the materialized numpy array AFTER `.convert('RGB')` so the
+    final array channel order = `color_order`.
+
+    Args:
+        image_path: Path to image file.
+        pad_color: Background fill for transparency compositing (interpreted in
+            the resulting `color_order`; pad colors are symmetric for grays).
+        color_order: One of 'RGB' or 'BGR'. Channel order of the returned array.
+
     Returns:
-        (H, W, 3) uint8 RGB numpy array and a flag indicating if transparency
-        compositing occurred (used to suppress gray_background tag).
+        (H, W, 3) uint8 image as an HWC array with channel order = color_order,
+        and a flag indicating if transparency compositing occurred (used to
+        suppress gray_background tag).
     """
     was_composited = False
     with Image.open(image_path) as img:
         img.load()
         img = ImageOps.exif_transpose(img)
-        # Check for transparency and composite if necessary
+        # Check for transparency and composite if necessary (always in RGB-space)
         if img.mode in ('RGBA', 'LA') or 'transparency' in img.info:
             was_composited = True
             # Create background using pad_color to match training
@@ -112,6 +136,10 @@ def _load_image(image_path: str, pad_color: tuple[int, int, int] = (114, 114, 11
 
         arr = np.asarray(img, dtype=np.uint8)
 
+    # Apply channel flip exactly once, immediately after PIL->numpy materialization
+    if str(color_order).upper() == "BGR":
+        arr = arr[..., ::-1].copy()
+
     return arr, was_composited
 
 
@@ -121,6 +149,7 @@ def _preprocess_for_model(
     mean: list[float],
     std: list[float],
     pad_color: tuple[int, int, int] = (114, 114, 114),
+    color_order: str = "RGB",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Letterbox, normalize, and format an image for the ONNX model.
 
@@ -132,17 +161,24 @@ def _preprocess_for_model(
     5. Return (1, 3, H, W) float32 and (1, H, W) bool mask
 
     Args:
-        image: (H, W, 3) uint8 RGB numpy array.
+        image: (H, W, 3) uint8 image, channel order = color_order. The caller
+            (typically `_load_image`) is responsible for producing the array in
+            the correct channel order; this function does NOT re-flip.
         image_size: Target square size.
-        mean: Per-channel mean for normalization.
-        std: Per-channel std for normalization.
-        pad_color: RGB fill for letterbox padding.
+        mean: Per-channel mean for normalization (interpreted in `color_order`).
+        std: Per-channel std for normalization (interpreted in `color_order`).
+        pad_color: Per-channel pad fill for letterbox padding (interpreted in
+            `color_order`; pad colors are typically symmetric grays).
+        color_order: 'RGB' or 'BGR'. Used only for documentation/threading; the
+            math is identical in either ordering since mean/std/pad are already
+            in the same order as the input array.
 
     Returns:
         Tuple of:
           - (1, 3, image_size, image_size) float32 numpy array, normalized.
           - (1, image_size, image_size) bool numpy array, True=padding.
     """
+    _ = color_order  # accepted for API symmetry; flip is performed in _load_image
     h, w = image.shape[:2]
     target = image_size
 
@@ -177,12 +213,17 @@ def _preprocess_for_model(
     return np.expand_dims(x, axis=0), np.expand_dims(mask, axis=0)  # (1,C,H,W), (1,H,W)
 
 
-def _preprocess_legacy(image_path: str, pad_color: tuple[int, int, int] = (114, 114, 114)) -> tuple[np.ndarray, bool]:
+def _preprocess_legacy(
+    image_path: str,
+    pad_color: tuple[int, int, int] = (114, 114, 114),
+    color_order: str = "RGB",
+) -> tuple[np.ndarray, bool]:
     """Legacy preprocessing for old ONNX models that bake preprocessing into the graph.
 
-    Returns (1, H, W, 3) uint8 array and compositing flag.
+    Returns (1, H, W, 3) uint8 image with channel order = color_order, and the
+    transparency-compositing flag.
     """
-    arr, was_composited = _load_image(image_path, pad_color)
+    arr, was_composited = _load_image(image_path, pad_color, color_order=color_order)
     return np.expand_dims(arr, axis=0), was_composited
 
 
@@ -227,7 +268,7 @@ def main():
         logger.info(f"Using providers: {session.get_providers()}")
 
         # Load metadata - this contains the vocabulary
-        vocab, mean, std, image_size, patch_size, pad_color, meta = _load_metadata(session)
+        vocab, mean, std, image_size, patch_size, pad_color, color_order, meta = _load_metadata(session)
         vocab_embedded = True
 
         if vocab is None:
@@ -243,6 +284,13 @@ def main():
             # Use default pad_color for old models without metadata
             if pad_color is None:
                 pad_color = (114, 114, 114)
+            # Legacy models predate the BGR migration entirely.
+            if not color_order:
+                color_order = "RGB"
+                logger.info(
+                    "Legacy ONNX without embedded vocabulary - defaulting color_order to 'RGB'."
+                )
+        logger.info(f"Color order from ONNX metadata: {color_order}")
 
         # Load calibrated thresholds if available (supports both per-tag and per-bucket)
         calibrated_thresholds = None
@@ -304,11 +352,13 @@ def main():
             try:
                 if is_new_format:
                     # New format: load image, preprocess externally, feed (1, C, H, W) float32
-                    raw_image, was_composited = _load_image(path, pad_color)
-                    inp, padding_mask = _preprocess_for_model(raw_image, image_size, mean, std, pad_color)
+                    raw_image, was_composited = _load_image(path, pad_color, color_order=color_order)
+                    inp, padding_mask = _preprocess_for_model(
+                        raw_image, image_size, mean, std, pad_color, color_order=color_order
+                    )
                 else:
                     # Legacy format: model expects (1, H, W, 3) uint8
-                    inp, was_composited = _preprocess_legacy(path, pad_color)
+                    inp, was_composited = _preprocess_legacy(path, pad_color, color_order=color_order)
             except Exception as e:
                 logger.error(f"Preprocessing failed for {path}: {e}")
                 results.append(ImagePrediction(

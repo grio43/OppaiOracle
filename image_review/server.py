@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from .tensorboard_parser import TensorBoardParser, discover_runs, PredictionEntry, RatingInfo
+from .tensorboard_parser import TensorBoardParser, discover_runs
 from .corrections import CorrectionsStore
 
 

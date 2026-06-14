@@ -34,8 +34,7 @@ USAGE:
 """
 
 # Standard library imports
-import atexit
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import hashlib
 import json
 import logging
@@ -66,17 +65,14 @@ except ImportError:
 import logging.handlers
 import multiprocessing as mp
 import os
-import queue
 import random
-import threading
 import time
-import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Thread
 from typing import Optional, List, Dict, Any, Tuple, Set
 
 # Third-party imports
+import numpy as np
 import torch
 from PIL import Image, ImageOps, ImageFile
 from torch.utils.data import Dataset, DataLoader as _TorchDataLoader
@@ -102,10 +98,15 @@ from utils.metadata_ingestion import parse_tags_field
 from utils.path_utils import sanitize_identifier, validate_image_path
 from utils.exclusion_manager import ExclusionManager
 from vocabulary import load_vocabulary_for_training, TagVocabulary
-from shared_vocabulary import (
-    SharedVocabularyManager,
-    is_shared_memory_available,
-)
+
+
+def _nested_error_counter() -> "defaultdict[str, int]":
+    """Factory for per-tag error stat counters.
+
+    Module-level (rather than a lambda) so DatasetLoader instances stay
+    picklable for DataLoader workers under Windows spawn.
+    """
+    return defaultdict(int)
 
 
 class IndependentColorJitter:
@@ -178,9 +179,11 @@ class IndependentColorJitter:
 try:  # Pillow ≥10
     RESAMPLE_BILINEAR = Image.Resampling.BILINEAR  # type: ignore[attr-defined]
     RESAMPLE_BICUBIC = Image.Resampling.BICUBIC  # type: ignore[attr-defined]
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
 except AttributeError:  # Pillow <10
     RESAMPLE_BILINEAR = Image.BILINEAR
     RESAMPLE_BICUBIC = Image.BICUBIC
+    RESAMPLE_LANCZOS = Image.LANCZOS
 
 # Strict mode by default: truncated/corrupt images are rejected immediately.
 # Set OO_ALLOW_TRUNCATED=1 to enable lenient mode which fills missing bytes
@@ -282,8 +285,16 @@ def process_image_cpu(
     ratio = min(target_size / float(w), target_size / float(h)) if (w > 0 and h > 0) else 1.0
     scale = min(1.0, ratio)
     nw, nh = int(round(w * scale)), int(round(h * scale))
-    
-    resized = img.resize((max(1, nw), max(1, nh)), RESAMPLE_BILINEAR)
+
+    # LANCZOS (windowed-sinc) for the downscale: higher frequency response near
+    # Nyquist than bilinear, which blurs+aliases below Nyquist and discards
+    # fine line-art detail (eye highlights, single hair strands) before it ever
+    # reaches the patch tokens. This is a downscale-only path (scale <= 1.0), so
+    # there is no upscale ringing. See todos/progressive-training-plan.md v2
+    # "fix the resampler" note. NOTE: this shifts the input distribution — match
+    # the inference/serving preprocessor to LANCZOS for any model trained after
+    # this change to avoid train/serve skew.
+    resized = img.resize((max(1, nw), max(1, nh)), RESAMPLE_LANCZOS)
 
     canvas = Image.new("RGB", (target_size, target_size), pad_color)
     left = (target_size - resized.size[0]) // 2
@@ -334,7 +345,6 @@ class ResumableSampler(DistributedSampler):
                  seed=0, drop_last=False):
         super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
         self._start_index = 0
-        self._cached_indices = None
 
     def set_start_index(self, index: int):
         """Set the starting index for iteration (for mid-epoch resume)."""
@@ -368,7 +378,6 @@ class ResumableSampler(DistributedSampler):
     def __iter__(self):
         # Generate indices using parent's logic
         indices = list(super().__iter__())
-        self._cached_indices = indices
 
         # Skip to start_index for mid-epoch resume
         for i in range(self._start_index, len(indices)):
@@ -427,18 +436,21 @@ def _try_load_cached_split(root: Path, seed: int = 42) -> Optional[tuple[list[Pa
         seed: Random seed to validate against cached seed
 
     Optimizations:
-      - Stratified validation: sample 50 paths (25 train + 25 val) from beginning/end/middle instead of the full list
+      - Stratified validation: sample 300 paths (150 train + 150 val) from beginning/end/middle instead of the full list
       - Parallel existence checks using ThreadPoolExecutor
       - Early return on cache hit without full validation
 
-    v2.1 Validation (added filesystem count check):
+    Validation:
       - Version check
       - Exclusion hash check (detects changes to manifest file filtering)
       - Cache internal consistency check (header FILE_COUNT matches path count)
       - Seed check (detects when seed changes between runs)
-      - FILESYSTEM COUNT CHECK: Scans actual filesystem to detect new/deleted files
-        (prevents stale cache from silently ignoring new dataset files)
-      - Sample existence check (verifies subset of cached paths still exist)
+      - Sampled existence check (verifies a stratified subset of cached paths
+        still exists, modeled on the Arrow cache's sampled staleness check).
+        NOTE: a full-filesystem rglob count was removed here — it walked all
+        ~5.6M files on every startup, costing nearly as much as the scan the
+        cache avoids. Newly added dataset files are NOT auto-detected; delete
+        the split cache (logs/splits/) or change the seed to force a re-scan.
     """
     logger = logging.getLogger(__name__)
     train_file, val_file = _split_cache_paths(root)
@@ -514,28 +526,6 @@ def _try_load_cached_split(root: Path, seed: int = 42) -> Optional[tuple[list[Pa
                 )
                 return None
 
-            # CRITICAL: Validate cached count against ACTUAL filesystem count
-            # This catches new files added after the cache was created
-            # Without this check, new files would be silently ignored!
-            if "FILE_COUNT" in train_header:
-                cached_count = int(train_header["FILE_COUNT"])
-                logger.debug(f"Counting current JSON files in {root} to validate split cache...")
-                # Count files on filesystem (generator avoids memory overhead)
-                filesystem_count = sum(
-                    1 for jp in root.rglob("*.json")
-                    if jp.name not in _EXCLUSION_PATTERNS
-                )
-                tolerance = max(100, int(max(cached_count, filesystem_count) * 0.001))  # 0.1% of larger count
-
-                if abs(filesystem_count - cached_count) > tolerance:
-                    logger.info(
-                        f"Split cache stale: filesystem has {filesystem_count:,} JSON files, "
-                        f"cache has {cached_count:,} (diff={abs(filesystem_count - cached_count):,}, "
-                        f"tolerance={tolerance}). Rebuilding split cache..."
-                    )
-                    return None
-                logger.debug(f"Filesystem count validated: {filesystem_count:,} files match cache")
-
             # Stratified sampling: check files from beginning, end, and random middle
             # This catches orphan files anywhere in the list, not just at the start
             sample_paths = []
@@ -557,9 +547,11 @@ def _try_load_cached_split(root: Path, seed: int = 42) -> Optional[tuple[list[Pa
                     samples.extend(random.sample(middle, min(middle_count, len(middle))))
                 return samples
 
-            # Sample 25 from train, 25 from val (50 total)
-            sample_paths.extend(stratified_sample(train_list, 25))
-            sample_paths.extend(stratified_sample(val_list, 25))
+            # Sample 150 from train, 150 from val (300 total) — a cheap probe
+            # that replaces the former full-filesystem rglob count, which
+            # re-walked all ~5.6M files on every startup.
+            sample_paths.extend(stratified_sample(train_list, 150))
+            sample_paths.extend(stratified_sample(val_list, 150))
 
             if sample_paths:
                 logging.getLogger(__name__).debug(
@@ -749,22 +741,32 @@ class ArrowMetadataAccessor:
     Used by SidecarJsonDataset to access metadata without RAM duplication
     across DataLoader workers.
 
-    When pickled for multiprocessing, only the cache path is serialized.
-    Workers re-open the memory-mapped file independently, allowing the OS
-    to share the same physical memory pages across all workers.
+    When pickled for multiprocessing, only the cache path and the selected
+    row indices are serialized. Workers re-open the memory-mapped file
+    independently (sharing physical pages via the OS) and re-apply the row
+    selection so they serve the exact same rows as the main process.
 
     Memory savings: ~15 GB per worker for 5.6M images dataset.
     """
 
-    def __init__(self, table: "pa.Table", cache_path: Path):
+    def __init__(self, table: "pa.Table", cache_path: Path,
+                 row_indices: Optional["np.ndarray"] = None):
         """Initialize accessor.
 
         Args:
-            table: PyArrow Table (memory-mapped)
+            table: PyArrow Table — must already be filtered to ``row_indices``
+                (i.e. ``full_table.take(row_indices)``) when indices are given
             cache_path: Path to the Arrow IPC file (for pickling)
+            row_indices: Row indices into the FULL on-disk cache that this
+                accessor represents (split/exclusion/bad-row filters), or None
+                when the table is the unfiltered on-disk cache. CRITICAL for
+                correctness: without these, workers reloading the combined
+                train+val cache from disk would silently serve unfiltered rows
+                (train/val leakage).
         """
         self._table = table
         self._cache_path = cache_path
+        self._row_indices = row_indices
         self._len = len(table)
 
     def __len__(self) -> int:
@@ -782,13 +784,26 @@ class ArrowMetadataAccessor:
             from utils.metadata_cache import _load_arrow_cache
             import logging
             logger = logging.getLogger(__name__)
-            self._table = _load_arrow_cache(self._cache_path, logger)
-            if self._table is None:
+            table = _load_arrow_cache(self._cache_path, logger)
+            if table is None:
                 raise RuntimeError(
                     f"Failed to load Arrow metadata cache: {self._cache_path}. "
                     "The cache file may be missing, corrupted, or locked. "
                     "Try deleting the cache file and restarting training."
                 )
+            # Re-apply the row selection computed in the main process — the
+            # on-disk cache contains ALL rows (train+val, pre-exclusion).
+            # Skipping this would alias the splits and leak val into train.
+            if self._row_indices is not None:
+                table = table.take(self._row_indices)
+            if len(table) != self._len:
+                raise RuntimeError(
+                    f"Arrow metadata cache row count mismatch after reload: "
+                    f"expected {self._len}, got {len(table)} ({self._cache_path}). "
+                    "The on-disk cache changed since the dataset was created; "
+                    "restart training so the cache and row selection are rebuilt."
+                )
+            self._table = table
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get metadata for a single sample.
@@ -810,13 +825,18 @@ class ArrowMetadataAccessor:
         # Include json_stem if available (v2.0+ cache format)
         if "json_stem" in self._table.column_names:
             result["json_stem"] = row.column("json_stem")[0].as_py()
+        # Include exact image filename if available (caches built after the
+        # filename column was added) — lets path resolution skip extension probing
+        if "filename" in self._table.column_names:
+            result["filename"] = row.column("filename")[0].as_py()
         return result
 
     def __getstate__(self) -> Dict[str, Any]:
-        """Prepare for pickling - only serialize the cache path."""
+        """Prepare for pickling - serialize the cache path and row selection."""
         return {
             "_cache_path": self._cache_path,
             "_len": self._len,
+            "_row_indices": self._row_indices,
         }
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -832,26 +852,31 @@ class ArrowMetadataAccessor:
         """
         self._cache_path = state["_cache_path"]
         self._len = state["_len"]
+        # Row selection into the full on-disk cache (None = unfiltered).
+        # .get() tolerates accessors pickled before this field existed.
+        self._row_indices = state.get("_row_indices")
         self._table = None  # Lazy load on first access via _ensure_table()
 
 
 class WorkerInitializer:
     """Picklable worker initialization callable for DataLoader.
 
-    Handles logging queue setup and shared vocabulary loading in worker processes.
+    Handles RNG seeding and logging queue setup in worker processes.
     Unlike closures, class instances are picklable by default.
+
+    Note: the vocabulary is small (~1-2 MB) and is pickled into workers with
+    the dataset; the former shared-memory vocab path duplicated that work and
+    was removed.
     """
 
-    def __init__(self, log_queue=None, shared_vocab_info=None, worker_log_level="WARNING"):
+    def __init__(self, log_queue=None, worker_log_level="WARNING"):
         """
         Args:
             log_queue: Queue for logging (optional)
-            shared_vocab_info: Tuple of (shm_name, vocab_size) for shared vocabulary (optional)
             worker_log_level: Log level for workers (DEBUG, INFO, WARNING, ERROR, CRITICAL)
                              WARNING allows debugging issues, CRITICAL minimizes queue overhead
         """
         self.log_queue = log_queue
-        self.shared_vocab_info = shared_vocab_info
         self.worker_log_level = worker_log_level
 
     def __call__(self, worker_id: int):
@@ -900,31 +925,6 @@ class WorkerInitializer:
             except Exception:
                 pass
 
-        # Load shared vocabulary if available
-        if self.shared_vocab_info is not None:
-            from torch.utils.data import get_worker_info
-            worker_info = get_worker_info()
-            if worker_info is not None:
-                dataset = worker_info.dataset
-                shm_name, vocab_size = self.shared_vocab_info
-
-                # Check if dataset has vocab attribute and needs loading
-                if hasattr(dataset, 'vocab') and hasattr(dataset, '_shared_vocab_loaded'):
-                    if not dataset._shared_vocab_loaded:
-                        try:
-                            from shared_vocabulary import SharedVocabularyManager, populate_vocab_from_shared
-                            # Load vocabulary from shared memory
-                            vocab_data = SharedVocabularyManager.load_from_shared(shm_name, vocab_size)
-                            populate_vocab_from_shared(dataset.vocab, vocab_data)
-                            dataset._shared_vocab_loaded = True
-                            logging.getLogger(__name__).debug(
-                                f"Worker {worker_id}: Loaded vocabulary from shared memory ({vocab_size / 1024:.1f} KB)"
-                            )
-                        except Exception as e:
-                            logging.getLogger(__name__).warning(
-                                f"Worker {worker_id}: Failed to load shared vocabulary: {e}"
-                            )
-
 
 class DatasetLoader(Dataset):
     def __init__(
@@ -944,8 +944,6 @@ class DatasetLoader(Dataset):
         normalize_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         color_order: str = "RGB",
         preload_files: int = 0,
-        # Background validator control
-        enable_background_validator: Optional[bool] = None,
         # Dtype configuration
         tag_vector_dtype: str = "bfloat16",
     ):
@@ -953,6 +951,8 @@ class DatasetLoader(Dataset):
         Dataset loader for images and JSON metadata.
         Note: Despite legacy naming, this does NOT handle HDF5 files.
         """
+        # Logger must exist before _load_annotations (which logs progress)
+        self.logger = logging.getLogger(__name__)
         self.annotations = self._load_annotations(annotations_path)
         self.image_dir = image_dir
         self.transform = transform
@@ -982,12 +982,11 @@ class DatasetLoader(Dataset):
         self.retry_counts: OrderedDict[int, int] = OrderedDict()
         self.failed_samples = set()
         self._sample_error_log_count = 0  # Rate-limit error logs
-        self.logger = logging.getLogger(__name__)
         # Track error distribution per tag to detect bias
         # Memory bound: limited to _MAX_ERROR_STATS_TAGS unique tags (see _track_error_for_tags)
         # Once limit reached, new tags are not tracked but existing tags continue accumulating
-        from collections import defaultdict
-        self.error_stats = defaultdict(lambda: defaultdict(int))
+        # Module-level factory (not a lambda) keeps this picklable for spawn workers
+        self.error_stats = defaultdict(_nested_error_counter)
         self._error_warn_counts = defaultdict(int)  # Rate limit warnings per tag
         # For manifest mode, allow symlink targets to resolve within this dataset root
         self.dataset_root = dataset_root
@@ -1022,31 +1021,10 @@ class DatasetLoader(Dataset):
         # Tag vector dtype
         self._tag_vector_dtype = _canon_dtype(str(tag_vector_dtype).lower())
 
-        # Properly initialise background validator (opt-out via env or param)
-        if enable_background_validator is None:
-            enable_background_validator = os.getenv("DATASET_BACKGROUND_VALIDATOR", "1") != "0"
-
-        # Check if we're in a worker process - if so, disable validator to avoid fork issues
-        worker_info = torch.utils.data.get_worker_info()
-        in_worker = worker_info is not None
-
-        # Only create validator in main process
-        self.validator = None
-        if enable_background_validator and not in_worker:
-            self.validator = BackgroundValidator(self)
-            self.validator.start()
-        elif enable_background_validator and in_worker:
-            self.logger.debug(
-                "Disabled BackgroundValidator in DataLoader worker process"
-            )
-
         # Epoch tracking for future flip support and consistency with SidecarJsonDataset.
         # Backed by shared memory so DataLoader workers (spawned at first iter()) observe
         # set_epoch() updates from the main process; a plain int would be frozen at fork/spawn time.
         self._current_epoch = mp.Value('i', 0, lock=False)
-
-        # --- Shared vocabulary flag (for worker_init_fn) ---
-        self._shared_vocab_loaded = False
 
         # --- Pre-created transforms for performance (avoid recreating per sample) ---
         # Use v2 API to avoid deprecation warning (ToTensor is deprecated)
@@ -1069,13 +1047,34 @@ class DatasetLoader(Dataset):
         """Prepare for pickling - exclude unpicklable objects."""
         state = self.__dict__.copy()
         # Remove unpicklable objects before sending to worker
-        state['validator'] = None           # BackgroundValidator thread
+        state['_exclusion_manager'] = None   # Contains threading lock (will be recreated)
+        # Snapshot exclusions for lock-free worker startup
+        # Workers restore from snapshot instead of blocking on file lock
+        state['_excluded_ids_snapshot'] = set(getattr(self, 'excluded_image_ids', set()))
         return state
 
     def __setstate__(self, state):
         """Restore from pickle in worker process."""
         self.__dict__.update(state)
-        # validator stays None in workers
+        # Recreate exclusion manager in worker process (mirrors SidecarJsonDataset)
+        exclusion_base = Path(self.dataset_root) if self.dataset_root else Path(self.image_dir).parent
+        exclusion_path = exclusion_base / 'cache_exclusions.txt'
+        self._exclusion_manager = ExclusionManager(
+            exclusion_path,
+            reload_interval_seconds=_EXCLUSION_RELOAD_INTERVAL
+        )
+        # Lock-free restore from snapshot (avoids file lock contention at startup)
+        snapshot = state.get('_excluded_ids_snapshot', set())
+        self.excluded_image_ids = snapshot
+        self._exclusion_manager._excluded_ids = snapshot.copy()
+        self._exclusion_manager._last_load_time = time.time()  # Treat snapshot as fresh
+        # Set _last_mtime to current file mtime to prevent reload_if_stale()
+        # from triggering _load_internal() on first __getitem__ call
+        try:
+            if self._exclusion_manager.exclusion_path.exists():
+                self._exclusion_manager._last_mtime = self._exclusion_manager.exclusion_path.stat().st_mtime
+        except OSError:
+            pass  # File doesn't exist yet, that's fine
 
     def _get_image_path_for_idx(self, idx: int) -> Path:
         """Get image path for a given index.
@@ -1560,202 +1559,18 @@ class DatasetLoader(Dataset):
         resolved_image_id = str(image_id).strip() if image_id else ""
         if not resolved_image_id:
             resolved_image_id = f"error_{idx}"
+        # NOTE: key set must match _build_sample_dict exactly — default_collate
+        # raises KeyError on heterogeneous dicts. Manifest mode has no flip
+        # support, so no flip_applied/flip_mode keys on either path.
         return {
             "images": torch.zeros((3, sz, sz), dtype=img_dtype),
             "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
             "tag_labels": torch.zeros(self.num_classes, dtype=self._tag_vector_dtype),
             "image_id": resolved_image_id,
             "cached": False,
-            "flip_applied": False,
-            "flip_mode": "none",
             "error": True,
             "error_reason": reason,
         }
-
-    def close(self):
-        """Release resources."""
-        # Cleanup validator
-        if hasattr(self, "validator") and self.validator is not None:
-            try:
-                self.validator.close()
-                # Give thread time to finish
-                if hasattr(self.validator, "join"):
-                    self.validator.join(timeout=2.0)
-            except Exception as e:
-                logging.getLogger(__name__).debug(
-                    f"Error stopping validator: {e}"
-                )
-            finally:
-                self.validator = None
-
-    def __del__(self):
-        """Fallback cleanup when object is garbage collected."""
-        try:
-            self.close()
-        except Exception:
-            pass  # Silently ignore errors in __del__
-
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - cleanup resources."""
-        self.close()
-        return False
-
-
-_active_validators = weakref.WeakSet()
-
-
-class BackgroundValidator(Thread):
-    """Background validation thread with explicit cleanup and registry tracking."""
-
-    def __init__(self, dataset_loader):
-        # Use daemon=True so thread doesn't block process exit
-        # Validation is non-critical and can be safely interrupted
-        super().__init__(daemon=True)
-        self.dataset_loader = dataset_loader
-        self.validation_queue = queue.Queue(maxsize=1000)
-        self.running = True
-        self._stop_event = threading.Event()
-        self.logger = logging.getLogger(__name__)
-        _active_validators.add(self)
-
-    def run(self):
-        """Background validation loop"""
-        self.logger.debug("BackgroundValidator thread started")
-        while self.running and not self._stop_event.is_set():
-            try:
-                # Use timeout to check stop_event periodically
-                try:
-                    item_idx = self.validation_queue.get(timeout=1.0)
-                except queue.Empty:
-                    continue
-
-                if item_idx is None:  # Sentinel for shutdown
-                    break
-
-                self.validate_item(item_idx)
-                self.validation_queue.task_done()
-
-            except Exception as e:
-                self.logger.error(f"Validation error: {e}")
-
-        self.logger.debug("BackgroundValidator thread stopping")
-
-    def validate_item(self, idx):
-        """Perform actual validation of dataset items"""
-        try:
-            annotation = self.dataset_loader.annotations[idx]
-
-            # Confine and locate image file safely
-            try:
-                image_id = sanitize_identifier(str(annotation["image_id"]))
-                image_path = validate_image_path(
-                    Path(self.dataset_loader.image_dir),
-                    image_id,
-                    allowed_external_roots=([Path(self.dataset_loader.dataset_root)] if getattr(self.dataset_loader, 'dataset_root', None) else None),
-                )
-            except Exception as e:
-                logging.warning(f"Invalid image_id for item {idx}: {e}")
-                return False
-
-            # Validate image can be opened
-            try:
-                with Image.open(image_path) as img:
-                    if img.mode not in ["RGB", "L"]:
-                        logging.warning(f"Unexpected image mode {img.mode} for {image_path}")
-            except Exception as e:
-                logging.warning(f"Cannot open image {image_path}: {e}")
-                return False
-
-            # Validate labels are within expected range
-            if "labels" in annotation and self.dataset_loader.num_classes is not None:
-                labels = annotation["labels"]
-                try:
-                    if not all(0 <= int(label) < int(self.dataset_loader.num_classes) for label in labels):
-                        logging.warning(f"Invalid labels for item {idx}: {labels}")
-                        return False
-                except Exception:
-                    return False
-
-            return True
-
-        except Exception as e:
-            logging.error(f"Validation failed for item {idx}: {e}")
-            return False
-
-    def stop(self, timeout=5.0):
-        """Stop the validation thread gracefully."""
-        if not self.running:
-            return  # Already stopped
-
-        self.logger.debug("Stopping BackgroundValidator...")
-        self.running = False
-        self._stop_event.set()
-
-        # Send sentinel to unblock queue.get()
-        try:
-            self.validation_queue.put_nowait(None)
-        except queue.Full:
-            pass
-
-        # Wait for thread to finish
-        if self.is_alive():
-            self.join(timeout=timeout)
-            if self.is_alive():
-                self.logger.warning(
-                    f"BackgroundValidator did not stop within {timeout}s timeout"
-                )
-
-        # Clean up queue
-        try:
-            while not self.validation_queue.empty():
-                self.validation_queue.get_nowait()
-        except queue.Empty:
-            pass
-
-    def close(self):
-        """Explicit cleanup method for resource management."""
-        if not self.running:
-            return  # Already closed
-
-        self.logger.debug("Closing BackgroundValidator...")
-        self.stop(timeout=10.0)  # Longer timeout for explicit cleanup
-
-        # Remove from registry
-        _active_validators.discard(self)
-
-    def __enter__(self):
-        """Context manager entry."""
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - guaranteed cleanup."""
-        self.close()
-        return False
-
-    def __del__(self):
-        """Cleanup on garbage collection."""
-        try:
-            if self.running:
-                self.stop(timeout=1.0)
-                _active_validators.discard(self)
-        except Exception:
-            pass
-
-
-@atexit.register
-def _cleanup_all_validators():
-    """Emergency cleanup of any remaining validators."""
-    for validator in list(_active_validators):
-        try:
-            validator.close()
-        except Exception:
-            pass
-
 
 class AugmentationStats:
     """Placeholder class for augmentation statistics."""
@@ -1763,7 +1578,17 @@ class AugmentationStats:
 
 
 def validate_dataset(*args, **kwargs):
-    """Placeholder dataset validation function."""
+    """Placeholder dataset validation function.
+
+    NOT IMPLEMENTED: this returns immediately without inspecting any inputs or
+    labels. It is only reachable when ``config.debug.validate_input_data`` is
+    enabled; warn loudly so that flag does not give false assurance that inputs
+    were validated.
+    """
+    logging.getLogger(__name__).warning(
+        "validate_dataset() is a no-op placeholder — config.debug.validate_input_data "
+        "is enabled but NO input/label validation is actually performed."
+    )
     return {}
 
 
@@ -1869,7 +1694,8 @@ class SidecarJsonDataset(Dataset):
             raise ValueError(f"color_order must be 'RGB' or 'BGR', got {color_order!r}")
         self.color_order: str = _co
 
-        # Image tensor dtype (matches _to_tensor_v2 output)
+        # Image tensor dtype (matches _to_tensor output; downgraded below if the
+        # torchvision v2 API is unavailable so error samples match real samples)
         self._image_dtype = torch.bfloat16
 
         # Tag vector dtype
@@ -1898,9 +1724,6 @@ class SidecarJsonDataset(Dataset):
         # Telemetry queue retained for compatibility (no orientation stats are pushed)
         self._stats_queue = stats_queue
 
-        # --- Shared vocabulary flag (for worker_init_fn) ---
-        self._shared_vocab_loaded = False
-
         # Epoch tracking for flip variation across epochs.
         # Backed by shared memory so DataLoader workers (spawned at first iter() under
         # persistent_workers=True) observe set_epoch() updates from the main process;
@@ -1917,9 +1740,11 @@ class SidecarJsonDataset(Dataset):
         elif transforms is not None:
             self._to_tensor_v2 = None
             self._to_tensor = transforms.ToTensor()  # Legacy fallback
+            self._image_dtype = torch.float32  # ToTensor outputs float32
         else:
             self._to_tensor_v2 = None
             self._to_tensor = None
+            self._image_dtype = torch.float32  # Default fallback dtype
 
         # Augmentation transforms (applied fresh each sample, NOT cached)
         self._color_jitter = None
@@ -2003,7 +1828,18 @@ class SidecarJsonDataset(Dataset):
                 # Use ArrowMetadataAccessor for zero-copy access
                 self._arrow_cache_path = _arrow_cache_path(self.root)
 
-                # If using prebuilt table (contains ALL files), filter to this dataset's files
+                # Build ONE boolean keep-mask over the FULL table combining
+                # (a) split membership, (b) exclusions, and (c) known-bad rows.
+                # The resulting row indices are handed to ArrowMetadataAccessor
+                # so DataLoader workers — which reload the full combined cache
+                # from disk (see ArrowMetadataAccessor.__getstate__) — can
+                # reconstruct the exact same row selection. Filtering the table
+                # without recording indices caused train/val split aliasing in
+                # workers (val served a subset of train).
+                full_len = len(arrow_table)
+                keep_mask = None  # None = keep every row
+
+                # (a) If using prebuilt table (contains ALL files), select this dataset's files
                 if prebuilt_arrow_table is not None and "json_stem" in arrow_table.column_names:
                     # Build lookup set of combined keys from our json_files
                     # Using vectorized PyArrow filtering (10-100x faster than Python loop)
@@ -2016,38 +1852,56 @@ class SidecarJsonDataset(Dataset):
                     combined_keys = pc.binary_join_element_wise(dir_col, stem_col, "/")
 
                     # Vectorized membership test (much faster than Python loop)
-                    mask = pc.is_in(combined_keys, value_set=our_keys_array)
-                    arrow_table = arrow_table.filter(mask)
-                    self.logger.info(f"Filtered Arrow table to {len(arrow_table):,} rows for this split (vectorized)")
+                    keep_mask = pc.is_in(combined_keys, value_set=our_keys_array)
+                    self.logger.info(
+                        f"Split membership mask: {pc.sum(keep_mask).as_py():,} of {full_len:,} "
+                        "cache rows belong to this split (vectorized)"
+                    )
 
+                # (b) Exclusions (vectorized: O(n) Arrow ops vs O(n*m) Python)
                 if self.excluded_image_ids:
-                    # Filter exclusions using vectorized PyArrow operations (much faster)
-                    # This preserves zero-copy semantics by filtering the Arrow table directly
                     self.logger.info(
                         f"Filtering {len(self.excluded_image_ids)} exclusions from Arrow cache..."
                     )
-                    original_count = len(arrow_table)
-
-                    # Vectorized exclusion filtering (O(n) Arrow ops vs O(n*m) Python)
                     exclusion_array = pa.array(list(self.excluded_image_ids))
                     image_id_col = arrow_table.column("image_id")
                     is_excluded = pc.is_in(image_id_col, value_set=exclusion_array)
-                    keep_mask = pc.invert(is_excluded)  # Keep items NOT in exclusion set
-                    arrow_table = arrow_table.filter(keep_mask)
+                    not_excluded = pc.invert(is_excluded)  # Keep items NOT in exclusion set
+                    keep_mask = not_excluded if keep_mask is None else pc.and_(keep_mask, not_excluded)
 
-                    excluded_count = original_count - len(arrow_table)
-                    # Use zero-copy Arrow accessor on filtered table
-                    self.items = ArrowMetadataAccessor(arrow_table, self._arrow_cache_path)
-                    self._using_arrow = True  # Still using Arrow (zero-copy preserved!)
-                    self.logger.info(
-                        f"Filtered {excluded_count} excluded images, {len(self.items):,} items remaining "
-                        "(zero-copy preserved via vectorized filtering)"
-                    )
+                # (c) Known-bad rows: empty tag lists or missing/unknown ratings
+                # only ever produce error samples (see the __getitem__ guard,
+                # kept as fallback for the non-Arrow path) — drop them once
+                # here instead of re-discovering them every epoch. The rating
+                # set must mirror _map_rating_to_tag()'s string mapping.
+                has_tags = pc.greater(pc.list_value_length(arrow_table.column("tags")), 0)
+                known_ratings = pa.array(
+                    ["g", "general", "safe", "sensitive", "q", "questionable", "e", "explicit"]
+                )
+                rating_ok = pc.is_in(
+                    pc.utf8_lower(pc.utf8_trim_whitespace(arrow_table.column("rating"))),
+                    value_set=known_ratings,
+                )
+                good_rows = pc.and_(has_tags, rating_ok)
+                keep_mask = good_rows if keep_mask is None else pc.and_(keep_mask, good_rows)
+
+                # Materialize the row selection. uint32 is plenty (<4.3B rows)
+                # and keeps the per-worker pickle payload compact (~4 bytes/row).
+                keep_mask = pc.fill_null(keep_mask, False)
+                row_indices = pc.indices_nonzero(keep_mask).to_numpy().astype(np.uint32)
+                if len(row_indices) != full_len:
+                    arrow_table = arrow_table.take(row_indices)
                 else:
-                    # No exclusions - use zero-copy Arrow accessor
-                    self.items = ArrowMetadataAccessor(arrow_table, self._arrow_cache_path)
-                    self._using_arrow = True
-                    self.logger.info(f"Loaded {len(self.items):,} items from Arrow cache (zero-copy)")
+                    row_indices = None  # Nothing filtered — workers can use the on-disk table as-is
+
+                self.items = ArrowMetadataAccessor(
+                    arrow_table, self._arrow_cache_path, row_indices=row_indices
+                )
+                self._using_arrow = True
+                self.logger.info(
+                    f"Loaded {len(self.items):,} of {full_len:,} Arrow cache rows "
+                    "(split/exclusion/bad-row filters applied; selection is worker-safe)"
+                )
             else:
                 # Arrow cache unavailable (PyArrow not installed or build failed)
                 # Fall back to sequential parsing
@@ -2084,6 +1938,7 @@ class SidecarJsonDataset(Dataset):
                         "tags": tags_list,
                         "rating": rating,
                         "dir": Path(jp).parent,
+                        "filename": Path(fname).name,  # Exact image filename (skips extension probing)
                     })
                 except Exception as e:
                     self.logger.warning(f"Failed to parse {jp}: {e}")
@@ -2103,6 +1958,9 @@ class SidecarJsonDataset(Dataset):
         # Remove unpicklable objects before sending to worker
         state['_stats_queue'] = None         # multiprocessing.Queue (cannot be pickled on Windows spawn)
         state['_exclusion_manager'] = None   # Contains threading lock (will be recreated)
+        # json_files (~5.6M Path objects) is only used in __init__; pickling it
+        # into every spawn worker costs ~1 GB RAM + tens of seconds per worker
+        state['json_files'] = []
         # Snapshot exclusions for lock-free worker startup
         # Workers restore from snapshot instead of blocking on file lock
         if hasattr(self, 'excluded_image_ids'):
@@ -2159,7 +2017,7 @@ class SidecarJsonDataset(Dataset):
         ann = self.items[idx]
         image_id = ann["image_id"]
         img_root = ann.get("dir", self.root)
-        return validate_image_path(Path(img_root), image_id)
+        return validate_image_path(Path(img_root), image_id, filename=ann.get("filename"))
 
     def set_epoch(self, epoch: int) -> None:
         """Set the current epoch for deterministic-yet-varying flip decisions.
@@ -2297,26 +2155,28 @@ class SidecarJsonDataset(Dataset):
                 if len(new_exclusions) > len(self.excluded_image_ids):
                     self.excluded_image_ids = new_exclusions
 
+        # Materialize the metadata row ONCE per access and reuse it everywhere
+        # below — each Arrow fetch decodes the full row (including the tags
+        # list), so fetching for the exclusion check and again for the
+        # annotation doubled per-sample metadata decode every epoch.
+        ann = None
+        image_id = None
+        try:
+            if 0 <= idx < len(self.items):
+                ann = self.items[idx]
+                image_id = ann.get("image_id")
+        except Exception:
+            ann = None
+
         if idx in self.failed_samples:
-            failed_image_id = None
-            try:
-                failed_image_id = self.items[idx].get("image_id") if idx < len(self.items) else None
-            except Exception:
-                pass
-            return self._error_sample(idx, "Previously failed sample", image_id=failed_image_id)
+            return self._error_sample(idx, "Previously failed sample", image_id=image_id)
 
         # Check if this sample was excluded by another worker (cross-worker sync)
-        if idx < len(self.items):
-            item_image_id = None
-            try:
-                item_image_id = self.items[idx].get("image_id")
-            except Exception:
-                item_image_id = None
-            if item_image_id and item_image_id in self.excluded_image_ids:
-                # Mark as failed in memory too to speed up subsequent checks
-                if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
-                    self.failed_samples.add(idx)
-                return self._error_sample(idx, f"Excluded by other worker: {item_image_id}", image_id=item_image_id)
+        if image_id and image_id in self.excluded_image_ids:
+            # Mark as failed in memory too to speed up subsequent checks
+            if len(self.failed_samples) < _MAX_FAILED_SAMPLES:
+                self.failed_samples.add(idx)
+            return self._error_sample(idx, f"Excluded by other worker: {image_id}", image_id=image_id)
 
         # Track retries with memory bounds to prevent unbounded growth
         # PERF: Using OrderedDict for O(1) FIFO eviction via popitem(last=False)
@@ -2330,13 +2190,13 @@ class SidecarJsonDataset(Dataset):
                     self.retry_counts.popitem(last=False)  # O(1) removal of oldest
             self.retry_counts[idx] = 0
 
-        ann = None
-        image_id = None
         img_root = None
         img_path = None
         try:
-            ann = self.items[idx]
-            image_id = ann["image_id"]
+            # Reuse the row fetched above; a failed fetch routes through the
+            # standard retry/error path.
+            if ann is None:
+                raise IndexError(f"Failed to materialize metadata row for idx={idx}")
             # Use original tags directly for read-only operations (avoid unnecessary copy)
             original_tags = ann["tags"]  # No copy - read-only reference
 
@@ -2362,8 +2222,9 @@ class SidecarJsonDataset(Dataset):
             tags_now = original_tags
 
             # Resolve image path first (needed for both cache lookup and loading)
+            # Exact filename (when the cache provides it) skips per-extension probing
             img_root = ann.get("dir", self.root)
-            img_path = validate_image_path(Path(img_root), image_id)
+            img_path = validate_image_path(Path(img_root), image_id, filename=ann.get("filename"))
 
             # Load image from disk
             # Fully decode and correct EXIF while file is open
@@ -2663,27 +2524,10 @@ def create_dataloaders(
     }
 
     # Load vocabulary once (needed for sidecar mode and to determine num classes)
+    # The vocab is small (~1-2 MB) and is simply pickled into workers with the
+    # dataset — the former shared-memory vocab path duplicated that work.
     vocab = load_vocabulary_for_training(Path(vocab_path))
     num_tags = len(vocab.tag_to_index)
-
-    # Create shared vocabulary to avoid pickling overhead with spawn multiprocessing
-    # This reduces worker startup time from ~400ms (8 workers × 50ms) to near-zero
-    shared_vocab_manager = None
-    shared_vocab_info = None
-    if is_shared_memory_available():
-        try:
-            shared_vocab_manager = SharedVocabularyManager()
-            shm_name = shared_vocab_manager.create_from_vocab(vocab)
-            shared_vocab_info = (shm_name, shared_vocab_manager.vocab_size)
-            logger.info(f"Created shared vocabulary ({shared_vocab_manager.vocab_size / 1024:.1f} KB)")
-            # Register cleanup on program exit
-            atexit.register(shared_vocab_manager.cleanup)
-        except Exception as e:
-            logger.warning(f"Failed to create shared vocabulary, falling back to pickling: {e}")
-            shared_vocab_manager = None
-            shared_vocab_info = None
-    else:
-        logger.debug("Shared memory not available (requires Python 3.8+), using vocabulary pickling")
 
     image_size = config_cache['image_size']
     pad_color = config_cache['pad_color']
@@ -2955,7 +2799,7 @@ def create_dataloaders(
     # Attach logging QueueHandler in workers if a queue is provided
     log_queue = kwargs.get("log_queue")
     worker_log_level = getattr(data_config, "worker_log_level", "WARNING")
-    _train_kw["worker_init_fn"] = WorkerInitializer(log_queue, shared_vocab_info, worker_log_level)
+    _train_kw["worker_init_fn"] = WorkerInitializer(log_queue, worker_log_level)
     train_loader = DataLoader(train_ds, **_train_kw)
 
     # Build validation loader kwargs using validation-specific config if available
@@ -2963,7 +2807,7 @@ def create_dataloaders(
     _val_kw = _dl_kwargs(data_config, shuffle=False, drop_last=False, override_cfg=val_override_cfg)
     if val_sampler is not None:
         _val_kw["sampler"] = val_sampler
-    _val_kw["worker_init_fn"] = WorkerInitializer(log_queue, shared_vocab_info, worker_log_level)
+    _val_kw["worker_init_fn"] = WorkerInitializer(log_queue, worker_log_level)
     val_loader = DataLoader(val_ds, **_val_kw)
 
     # Log validation dataloader settings for visibility

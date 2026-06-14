@@ -27,31 +27,12 @@ import threading
 import torch
 from torch.amp import GradScaler, autocast
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data import DataLoader, Subset
 from torchmetrics.classification import MultilabelF1Score, MultilabelAveragePrecision
 import numpy as np
 
 
-def _shutdown_dataloader_workers(loader: "Optional[DataLoader]") -> None:
-    """Safely shutdown DataLoader workers to prevent orphaned processes.
-
-    Call this before reassigning a DataLoader variable to ensure the old
-    loader's worker processes are properly terminated.
-    """
-    if loader is None:
-        return
-    try:
-        # Access internal iterator which holds worker references
-        if hasattr(loader, '_iterator') and loader._iterator is not None:
-            loader._iterator._shutdown_workers()
-            logger.debug("Successfully shut down dataloader workers")
-    except Exception as e:
-        # Best effort - may fail if already cleaned up or workers not started
-        logger.debug(f"DataLoader worker cleanup (expected if already clean): {type(e).__name__}")
-
-
 from Monitor_log import MonitorConfig, TrainingMonitor
-from evaluation_metrics import MetricComputer, FrequencyBucketMetrics, ThresholdCalibrator
+from evaluation_metrics import FrequencyBucketMetrics, ThresholdCalibrator
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -531,51 +512,9 @@ def train_with_orientation_tracking(config: FullConfig):
         patch_size=getattr(config.model, 'patch_size', None),
     )
 
-    # Apply validation max_samples subsampling if configured
-    # This significantly speeds up validation by using a random subset
-    # Use seeded RNG for deterministic subset selection across runs
-    val_max_samples = getattr(config.validation, 'max_samples', None)
-    if val_loader is not None and val_max_samples and val_max_samples < len(val_loader.dataset):
-        original_val_size = len(val_loader.dataset)
-        val_subset_seed = getattr(config.training, 'seed', 42)
-        val_rng = np.random.RandomState(val_subset_seed)
-        indices = val_rng.choice(original_val_size, val_max_samples, replace=False)
-        indices = np.sort(indices)  # Sort to maintain consistent dataset ordering
-        val_subset = Subset(val_loader.dataset, indices.tolist())
-
-        # Extract validation dataloader config (fall back to training config)
-        val_dl_cfg = getattr(config.validation, "dataloader", None)
-        val_batch = getattr(val_dl_cfg, "batch_size", None) or config.data.batch_size
-        val_num_workers = getattr(val_dl_cfg, "num_workers", None) or config.data.num_workers
-        val_prefetch = getattr(val_dl_cfg, "prefetch_factor", None) or getattr(config.data, "prefetch_factor", 2)
-        val_pin_memory = getattr(val_dl_cfg, "pin_memory", None)
-        if val_pin_memory is None:
-            val_pin_memory = getattr(config.data, "pin_memory", True)
-        val_persistent = getattr(val_dl_cfg, "persistent_workers", None)
-        if val_persistent is None:
-            val_persistent = getattr(config.data, "persistent_workers", False)
-
-        # Shutdown old loader's workers before creating new one to prevent orphaned processes
-        _shutdown_dataloader_workers(val_loader)
-
-        # Rebuild val_loader with the subset, preserving ALL config settings
-        val_loader_kwargs = dict(
-            batch_size=val_batch,
-            shuffle=False,
-            num_workers=val_num_workers,
-            pin_memory=val_pin_memory,
-        )
-        # Only add multiprocessing-specific kwargs when workers > 0
-        if val_num_workers > 0:
-            val_loader_kwargs["prefetch_factor"] = val_prefetch
-            val_loader_kwargs["persistent_workers"] = val_persistent
-
-        val_loader = DataLoader(val_subset, **val_loader_kwargs)
-        logger.info(
-            f"Validation subsampled: {val_max_samples:,} of {original_val_size:,} samples "
-            f"({100 * val_max_samples / original_val_size:.1f}%) "
-            f"[workers={val_num_workers}, prefetch={val_prefetch}]"
-        )
+    # NOTE: in-train validation subsampling is controlled by data.max_val_samples
+    # (applied inside create_dataloaders). validation.max_samples is only consumed
+    # by the standalone validation_loop runner.
 
     # Set initial epoch before any DataLoader access (prevents worker spawn warnings)
     if hasattr(train_loader.dataset, 'set_epoch'):
@@ -586,10 +525,10 @@ def train_with_orientation_tracking(config: FullConfig):
     # Pre-training validation
     if getattr(config.debug, 'validate_input_data', False):
         logger.info("Starting pre-training input validation...")
-        # Limiting validation to a few batches to avoid long startup times
+        # NOTE: validate_dataset() is currently a no-op placeholder; these calls
+        # do NOT actually validate inputs/labels (it warns to that effect).
         validate_dataset(train_loader, vocab, config, num_batches_to_check=10)
         validate_dataset(val_loader, vocab, config, num_batches_to_check=5)
-        logger.info("Pre-training input validation complete.")
 
     num_tags = len(vocab.tag_to_index)
 
@@ -607,17 +546,19 @@ def train_with_orientation_tracking(config: FullConfig):
 
     logger.info(f"Creating model with {num_tags} tags (including rating tags)")
 
-    metric_computer = MetricComputer(
-        num_labels=num_tags,
-        skip_indices=[0, 1],  # Skip <PAD> (0) and <UNK> (1) in metric computation
-    )
-
     # Determine architecture type (only ViT is supported)
     architecture_type = getattr(config.model, 'architecture_type', 'vit')
     logger.info(f"Creating model with architecture: {architecture_type}")
 
     model_config = config.model.to_dict()
     model_config["num_tags"] = num_tags
+    # Bridge the user-facing dropout knob to the architecture field name. The YAML
+    # exposes model.hidden_dropout_prob, but VisionTransformerConfig's MLP/projection
+    # dropout field is named `dropout`; without this remap the YAML value is stripped
+    # below and MLP dropout silently stays at the dataclass default (0.1).
+    model_config["dropout"] = model_config.get(
+        "hidden_dropout_prob", model_config.get("dropout", 0.1)
+    )
 
     # Filter out config keys that are in unified_config.yaml but not used by VisionTransformerConfig.
     # These remain in the YAML purely for legacy reasons (grouped-prediction prototype was
@@ -963,10 +904,24 @@ def train_with_orientation_tracking(config: FullConfig):
     resume_batch_idx = 0
     is_mid_epoch = False
     ckpt_original_batch_size = None  # For batch-size agnostic resume from legacy checkpoints
+    ckpt_sampler_state = None  # Saved sampler state (carries dataset-size guard for resume)
     # Soft-stop sentinel files (located in log_dir)
     stop_sentinel = Path(config.log_dir) / "STOP_TRAINING"
     save_sentinel = Path(config.log_dir) / "SAVE_CHECKPOINT"
     image_log_sentinel = Path(config.log_dir) / "LOG_IMAGES_NOW"
+    # Clear any leftover STOP_TRAINING sentinel from a previous run so a resume does
+    # not immediately soft-stop again. Unlike SAVE_CHECKPOINT / LOG_IMAGES_NOW (which
+    # are one-shot and unlinked on consumption), STOP_TRAINING was never cleared
+    # anywhere, so a single soft-stop would block every subsequent invocation until
+    # the file was deleted by hand. A genuine stop for THIS run is requested by
+    # (re)creating the file after startup.
+    try:
+        stop_sentinel.unlink()
+        logger.info("Cleared stale STOP_TRAINING sentinel from a previous run.")
+    except FileNotFoundError:
+        pass
+    except Exception as _stop_sentinel_exc:
+        logger.debug("Could not clear stale STOP_TRAINING sentinel: %s", _stop_sentinel_exc)
     early_exit = False
     soft_stop_pending = False  # defer stop until accumulation completes
     # PERF: Throttle filesystem sentinel checks to reduce syscall overhead in hot loop
@@ -1081,7 +1036,12 @@ def train_with_orientation_tracking(config: FullConfig):
                     optimizer=optimizer,
                     scheduler=scheduler,
                     device=device,
+                    scaler=scaler,
                     expected_vocab_sha256=current_vocab_sha,
+                    enforce_vocab_check=True,
+                    allow_unverified_vocab_resume=getattr(
+                        config.training, 'allow_unverified_vocab_resume', False
+                    ),
                 )
                 if not ckpt:
                     raise RuntimeError(f"Checkpoint returned empty data from {ckpt_path}")
@@ -1135,6 +1095,10 @@ def train_with_orientation_tracking(config: FullConfig):
                     if ckpt_original_batch_size and ckpt_original_batch_size != config.data.batch_size:
                         logger.info(f"Checkpoint was trained with batch_size={ckpt_original_batch_size}, "
                                    f"current batch_size={config.data.batch_size} - will use original for resume offset")
+
+                # Keep sampler state so the mid-epoch resume path can verify the
+                # dataset size hasn't changed before applying a sample offset.
+                ckpt_sampler_state = ckpt.get('sampler_state')
 
                 # Release checkpoint memory after extraction - model/optimizer states already loaded
                 del ckpt
@@ -1229,56 +1193,15 @@ def train_with_orientation_tracking(config: FullConfig):
 
         logger.info("=" * 70)
 
-        # --- Force compilation during worker warmup (Windows optimization) ---
-        # torch.compile() only wraps the model - actual compilation happens on first forward pass.
-        # By triggering compilation NOW with a dummy input, we overlap it with worker warmup
-        # (which is spawning workers in background thread), reducing total startup time.
-        # Without this, worker spawn (~50s) and compilation (2-5min) would be sequential.
-        try:
-            logger.info("Triggering torch.compile graph compilation (overlapping with worker warmup)...")
-            compile_start = time.time()
+        # NOTE: no dummy-input warmup forward here. A no_grad/no-autocast warmup
+        # compiles an *inference* graph (Dynamo guards on grad mode and autocast
+        # state), so the first real training batch triggers a full recompile anyway
+        # - the warmup was pure additive startup cost. A fwd+bwd warmup is also
+        # undesirable: it would perturb RNG state and break resume reproducibility.
 
-            # Create dummy input matching expected batch shape
-            dummy_batch_size = config.data.batch_size
-            dummy_images = torch.randn(
-                dummy_batch_size, 3, config.data.image_size, config.data.image_size,
-                device=device, dtype=amp_dtype
-            )
-            if use_channels_last:
-                dummy_images = dummy_images.contiguous(memory_format=torch.channels_last)
-
-            # Trigger actual compilation (this takes 2-5 minutes on first run)
-            with torch.no_grad():
-                _ = model(dummy_images)
-
-            compile_time = time.time() - compile_start
-            logger.info(f"Graph compilation complete in {compile_time:.1f}s (workers spawned in parallel)")
-
-            # Clear dummy tensors
-            del dummy_images
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        except Exception as e:
-            logger.warning(f"Forced compilation failed: {e}")
-            logger.warning("Compilation will happen on first real training batch instead")
-
-    # Log TensorBoard model graph - skip when model is compiled because FX trace
-    # is incompatible with torch.compile (causes "FX to torch.jit.trace a dynamo-optimized function" error)
-    if config.training.use_tensorboard and not use_compile:
-        try:
-            sample_batch = next(iter(train_loader))
-            images = sample_batch['images'].to(device)
-            if use_channels_last:
-                images = images.contiguous(memory_format=torch.channels_last)
-            padding_mask = sample_batch.get('padding_mask', None)
-            if padding_mask is not None:
-                padding_mask = padding_mask.to(device)
-            monitor.log_model_graph(model, images, padding_mask)
-        except Exception as e:
-            logger.warning(f"Could not log model graph: {e}")
-    elif config.training.use_tensorboard and use_compile:
-        logger.info("Skipping TensorBoard model graph logging (incompatible with torch.compile)")
+    # NOTE: TensorBoard model-graph logging was removed: it consumed a throwaway
+    # next(iter(train_loader)) batch, which spins up all workers early and perturbs
+    # restored RNG/data order on resume (and was inactive with use_compile=true).
 
     # Track optimizer updates (optimizer steps), distinct from micro-steps (batches)
     # Maintain in training_state for resume compatibility - ensure all required fields exist
@@ -1294,18 +1217,22 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # Create validation metrics once before training loop (CR-040 fix)
     # These will be reset each epoch instead of being recreated
-    tc = getattr(config, "threshold_calibration", {})
-    threshold = tc.get("default_threshold", 0.5) if isinstance(tc, dict) else getattr(tc, "default_threshold", 0.5)
+    # Single source of truth for the prediction threshold (also used by the
+    # bucketed metrics below and the standalone validation runner).
+    threshold = float(config.inference.prediction_threshold)
     skip_metric_cols = 2  # PAD=0, UNK=1 — consistent with loss ignore_indices and bucketed metrics
     num_metric_labels = num_tags - skip_metric_cols
     # Per-class metrics (average=None) so we can filter classes with zero positives
     # in the validation draw before macro-averaging. Without this, an 18-24K-class
     # long-tailed vocabulary leaves thousands of classes unrepresented in any
     # ~30k-sample draw, each contributing AP=0 and pulling the macro toward zero.
+    # thresholds=200 puts the AP metric in binned mode (constant memory): the
+    # default thresholds=None retains every update's preds/targets on GPU
+    # (~7 GB at 30K x 19.3K labels) and concatenates them at compute().
     val_metrics = {
         'f1_macro_per_class': MultilabelF1Score(num_labels=num_metric_labels, average=None, threshold=threshold).to(device),
         'f1_micro': MultilabelF1Score(num_labels=num_metric_labels, average="micro", threshold=threshold).to(device),
-        'map_per_class': MultilabelAveragePrecision(num_labels=num_metric_labels, average=None).to(device)
+        'map_per_class': MultilabelAveragePrecision(num_labels=num_metric_labels, average=None, thresholds=200).to(device)
     }
     val_pos_counts = torch.zeros(num_metric_labels, dtype=torch.long, device=device)
     logger.info(f"Validation metrics initialized with {num_metric_labels} labels (skipping {skip_metric_cols} special tokens), threshold={threshold}")
@@ -1374,7 +1301,22 @@ def train_with_orientation_tracking(config: FullConfig):
             if epoch == start_epoch and is_mid_epoch and (resume_batch_idx > 0 or resume_sample_idx > 0):
                 # Try instant resume via ResumableSampler (O(1) instead of O(n) batch iteration)
                 sampler = getattr(train_loader, 'sampler', None)
-                if hasattr(sampler, 'set_start_index'):
+                # Dataset-size-change guard (mirrors ResumableSampler.load_state):
+                # a sample offset recorded against a different dataset size would
+                # address different samples, so refuse to apply a stale offset and
+                # restart the epoch instead. Also disables the skip-by-index
+                # fallback below, which is equally stale.
+                saved_total = (ckpt_sampler_state or {}).get('total_size')
+                current_total = getattr(sampler, 'total_size', None)
+                if saved_total is not None and current_total is not None and saved_total != current_total:
+                    logger.warning(
+                        "Dataset size changed from %s to %s since checkpoint was saved. "
+                        "Mid-epoch sample offset cannot be applied safely - resuming from epoch start.",
+                        saved_total, current_total,
+                    )
+                    resume_batch_idx = 0
+                    resume_sample_idx = 0
+                elif hasattr(sampler, 'set_start_index'):
                     # Set sampler offset BEFORE creating iterator
                     # Note: set_start_index expects SAMPLE index, not batch index
                     # Use sample_in_epoch if available (batch-size agnostic), otherwise calculate
@@ -1443,12 +1385,21 @@ def train_with_orientation_tracking(config: FullConfig):
                 # Sync H2D stream before compute (ensures all transfers complete before model forward)
                 if h2d_stream is not None:
                     torch.cuda.current_stream().wait_stream(h2d_stream)
+                    # record_stream marks these allocations as in-use by the default
+                    # stream. Without it the caching allocator considers them owned by
+                    # the side stream only and can recycle the memory for next batch's
+                    # H2D copy while backward still reads the activations (classic
+                    # prefetcher data race).
+                    images.record_stream(torch.cuda.current_stream())
+                    tag_labels.record_stream(torch.cuda.current_stream())
+                    if pmask is not None:
+                        pmask.record_stream(torch.cuda.current_stream())
 
                 # Assert that input data is finite and labels are in range (only when debug enabled to avoid GPU sync)
                 if config.debug.enabled:
                     assert_finite(images, tag_labels, names=['images', 'tag_labels'], batch=batch, config=config)
 
-                if getattr(config.debug, 'log_input_stats', False) and (global_step % config.training.logging_steps == 0):
+                if config.debug.enabled and getattr(config.debug, 'log_input_stats', False) and (global_step % config.training.logging_steps == 0):
                     # OPTIMIZED: Single GPU sync via .tolist() instead of multiple .item() calls
                     with torch.no_grad():
                         img_stats = torch.stack([images.min(), images.max(), images.mean()]).cpu().tolist()
@@ -1462,7 +1413,7 @@ def train_with_orientation_tracking(config: FullConfig):
                     with amp_autocast():
                         outputs = model(images, padding_mask=pmask)
 
-                        if getattr(config.debug, 'log_activation_stats', False) and (global_step % config.training.logging_steps == 0):
+                        if config.debug.enabled and getattr(config.debug, 'log_activation_stats', False) and (global_step % config.training.logging_steps == 0):
                             tag_logits = outputs.get('tag_logits')
                             with torch.no_grad():
                                 if tag_logits is not None:
@@ -1484,11 +1435,22 @@ def train_with_orientation_tracking(config: FullConfig):
 
                         loss, losses = criterion(outputs['tag_logits'], tag_labels)
 
+                    # global_step only increments on optimizer updates, so all periodic
+                    # per-step work below is gated on the update boundary (the microbatch
+                    # that completes the accumulation window). Without this gate, every
+                    # microbatch of a qualifying window fires the same event ~accum times
+                    # (duplicate TB writes, GPU syncs, psutil scans).
+                    is_update_boundary = (accum_count + 1 >= accum)
+                    # Anticipated post-increment step: losses dict is deleted before
+                    # global_step increments, so we predict the final step value here
+                    # to align extraction with the logging check below.
+                    anticipated_step = (global_step + 1) if is_update_boundary else global_step
+
                     # Periodic pre-backward NaN/Inf check on GPU tensor (avoids per-step sync overhead)
                     # This catches NaN loss early before backward pass corrupts gradients.
-                    # The check runs every N steps (configurable via NAN_CHECK_INTERVAL_STEPS env var).
+                    # The check runs every N updates (configurable via NAN_CHECK_INTERVAL_STEPS env var).
                     # Set NAN_CHECK_EVERY_STEPS=0 to disable (GradScaler still catches NaN gradients post-backward).
-                    if NAN_CHECK_EVERY_STEPS > 0 and global_step % NAN_CHECK_EVERY_STEPS == 0:
+                    if NAN_CHECK_EVERY_STEPS > 0 and is_update_boundary and anticipated_step % NAN_CHECK_EVERY_STEPS == 0:
                         # Use torch.isfinite on GPU - this triggers a sync but only periodically
                         if not torch.isfinite(loss):
                             # Log with available info before potentially crashing .item() call
@@ -1502,8 +1464,11 @@ def train_with_orientation_tracking(config: FullConfig):
                                 logger.warning(
                                     f"Discarding {accum_count} accumulated gradient steps due to NaN/Inf loss."
                                 )
+                            # NOTE: no scaler.update() here - it would assert on an enabled
+                            # fp16 scaler because no inf-checks were recorded (update()
+                            # requires a preceding unscale_/step). Skipping the batch and
+                            # zeroing gradients is sufficient.
                             optimizer.zero_grad(set_to_none=True)
-                            scaler.update()  # Keep scaler state consistent
                             accum_count = 0
                             skipped_batches += 1
                             del loss, losses, outputs
@@ -1516,13 +1481,11 @@ def train_with_orientation_tracking(config: FullConfig):
                     batch_size_current = images.size(0)
                     
                     # Optimization: Avoid per-step CPU-GPU sync (loss.item())
-                    # Only sync when strictly necessary (logging or periodic NaN check)
-                    # Use anticipated post-increment step: losses dict is deleted before
-                    # global_step increments, so we predict the final step value here
-                    # to align extraction with the logging check below.
-                    anticipated_step = (global_step + 1) if (accum_count + 1 >= accum) else global_step
-                    should_log = (anticipated_step == 1 or anticipated_step % config.training.logging_steps == 0)
-                    should_check_nan = (NAN_CHECK_EVERY_STEPS > 0 and anticipated_step % NAN_CHECK_EVERY_STEPS == 0)
+                    # Only sync when strictly necessary (logging or periodic NaN check),
+                    # and only on the update boundary so each event fires exactly once
+                    # per qualifying optimizer update (see is_update_boundary above).
+                    should_log = is_update_boundary and (anticipated_step == 1 or anticipated_step % config.training.logging_steps == 0)
+                    should_check_nan = is_update_boundary and (NAN_CHECK_EVERY_STEPS > 0 and anticipated_step % NAN_CHECK_EVERY_STEPS == 0)
                     
                     loss_item = None
                     losses_items = {}
@@ -1576,7 +1539,7 @@ def train_with_orientation_tracking(config: FullConfig):
                     if use_scaler:
                         scaler.unscale_(optimizer)
 
-                    if getattr(config.debug, 'log_gradient_norm', False) and (global_step % config.training.logging_steps == 0):
+                    if config.debug.enabled and getattr(config.debug, 'log_gradient_norm', False) and (global_step % config.training.logging_steps == 0):
                         # Compute gradient norm using foreach operations (avoids memory spike from concatenation)
                         grads = [p.grad for p in model.parameters() if p.grad is not None]
                         if grads:
@@ -1608,7 +1571,15 @@ def train_with_orientation_tracking(config: FullConfig):
                         monitor.log_scalar('train/nan_grad_skipped', 1.0, global_step)
                         optimizer.zero_grad(set_to_none=True)
                         accum_count = 0
-                        skipped_batches += 1
+                        # This boundary microbatch had a finite loss and its forward/backward
+                        # ran; only the optimizer update was discarded (tracked via the
+                        # nan_grad_skipped scalar above). Account its loss like the other
+                        # microbatches of the window so epoch loss averaging stays correct,
+                        # and free the detached loss tensor before skipping.
+                        running_loss += loss_detached.float() * batch_size_current
+                        total_train_samples += batch_size_current
+                        processed_batches += 1
+                        del loss_detached
                         continue
 
                     if use_scaler:
@@ -1645,9 +1616,12 @@ def train_with_orientation_tracking(config: FullConfig):
                         training_state.epoch = epoch + 1
                         training_state.global_step = global_step
                         training_state.train_loss = current_train_loss_value
-                        # Track mid-epoch position for resume
-                        training_state.batch_in_epoch = step
-                        training_state.sample_in_epoch = step * train_loader.batch_size
+                        # Track mid-epoch position for resume. Batch `step` has been
+                        # consumed, so resume at the NEXT batch (consistent with the
+                        # soft-stop and one-shot save paths) - recording `step` would
+                        # retrain one batch and shift accumulation windows on resume.
+                        training_state.batch_in_epoch = step + 1
+                        training_state.sample_in_epoch = (step + 1) * train_loader.batch_size
                         training_state.is_epoch_boundary = False
 
                         try:
@@ -1808,8 +1782,11 @@ def train_with_orientation_tracking(config: FullConfig):
                         except Exception:
                             pass
 
-                # Log every N steps (throttled) and ensure first-step write
-                if global_step == 1 or (global_step % config.training.logging_steps == 0):
+                # Log every N optimizer updates (throttled) and ensure first-update write.
+                # should_log is True only on the boundary microbatch of a qualifying
+                # window, so this fires exactly once per qualifying update (skipped
+                # updates never reach here - they `continue` above).
+                if should_log:
                     # Uses pre-extracted loss_item and losses_items (tensors already deleted after backward)
                     monitor.log_step(
                         global_step,
@@ -1818,9 +1795,12 @@ def train_with_orientation_tracking(config: FullConfig):
                         optimizer.param_groups[0]['lr'],
                         batch_size_current,
                     )
-                # Memory monitoring (check every 2000 steps to reduce psutil overhead)
-                # psutil calls are ~1-5ms each; at scale this adds up
-                if global_step % 2000 == 0:
+                # Memory monitoring (check every 2000 updates to reduce psutil overhead)
+                # psutil calls are ~1-5ms each; at scale this adds up.
+                # accum_count == 0 here means an optimizer update completed on THIS
+                # microbatch (it is reset right after stepping), so the check fires
+                # once per qualifying update instead of once per microbatch.
+                if accum_count == 0 and global_step > 0 and global_step % 2000 == 0:
                     try:
                         mem_stats = mem_monitor.check_memory()
                         # Log to TensorBoard for tracking trends
@@ -1856,7 +1836,7 @@ def train_with_orientation_tracking(config: FullConfig):
                     try:
                         with torch.no_grad():
                             probs = torch.sigmoid(_saved_tag_logits)
-                            tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
+                            tag_names = [vocab.index_to_tag.get(i, vocab.unk_token) for i in range(len(vocab.index_to_tag))]
                             raw_image_ids = batch.get("image_id")
                             image_ids: Optional[List[str]] = None
                             if raw_image_ids is not None:
@@ -1918,12 +1898,29 @@ def train_with_orientation_tracking(config: FullConfig):
             # accumulate gradients but never reach the accum threshold. Rather than
             # silently discarding them, perform a partial optimizer step with
             # appropriately scaled gradients.
-            if accum_count > 0 and not soft_stop_pending:
+            # A pending soft stop normally defers the flush (the partial window is
+            # carried into the next epoch - see the epoch-boundary handler below),
+            # but on the FINAL epoch there is no next epoch: flush here so the
+            # accumulated work is not lost and the soft-stop checkpoint still saves.
+            is_final_epoch = (epoch + 1 >= config.training.num_epochs)
+            if accum_count > 0 and (not soft_stop_pending or is_final_epoch):
                 logger.info(
                     "Epoch %s: flushing %s/%s accumulated micro-batches at epoch boundary",
                     epoch + 1, accum_count, accum,
                 )
                 try:
+                    # Each micro-batch divided its loss by the FULL accum, but only
+                    # accum_count < accum micro-batches accumulated into this partial
+                    # window. Rescale the summed gradients by accum/accum_count so this
+                    # flush step carries the same effective magnitude as a full window
+                    # (otherwise it is under-weighted by accum_count/accum, biasing the
+                    # update and effective LR of every non-divisible epoch boundary).
+                    # Applied before unscale_; the constant commutes with the GradScaler.
+                    if accum > 1 and 0 < accum_count < accum:
+                        _partial_scale = accum / accum_count
+                        for _p in model.parameters():
+                            if _p.grad is not None:
+                                _p.grad.mul_(_partial_scale)
                     scaler.unscale_(optimizer)
                     grad_clip_cfg = getattr(config.training, 'gradient_clipping', None)
                     if grad_clip_cfg and getattr(grad_clip_cfg, 'enabled', True):
@@ -2066,7 +2063,15 @@ def train_with_orientation_tracking(config: FullConfig):
             for metric in val_metrics.values():
                 metric.reset()
             total_val_samples = 0  # Track samples for proper loss averaging
-            all_val_probs = []  # Accumulate for frequency-bucketed metrics
+            # CPU accumulation feeds the bucketed TB diagnostics and threshold
+            # calibration; skip it entirely when neither consumer is active
+            # (otherwise ~N x 19K matrices are transferred, held, and discarded).
+            calibration_enabled = bool(
+                getattr(config, 'threshold_calibration', None)
+                and config.threshold_calibration.enabled
+            )
+            accumulate_val_cpu = config.training.use_tensorboard or calibration_enabled
+            all_val_probs = []  # Accumulate for frequency-bucketed metrics / calibration
             all_val_targs = []
             val_h2d_stream = torch.cuda.Stream() if device.type == 'cuda' else None
             with torch.no_grad():
@@ -2095,6 +2100,13 @@ def train_with_orientation_tracking(config: FullConfig):
                     # Sync H2D stream before compute
                     if val_h2d_stream is not None:
                         torch.cuda.current_stream().wait_stream(val_h2d_stream)
+                        # See the train-loop comment: mark side-stream allocations as
+                        # in-use by the default stream so the allocator cannot recycle
+                        # them for the next batch's H2D copy while still being read.
+                        images.record_stream(torch.cuda.current_stream())
+                        tag_labels.record_stream(torch.cuda.current_stream())
+                        if pmask is not None:
+                            pmask.record_stream(torch.cuda.current_stream())
                     total_val_samples += images.size(0)  # Count actual samples processed
 
                     with amp_autocast():
@@ -2114,11 +2126,15 @@ def train_with_orientation_tracking(config: FullConfig):
                     val_metrics['f1_micro'].update(metric_probs, metric_targs)
                     val_metrics['map_per_class'].update(metric_probs, metric_targs)
                     val_pos_counts += metric_targs.sum(dim=0)
-                    all_val_probs.append(probs.to('cpu', non_blocking=True))
-                    all_val_targs.append(targs.to('cpu', non_blocking=True))
+                    if accumulate_val_cpu:
+                        # Compact dtypes for host accumulation: fp16 probs (cast back to
+                        # fp32 by the consumers) and bool targets (vs int64 = 8 bytes per
+                        # {0,1} value) cut host RAM and PCIe traffic ~5x.
+                        all_val_probs.append(probs.to(torch.float16).to('cpu', non_blocking=True))
+                        all_val_targs.append(targs.to(torch.bool).to('cpu', non_blocking=True))
 
                     if val_step == 0 and config.training.use_tensorboard:
-                        tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
+                        tag_names = [vocab.index_to_tag.get(i, vocab.unk_token) for i in range(len(vocab.index_to_tag))]
                         monitor.log_predictions(
                             step=global_step,
                             images=images,
@@ -2167,18 +2183,23 @@ def train_with_orientation_tracking(config: FullConfig):
             monitor.log_validation(global_step, {'loss': avg_val_loss, 'f1_macro': val_f1_macro, 'f1_micro': val_f1_micro, 'mAP': val_mAP})
             monitor.log_scalar('train/loss_epoch', avg_train_loss, global_step)
 
-            # Frequency-bucketed diagnostic metrics
+            # Frequency-bucketed diagnostic metrics + threshold calibration (both
+            # consume the CPU-accumulated probability/target matrices)
             try:
-                if all_val_probs and config.training.use_tensorboard:
+                cat_probs = None
+                cat_targs = None
+                if all_val_probs:
                     cat_probs = torch.cat(all_val_probs, dim=0).float()
                     del all_val_probs
                     cat_targs = torch.cat(all_val_targs, dim=0)
                     del all_val_targs
+                    freq_bins = getattr(config.validation, 'frequency_bins', None) or [300, 500, 1000, 5000, 10000, float('inf')]
+                    tag_names = [vocab.index_to_tag.get(i, vocab.unk_token) for i in range(len(vocab.index_to_tag))]
+
+                if cat_probs is not None and config.training.use_tensorboard:
                     pred_thr = float(config.inference.prediction_threshold)
                     mean_active = (cat_probs[:, skip_metric_cols:] > pred_thr).float().sum(dim=1).mean().item()
                     monitor.log_scalar('val/mean_active', mean_active, global_step)
-                    freq_bins = getattr(config.validation, 'frequency_bins', None) or [300, 500, 1000, 5000, 10000, float('inf')]
-                    tag_names = [vocab.index_to_tag[i] for i in range(len(vocab.index_to_tag))]
                     bucket_metrics = FrequencyBucketMetrics(
                         tag_frequencies=vocab.tag_frequencies,
                         frequency_bins=freq_bins,
@@ -2186,7 +2207,7 @@ def train_with_orientation_tracking(config: FullConfig):
                         skip_indices=[0, 1],
                     )
                     bucketed_results = bucket_metrics.compute_bucketed_metrics(
-                        cat_probs, cat_targs, threshold=config.inference.prediction_threshold,
+                        cat_probs, cat_targs, threshold=pred_thr,
                     )
                     for bucket_name, metrics in bucketed_results.items():
                         for metric_name, value in metrics.items():
@@ -2197,32 +2218,36 @@ def train_with_orientation_tracking(config: FullConfig):
                     )
                     logger.info(f"Bucketed metrics: {bucket_summary}")
 
-                    # Threshold calibration (reuses accumulated tensors)
-                    if getattr(config, 'threshold_calibration', None) and config.threshold_calibration.enabled:
-                        try:
-                            calibrator = ThresholdCalibrator(
-                                mode=config.threshold_calibration.mode,
-                                default_threshold=config.threshold_calibration.default_threshold,
-                                search_min=config.threshold_calibration.search_min,
-                                search_max=config.threshold_calibration.search_max,
-                                search_step=config.threshold_calibration.search_step,
-                            )
-                            calibrated_thresholds = calibrator.calibrate(
-                                cat_probs, cat_targs, tag_names=tag_names,
-                                skip_indices=[0, 1], frequency_bins=freq_bins,
-                                tag_frequencies=vocab.tag_frequencies,
-                            )
-                            save_path = config.threshold_calibration.save_path
-                            ThresholdCalibrator.save(calibrated_thresholds, save_path)
-                            logger.info(f"Calibrated thresholds saved to {save_path}")
-                            thresh_summary = ", ".join(
-                                f"{k}: {v:.3f}" for k, v in calibrated_thresholds.items()
-                            )
-                            logger.info(f"Calibrated thresholds ({config.threshold_calibration.mode}): {thresh_summary}")
+                # Threshold calibration (reuses accumulated tensors). Deliberately NOT
+                # gated on use_tensorboard: calibrated_thresholds is a training artifact
+                # consumed at inference, not a logging concern - only the TB scalar
+                # writes below remain TB-gated.
+                if cat_probs is not None and calibration_enabled:
+                    try:
+                        calibrator = ThresholdCalibrator(
+                            mode=config.threshold_calibration.mode,
+                            default_threshold=config.threshold_calibration.default_threshold,
+                            search_min=config.threshold_calibration.search_min,
+                            search_max=config.threshold_calibration.search_max,
+                            search_step=config.threshold_calibration.search_step,
+                        )
+                        calibrated_thresholds = calibrator.calibrate(
+                            cat_probs, cat_targs, tag_names=tag_names,
+                            skip_indices=[0, 1], frequency_bins=freq_bins,
+                            tag_frequencies=vocab.tag_frequencies,
+                        )
+                        save_path = config.threshold_calibration.save_path
+                        ThresholdCalibrator.save(calibrated_thresholds, save_path)
+                        logger.info(f"Calibrated thresholds saved to {save_path}")
+                        thresh_summary = ", ".join(
+                            f"{k}: {v:.3f}" for k, v in calibrated_thresholds.items()
+                        )
+                        logger.info(f"Calibrated thresholds ({config.threshold_calibration.mode}): {thresh_summary}")
+                        if config.training.use_tensorboard:
                             for name, thresh_val in calibrated_thresholds.items():
                                 monitor.log_scalar(f"val_threshold/{name}", thresh_val, global_step)
-                        except Exception as e:
-                            logger.warning(f"Failed to calibrate thresholds: {e}")
+                    except Exception as e:
+                        logger.warning(f"Failed to calibrate thresholds: {e}")
             except Exception as e:
                 logger.warning(f"Failed to compute bucketed metrics: {e}")
             finally:
@@ -2267,8 +2292,10 @@ def train_with_orientation_tracking(config: FullConfig):
         if burn_in_epochs > 0 and (epoch + 1) <= burn_in_epochs:
             _burn_in_vals.append(val_f1_macro)
             prev_best_for_log = training_state.best_metric  # Capture before any modifications
-            # Track best during burn-in to avoid losing a great model
-            if val_f1_macro > training_state.best_metric + es_threshold:
+            # Track best during burn-in to avoid losing a great model. Only act on
+            # epochs where validation actually ran; on a validation-skipped epoch
+            # val_f1_macro is a stale cached value and must not move best/patience.
+            if should_validate and val_f1_macro > training_state.best_metric + es_threshold:
                 training_state.best_metric = val_f1_macro
                 training_state.best_epoch = epoch + 1
                 # Don't save is_best during burn-in: early metrics are unreliable and
@@ -2304,12 +2331,17 @@ def train_with_orientation_tracking(config: FullConfig):
             cycle_max_lr = scheduler.max_lr  # Already accounts for gamma decay
             lr_ratio = current_lr / cycle_max_lr if cycle_max_lr > 0 else 1.0
 
-            if val_f1_macro > training_state.best_metric + es_threshold:
+            # Only update best/patience on epochs where validation actually ran.
+            # When validation is skipped (eval_steps cadence), val_f1_macro is a
+            # stale cached value: it never beats best, so without this guard the
+            # `elif lr_ratio < 0.5` branch would advance patience toward the early-
+            # stop limit on an epoch that produced no new metric.
+            if should_validate and val_f1_macro > training_state.best_metric + es_threshold:
                 training_state.best_metric = val_f1_macro
                 training_state.patience_counter = 0
                 training_state.best_epoch = epoch + 1
                 is_best = True
-            elif lr_ratio < 0.5:
+            elif should_validate and lr_ratio < 0.5:
                 # Only count patience when LR < 50% of cycle max (fine-tuning phase)
                 training_state.patience_counter += 1
             # else: During warmup/early-cycle phase, don't increment patience
@@ -2365,7 +2397,7 @@ def train_with_orientation_tracking(config: FullConfig):
 
     # Shutdown async checkpoint writer first (waits for pending saves)
     try:
-        checkpoint_manager.shutdown(wait=True, timeout=60.0)
+        checkpoint_manager.shutdown(wait=True, timeout=300.0)
         logger.debug("Checkpoint manager shutdown successfully")
     except Exception as e:
         logger.warning(f"Error shutting down checkpoint manager: {e}")

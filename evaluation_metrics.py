@@ -8,12 +8,27 @@ from torchmetrics.functional.classification import (
     multilabel_f1_score,
     multilabel_average_precision,
 )
-# Note: multilabel_precision and multilabel_recall were removed from imports.
-# The compute_per_tag_metrics method now computes these directly from the confusion
-# matrix for better performance (single pass instead of 3 separate passes).
-
 # Type alias for averaging modes
 AveragingMode = Literal["micro", "macro", "weighted"]
+
+
+def _ensure_full_frequency_coverage(bins: List[float]) -> List[float]:
+    """Return bin edges covering [0, inf) so no tag is silently dropped.
+
+    The bucketing loops assign a tag only when ``bins[i] <= freq < bins[i+1]``;
+    a tag whose frequency is below the lowest edge (e.g. the default bins start
+    at 300) or at/above the highest finite edge would otherwise vanish from the
+    bucketed breakdown and per-bucket threshold calibration. Prepending 0 and
+    appending inf keeps the rare/very-common tails visible.
+    """
+    if not bins:
+        return [0.0, float('inf')]
+    out = list(bins)
+    if out[0] > 0:
+        out = [0.0] + out
+    if out[-1] != float('inf'):
+        out = out + [float('inf')]
+    return out
 
 
 @dataclass
@@ -23,7 +38,7 @@ class MetricComputer:
     Args:
         num_labels: Total number of labels in the vocabulary.
         threshold: Threshold for converting probabilities to binary predictions.
-            Default is 0.5, but this may not be optimal for all models. Consider
+            Default is 0.2653, but this may not be optimal for all models. Consider
             using find_optimal_threshold() on validation data to determine the
             best threshold for your specific model and dataset.
         skip_indices: Optional list of label indices to exclude from metric computation
@@ -117,17 +132,28 @@ class MetricComputer:
             preds = preds[:, self._keep_mask]
             targs = targs[:, self._keep_mask]
 
-        preds, targs, effective_labels = self._drop_zero_positive_classes(preds, targs)
+        # Zero-positive-class filtering is only meaningful for MACRO averaging:
+        # torchmetrics returns AP/F1=0 for unsupported classes, dragging the macro
+        # mean toward vocabulary sparsity. Micro-F1 aggregates TP/FP/FN across all
+        # classes, so dropping guaranteed-FP columns would INFLATE it; and non-macro
+        # mAP must see the full class set. Use the filtered tensors only for macro.
+        full_labels = preds.size(1)
+        preds_drop, targs_drop, effective_labels = self._drop_zero_positive_classes(preds, targs)
 
         f1_macro = multilabel_f1_score(
-            preds, targs, num_labels=effective_labels, average="macro", threshold=self.threshold
+            preds_drop, targs_drop, num_labels=effective_labels, average="macro", threshold=self.threshold
         ).item()
         f1_micro = multilabel_f1_score(
-            preds, targs, num_labels=effective_labels, average="micro", threshold=self.threshold
+            preds, targs, num_labels=full_labels, average="micro", threshold=self.threshold
         ).item()
-        mAP = multilabel_average_precision(
-            preds, targs, num_labels=effective_labels, average=self.mAP_average
-        ).item()
+        if self.mAP_average == "macro":
+            mAP = multilabel_average_precision(
+                preds_drop, targs_drop, num_labels=effective_labels, average=self.mAP_average
+            ).item()
+        else:
+            mAP = multilabel_average_precision(
+                preds, targs, num_labels=full_labels, average=self.mAP_average
+            ).item()
         return {"f1_macro": f1_macro, "f1_micro": f1_micro, "mAP": mAP}
 
     @staticmethod
@@ -186,17 +212,24 @@ class MetricComputer:
             preds = preds[:, self._keep_mask]
             targs = targs[:, self._keep_mask]
 
-        preds, targs, effective_labels = self._drop_zero_positive_classes(preds, targs)
+        # Filter zero-positive classes for MACRO metrics only (see compute_all_metrics).
+        full_labels = preds.size(1)
+        preds_drop, targs_drop, effective_labels = self._drop_zero_positive_classes(preds, targs)
 
         f1_macro = multilabel_f1_score(
-            preds, targs, num_labels=effective_labels, average="macro", threshold=threshold
+            preds_drop, targs_drop, num_labels=effective_labels, average="macro", threshold=threshold
         ).item()
         f1_micro = multilabel_f1_score(
-            preds, targs, num_labels=effective_labels, average="micro", threshold=threshold
+            preds, targs, num_labels=full_labels, average="micro", threshold=threshold
         ).item()
-        mAP = multilabel_average_precision(
-            preds, targs, num_labels=effective_labels, average=self.mAP_average
-        ).item()
+        if self.mAP_average == "macro":
+            mAP = multilabel_average_precision(
+                preds_drop, targs_drop, num_labels=effective_labels, average=self.mAP_average
+            ).item()
+        else:
+            mAP = multilabel_average_precision(
+                preds, targs, num_labels=full_labels, average=self.mAP_average
+            ).item()
         return {"f1_macro": f1_macro, "f1_micro": f1_micro, "mAP": mAP}
 
     def find_optimal_threshold(
@@ -320,14 +353,22 @@ class MetricComputer:
         # Support = number of positive samples per label (same as tp + fn)
         support_per_label = targs_filtered.sum(dim=0)
 
+        # PERFORMANCE OPTIMIZATION: Move each stat vector to CPU once and index the
+        # resulting lists. Per-element .item() calls would each force a GPU sync
+        # (~4 syncs x ~19K tags per call).
+        precision_list = precision_per_label.cpu().tolist()
+        recall_list = recall_per_label.cpu().tolist()
+        f1_list = f1_per_label.cpu().tolist()
+        support_list = support_per_label.cpu().tolist()
+
         per_tag_metrics = {}
         for filtered_idx, original_idx in enumerate(original_indices):
             tag_key = tag_names[original_idx] if tag_names and original_idx < len(tag_names) else str(original_idx)
             per_tag_metrics[tag_key] = {
-                'precision': precision_per_label[filtered_idx].item(),
-                'recall': recall_per_label[filtered_idx].item(),
-                'f1': f1_per_label[filtered_idx].item(),
-                'support': support_per_label[filtered_idx].item(),
+                'precision': precision_list[filtered_idx],
+                'recall': recall_list[filtered_idx],
+                'f1': f1_list[filtered_idx],
+                'support': support_list[filtered_idx],
             }
 
         return per_tag_metrics
@@ -359,7 +400,9 @@ class FrequencyBucketMetrics:
 
     def __post_init__(self) -> None:
         skip_set = set(self.skip_indices) if self.skip_indices else set()
-        bins = self.frequency_bins
+        # Guarantee [0, inf) coverage so rare (freq < bins[0]) and very-common
+        # tags aren't silently dropped from the bucketed breakdown.
+        bins = _ensure_full_frequency_coverage(self.frequency_bins)
 
         # Build bucket names from bin edges
         self._bucket_names = []
@@ -396,14 +439,17 @@ class FrequencyBucketMetrics:
             threshold: Threshold for binarizing predictions.
 
         Returns:
-            Dict mapping bucket name to {f1_macro, f1_micro, mAP, num_tags, mean_support}.
+            Dict mapping bucket name to {f1_macro, f1_micro, mAP, num_tags,
+            num_supported_tags, mean_support}.
         """
         targs = targets.detach()
         if targs.dtype.is_floating_point:
             targs = (targs > 0.5).to(torch.long)
         else:
             targs = targs.to(torch.long)
-        preds = predictions.detach()
+        # fp32 cast to match compute_all_metrics: bf16 preds lose precision near
+        # the threshold, making bucketed F1/mAP inconsistent with the headline.
+        preds = predictions.detach().float()
 
         results: Dict[str, Dict[str, float]] = {}
         for bucket_name, indices in self._bucket_assignments.items():
@@ -411,7 +457,7 @@ class FrequencyBucketMetrics:
             if num_tags == 0:
                 results[bucket_name] = {
                     "f1_macro": 0.0, "f1_micro": 0.0, "mAP": 0.0,
-                    "num_tags": 0, "mean_support": 0.0,
+                    "num_tags": 0, "num_supported_tags": 0, "mean_support": 0.0,
                 }
                 continue
 
@@ -419,8 +465,19 @@ class FrequencyBucketMetrics:
             bucket_preds = preds[:, idx_tensor]
             bucket_targs = targs[:, idx_tensor]
 
+            # Drop zero-support columns before MACRO metrics, mirroring the headline
+            # metrics (_drop_zero_positive_classes): torchmetrics returns F1/AP=0 for
+            # classes with no positives in the draw, dragging rare buckets toward 0
+            # and measuring draw sparsity rather than model quality. Micro-F1 keeps
+            # the full bucket (see compute_all_metrics).
+            support_per_tag = bucket_targs.sum(dim=0)
+            num_supported = int((support_per_tag > 0).sum().item())
+            preds_drop, targs_drop, effective_tags = MetricComputer._drop_zero_positive_classes(
+                bucket_preds, bucket_targs
+            )
+
             f1_macro = multilabel_f1_score(
-                bucket_preds, bucket_targs, num_labels=num_tags,
+                preds_drop, targs_drop, num_labels=effective_tags,
                 average="macro", threshold=threshold,
             ).item()
             f1_micro = multilabel_f1_score(
@@ -428,15 +485,16 @@ class FrequencyBucketMetrics:
                 average="micro", threshold=threshold,
             ).item()
             mAP = multilabel_average_precision(
-                bucket_preds, bucket_targs, num_labels=num_tags, average="macro",
+                preds_drop, targs_drop, num_labels=effective_tags, average="macro",
             ).item()
-            mean_support = bucket_targs.sum(dim=0).float().mean().item()
+            mean_support = support_per_tag.float().mean().item()
 
             results[bucket_name] = {
                 "f1_macro": f1_macro,
                 "f1_micro": f1_micro,
                 "mAP": mAP,
                 "num_tags": num_tags,
+                "num_supported_tags": num_supported,
                 "mean_support": mean_support,
             }
 
@@ -494,8 +552,10 @@ class ThresholdCalibrator:
         Returns:
             Dict mapping tag name (per_tag) or bucket name (per_bucket) to optimal threshold.
         """
-        preds_np = predictions.detach().float().numpy()
-        targs_np = targets.detach().numpy()
+        # .cpu() before .numpy(): callers today pass CPU tensors, but a CUDA
+        # tensor would otherwise raise "can't convert cuda tensor to numpy".
+        preds_np = predictions.detach().cpu().float().numpy()
+        targs_np = targets.detach().cpu().numpy()
         if targs_np.dtype != np.int64:
             targs_np = (targs_np > 0.5).astype(np.int64)
 
@@ -514,6 +574,30 @@ class ThresholdCalibrator:
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
+    @staticmethod
+    def _compute_f1_grid(
+        preds: np.ndarray,
+        targs: np.ndarray,
+        thresholds: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build a (num_thresholds, num_labels) F1 grid plus per-label support.
+
+        One boolean (N, C) binarization per threshold with column-wise integer
+        counts replaces the old per-tag Python loops (~41 thresholds x ~19K tags
+        of O(N) numpy ops each). Counts are exact integers and the denominator
+        is algebraically identical (2*tp + fp + fn == pred_pos + support), so
+        the grid matches the loop version's F1 values exactly.
+        """
+        targ_bool = targs.astype(bool)
+        support = targs.sum(axis=0)  # tp + fn; invariant in threshold
+        f1_grid = np.empty((len(thresholds), preds.shape[1]), dtype=np.float64)
+        for ti, t in enumerate(thresholds):
+            pred_bin = preds > t  # bool (N, C); transient, freed each iteration
+            tp = (pred_bin & targ_bool).sum(axis=0)
+            pred_pos = pred_bin.sum(axis=0)
+            f1_grid[ti] = 2 * tp / (pred_pos + support + 1e-8)
+        return f1_grid, support
+
     def _calibrate_per_tag(
         self,
         preds: np.ndarray,
@@ -522,28 +606,19 @@ class ThresholdCalibrator:
         skip_set: set,
         thresholds: np.ndarray,
     ) -> Dict[str, float]:
+        f1_grid, support = self._compute_f1_grid(preds, targs, thresholds)
+        # np.argmax returns the FIRST max per column, matching the old loop's
+        # strict `>` tie-break (earlier threshold wins on equal F1).
+        best_idx = np.argmax(f1_grid, axis=0)
         result = {}
         for idx in range(preds.shape[1]):
             if idx in skip_set:
                 continue
             tag_name = tag_names[idx] if idx < len(tag_names) else str(idx)
-            support = targs[:, idx].sum()
-            if support == 0:
+            if support[idx] == 0:
                 result[tag_name] = self.default_threshold
                 continue
-            best_thresh = self.default_threshold
-            best_f1 = -1.0
-            for t in thresholds:
-                pred_bin = (preds[:, idx] > t).astype(np.int64)
-                targ_col = targs[:, idx]
-                tp = (pred_bin * targ_col).sum()
-                fp = (pred_bin * (1 - targ_col)).sum()
-                fn = ((1 - pred_bin) * targ_col).sum()
-                f1 = 2 * tp / (2 * tp + fp + fn + 1e-8)
-                if f1 > best_f1:
-                    best_f1 = f1
-                    best_thresh = float(t)
-            result[tag_name] = best_thresh
+            result[tag_name] = float(thresholds[best_idx[idx]])
         return result
 
     def _calibrate_per_bucket(
@@ -556,7 +631,9 @@ class ThresholdCalibrator:
         frequency_bins: List[float],
         tag_frequencies: Dict[str, int],
     ) -> Dict[str, float]:
-        # Group tag indices by frequency bucket
+        # Group tag indices by frequency bucket. Guarantee [0, inf) coverage so
+        # rare/very-common tags get a calibrated threshold instead of vanishing.
+        frequency_bins = _ensure_full_frequency_coverage(frequency_bins)
         buckets: Dict[str, List[int]] = {}
         for i in range(len(frequency_bins) - 1):
             low = int(frequency_bins[i])
@@ -574,33 +651,26 @@ class ThresholdCalibrator:
                     buckets[bucket_names[i]].append(idx)
                     break
 
+        # Support is invariant in the threshold, so it is computed once here
+        # (the old loop recomputed it per threshold) along with the F1 grid.
+        f1_grid, support = self._compute_f1_grid(preds, targs, thresholds)
+
         result = {}
         for bucket_name, indices in buckets.items():
             if not indices:
                 result[bucket_name] = self.default_threshold
                 continue
-            best_thresh = self.default_threshold
-            best_f1 = -1.0
-            for t in thresholds:
-                # Compute macro-F1 across all tags in this bucket
-                f1_sum = 0.0
-                count = 0
-                for idx in indices:
-                    support = targs[:, idx].sum()
-                    if support == 0:
-                        continue
-                    pred_bin = (preds[:, idx] > t).astype(np.int64)
-                    targ_col = targs[:, idx]
-                    tp = (pred_bin * targ_col).sum()
-                    fp = (pred_bin * (1 - targ_col)).sum()
-                    fn = ((1 - pred_bin) * targ_col).sum()
-                    f1_sum += 2 * tp / (2 * tp + fp + fn + 1e-8)
-                    count += 1
-                macro_f1 = f1_sum / max(count, 1)
-                if macro_f1 > best_f1:
-                    best_f1 = macro_f1
-                    best_thresh = float(t)
-            result[bucket_name] = best_thresh
+            # Macro-F1 per threshold across the bucket's supported tags
+            supported = [idx for idx in indices if support[idx] > 0]
+            count = len(supported)
+            if count:
+                macro_f1 = f1_grid[:, supported].sum(axis=1) / count
+            else:
+                macro_f1 = np.zeros(len(thresholds))
+            # np.argmax returns the FIRST max, matching the old loop's strict `>`
+            # tie-break (including count == 0: an all-zero macro-F1 picks
+            # thresholds[0], as the old loop did).
+            result[bucket_name] = float(thresholds[np.argmax(macro_f1)])
         return result
 
     @staticmethod

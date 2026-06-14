@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 import yaml
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from contextlib import nullcontext
 import hashlib
 from datetime import datetime
@@ -45,7 +45,7 @@ except ImportError:
 # We dropped `pl_bolts` because it is incompatible with PyTorch Lightning >= 2.0.
 # Use our vendored scheduler instead (behavior matches the one from pl_bolts).
 from schedulers import LinearWarmupCosineLR as LinearWarmupCosineAnnealingLR
-from torch.amp import GradScaler, autocast
+from torch.amp import GradScaler
 import torch.backends.cudnn as cudnn
 
 # Import ModelMetadata at module level for fail-fast behavior
@@ -432,7 +432,6 @@ def validate_config_compatibility(
     # Critical parameters that MUST match (will cause training issues if different)
     critical_params = [
         ('model.num_labels', 'Vocabulary size', 'Model head size mismatch will cause crashes'),
-        ('data.image_size', 'Image size', 'Images will be wrong size for model'),
         ('data.patch_size', 'Patch size', 'Patch embedding size mismatch'),
         ('model.architecture_type', 'Architecture type', 'Architecture mismatch will cause crashes'),
     ]
@@ -440,6 +439,13 @@ def validate_config_compatibility(
     # Important parameters that SHOULD match (may cause subtle issues)
     important_params = [
         ('training.gradient_accumulation_steps', 'Gradient accumulation', 'Effective batch size changed'),
+        # image_size is intentionally NOT critical: load_checkpoint bicubically
+        # interpolates the positional embeddings across a resolution change
+        # (e.g. Phase 1 320 -> Phase 2 448). Treating it as a critical+strict
+        # mismatch made resume_from=latest/best catch the ValueError and SILENTLY
+        # skip the checkpoint, restarting a multi-day run from scratch. patch_size
+        # stays critical, so a non-divisible patch grid is still rejected.
+        ('data.image_size', 'Image size', 'pos_embed will be bicubically interpolated to the new resolution'),
     ]
 
     # Check critical parameters
@@ -670,6 +676,11 @@ class TrainingState:
     train_loss: float = 0.0
     val_loss: float = 0.0
     loss_history: List[float] = field(default_factory=list)
+
+    # Validation metric tracking (real fields so asdict()/checkpoints preserve
+    # them; the trainer's validation-skip branch reads them back on resume)
+    val_f1_macro: float = 0.0
+    val_mAP: float = 0.0
     
     # Metric tracking
     metrics_history: Dict[str, List[float]] = field(default_factory=dict)
@@ -706,8 +717,13 @@ class TrainingState:
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'TrainingState':
-        """Load from dictionary"""
-        return cls(**data)
+        """Load from dictionary.
+
+        Filters to known field names so checkpoints carrying keys for
+        removed/renamed fields (legacy runs) load instead of TypeError-ing.
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
     
     def get_summary(self) -> str:
         """Get training state summary"""
@@ -739,7 +755,11 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
         self.warmup_steps = warmup_steps
         self.gamma = gamma
         
-        self.cur_cycle_steps = first_cycle_steps
+        # Clamp so the cosine denominator (cur_cycle_steps - warmup_steps) in get_lr
+        # is always >= 1. For multi-cycle configs first_cycle_steps can be
+        # <= warmup_steps, which would divide by zero/negative -> NaN/inf LR. This
+        # mirrors the restart guard in step() below.
+        self.cur_cycle_steps = max(first_cycle_steps, warmup_steps + 1)
         self.cycle = 0
         self.step_in_cycle = 0
         
@@ -756,16 +776,24 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
         super().__init__(optimizer, last_epoch)
     
     def get_lr(self):
-        if self.step_in_cycle < self.warmup_steps:
-            # Linear warmup
-            return [(self.max_lr - self.min_lr) * self.step_in_cycle / self.warmup_steps + self.min_lr
-                    for _ in self.base_lrs]
-        else:
-            # Cosine annealing
-            return [self.min_lr + (self.max_lr - self.min_lr) * 
-                    (1 + math.cos(math.pi * (self.step_in_cycle - self.warmup_steps) / 
-                    (self.cur_cycle_steps - self.warmup_steps))) / 2
-                    for _ in self.base_lrs]
+        lrs = []
+        for base_lr in self.base_lrs:
+            # Honor each param group's own base LR (layer-wise decay / separate
+            # head LR). When all groups share the configured max_lr (the common
+            # case) this ratio is exactly 1.0, so this is a no-op there; the old
+            # `for _ in self.base_lrs` returned max_lr for every group, silently
+            # collapsing any intended per-group LR.
+            group_max = self.max_lr * (base_lr / self.base_max_lr) if self.base_max_lr else self.max_lr
+            if self.step_in_cycle < self.warmup_steps:
+                # Linear warmup
+                lr = (group_max - self.min_lr) * self.step_in_cycle / self.warmup_steps + self.min_lr
+            else:
+                # Cosine annealing
+                lr = self.min_lr + (group_max - self.min_lr) * \
+                    (1 + math.cos(math.pi * (self.step_in_cycle - self.warmup_steps) /
+                                  (self.cur_cycle_steps - self.warmup_steps))) / 2
+            lrs.append(lr)
+        return lrs
     
     def state_dict(self):
         d = super().state_dict()
@@ -814,78 +842,6 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
         
         super().step(epoch)
 
-class EarlyStopping:
-    """Early stopping handler"""
-    
-    def __init__(
-        self,
-        patience: int = 10,
-        min_delta: float = 0.0001,
-        mode: str = 'min',
-        verbose: bool = True
-    ):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.verbose = verbose
-        
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        self.val_score_min = np.Inf if mode == 'min' else -np.Inf
-        
-    def __call__(self, val_score: float, model: nn.Module = None) -> bool:
-        """Check if should stop training
-        
-        Returns:
-            True if should stop, False otherwise
-        """
-        if self.mode == 'min':
-            score = -val_score
-        else:
-            score = val_score
-        
-        if self.best_score is None:
-            self.best_score = score
-            self.save_checkpoint(val_score, model)
-        elif score < self.best_score + self.min_delta:
-            self.counter += 1
-            if self.verbose:
-                logger.info(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = score
-            self.save_checkpoint(val_score, model)
-            self.counter = 0
-        
-        return self.early_stop
-    
-    def save_checkpoint(self, val_score: float, model: nn.Module = None):
-        """Record a new best validation score.
-
-        Despite the name this does NOT write a checkpoint — it only logs the
-        improvement and updates ``self.val_score_min`` (the tracked best). Actual
-        checkpoint writing is handled by ``CheckpointManager.save_checkpoint``.
-        """
-        if self.verbose:
-            if self.mode == 'min':
-                delta = self.val_score_min - val_score
-            else:
-                delta = val_score - self.val_score_min
-            logger.info(f'Validation score improved ({self.val_score_min:.6f} --> {val_score:.6f}, delta={delta:.6f})')
-
-        # Update the tracked best score (val_score_min is misleading name for 'max' mode)
-        self.val_score_min = val_score
-    
-    def reset(self):
-        """Reset early stopping state"""
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        self.val_score_min = np.Inf if self.mode == 'min' else -np.Inf
-
-
 class AsyncCheckpointWriter:
     """
     Background thread for non-blocking checkpoint saves.
@@ -919,58 +875,65 @@ class AsyncCheckpointWriter:
 
     def _worker(self):
         """Background worker that processes checkpoint saves."""
+        import queue
         while not self._shutdown_event.is_set():
+            # Wait for work with timeout to check shutdown flag
             try:
-                # Wait for work with timeout to check shutdown flag
-                import queue
-                try:
-                    item = self._queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
-                if item is None:  # Shutdown signal
-                    break
+            if item is None:  # Shutdown sentinel — never counted in _pending_count
+                break
 
+            # From here the item was counted by save_async(). Guarantee the
+            # _pending_count decrement runs no matter what fails below (including a
+            # malformed item / unpack error) so wait_pending() can never hang on a
+            # stuck counter, and record _last_error so a worker failure is never
+            # silently swallowed.
+            try:
                 checkpoint, path, lock_context, callback = item
 
+                # Atomic save with temp file
+                temp_path = None
                 try:
-                    # Atomic save with temp file
-                    temp_path = None
-                    try:
-                        fd, temp_path = tempfile.mkstemp(
-                            suffix='.tmp',
-                            prefix='async_ckpt_',
-                            dir=path.parent
-                        )
-                        os.close(fd)
+                    fd, temp_path = tempfile.mkstemp(
+                        suffix='.tmp',
+                        prefix='async_ckpt_',
+                        dir=path.parent
+                    )
+                    os.close(fd)
 
-                        with lock_context:
-                            torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=True)
-                            os.replace(temp_path, path)
-                            temp_path = None  # Mark as consumed
+                    with lock_context:
+                        torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=True)
+                        os.replace(temp_path, path)
+                        temp_path = None  # Mark as consumed
 
-                        if callback:
-                            callback(path, success=True, error=None)
+                    if callback:
+                        callback(path, success=True, error=None)
 
-                    except Exception as e:
-                        self._last_error = e
-                        logger.error(f"Async checkpoint save failed: {e}")
-                        if callback:
-                            callback(path, success=False, error=e)
-                    finally:
-                        if temp_path and Path(temp_path).exists():
-                            try:
-                                Path(temp_path).unlink()
-                            except OSError:
-                                pass  # Best-effort cleanup, ignore filesystem errors
-
+                except Exception as e:
+                    self._last_error = e
+                    logger.error(f"Async checkpoint save failed: {e}")
+                    if callback:
+                        callback(path, success=False, error=e)
                 finally:
-                    with self._lock:
-                        self._pending_count -= 1
-                    self._queue.task_done()
+                    if temp_path and Path(temp_path).exists():
+                        try:
+                            Path(temp_path).unlink()
+                        except OSError:
+                            pass  # Best-effort cleanup, ignore filesystem errors
 
             except Exception as e:
+                # Unexpected failure (e.g. a malformed queue item) — record it so it
+                # is surfaced at shutdown instead of vanishing, then fall through to
+                # the finally so the pending counter is still released.
+                self._last_error = e
                 logger.error(f"AsyncCheckpointWriter worker error: {e}")
+            finally:
+                with self._lock:
+                    self._pending_count -= 1
+                self._queue.task_done()
 
     def save_async(
         self,
@@ -1154,6 +1117,19 @@ class CheckpointManager:
         """Shutdown async writer. Call at end of training."""
         if self._async_writer is not None:
             self._async_writer.shutdown(wait=wait, timeout=timeout)
+            # Surface any async-save failure that would otherwise let the run end
+            # "cleanly" with missing numbered/best checkpoints. last.pt is refreshed
+            # from each numbered file after it is fully written (atomic os.replace),
+            # so it is always a complete file - but on a failed async save it may be
+            # one save behind, and the operator must know the async best/numbered
+            # copies may be absent.
+            if self._async_writer.last_error is not None:
+                logger.error(
+                    "Async checkpoint writer reported an unresolved error during the run: "
+                    f"{self._async_writer.last_error!r}. Numbered/best async checkpoints may be "
+                    "missing or incomplete - verify the checkpoint directory. (last.pt is "
+                    "always a complete file but may be one save behind.)"
+                )
             self._async_writer = None
 
     def _deep_to_cpu(self, obj):
@@ -1454,13 +1430,62 @@ class CheckpointManager:
                     except Exception:
                         pass
 
+        def _update_last_from_file(source_path: Path) -> None:
+            """Refresh last.pt from an already-written checkpoint file.
+
+            Hardlinks the just-written file to a temp name and atomically
+            os.replace()s it onto last.pt - no second serialization, and last.pt is
+            always a complete file (crash-safe; numbered checkpoints are never
+            modified in place, only unlinked, so sharing the inode is safe). Falls
+            back to a copy where hardlinks are unsupported (non-NTFS/cross-volume).
+            """
+            if not self.save_last:
+                return
+            last_path = self.checkpoint_dir / LAST_CKPT_NAME
+            temp_last = None
+            last_lock = filelock.FileLock(lock_path, timeout=60) if HAS_FILELOCK else nullcontext()
+            try:
+                with last_lock:
+                    fd_last, temp_last = tempfile.mkstemp(
+                        suffix='.tmp',
+                        prefix='last_',
+                        dir=self.checkpoint_dir
+                    )
+                    try:
+                        os.close(fd_last)
+                    except Exception:
+                        pass
+                    # os.link refuses to overwrite, so drop the mkstemp placeholder first
+                    os.unlink(temp_last)
+                    try:
+                        os.link(source_path, temp_last)
+                    except OSError:
+                        shutil.copy2(source_path, temp_last)
+                    os.replace(temp_last, last_path)
+                    temp_last = None  # Mark as consumed
+                    logger.debug(f"Updated {last_path} from {source_path}")
+            except Exception as e:
+                logger.warning(f"Failed to update {last_path} from {source_path}: {e}")
+            finally:
+                if temp_last is not None:
+                    try:
+                        if Path(temp_last).exists():
+                            Path(temp_last).unlink()
+                    except Exception:
+                        pass
+
         # Callback for async save completion logging
         def _on_save_complete(path, success, error):
             if success:
                 logger.info(f"Async checkpoint saved to {path}")
                 _save_best_from_checkpoint(path)
+                _update_last_from_file(path)
             else:
                 logger.error(f"Async checkpoint save failed for {path}: {error}")
+
+        # Single CPU deep copy shared by the numbered and last.pt saves below.
+        # (Previously this was done twice per save - two ~GB-scale D2H copies.)
+        cpu_checkpoint = None
 
         if not (self.keep_best and not is_best):
             # Use async save if available (eliminates 30-90s training stalls)
@@ -1474,6 +1499,7 @@ class CheckpointManager:
                         self.checkpoints.append(checkpoint_path)
                         logger.debug(f"Queued async checkpoint save to {checkpoint_path}")
                         # Note: cpu_checkpoint ownership transferred to async writer, don't delete here
+                        # (last.pt is refreshed from the numbered file in _on_save_complete)
                     else:
                         # Queue full, fall back to sync save (use CPU checkpoint to avoid VRAM spike)
                         logger.warning("Async checkpoint queue full, falling back to sync save")
@@ -1482,14 +1508,15 @@ class CheckpointManager:
                         self.checkpoints.append(checkpoint_path)
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
                         _save_best_from_checkpoint(checkpoint_path)
-                        del cpu_checkpoint  # Free CPU copy after sync save completes
+                        _update_last_from_file(checkpoint_path)
+                        cpu_checkpoint = None  # Free CPU copy after sync save completes
                 except Exception as e:
                     logger.warning(f"Failed to prepare async checkpoint: {e}. Falling back to sync save.")
                     # Try to create CPU checkpoint for sync save to avoid VRAM spike
                     try:
                         cpu_checkpoint = self._deep_to_cpu(checkpoint)
                         self._sync_save_checkpoint(cpu_checkpoint, checkpoint_path, lock_context)
-                        del cpu_checkpoint  # Free CPU copy after saving
+                        cpu_checkpoint = None  # Free CPU copy after saving
                     except Exception:
                         # Last resort: save with GPU tensors if CPU conversion also fails
                         self._sync_save_checkpoint(checkpoint, checkpoint_path, lock_context)
@@ -1497,27 +1524,37 @@ class CheckpointManager:
                     self.checkpoints.append(checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                     _save_best_from_checkpoint(checkpoint_path)
+                    _update_last_from_file(checkpoint_path)
             else:
                 # Sync save (original behavior) - use CPU checkpoint to avoid VRAM spike
                 cpu_checkpoint = self._deep_to_cpu(checkpoint)
                 self._sync_save_checkpoint(cpu_checkpoint, checkpoint_path, lock_context)
-                del cpu_checkpoint  # Free CPU copy after sync save completes
+                cpu_checkpoint = None  # Free CPU copy after sync save completes
                 wrote_numbered = True
                 self.checkpoints.append(checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
                 _save_best_from_checkpoint(checkpoint_path)
+                _update_last_from_file(checkpoint_path)
         else:
             logger.debug("save_best_only=True: skipping numbered checkpoint at step %s", step)
 
-        # Always update last.pt atomically for crash-resume
-        # Use sync save for last.pt to ensure crash recovery works
-        # Convert to CPU to avoid VRAM spike during save
-        if self.save_last:
+        # last.pt (crash-resume pointer) is normally produced from the just-written
+        # numbered file via _update_last_from_file (hardlink/copy + atomic
+        # os.replace) - no second serialization. Only when the numbered save was
+        # skipped entirely (save_best_only and not best) does last.pt need its own
+        # serialization; queue it on the async writer when available.
+        if self.save_last and not wrote_numbered:
             last_path = self.checkpoint_dir / LAST_CKPT_NAME
             try:
-                last_cpu_checkpoint = self._deep_to_cpu(checkpoint)
-                self._sync_save_checkpoint(last_cpu_checkpoint, last_path, lock_context)
-                del last_cpu_checkpoint  # Free CPU copy after sync save completes
+                if cpu_checkpoint is None:
+                    cpu_checkpoint = self._deep_to_cpu(checkpoint)
+                if self._async_writer is not None and self._async_writer.save_async(
+                    cpu_checkpoint, last_path, lock_context, None
+                ):
+                    logger.debug(f"Queued async checkpoint save to {last_path}")
+                    # Ownership transferred to async writer
+                else:
+                    self._sync_save_checkpoint(cpu_checkpoint, last_path, lock_context)
             except Exception as e:
                 logger.warning("Failed to update %s using CPU copy: %s. Retrying with original tensors.", last_path, e)
                 try:
@@ -1695,6 +1732,8 @@ class CheckpointManager:
         device: torch.device = torch.device('cpu'),
         scaler: Optional[GradScaler] = None,
         expected_vocab_sha256: Optional[str] = None,
+        enforce_vocab_check: bool = False,
+        allow_unverified_vocab_resume: bool = False,
     ) -> Dict:
         """Load a checkpoint.
 
@@ -1702,7 +1741,18 @@ class CheckpointManager:
             expected_vocab_sha256: SHA256 of the vocabulary the caller is using right
                 now. If the checkpoint embeds a different ``vocab_sha256``, we refuse
                 to load — vocab indices would be misaligned and the model would train
-                against the wrong tags silently.
+                against the wrong tags silently. A falsy value or the sentinel
+                ``"unknown"`` means the caller could not compute the current vocab
+                hash, which is treated as unverifiable (see below).
+            enforce_vocab_check: when True (the resume path), verification is
+                MANDATORY: an unverifiable vocab (current SHA unknown, or the
+                checkpoint embeds no SHA) refuses the load unless
+                ``allow_unverified_vocab_resume`` is set. When False (inference /
+                export / standalone validation), the check is best-effort — a
+                concrete SHA mismatch still raises, but a missing SHA only warns.
+            allow_unverified_vocab_resume: escape hatch for ``enforce_vocab_check``;
+                set True to load a legacy checkpoint whose vocab cannot be verified —
+                the caller then owns confirming the vocabulary matches.
         """
 
         if checkpoint_path is None:
@@ -1723,20 +1773,52 @@ class CheckpointManager:
         # Refuse to resume into a model whose vocabulary has shifted under us.
         # Without this guard, indices in the checkpoint's tag head silently
         # address the wrong tags after any vocab regeneration.
-        if expected_vocab_sha256:
-            checkpoint_sha = meta.get('vocab_sha256')
-            if checkpoint_sha and checkpoint_sha != expected_vocab_sha256:
+        checkpoint_sha = meta.get('vocab_sha256')
+        # "unknown" is the sentinel compute_vocab_sha256 returns when it could not
+        # read the vocab; treat it the same as a missing value (unverifiable).
+        current_known = bool(expected_vocab_sha256) and expected_vocab_sha256 != "unknown"
+        checkpoint_known = bool(checkpoint_sha) and checkpoint_sha != "unknown"
+        if current_known and checkpoint_known:
+            # Both sides have a real hash: a mismatch is always fatal.
+            if checkpoint_sha != expected_vocab_sha256:
                 raise InvalidCheckpointError(
                     f"Vocabulary SHA mismatch loading {checkpoint_path}: "
                     f"checkpoint embeds {checkpoint_sha}, current vocab is "
                     f"{expected_vocab_sha256}. Tag indices would be misaligned. "
                     "Pin the matching vocabulary or retrain."
                 )
-            if not checkpoint_sha:
+        elif enforce_vocab_check:
+            # Resume path: verification is mandatory. Could not verify because the
+            # caller could not hash the current vocab, or the checkpoint embeds no
+            # SHA (legacy). Fail CLOSED unless explicitly overridden — a silent
+            # vocab mismatch scrambles every label index.
+            if not current_known and not checkpoint_known:
+                reason = "neither the current vocabulary nor the checkpoint provides a usable SHA256"
+            elif not current_known:
+                reason = "the current vocabulary SHA256 could not be computed"
+            else:
+                reason = "the checkpoint embeds no vocab_sha256 (legacy checkpoint)"
+            if allow_unverified_vocab_resume:
                 logger.warning(
-                    "Checkpoint at %s has no embedded vocab_sha256; cannot verify "
-                    "vocabulary compatibility on resume.", checkpoint_path,
+                    "Resuming with UNVERIFIED vocabulary for %s: %s. Proceeding only "
+                    "because training.allow_unverified_vocab_resume=True.",
+                    checkpoint_path, reason,
                 )
+            else:
+                raise InvalidCheckpointError(
+                    f"Cannot verify vocabulary compatibility loading {checkpoint_path}: "
+                    f"{reason}. Loading against a mismatched vocabulary silently "
+                    "scrambles every label index. Pin the matching vocabulary, or set "
+                    "training.allow_unverified_vocab_resume=true to override (legacy "
+                    "checkpoints only)."
+                )
+        elif current_known and not checkpoint_known:
+            # Best-effort (non-resume) caller asked to verify but the checkpoint has
+            # no usable SHA — warn, preserving the original behavior.
+            logger.warning(
+                "Checkpoint at %s has no embedded vocab_sha256; cannot verify "
+                "vocabulary compatibility.", checkpoint_path,
+            )
 
         # Load model state (handles DDP and torch.compile key prefix mismatches)
         if model is not None:
@@ -2099,6 +2181,16 @@ class CheckpointManager:
             except Exception as e:
                 logger.error(f"Failed to restore RNG states: {type(e).__name__}: {e}")
                 logger.error("Dataset shuffling WILL differ from original training run!")
+                # Re-raise so the critical RNG-restore failure (and the validation
+                # RuntimeErrors above) actually abort the resume. Previously this
+                # broad except swallowed the RuntimeError raised just above for a
+                # critical-component failure, defeating the entire guard and letting
+                # the run silently proceed with the wrong data order.
+                raise RuntimeError(
+                    f"RNG state restoration failed ({type(e).__name__}: {e}). Mid-epoch "
+                    f"resume would produce a different data order (repeating/skipping "
+                    f"batches). To start fresh, set training.resume_from='none'."
+                ) from e
 
         return {"state_dict": state_dict, **meta}
     
@@ -2314,103 +2406,6 @@ class LearningRateSchedulerFactory:
         
         else:
             raise ValueError(f"Unknown scheduler type: {scheduler_type}")
-
-
-class MixedPrecisionTrainer:
-    """Helper for mixed precision training"""
-    
-    def __init__(
-        self,
-        use_amp: bool = True,
-        amp_dtype: str = 'bfloat16',
-        gradient_accumulation_steps: int = 1,
-        max_grad_norm: float = 1.0
-    ):
-        if use_amp and not torch.cuda.is_available():
-            raise RuntimeError("bfloat16 AMP requested but CUDA is not available.")
-        self.use_amp = use_amp and torch.cuda.is_available()
-
-        # Enforce bfloat16 to avoid fp32/fp16 VRAM usage.
-        self.amp_dtype = torch.bfloat16
-        if self.use_amp:
-            amp_dtype_norm = str(amp_dtype).lower()
-            if amp_dtype_norm not in {"bfloat16", "bf16"}:
-                raise ValueError(f"MixedPrecisionTrainer requires bfloat16, got '{amp_dtype}'.")
-            if not torch.cuda.is_bf16_supported():
-                raise RuntimeError("bfloat16 AMP requested but CUDA device does not support bf16.")
-        
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.max_grad_norm = max_grad_norm
-
-        # GradScaler is only needed for float16 AMP, which we do not allow here.
-        self.scaler = None
-    
-    def train_step(
-        self,
-        model: nn.Module,
-        batch: Dict,
-        criterion: nn.Module,
-        optimizer: optim.Optimizer,
-        accumulation_step: int
-    ) -> Tuple[torch.Tensor, Dict]:
-        """Execute a single training step with mixed precision
-        
-        Returns:
-            Loss value and additional outputs
-        """
-        # Forward pass with autocast
-        device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
-        with autocast(device_type=device_type, enabled=self.use_amp, dtype=self.amp_dtype):
-            outputs = model(batch['image'], labels=batch.get('labels'))
-            
-            if isinstance(outputs, dict):
-                loss = outputs['loss']
-            else:
-                loss = criterion(outputs, batch['labels'])
-            
-            # Scale loss by accumulation steps
-            loss = loss / self.gradient_accumulation_steps
-        
-        # Backward pass
-        if self.scaler is not None:
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        
-        # Gradient clipping and optimizer step
-        if (accumulation_step + 1) % self.gradient_accumulation_steps == 0:
-            if self.scaler is not None:
-                self.scaler.unscale_(optimizer)
-            
-            if self.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
-            
-            if self.scaler is not None:
-                self.scaler.step(optimizer)
-                self.scaler.update()
-            else:
-                optimizer.step()
-            
-            optimizer.zero_grad(set_to_none=True)
-        
-        return loss.item() * self.gradient_accumulation_steps, outputs
-    
-    def state_dict(self) -> Dict:
-        """Get state dict for checkpointing"""
-        state = {
-            'use_amp': self.use_amp,
-            'amp_dtype': str(self.amp_dtype),
-            'gradient_accumulation_steps': self.gradient_accumulation_steps,
-            'max_grad_norm': self.max_grad_norm
-        }
-        if self.scaler is not None:
-            state['scaler_state'] = self.scaler.state_dict()
-        return state
-    
-    def load_state_dict(self, state_dict: Dict):
-        """Load state from checkpoint"""
-        if 'scaler_state' in state_dict and self.scaler is not None:
-            self.scaler.load_state_dict(state_dict['scaler_state'])
 
 
 class TrainingMetricsTracker:

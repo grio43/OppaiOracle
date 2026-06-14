@@ -65,7 +65,10 @@ class RunMetadata:
     model_path: Optional[str] = None
     num_tags: Optional[int] = None
     vocab_embedded: bool = True  # Whether vocab came from model metadata
-    
+    # Channel order of the image tensor and of ``normalize_mean``/``normalize_std``.
+    # Defaults to "RGB" when parsing legacy artifacts that pre-date this field.
+    color_order: str = "RGB"
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -170,96 +173,3 @@ def compute_vocab_sha256(vocab_path: Optional[Path] = None,
         # Truly unexpected error - log and re-raise for debugging
         logger.critical(f"Critical error in compute_vocab_sha256: {type(e).__name__}: {e}", exc_info=True)
         raise
-
-
-def validate_schema(data: Union[Dict, Path, str]) -> bool:
-    """Validate that data conforms to the standard prediction schema.
-
-    Args:
-        data: Dictionary, path to JSON file, or JSON string
-
-    Returns:
-        True if valid
-
-    Raises:
-        ValueError: If schema validation fails with details
-        FileNotFoundError: If file path doesn't exist
-    """
-    # Load data if needed
-    if isinstance(data, (Path, str)):
-        try:
-            if isinstance(data, str) and data.startswith('{'):
-                # JSON string
-                data = json.loads(data)
-            else:
-                # File path
-                path = Path(data)
-                if not path.exists():
-                    raise FileNotFoundError(f"Schema file not found: {path}")
-                with open(path) as f:
-                    data = json.load(f)
-
-        except json.JSONDecodeError as e:
-            # Invalid JSON - this is a validation error
-            raise ValueError(f"Invalid JSON in schema data: {e}") from e
-
-        except FileNotFoundError:
-            # File doesn't exist - re-raise as-is for specific handling
-            raise
-
-        except PermissionError:
-            # Permission denied - re-raise as-is for specific handling
-            # Don't wrap in ValueError, caller might want to retry with elevated permissions
-            raise
-
-        except OSError as e:
-            # Other I/O errors (disk full, network error, etc.)
-            raise ValueError(f"Failed to read schema file {path}: {e}") from e
-
-        except Exception as e:
-            # Truly unexpected errors (bugs)
-            raise ValueError(f"Unexpected error loading schema data: {type(e).__name__}: {e}") from e
-
-    # Check top-level structure
-    if not isinstance(data, dict):
-        raise ValueError("Data must be a dictionary")
-
-    required_keys = {'metadata', 'results'}
-    if not required_keys.issubset(data.keys()):
-        raise ValueError(f"Missing required keys: {required_keys - set(data.keys())}")
-
-    # Validate metadata
-    metadata = data['metadata']
-    required_metadata = {
-        'top_k', 'threshold', 'vocab_sha256', 'normalize_mean', 
-        'normalize_std', 'image_size', 'patch_size'
-    }
-    if not required_metadata.issubset(metadata.keys()):
-        raise ValueError(f"Missing metadata fields: {required_metadata - set(metadata.keys())}")
-
-    # Validate results
-    results = data['results']
-    if not isinstance(results, list):
-        raise ValueError("Results must be a list")
-
-    for i, result in enumerate(results):
-        if not isinstance(result, dict):
-            raise ValueError(f"Result {i} must be a dictionary")
-
-        if 'image' not in result or 'tags' not in result:
-            raise ValueError(f"Result {i} missing 'image' or 'tags'")
-
-        if not isinstance(result['tags'], list):
-            raise ValueError(f"Result {i} tags must be a list")
-
-        for j, tag in enumerate(result['tags']):
-            if not isinstance(tag, dict):
-                raise ValueError(f"Result {i} tag {j} must be a dictionary")
-            if 'name' not in tag or 'score' not in tag:
-                raise ValueError(f"Result {i} tag {j} missing 'name' or 'score'")
-            if not isinstance(tag['name'], str):
-                raise ValueError(f"Result {i} tag {j} name must be string")
-            if not isinstance(tag['score'], (int, float)):
-                raise ValueError(f"Result {i} tag {j} score must be numeric")
-
-    return True
