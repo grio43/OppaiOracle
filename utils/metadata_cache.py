@@ -1,8 +1,8 @@
 """
 Metadata cache for SidecarJsonDataset.
 
-Caches parsed JSON metadata (image_id, tags, rating, dir) to avoid
-re-parsing millions of JSON files on every training run.
+Caches parsed JSON metadata (image_id, tags, rating, dir, json_stem, filename)
+to avoid re-parsing millions of JSON files on every training run.
 
 Uses PyArrow IPC format for zero-copy memory-mapped access across workers.
 """
@@ -55,6 +55,10 @@ except ImportError:
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent
 _ARROW_CACHE_VERSION = "2.0"  # Arrow IPC format (added json_stem column)
+# NOTE: newly built caches also include a "filename" column (exact image file
+# name from the sidecar JSON, used to skip per-sample extension probing).
+# Intentionally NOT a version bump: readers treat the column as optional, so
+# existing caches stay valid — they just don't get the path-resolution speedup.
 
 
 def _compute_file_list_hash(json_files: List[Path]) -> str:
@@ -112,11 +116,17 @@ def _stratified_sample(json_files: List[Path], sample_size: int) -> List[Path]:
 
     total = len(json_files)
 
+    # Deterministic RNG so the staleness verdict is reproducible run-to-run. An
+    # unseeded random.sample() could draw different files each launch, letting a
+    # stale cache pass on one run and fail on the next (the file-list hash samples
+    # deterministically by sorted path for the same reason).
+    rng = random.Random(42)
+
     # For huge datasets (>1M files), use simple random sampling
     # Stratified grouping requires O(n) iteration which is too slow for 5M+ files
     # Random sampling is O(sample_size) and provides sufficient coverage for staleness checks
     if total > 1_000_000:
-        indices = random.sample(range(total), sample_size)
+        indices = rng.sample(range(total), sample_size)
         return [json_files[i] for i in indices]
 
     # For smaller datasets, use stratified sampling across directories
@@ -137,7 +147,7 @@ def _stratified_sample(json_files: List[Path], sample_size: int) -> List[Path]:
     for i, dir_path in enumerate(dirs):
         dir_sample_size = samples_per_dir + (1 if i < remainder else 0)
         dir_files = by_dir[dir_path]
-        samples.extend(random.sample(dir_files, min(dir_sample_size, len(dir_files))))
+        samples.extend(rng.sample(dir_files, min(dir_sample_size, len(dir_files))))
 
     # Ensure we don't exceed sample_size due to rounding
     return samples[:sample_size]
@@ -200,6 +210,7 @@ def _parse_json_batch(
                 "rating": rating,
                 "dir": str(jp.parent),  # Store as string for serialization
                 "json_stem": jp.stem,  # Original JSON filename stem for path reconstruction
+                "filename": Path(fname).name,  # Exact image filename (skips extension probing)
             })
         except Exception as e:
             # Log warning but continue processing
@@ -327,6 +338,21 @@ def _build_arrow_cache(
         parse_elapsed = time.time() - parse_start
         logger.info(f"  Parsed {len(all_items):,} items in {parse_elapsed:.1f}s")
 
+        # Surface systematic data loss: sanitize_identifier / parse failures are
+        # caught per-file with a warning + continue, so a naming-convention violation
+        # (spaces, unicode, parentheses) can silently drop every such image from the
+        # cache (and thus from training) with only buried per-file warnings. One
+        # aggregate warning makes the loss visible at build time.
+        dropped = total_files - len(all_items)
+        if dropped > 0:
+            drop_ratio = dropped / total_files if total_files else 0.0
+            logger.warning(
+                f"  {dropped:,} of {total_files:,} JSON files ({drop_ratio * 100:.2f}%) were "
+                f"dropped during parse and are absent from the cache (and from training). "
+                f"Common cause: filenames violating the id pattern (spaces/unicode/parentheses). "
+                f"Inspect the per-file 'Failed to parse' warnings above if this ratio is unexpected."
+            )
+
         if not all_items:
             logger.error("No items parsed from JSON files")
             return False
@@ -341,6 +367,7 @@ def _build_arrow_cache(
         ratings = [item["rating"] for item in all_items]
         dirs = [item["dir"] for item in all_items]
         json_stems = [item["json_stem"] for item in all_items]
+        filenames = [item["filename"] for item in all_items]
 
         # Create PyArrow arrays
         # Tags use list type for variable-length arrays
@@ -350,6 +377,7 @@ def _build_arrow_cache(
             "rating": pa.array(ratings, type=pa.string()),
             "dir": pa.array(dirs, type=pa.string()),
             "json_stem": pa.array(json_stems, type=pa.string()),
+            "filename": pa.array(filenames, type=pa.string()),
         })
 
         arrow_elapsed = time.time() - arrow_start
@@ -420,6 +448,11 @@ def _build_arrow_cache(
         meta_data = {
             "version": _ARROW_CACHE_VERSION,
             "count": len(table),
+            # NOTE: recorded for provenance/future use but intentionally NOT consulted
+            # by _is_arrow_cache_stale() - the cache is built once per run with no
+            # mid-run sidecar edits (build-once policy), so a file-list-hash staleness
+            # gate would never fire. Kept so the meta stays self-describing; do not
+            # treat its presence as an active integrity check.
             "file_list_hash": _compute_file_list_hash(json_files),
             "file_count": len(json_files),
             "created_at": time.time(),

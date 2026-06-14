@@ -126,7 +126,7 @@ class VisionTransformerConfig:
     patch_size: int = 16
     num_channels: int = 3
     hidden_size: int = 1024
-    num_hidden_layers: int = 17
+    num_hidden_layers: int = 18
     num_attention_heads: int = 16
     intermediate_size: int = 4096
     num_tags: int = 100000  # This should be overridden with actual vocab size (includes rating tags)
@@ -146,8 +146,10 @@ class VisionTransformerConfig:
     drop_path_rate: float = 0.0
     # Enable numerical stability checking (for debugging only)
     check_numerical_stability: bool = False
-    # Logit clamping for numerical stability (None to disable)
+    # Logit clamping for inference/export outputs (None to disable)
     # exp(15) ~ 3.3M which is safe for softmax in float16/bfloat16
+    # Applied only in eval mode: training logits are left unclamped because
+    # clamp has zero gradient outside the bounds (see forward()).
     logit_clamp_value: Optional[float] = 15.0
     # Precision configuration
     use_fp32_layernorm: bool = False  # Use FP32 for LayerNorm (better stability, slight speed cost). Set to False for full bfloat16.
@@ -451,6 +453,33 @@ class SimplifiedTagger(BaseTagger):
         """Return model configuration."""
         return self._config
 
+    def _get_pos_embed(self, grid_h: int, grid_w: int) -> torch.Tensor:
+        """Return position embeddings matched to the runtime token grid.
+
+        Fast path (the common case, and the ONNX-export resolution): the runtime
+        grid equals the stored square grid, so the stored parameter is returned
+        unchanged. Otherwise the 2D patch position embeddings are bicubically
+        interpolated to (grid_h, grid_w) — same approach as the checkpoint-resume
+        interpolation in training_utils.py — keeping the CLS embedding as-is.
+        Without this, inputs at a different resolution would silently add the
+        raster-order *prefix* of the stored grid.
+        """
+        stored_len = self.pos_embed.shape[1]  # 1 (CLS) + stored_grid**2
+        stored_grid = int(math.isqrt(stored_len - 1))
+        if grid_h == stored_grid and grid_w == stored_grid:
+            return self.pos_embed
+        cls_pos = self.pos_embed[:, :1, :]
+        patch_pos = self.pos_embed[:, 1:, :]
+        hidden_size = patch_pos.shape[-1]
+        # Reshape to 2D spatial grid, interpolate, flatten back
+        patch_pos = patch_pos.reshape(1, stored_grid, stored_grid, hidden_size).permute(0, 3, 1, 2).float()
+        patch_pos = F.interpolate(
+            patch_pos, size=(grid_h, grid_w), mode='bicubic', align_corners=False
+        )
+        patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, grid_h * grid_w, hidden_size)
+        patch_pos = patch_pos.to(self.pos_embed.dtype)
+        return torch.cat([cls_pos, patch_pos], dim=1)
+
     def _check_numerical_stability(
         self,
         tag_logits: torch.Tensor,
@@ -471,14 +500,18 @@ class SimplifiedTagger(BaseTagger):
                 f"mean={tag_logits.mean():.2f}, std={tag_logits.std():.2f}"
             )
 
-        clamp_threshold = 15.0
-        tag_needs_clamp = (tag_logits.abs() > clamp_threshold).any().item()
-        if tag_needs_clamp:
-            num_clamped = (tag_logits.abs() > clamp_threshold).sum().item()
-            warnings.warn(
-                f"Clamping {num_clamped} tag logits "
-                f"(max abs value: {tag_logits.abs().max():.2f})"
-            )
+        # Diagnostic only: report how many logits exceed the *configured* clamp
+        # value (the real clamp happens later in forward() at logit_clamp_value,
+        # eval mode only — training logits are left unclamped).
+        clamp_threshold = self._config.logit_clamp_value
+        if clamp_threshold is not None:
+            tag_over_clamp = (tag_logits.abs() > clamp_threshold).any().item()
+            if tag_over_clamp:
+                num_over = (tag_logits.abs() > clamp_threshold).sum().item()
+                warnings.warn(
+                    f"{num_over} tag logits exceed logit_clamp_value={clamp_threshold} "
+                    f"(clamped downstream in eval mode only; max abs value: {tag_logits.abs().max():.2f})"
+                )
 
     def _create_block_mask(self, key_padding_mask: torch.Tensor, seq_len: int) -> BlockMask:
         """Create BlockMask for padding-aware attention.
@@ -546,12 +579,15 @@ class SimplifiedTagger(BaseTagger):
             x = x.to(pixel_values.dtype)
         else:
             x = self.patch_embed(pixel_values)
+        # Capture the runtime token grid before flattening (for pos-embed matching)
+        grid_h, grid_w = x.shape[-2], x.shape[-1]
         x = x.flatten(2).transpose(1, 2).contiguous()
         # Add CLS token
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat([cls_tokens, x], dim=1)
-        # Add position embeddings
-        x = x + self.pos_embed[:, :x.size(1), :]
+        # Add position embeddings (bicubically interpolated to the runtime grid
+        # if it differs from the stored grid; no-op at the trained resolution)
+        x = x + self._get_pos_embed(grid_h, grid_w)
         x = self.pos_drop(x)
         # =======================================================================
         # MASK SEMANTICS DOCUMENTATION
@@ -624,7 +660,10 @@ class SimplifiedTagger(BaseTagger):
             # _create_block_mask handles the inversion internally:
             #   attend_mask = ~key_padding_mask (True=ATTEND)
             #   BlockMask allows attention where attend_mask[q] & attend_mask[kv] is True
-            if attn_kpm is not None and attn_kpm.any():
+            # No .any() guard: it forces a GPU->CPU sync every forward and with
+            # letterboxed data the mask is almost always non-empty anyway. An
+            # all-False attn_kpm yields an all-attend BlockMask (same result).
+            if attn_kpm is not None:
                 block_mask = self._create_block_mask(attn_kpm, x.size(1))
 
         # Transformer blocks with optional selective gradient checkpointing
@@ -669,8 +708,12 @@ class SimplifiedTagger(BaseTagger):
         if self._config.check_numerical_stability:
             self._check_numerical_stability(tag_logits)
 
-        # Clamp logits to prevent numerical instability with mixed precision
-        if self._config.logit_clamp_value is not None:
+        # Clamp logits for inference/export outputs only. During training the
+        # clamp is skipped: torch.clamp has zero gradient outside the bounds,
+        # which would kill the learning signal exactly for confidently-wrong
+        # predictions. The loss (loss_functions.py) computes in fp32 with its
+        # own log/exp clamps, so unclamped training logits are numerically safe.
+        if self._config.logit_clamp_value is not None and not self.training:
             clamp_val = self._config.logit_clamp_value
             tag_logits = torch.clamp(tag_logits, min=-clamp_val, max=clamp_val)
 

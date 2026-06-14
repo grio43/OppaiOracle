@@ -749,7 +749,7 @@ class ModelConfig(BaseConfig):
     # Architecture
     architecture_type: str = "vit"  # Must be "vit" — the only supported architecture (hard-asserted in validate())
     hidden_size: int = 1024
-    num_hidden_layers: int = 17
+    num_hidden_layers: int = 18
     num_attention_heads: int = 16
     intermediate_size: int = 4096
 
@@ -801,11 +801,16 @@ class ModelConfig(BaseConfig):
         # Note: num_labels validation is deferred until after vocabulary is loaded
         # because the actual vocabulary size is only known at runtime.
         # A value of 0 indicates "use vocabulary size" (computed dynamically).
-        if self.num_labels != 0 and self.num_labels != self.num_groups * self.tags_per_group:
+        # At runtime train_direct sets num_labels = vocabulary size (~19K), so this
+        # is a CAPACITY check, not strict equality: the grouped-head prototype was
+        # never shipped (model_architecture ignores num_groups/tags_per_group), and
+        # requiring exact equality would make any post-vocab-load validate() raise.
+        if self.num_labels != 0 and self.num_labels > self.num_groups * self.tags_per_group:
             errors.append(
-                f"num_labels ({self.num_labels}) must equal "
-                f"num_groups ({self.num_groups}) * tags_per_group ({self.tags_per_group}) "
-                f"or be 0 (auto-detect from vocabulary)"
+                f"num_labels ({self.num_labels}) exceeds grouped-head capacity: "
+                f"num_groups ({self.num_groups}) * tags_per_group ({self.tags_per_group}) = "
+                f"{self.num_groups * self.tags_per_group}. Increase num_groups/tags_per_group, "
+                f"or set num_labels to 0 (auto-detect from vocabulary)."
             )
         
         if self.patch_size > self.image_size:
@@ -1185,6 +1190,10 @@ class TrainingConfig(BaseConfig):
     lr_base_batch_size: int = 256
     weight_decay: float = 0.01
     gradient_accumulation_steps: int = 4
+    # Number of distributed processes (1 = single GPU/CPU). Referenced by the
+    # FullConfig effective-batch scaling helpers; default 1 keeps them from
+    # raising AttributeError if they are ever called.
+    world_size: int = 1
 
     # Optimizer
     optimizer: str = "adamw"
@@ -1196,12 +1205,20 @@ class TrainingConfig(BaseConfig):
     # Scheduler
     scheduler: str = "cosine"
     warmup_epochs: int = 5  # Linear LR warmup over this many epochs
-    num_cycles: float = 0.5
+    # Number of cosine cycles (integer COUNT, as consumed by train_direct's
+    # int(num_cycles)): 1 = single cosine decay (no restarts), >1 = SGDR restarts.
+    # NOT the HuggingFace "fraction of a cosine wave" float semantics.
+    num_cycles: int = 1
+    # SGDR per-restart max_lr decay (gamma in CosineAnnealingWarmupRestarts).
+    # Inert at num_cycles=1 (no restarts); read at train_direct.py via getattr,
+    # so a missing field silently defaulted to 0.9 — define it to make it
+    # configurable and remove that footgun before any multi-cycle run.
+    cycle_decay: float = 0.9
     lr_end: float = 1e-6
     
     # Mixed precision
     use_amp: bool = True
-    amp_dtype: str = "bfloat16"  # float16 or bfloat16
+    amp_dtype: str = "bfloat16"  # only "bfloat16" is supported (bf16-only invariant)
     enable_anomaly_detection: bool = False
 
     # Gradient clipping
@@ -1224,6 +1241,12 @@ class TrainingConfig(BaseConfig):
     # to avoid replaying the same early-epoch examples after a resume.
     # Deterministic per checkpoint; set false to preserve strict reproducibility across resumes.
     resume_reseed: bool = True
+    # Vocabulary-resume safety: by default a resume is REFUSED unless the current
+    # vocabulary's SHA256 can be verified against the SHA embedded in the checkpoint.
+    # Loading against a mismatched vocabulary silently scrambles every label index.
+    # Set True only to load a legacy checkpoint that predates embedded vocab SHAs
+    # (you are then responsible for confirming the vocabulary matches).
+    allow_unverified_vocab_resume: bool = False
     
     # Loss configuration
     tag_loss: LossConfig = field(default_factory=LossConfig)
@@ -1286,6 +1309,11 @@ class TrainingConfig(BaseConfig):
         if self.scheduler not in valid_schedulers:
             errors.append(f"Unknown scheduler: {self.scheduler}. Must be one of {valid_schedulers}")
 
+        # num_cycles is an integer cycle COUNT (train_direct does int(num_cycles));
+        # fractional values would silently truncate (int(0.5) == 0).
+        if int(self.num_cycles) < 1:
+            errors.append(f"num_cycles must be an integer >= 1 (cycle count), got {self.num_cycles}")
+
         # Validate beta values for Adam optimizers
         if self.optimizer in ["adam", "adamw", "adamw8bit"]:
             if not 0 <= self.adam_beta1 < 1:
@@ -1312,7 +1340,14 @@ class TrainingConfig(BaseConfig):
             errors.append(
                 f"early_stopping_burn_in_strategy must be one of {sorted(allowed_es_strategies)}"
             )
-        
+
+        # bf16-only invariant: enforce in the config layer (fail-fast) instead of
+        # only deep inside train_direct/MixedPrecisionTrainer AMP setup.
+        if str(self.amp_dtype).lower() not in {"bfloat16", "bf16"}:
+            errors.append(
+                f"amp_dtype must be 'bfloat16' (only bf16 AMP is supported), got '{self.amp_dtype}'"
+            )
+
         if errors:
             raise ConfigValidationError("Training config validation failed:\n" + "\n".join(errors))
 
@@ -1474,18 +1509,82 @@ class ThresholdCalibrationConfig(BaseConfig):
     """Configuration for post-training per-tag/per-bucket threshold calibration."""
     enabled: bool = False
     mode: str = "per_bucket"  # "per_tag" | "per_bucket"
+    # Must equal inference.prediction_threshold (single source of truth; enforced
+    # in FullConfig.validate()).
     default_threshold: float = 0.2653
     search_min: float = 0.1
     search_max: float = 0.9
     search_step: float = 0.02
     save_path: str = "./thresholds.json"
 
+    def validate(self):
+        """Validate threshold calibration configuration"""
+        errors = []
+
+        valid_modes = ["per_tag", "per_bucket"]
+        if self.mode not in valid_modes:
+            errors.append(f"mode must be one of {valid_modes}, got {self.mode!r}")
+
+        if not 0 <= self.default_threshold <= 1:
+            errors.append(f"default_threshold must be in [0, 1], got {self.default_threshold}")
+
+        if not 0 <= self.search_min < self.search_max <= 1:
+            errors.append(
+                f"Require 0 <= search_min < search_max <= 1, "
+                f"got search_min={self.search_min}, search_max={self.search_max}"
+            )
+
+        if self.search_step <= 0:
+            errors.append(f"search_step must be > 0, got {self.search_step}")
+
+        if errors:
+            raise ConfigValidationError("Threshold calibration config validation failed:\n" + "\n".join(errors))
+
 
 @dataclass
 class ValidationConfig(BaseConfig):
     dataloader: ValidationDataloaderConfig = field(default_factory=ValidationDataloaderConfig)
     preprocessing: ValidationPreprocessingConfig = field(default_factory=ValidationPreprocessingConfig)
+    # Applies only to the standalone validation_loop.py runner; the in-training
+    # validation split is capped separately by data.max_val_samples.
     max_samples: Optional[int] = None  # Maximum samples to use for validation (None = use all)
+    # Frequency-bin edges for the bucketed validation metrics (val_bucketed/* in
+    # train_direct). None = use the built-in default [300, 500, 1000, 5000, 10000, inf].
+    frequency_bins: Optional[List[float]] = None
+
+    def validate(self):
+        """Validate validation configuration"""
+        errors = []
+
+        if self.dataloader.batch_size <= 0:
+            errors.append(f"dataloader.batch_size must be positive, got {self.dataloader.batch_size}")
+        if self.dataloader.num_workers < 0:
+            errors.append(f"dataloader.num_workers must be non-negative, got {self.dataloader.num_workers}")
+        if self.dataloader.prefetch_factor < 1:
+            errors.append(f"dataloader.prefetch_factor must be >= 1, got {self.dataloader.prefetch_factor}")
+
+        if self.preprocessing.image_size <= 0:
+            errors.append(f"preprocessing.image_size must be positive, got {self.preprocessing.image_size}")
+        if self.preprocessing.patch_size <= 0:
+            errors.append(f"preprocessing.patch_size must be positive, got {self.preprocessing.patch_size}")
+        for param_name, param_value in [('preprocessing.normalize_mean', self.preprocessing.normalize_mean),
+                                        ('preprocessing.normalize_std', self.preprocessing.normalize_std)]:
+            if len(param_value) != 3:
+                errors.append(f"{param_name} must have 3 values, got {len(param_value)}")
+
+        if self.max_samples is not None and self.max_samples <= 0:
+            errors.append(f"max_samples must be positive or null, got {self.max_samples}")
+
+        if self.frequency_bins is not None:
+            if not self.frequency_bins:
+                errors.append("frequency_bins must be a non-empty list or null")
+            elif any(b <= 0 for b in self.frequency_bins):
+                errors.append(f"frequency_bins values must be positive, got {self.frequency_bins}")
+            elif list(self.frequency_bins) != sorted(self.frequency_bins):
+                errors.append(f"frequency_bins must be ascending, got {self.frequency_bins}")
+
+        if errors:
+            raise ConfigValidationError("Validation config validation failed:\n" + "\n".join(errors))
 
 
 @dataclass
@@ -1616,82 +1715,11 @@ class DebugConfig(BaseConfig):
             logger.warning("`log_activation_stats` is true but debug mode is disabled.")
 
 
-@dataclass
-class AdamW8bitConfig(BaseConfig):
-    """Configuration for AdamW8bit optimizer with dataset-aware scaling.
-
-    This configuration automatically adjusts hyperparameters based on:
-    - Dataset size (number of training samples)
-    - Effective batch size (batch_size * grad_accum * num_gpus)
-    - Number of training epochs
-
-    Key principles:
-    1. Learning rate scales with sqrt(effective_batch_size) following linear scaling rule
-    2. Warmup steps scale with dataset size to ensure stable initialization
-    3. Weight decay adjusted based on model size and dataset size
-    4. Beta2 adjusted for longer training runs
-    """
-
-    # Base hyperparameters (for reference batch size of 256)
-    base_lr: float = 1e-4
-    base_batch_size: int = 256
-
-    # AdamW-specific parameters
-    beta1: float = 0.9
-    beta2: float = 0.999
-    eps: float = 1e-8
-    weight_decay: float = 0.01
-
-    # Learning rate scaling
-    lr_scaling_mode: str = "sqrt"  # "linear", "sqrt", or "none"
-
-    # Warmup configuration
-    warmup_ratio: float = 0.05  # 5% of total steps for warmup
-    min_warmup_steps: int = 500
-    max_warmup_steps: int = 10000
-
-    # Weight decay scaling
-    wd_scaling_mode: str = "inverse_sqrt"  # "fixed", "linear", "inverse_sqrt"
-    min_weight_decay: float = 0.001
-    max_weight_decay: float = 0.1
-
-
-class SchedulerType(Enum):
-    """Available learning rate scheduler types"""
-    COSINE = "cosine"                          # Simple cosine decay
-    COSINE_RESTARTS = "cosine_restarts"       # Cosine with warm restarts (SGDR)
-    LINEAR = "linear"                          # Linear decay
-    POLYNOMIAL = "polynomial"                  # Polynomial decay
-    CONSTANT_WARMUP = "constant_warmup"       # Constant LR after warmup
-    ONE_CYCLE = "one_cycle"                   # One-cycle policy
-
-
-@dataclass
-class SchedulerConfig(BaseConfig):
-    """Configuration for learning rate schedulers.
-
-    This config helps you choose and configure the best scheduler for your training scenario.
-    """
-
-    # Scheduler type
-    scheduler_type: SchedulerType = SchedulerType.COSINE
-
-    # Warmup configuration
-    warmup_steps: int = 1000
-    warmup_strategy: str = "linear"  # "linear" or "constant"
-
-    # Cosine-specific
-    min_lr_ratio: float = 0.01  # min_lr = max_lr * min_lr_ratio
-
-    # Cosine with restarts specific
-    num_cycles: int = 3          # Number of cosine cycles
-    cycle_mult: float = 2.0      # Multiplier for cycle length (1.0 = same length)
-    restart_decay: float = 1.0   # Decay factor for max_lr after each restart
-
-    # One-cycle specific
-    pct_start: float = 0.3       # Percentage of training in warmup phase
-    div_factor: float = 25.0     # Initial LR = max_lr / div_factor
-    final_div_factor: float = 1e4  # Final LR = max_lr / final_div_factor
+# NOTE: AdamW8bitConfig / SchedulerType / SchedulerConfig sub-configs were removed
+# from FullConfig — they were never consumed by training (a "silent second source of
+# truth" with base_lr=1e-4/weight_decay=0.01 that looked authoritative but did
+# nothing). The active optimizer/scheduler settings live under config.training.* and
+# the standalone helpers in training_config.py.
 
 
 @dataclass
@@ -1706,9 +1734,7 @@ class FullConfig(BaseConfig):
     threshold_calibration: ThresholdCalibrationConfig = field(default_factory=ThresholdCalibrationConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
-    optimizer: AdamW8bitConfig = field(default_factory=AdamW8bitConfig)
-    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-    
+
     # Global settings
     project_name: str = "anime-image-tagger"
     experiment_name: str = field(default_factory=lambda: f"exp_{datetime.now():%Y%m%d_%H%M%S}")
@@ -1735,7 +1761,8 @@ class FullConfig(BaseConfig):
         errors = []
         
         # Validate each sub-config
-        for config_name in ['model', 'data', 'training', 'inference', 'export', 'monitor', 'debug', 'optimizer', 'scheduler']:
+        for config_name in ['model', 'data', 'training', 'inference', 'export',
+                            'validation', 'threshold_calibration', 'monitor', 'debug']:
             try:
                 config_obj = getattr(self, config_name)
                 if hasattr(config_obj, 'validate') and callable(getattr(config_obj, 'validate')):
@@ -1774,7 +1801,45 @@ class FullConfig(BaseConfig):
                     f"from model.patch_size ({self.model.patch_size})"
                 )
                 self.validation.preprocessing.patch_size = self.model.patch_size
-            
+            # data.patch_size drives the token-level padding-mask grid and is part
+            # of the resume-compatibility check; keep it locked to model.patch_size
+            # (the source of truth) so the mask grid can't silently diverge from
+            # the model's patch grid.
+            if self.data.patch_size != self.model.patch_size:
+                logger.info(
+                    f"Syncing data.patch_size ({self.data.patch_size}) "
+                    f"from model.patch_size ({self.model.patch_size})"
+                )
+                self.data.patch_size = self.model.patch_size
+
+            # Re-validate patch divisibility on the SYNCED sizes. Each sub-config's
+            # validate() ran BEFORE the image_size sync above, so it checked the
+            # stale model.image_size; without this a non-divisible data.image_size
+            # passes config validation and only crashes later in model construction.
+            if self.model.patch_size <= 0 or self.model.image_size % self.model.patch_size != 0:
+                errors.append(
+                    f"model.image_size ({self.model.image_size}) must be divisible by "
+                    f"model.patch_size ({self.model.patch_size}) after image-size sync"
+                )
+            _vp = self.validation.preprocessing
+            if _vp.patch_size <= 0 or _vp.image_size % _vp.patch_size != 0:
+                errors.append(
+                    f"validation.preprocessing.image_size ({_vp.image_size}) must be divisible by "
+                    f"validation.preprocessing.patch_size ({_vp.patch_size}) after sync"
+                )
+
+            # Prediction-threshold single source of truth: inference.prediction_threshold.
+            # threshold_calibration.default_threshold must match it exactly; the two
+            # knobs feed the same decision boundary (in-train F1 vs bucketed/inference
+            # metrics) and silently desynchronize if edited independently.
+            if self.threshold_calibration.default_threshold != self.inference.prediction_threshold:
+                errors.append(
+                    f"threshold_calibration.default_threshold ({self.threshold_calibration.default_threshold}) "
+                    f"must equal inference.prediction_threshold ({self.inference.prediction_threshold}). "
+                    f"inference.prediction_threshold is the single source of truth — "
+                    f"update both keys together in configs/unified_config.yaml."
+                )
+
             # Check device availability
             if self.training.device.startswith("cuda"):
                 try:
@@ -1792,111 +1857,15 @@ class FullConfig(BaseConfig):
         if errors:
             raise ConfigValidationError("Config validation failed:\n" + "\n".join(errors))
 
-    def compute_effective_batch_size(self) -> int:
-        """Compute the effective batch size for optimization."""
-        result = self.data.batch_size * self.training.gradient_accumulation_steps * self.training.world_size
-        if result <= 0:
-            raise ValueError(f"Effective batch size must be positive, got {result}")
-        return result
-
-    def scale_learning_rate(self) -> float:
-        """Scale learning rate based on effective batch size."""
-        effective_batch_size = self.compute_effective_batch_size()
-        if self.optimizer.lr_scaling_mode == "none":
-            return self.training.learning_rate
-        elif self.optimizer.lr_scaling_mode == "linear":
-            return self.training.learning_rate * (effective_batch_size / self.optimizer.base_batch_size)
-        elif self.optimizer.lr_scaling_mode == "sqrt":
-            return self.training.learning_rate * (effective_batch_size / self.optimizer.base_batch_size)**0.5
-        else:
-            raise ValueError(f"Unknown scaling mode: {self.optimizer.lr_scaling_mode}")
-
-    def compute_total_steps(self, dataset_size: int) -> int:
-        """Compute total training steps."""
-        effective_batch_size = self.compute_effective_batch_size()
-        steps_per_epoch = (dataset_size + effective_batch_size - 1) // effective_batch_size
-        return steps_per_epoch * self.training.num_epochs
-
-    def compute_warmup_steps(self, dataset_size: int) -> int:
-        """Compute number of warmup steps."""
-        total_steps = self.compute_total_steps(dataset_size)
-        warmup_steps = int(total_steps * self.optimizer.warmup_ratio)
-        return max(self.optimizer.min_warmup_steps, min(warmup_steps, self.optimizer.max_warmup_steps))
-
-    def scale_weight_decay(self, dataset_size: int) -> float:
-        """Scale weight decay based on dataset size."""
-        if self.optimizer.wd_scaling_mode == "fixed":
-            return self.training.weight_decay
-
-        ref_size = 100_000
-        if self.optimizer.wd_scaling_mode == "inverse_sqrt":
-            scale_factor = (ref_size / max(dataset_size, 1000))**0.5
-            scaled_wd = self.training.weight_decay * scale_factor
-        elif self.optimizer.wd_scaling_mode == "linear":
-            scale_factor = ref_size / max(dataset_size, 1000)
-            scaled_wd = self.training.weight_decay * scale_factor
-        else:
-            raise ValueError(f"Unknown weight decay scaling mode: {self.optimizer.wd_scaling_mode}")
-
-        return max(self.optimizer.min_weight_decay, min(scaled_wd, self.optimizer.max_weight_decay))
-
-    def adjust_beta2_for_long_training(self, dataset_size: int) -> float:
-        """Adjust beta2 for long training runs."""
-        total_steps = self.compute_total_steps(dataset_size)
-        if total_steps > 100_000:
-            adjustment = min(0.0009, 0.0009 * (total_steps - 100_000) / 400_000)
-            return min(self.training.adam_beta2 + adjustment, 0.9999)
-        return self.training.adam_beta2
-
-    def get_optimizer_kwargs(self, dataset_size: int) -> dict:
-        """Get keyword arguments for the optimizer."""
-        return {
-            'lr': self.scale_learning_rate(),
-            'betas': (self.training.adam_beta1, self.adjust_beta2_for_long_training(dataset_size)),
-            'eps': self.training.adam_epsilon,
-            'weight_decay': self.scale_weight_decay(dataset_size),
-        }
-
-    def get_scheduler_kwargs(self, dataset_size: int) -> dict:
-        """Get keyword arguments for the scheduler."""
-        total_steps = self.compute_total_steps(dataset_size)
-        warmup_steps = self.compute_warmup_steps(dataset_size)
-        
-        kwargs = {
-            'warmup_steps': warmup_steps,
-            'total_steps': total_steps,
-        }
-
-        if self.scheduler.scheduler_type == SchedulerType.COSINE:
-            kwargs['min_lr_ratio'] = self.scheduler.min_lr_ratio
-        elif self.scheduler.scheduler_type == SchedulerType.COSINE_RESTARTS:
-            if total_steps < 20000:
-                num_cycles = 2
-            elif total_steps < 100000:
-                num_cycles = 3
-            else:
-                num_cycles = 4
-            
-            if self.scheduler.cycle_mult == 1.0:
-                first_cycle_steps = total_steps // num_cycles
-            else:
-                sum_mult = (self.scheduler.cycle_mult ** num_cycles - 1) / (self.scheduler.cycle_mult - 1)
-                first_cycle_steps = int(total_steps / sum_mult)
-
-            kwargs.update({
-                'first_cycle_steps': first_cycle_steps,
-                'cycle_mult': self.scheduler.cycle_mult,
-                'num_cycles': num_cycles,
-                'min_lr_ratio': self.scheduler.min_lr_ratio,
-            })
-        elif self.scheduler.scheduler_type == SchedulerType.ONE_CYCLE:
-            kwargs.update({
-                'pct_start': self.scheduler.pct_start,
-                'div_factor': self.scheduler.div_factor,
-                'final_div_factor': self.scheduler.final_div_factor,
-            })
-        
-        return kwargs
+    # NOTE: The dataset-aware optimizer/scheduler "scaling API" that used to live
+    # here (compute_effective_batch_size / scale_learning_rate / scale_weight_decay /
+    # get_optimizer_kwargs / get_scheduler_kwargs, plus the AdamW8bitConfig +
+    # SchedulerConfig sub-configs) was removed. It was never wired into training —
+    # train_direct.py reads config.training.* directly and scales the LR via
+    # training_config.scale_learning_rate — and the dead `scale_weight_decay` here
+    # implemented a research-refuted 1/sqrt(N) formula. Keeping it as a second,
+    # authoritative-looking source of truth was a footgun. Weight decay is fixed at
+    # config.training.weight_decay by design (see memory project-weight-decay-fixed).
 
 
 class ConfigManager:
@@ -1958,7 +1927,7 @@ class ConfigManager:
             config_class = type(self.config)
             self.config = config_class.from_dict(data)
 
-            # Note: Validation is deferred to load_config() after env/args are merged
+            # Note: Validation is deferred to load_config() after env overrides are merged
             logger.info(f"Successfully loaded config from {path}")
             return self.config
             
@@ -2072,10 +2041,25 @@ class ConfigManager:
         Returns:
             Parsed value as bool, int, float, str, list, dict, or None
         """
-        # Boolean
-        if value.lower() in ('true', 'yes', '1'):
+        # Number FIRST: parse '1'/'0' as int, not bool. Otherwise an integer env
+        # override of 1 or 0 (e.g. MODEL__PATCH_SIZE=1) is silently coerced to a
+        # Python bool and written into an int field with no per-field validation.
+        # int then float unconditionally: gating float on '.' missed scientific
+        # notation ('1e-5' stayed a string and reached float fields uncoerced).
+        try:
+            return int(value)
+        except ValueError:
+            pass
+        try:
+            return float(value)
+        except ValueError:
+            pass
+
+        # Boolean (textual only; numeric 1/0 are handled as ints above)
+        low = value.lower()
+        if low in ('true', 'yes'):
             return True
-        elif value.lower() in ('false', 'no', '0'):
+        if low in ('false', 'no'):
             return False
 
         # Try JSON for complex types (only if it looks like JSON)
@@ -2104,31 +2088,13 @@ class ConfigManager:
             except json.JSONDecodeError:
                 pass
         
-        # Number
-        try:
-            if '.' in value:
-                return float(value)
-            else:
-                return int(value)
-        except ValueError:
-            pass
-        
         # String (default)
         return value
-    
-    def update_from_args(self, args: argparse.Namespace):
-        """Update configuration from command line arguments"""
-        updates = {}
-        
-        for key, value in vars(args).items():
-            if value is not None and key not in {'config', 'output_config', 'validate_only'}:
-                updates[key] = value
-        
-        if updates:
-            self._apply_nested_updates(self.config, updates)
-            self.config.validate()
-            logger.info(f"Updated config from {len(updates)} command line arguments")
-    
+
+    # NOTE: update_from_args was removed. This project is configured exclusively
+    # via the unified YAML (configs/unified_config.yaml) plus ANIME_TAGGER_* env
+    # overrides — there are no per-field CLI overrides (see create_config_parser).
+
     def _apply_nested_updates(self, config: Any, updates: Dict[str, Any]):
         """Apply nested updates to configuration"""
         for key, value in updates.items():
@@ -2146,9 +2112,18 @@ class ConfigManager:
                 else:
                     setattr(config, key, value)
             else:
-                # Direct update
+                # Direct update — route through BaseConfig.update() so the value
+                # gets the same dataclass type coercion as from_dict (env-var
+                # strings/ints land with correct field types) instead of a raw
+                # setattr that bypasses Optional/Union/nested handling.
                 if hasattr(config, key):
-                    setattr(config, key, value)
+                    if isinstance(config, BaseConfig):
+                        try:
+                            config.update({key: value}, validate=False)
+                        except (TypeError, ValueError, AttributeError) as e:
+                            logger.warning(f"Failed to set {key}={value!r}: {e}")
+                    else:
+                        setattr(config, key, value)
                 else:
                     logger.warning(f"Unknown config field: {key}")
     
@@ -2248,80 +2223,48 @@ def deep_update(target: Dict, source: Dict) -> Dict:
     return target
 
 
-def create_config_parser(config_type: ConfigType = ConfigType.FULL) -> argparse.ArgumentParser:
-    """Create argument parser for configuration"""
+def create_config_parser() -> argparse.ArgumentParser:
+    """Create the argument parser for the training entrypoint.
+
+    Configuration is YAML-only: configs/unified_config.yaml (plus ANIME_TAGGER_*
+    env overrides) is the single source of truth. There are deliberately no
+    per-field CLI overrides (--training.learning_rate etc.) — the parser exposes
+    only the arguments train_direct.py actually consumes.
+    """
     parser = argparse.ArgumentParser(
         description="Anime Image Tagger Configuration",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    
-    # General arguments
+
     parser.add_argument('--config', type=str, help='Path to config file')
-    parser.add_argument('--output-config', type=str, help='Save final config to file')
     parser.add_argument('--validate-only', action='store_true', default=None, help='Only validate config and exit')
-    
-    # Create subparsers for different config sections
-    if config_type == ConfigType.FULL:
-        # Model arguments
-        model_group = parser.add_argument_group('model')
-        model_group.add_argument('--model.architecture_type', type=str, help='Model architecture')
-        model_group.add_argument('--model.hidden_size', type=int, help='Hidden size')
-        model_group.add_argument('--model.num_hidden_layers', type=int, help='Number of layers')
-        model_group.add_argument('--model.num_attention_heads', type=int, help='Number of attention heads')
-        
-        # Data arguments
-        data_group = parser.add_argument_group('data')
-        data_group.add_argument('--data.batch_size', type=int, help='Batch size')
-        data_group.add_argument('--data.num_workers', type=int, help='Number of data workers')
-        data_group.add_argument('--data.image_size', type=int, help='Input image size')
-        data_group.add_argument('--data.output_dir', type=str, help='Output directory')
-        
-        # Training arguments
-        train_group = parser.add_argument_group('training')
-        train_group.add_argument('--training.num_epochs', type=int, help='Number of epochs')
-        train_group.add_argument('--training.learning_rate', type=float, help='Learning rate')
-        train_group.add_argument('--training.weight_decay', type=float, help='Weight decay')
-        train_group.add_argument('--training.device', type=str, help='Device (cuda/cpu)')
-        train_group.add_argument('--training.seed', type=int, help='Random seed')
-        
-        # Inference arguments
-        infer_group = parser.add_argument_group('inference')
-        infer_group.add_argument('--inference.model_path', type=str, help='Path to model')
-        infer_group.add_argument('--inference.prediction_threshold', type=float, help='Prediction threshold')
-        infer_group.add_argument('--inference.top_k', type=int, help='Top-k predictions')
-        # Export arguments
-        export_group = parser.add_argument_group('export')
-        export_group.add_argument('--export.export_format', type=str, help='Export format')
-        export_group.add_argument('--export.optimize', action='store_true', default=None, help='Optimize exported model')
-        export_group.add_argument('--export.quantize', action='store_true', default=None, help='Quantize model')
-    
+
     return parser
 
 
 def load_config(
     config_file: Optional[str] = None,
     config_type: ConfigType = ConfigType.FULL,
-    args: Optional[argparse.Namespace] = None,
     env_prefix: str = "ANIME_TAGGER_",
     validate: bool = True
 ) -> BaseConfig:
     """
     Load configuration from multiple sources
-    
-    Priority: args > env > file > defaults
-    
+
+    Priority: env > file > defaults
+    (There are no CLI overrides — the unified YAML is the configuration source.)
+
     Args:
         config_file: Path to configuration file
         config_type: Type of configuration
-        args: Command line arguments
         env_prefix: Environment variable prefix
         validate: Whether to validate the final config
-        
+
     Returns:
         Loaded and validated configuration
     """
     manager = ConfigManager(config_type)
-    
+
     # Load from file if provided
     if config_file:
         try:
@@ -2329,14 +2272,10 @@ def load_config(
         except ConfigError as e:
             logger.error(f"Failed to load config file: {e}")
             raise
-    
+
     # Update from environment
     manager.update_from_env(env_prefix)
-    
-    # Update from args
-    if args:
-        manager.update_from_args(args)
-    
+
     # Validate final config
     if validate:
         try:

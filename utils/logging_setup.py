@@ -1,14 +1,12 @@
 import logging
 import logging.handlers
 import sys
-import os
 import json
 import uuid
 import subprocess
 import socket
 import multiprocessing
 from pathlib import Path
-from typing import Optional, Dict, Any
 from utils.file_handlers import CompressingRotatingFileHandler
 
 # --- Globals for context ---

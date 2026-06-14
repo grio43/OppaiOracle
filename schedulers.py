@@ -1,4 +1,4 @@
-# Minimal, PL 2.x-compatible warmup + cosine LR scheduler.
+# Minimal warmup + cosine LR scheduler.
 # Mirrors the behavior of pl_bolts.optimizers.lr_scheduler.LinearWarmupCosineAnnealingLR
 # so you don't need the pl_bolts package.
 import math
@@ -13,8 +13,7 @@ class LinearWarmupCosineLR(_LRScheduler):
     Linearly warms up from `warmup_start_lr` to each param group's base_lr over `warmup_epochs`,
     then cosine anneals from base_lr to `eta_min` over the remaining epochs up to `max_epochs`.
 
-    Step this scheduler once per epoch. In PyTorch Lightning, set
-    `interval="epoch"` when returning it from `configure_optimizers`.
+    Step this scheduler once per epoch.
     """
 
     def __init__(

@@ -33,7 +33,7 @@ import logging
 import platform
 import threading
 from pathlib import Path
-from typing import Set, List, Optional
+from typing import Set, List
 
 # Platform-specific file locking
 if platform.system() == 'Windows':
@@ -271,12 +271,26 @@ class ExclusionManager:
                 # Acquire exclusive lock
                 self._acquire_lock(f, exclusive=True)
                 try:
-                    # Read existing entries (in case other workers wrote while we waited)
+                    # Read existing entries (in case other workers wrote while we waited).
+                    # Normalize both existing lines and incoming ids to the SAME stem
+                    # form the reader (load()) uses, so the on-disk file stays canonical
+                    # and dedup is symmetric (the writer previously dedup'd on raw lines
+                    # while the reader normalized to stems, allowing duplicate logical
+                    # entries / unbounded growth for ids that normalize differently).
                     f.seek(0)
-                    existing = {line.strip() for line in f if line.strip()}
+                    existing = {
+                        _normalize_exclusion_line(line)
+                        for line in f
+                        if _normalize_exclusion_line(line)
+                    }
 
-                    # Find truly new unique entries
-                    new_unique = [id for id in new_ids if id not in existing]
+                    # Find truly new unique entries (in normalized form)
+                    new_unique = []
+                    for raw_id in new_ids:
+                        norm_id = _normalize_exclusion_line(raw_id)
+                        if norm_id and norm_id not in existing:
+                            existing.add(norm_id)
+                            new_unique.append(norm_id)
 
                     if new_unique:
                         # Seek to end and append
@@ -384,6 +398,11 @@ class ExclusionManager:
             True if lock acquired, False if lock is held by another process
         """
         if platform.system() == 'Windows':
+            # NOTE: msvcrt.locking only provides MANDATORY EXCLUSIVE byte-range
+            # locks; the `exclusive` arg is honored on Unix only. On Windows even
+            # a "shared read" lock serializes readers against the writer (readers
+            # then fall back to the cached snapshot). There is no shared-lock
+            # primitive in msvcrt, so this is a known limitation, not a bug.
             lock_size = max(1, f.seek(0, 2))
             f.seek(0)
             try:

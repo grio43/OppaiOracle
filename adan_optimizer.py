@@ -213,12 +213,17 @@ class Adan(Optimizer):
                 if p.grad is None:
                     continue
                 params_with_grad.append(p)
-                # Always clone gradient to avoid mutation of original p.grad
-                # Apply clipping at clone time when needed
+                # Only clone when we must scale by the global-grad-norm clip
+                # (clone-then-mul_ avoids mutating p.grad). When no clip applies
+                # (the live path: Adan max_grad_norm=0 => clip==1.0), pass p.grad
+                # directly — the single/multi-tensor impls below treat `grads`
+                # strictly as a read-only source, and train_direct zero_grad()s
+                # after the step, so no clone is needed (saves a full-param fp32
+                # allocation every step).
                 if clip_global_grad_norm != 1.0:
                     grads.append(p.grad.clone().mul_(clip_global_grad_norm))
                 else:
-                    grads.append(p.grad.clone())
+                    grads.append(p.grad)
 
                 state = self.state[p]
                 if len(state) == 0:
@@ -429,7 +434,10 @@ def _fused_adan_multi_tensor(
     # Balances GPU kernel launch overhead vs. memory usage
     FUSED_CHUNK_SIZE = 2048 * 32
     multi_tensor_applier = MultiTensorApply(FUSED_CHUNK_SIZE)
-    _dummy_overflow_buf = torch.cuda.IntTensor([0])
+    # Place the overflow buffer on the params' own device (not the default CUDA
+    # device) so a multi-GPU param group cannot hit a device mismatch; the legacy
+    # torch.cuda.IntTensor([0]) is also deprecated.
+    _dummy_overflow_buf = torch.zeros(1, dtype=torch.int32, device=params[0].device)
     multi_tensor_applier(
         fused_adan.adan_multi_tensor, _dummy_overflow_buf,
         [params, grads, exp_avgs, exp_avg_sqs, exp_avg_diffs, neg_pre_grads],

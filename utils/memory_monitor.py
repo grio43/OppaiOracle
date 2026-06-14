@@ -86,7 +86,7 @@ class MemoryMonitor:
         process = psutil.Process(os.getpid())
         process_mem_gb = process.memory_info().rss / (1024**3)
 
-        # Children memory (DataLoader workers, L2 writer, etc.)
+        # Children memory (DataLoader workers, etc.)
         # Use cached value if recent enough to avoid expensive process tree traversal
         now = time.time()
         if now - self._children_cache_time > self._children_cache_interval:

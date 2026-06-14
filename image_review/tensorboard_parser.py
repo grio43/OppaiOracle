@@ -155,16 +155,19 @@ class TensorBoardParser:
                 self._samples[(step, sample_idx)] = sample
 
     def _parse_markdown_table(self, markdown: str) -> Tuple[List[PredictionEntry], List[str], Optional[RatingInfo], Optional[str]]:
-        """Parse markdown table from log_predictions.
+        """Parse a markdown table emitted by ``Monitor_log.log_predictions``.
 
-        Format (with rating and filename):
+        Current format (optional ``**file:**`` prefix followed by the tag table):
         **file:** 1245001.jpg
-
-        **Rating:** safe (95.2%) | Actual: explicit | WRONG
 
         | tag | prob | expected | status |
         | --- | --- | --- | --- |
         | tag_name | 0.9876 | YES | TP |
+
+        Legacy back-compat: older logs also carried a
+        ``**Rating:** safe (95.2%) | Actual: explicit | WRONG`` line. The rating head
+        was removed, so the producer no longer emits it, but the parse branch below is
+        kept intact to read pre-existing logs.
         """
         predictions = []
         ground_truth = []

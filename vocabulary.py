@@ -7,13 +7,10 @@ management for both training and inference, eliminating code duplication.
 """
 
 import atexit
-import copy
 import hashlib
 import json
 import logging
-import itertools
 import os
-import random
 import tempfile
 import threading
 import time
@@ -29,11 +26,10 @@ except ImportError:
 _JSON_ERRORS = (json.JSONDecodeError, orjson.JSONDecodeError) if HAS_ORJSON else (json.JSONDecodeError,)
 
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Union
 import torch
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -1168,6 +1164,28 @@ def verify_vocabulary_integrity(vocab: TagVocabulary, source_path: Optional[Path
                 f"CRITICAL: Vocabulary{source_str} inconsistent - "
                 f"index_to_tag[{idx}] = '{tag}', but tag_to_index['{tag}'] = {vocab.tag_to_index[tag]}"
             )
+
+    # Verify indices form a gapless 0..N-1 range. encode_tags' bounds check
+    # (idx < len), the label-tensor width, and the model head all assume
+    # contiguity; a gap (max index >= len) round-trips perfectly and passes the
+    # bidirectional checks above, yet silently drops the highest-index tags from
+    # every encoded label.
+    n = len(vocab.index_to_tag)
+    if len(vocab.tag_to_index) != n:
+        raise ValueError(
+            f"CRITICAL: Vocabulary{source_str} size mismatch - "
+            f"tag_to_index has {len(vocab.tag_to_index)} entries but index_to_tag has {n}"
+        )
+    actual_indices = set(vocab.index_to_tag.keys())
+    expected_indices = set(range(n))
+    if actual_indices != expected_indices:
+        missing = sorted(expected_indices - actual_indices)[:5]
+        out_of_range = sorted(actual_indices - expected_indices)[:5]
+        raise ValueError(
+            f"CRITICAL: Vocabulary{source_str} indices are not a gapless 0..{n - 1} range. "
+            f"Missing indices: {missing}, out-of-range indices: {out_of_range}. "
+            f"encode_tags would silently drop out-of-range tags from every label."
+        )
 
 # Keep backward compatibility alias
 _verify_vocabulary_integrity = verify_vocabulary_integrity

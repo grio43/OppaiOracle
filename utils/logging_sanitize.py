@@ -70,36 +70,3 @@ def ensure_finite_tensor(x):
     # Return a tensor of zeros with the same graph as the input
     return x * 0
 
-def assert_all_finite(metrics: Dict[str, Any], where: str = ""):
-    import math
-    import torch
-    bad = []
-    for k, v in metrics.items():
-        if torch.is_tensor(v):
-            v = v.detach()
-            if v.numel() == 0:
-                bad.append(k)
-                continue
-            if not torch.isfinite(v).all():
-                bad.append(k)
-        else:
-            try:
-                f = float(v)
-                if not math.isfinite(f):
-                    bad.append(k)
-            except Exception:
-                bad.append(k)
-    if bad:
-        raise ValueError(f"Non-finite metrics {bad} {('at ' + where) if where else ''}")
-
-
-def safe_div(numer, denom, eps: float = 1e-12):
-    """
-    Guard against divide-by-zero in custom loss normalizations.
-    """
-    import torch
-    if torch.is_tensor(denom):
-        denom = denom.clamp_min(eps)
-    else:
-        denom = denom if denom != 0 else eps
-    return numer / denom

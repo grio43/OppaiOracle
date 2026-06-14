@@ -15,6 +15,8 @@ class SafeDropPath(nn.Module):
         keep_prob = 1.0 - self.drop_prob
         # keep_prob is always > 0 due to __init__ validation
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        # Draw in float32: drawing in x.dtype (e.g. bf16) quantizes keep_prob
+        # and skews the realized keep rate. The 0/1 mask casts back exactly.
+        random_tensor = keep_prob + torch.rand(shape, dtype=torch.float32, device=x.device)
         random_tensor.floor_()
-        return x.div(keep_prob) * random_tensor
+        return x.div(keep_prob) * random_tensor.to(x.dtype)
