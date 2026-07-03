@@ -1142,6 +1142,12 @@ class LossConfig(BaseConfig):
     """Hyperparameters for loss functions."""
     alpha: float = 0.5
     gamma_neg: float = 3.0
+    # Manual guarded gamma_neg step (todos/ASL_plan.md SS3): set to the target
+    # value and restart; the ASL drive manager validates the step against the
+    # phase window / hold / dwell guards and applies it, then this key should
+    # be cleared back to null. When null, the checkpoint's persisted gamma_neg
+    # wins over the gamma_neg value above on resume.
+    gamma_neg_override: Optional[float] = None
     gamma_pos: float = 1.0
     label_smoothing: float = 0.0
     clip: float = 0.05
@@ -1157,6 +1163,10 @@ class LossConfig(BaseConfig):
             errors.append(f"alpha must be in [0, 1], got {self.alpha}")
         if self.gamma_neg < 0 or self.gamma_pos < 0:
             errors.append("gamma_neg and gamma_pos must be >= 0")
+        if self.gamma_neg_override is not None and self.gamma_neg_override < 0:
+            errors.append(
+                f"gamma_neg_override must be >= 0 or null, got {self.gamma_neg_override}"
+            )
         if not 0.0 <= self.label_smoothing <= 1.0:
             errors.append(
                 f"label_smoothing must be in [0, 1], got {self.label_smoothing}"
@@ -1173,6 +1183,133 @@ class LossConfig(BaseConfig):
             errors.append(f"class_weight_clip_max must be > class_weight_clip_min")
         if errors:
             raise ConfigValidationError("Loss config validation failed:\n" + "\n".join(errors))
+
+
+@dataclass
+class ASLPhaseWindowConfig(BaseConfig):
+    """Per-phase gamma_neg window for the ASL drive plan (todos/ASL_plan.md SS3).
+
+    hold_epochs: gamma_neg is frozen for the first N (phase-local, 1-based)
+    epochs of the phase — Phase 1's warmup/early-learning hard hold, Phase 2's
+    re-warmup freeze at the resolution switch.
+    """
+    gamma_neg_min: float = 5.0
+    gamma_neg_max: float = 7.0
+    hold_epochs: int = 8
+
+    def validate(self):
+        errors = []
+        if self.gamma_neg_min < 0 or self.gamma_neg_max < 0:
+            errors.append("gamma_neg_min/max must be >= 0")
+        if self.gamma_neg_max < self.gamma_neg_min:
+            errors.append(
+                f"gamma_neg_max ({self.gamma_neg_max}) must be >= gamma_neg_min ({self.gamma_neg_min})"
+            )
+        if int(self.hold_epochs) < 0:
+            errors.append("hold_epochs must be >= 0")
+        if errors:
+            raise ConfigValidationError("ASL phase window validation failed:\n" + "\n".join(errors))
+
+
+@dataclass
+class ASLScheduleConfig(BaseConfig):
+    """Guards for MANUAL gamma_neg steps (todos/ASL_plan.md SS3).
+
+    The descent is driven by hand (stop / edit gamma_neg_override / resume);
+    this config only enforces the plan's safety rails: per-phase clamp windows,
+    hold/freeze windows, and the minimum dwell between unit steps. The SS4
+    adaptive controller has zero authority (shadow/logging-only, see
+    ASLTelemetryConfig).
+    """
+    enabled: bool = True
+    min_dwell_epochs: int = 3
+    phase1: ASLPhaseWindowConfig = field(default_factory=lambda: ASLPhaseWindowConfig(
+        gamma_neg_min=5.0, gamma_neg_max=7.0, hold_epochs=8))
+    phase2: ASLPhaseWindowConfig = field(default_factory=lambda: ASLPhaseWindowConfig(
+        gamma_neg_min=5.0, gamma_neg_max=6.0, hold_epochs=2))
+    phase3: ASLPhaseWindowConfig = field(default_factory=lambda: ASLPhaseWindowConfig(
+        gamma_neg_min=5.0, gamma_neg_max=6.0, hold_epochs=0))
+
+    def validate(self):
+        errors = []
+        if int(self.min_dwell_epochs) < 0:
+            errors.append("min_dwell_epochs must be >= 0")
+        for name in ("phase1", "phase2", "phase3"):
+            try:
+                getattr(self, name).validate()
+            except ConfigValidationError as e:
+                errors.append(f"{name}: {e}")
+        if errors:
+            raise ConfigValidationError("ASL schedule validation failed:\n" + "\n".join(errors))
+
+
+@dataclass
+class ASLTelemetryConfig(BaseConfig):
+    """Always-on ASL telemetry set (todos/ASL_plan.md SS5).
+
+    Train-side metrics ride the already-computed detached logits at
+    optimizer-update boundaries; val-side variants consume the accumulated
+    probability/target matrices. The shadow controller logs the gamma the
+    paper's adaptive-asymmetry law WOULD set — it never sets gamma (SS4).
+    """
+    enabled: bool = True
+    # Compute train-side telemetry every N optimizer updates (EMA cadence)
+    interval_updates: int = 100
+    # Write TB scalars / persist EMA floats every N optimizer updates
+    # (must be a multiple of interval_updates to fire on a compute step)
+    log_every_updates: int = 500
+    ema_beta: float = 0.98
+    # top-K for the dp_hard non-GT capture (SS5: excludes PAD/UNK + rating tags)
+    topk_hard: int = 10
+    num_deciles: int = 10
+    # Non-GT score histogram range/bins; watch band = the SS2 clip-cost band
+    hist_min: float = 0.05
+    hist_max: float = 0.95
+    hist_bins: int = 18
+    watch_band_low: float = 0.2
+    watch_band_high: float = 0.5
+    # EPR trend alarm: sustained relative drop in any decile within N epochs
+    # of a gamma step -> step back up (SS5)
+    epr_alarm_rel_drop: float = 0.05
+    epr_alarm_window_epochs: int = 2
+    # SS5 hygiene: rating tags inflate mean(p_pos); exclude them from dp metrics
+    exclude_rating_tags: bool = True
+    # JSON {group_name: [tags]} for the sibling-gap metric; null disables
+    sibling_groups_path: Optional[str] = "./configs/confusable_groups.json"
+    # SS4 shadow controller (logging only, zero authority)
+    shadow_controller_enabled: bool = True
+    shadow_lambda: float = 0.05
+    shadow_delta_p_target: float = 0.2
+
+    def validate(self):
+        errors = []
+        if int(self.interval_updates) < 1:
+            errors.append("interval_updates must be >= 1")
+        if int(self.log_every_updates) < 1:
+            errors.append("log_every_updates must be >= 1")
+        elif int(self.log_every_updates) % max(1, int(self.interval_updates)) != 0:
+            errors.append(
+                f"log_every_updates ({self.log_every_updates}) must be a multiple of "
+                f"interval_updates ({self.interval_updates}) so logging lands on a compute step"
+            )
+        if not 0.0 < self.ema_beta < 1.0:
+            errors.append(f"ema_beta must be in (0, 1), got {self.ema_beta}")
+        if int(self.topk_hard) < 1:
+            errors.append("topk_hard must be >= 1")
+        if int(self.num_deciles) < 1:
+            errors.append("num_deciles must be >= 1")
+        if not (0.0 <= self.hist_min < self.hist_max <= 1.0):
+            errors.append(f"hist range invalid: [{self.hist_min}, {self.hist_max}]")
+        if int(self.hist_bins) < 1:
+            errors.append("hist_bins must be >= 1")
+        if not (0.0 <= self.watch_band_low < self.watch_band_high <= 1.0):
+            errors.append(f"watch band invalid: [{self.watch_band_low}, {self.watch_band_high}]")
+        if not 0.0 < self.epr_alarm_rel_drop < 1.0:
+            errors.append(f"epr_alarm_rel_drop must be in (0, 1), got {self.epr_alarm_rel_drop}")
+        if int(self.epr_alarm_window_epochs) < 0:
+            errors.append("epr_alarm_window_epochs must be >= 0")
+        if errors:
+            raise ConfigValidationError("ASL telemetry validation failed:\n" + "\n".join(errors))
 
 
 @dataclass
@@ -1250,6 +1387,17 @@ class TrainingConfig(BaseConfig):
     
     # Loss configuration
     tag_loss: LossConfig = field(default_factory=LossConfig)
+
+    # Unified training-phase selector (todos/ASL_plan.md; progressive plan):
+    #   1 = 320px from-scratch, 2 = 448px fine-tune, 3 = optional 512px.
+    # Resuming a checkpoint whose recorded phase differs from this value
+    # triggers a PHASE TRANSITION: weights load, optimizer/scheduler/scaler
+    # start fresh (re-warmup), epoch counters reset to 0, and gamma_neg is
+    # carried over frozen from the checkpoint's loss state.
+    phase: int = 1
+    # ASL gamma_neg drive guards + always-on telemetry (todos/ASL_plan.md)
+    asl_schedule: ASLScheduleConfig = field(default_factory=ASLScheduleConfig)
+    asl_telemetry: ASLTelemetryConfig = field(default_factory=ASLTelemetryConfig)
     # Hardware
     device: str = "cuda"
     # torch.compile() Optimization (PyTorch 2.0+)
@@ -1326,6 +1474,18 @@ class TrainingConfig(BaseConfig):
             self.tag_loss.validate()
         except ConfigValidationError as e:
             errors.append(f"tag_loss: {e}")
+
+        # Unified phase selector + ASL drive configs
+        if int(self.phase) not in (1, 2, 3):
+            errors.append(f"phase must be 1, 2, or 3, got {self.phase}")
+        try:
+            self.asl_schedule.validate()
+        except ConfigValidationError as e:
+            errors.append(f"asl_schedule: {e}")
+        try:
+            self.asl_telemetry.validate()
+        except ConfigValidationError as e:
+            errors.append(f"asl_telemetry: {e}")
         
         # Validate device
         valid_devices = ["cuda", "cpu", "mps"]

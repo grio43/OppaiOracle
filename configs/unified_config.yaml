@@ -294,14 +294,80 @@ training:
     # Loss configuration
     tag_loss:
       alpha: 1.0            # 1.0 = disabled (pure ASL, no alpha weighting: pos_loss + neg_loss)
-      gamma_neg: 7.0        # Phase 2: hard-negative focus, matches Open Images sparsity regime per ASL paper (9,605 classes, ~0.5% positive rate). Phase 1 used 4.0.
+      # gamma_neg is the FRESH-START value only. On resume the checkpoint's
+      # persisted gamma_neg wins (asl_telemetry.ASLDriveManager); to take a
+      # manual guarded step, set gamma_neg_override below and restart.
+      # V2 plan (todos/ASL_plan.md §3): P1 holds 7.0 through epoch 8, then
+      # manual guarded descent 7→6→5 (≥3-epoch dwell, §5 gates); P2 lands 5.
+      # HISTORY NOTE (§0 item 2, unresolved): an earlier comment here claimed
+      # V1-P1 ran 4.0 and only P2 ran 7.0 — unverified against the V1
+      # checkpoints (peek_checkpoint_config); the γ-vs-clip blame split for
+      # V1's missing boundaries stays open until that is checked.
+      gamma_neg: 7.0
+      # Manual γ step (todos/ASL_plan.md §3): set to the target (e.g. 6.0),
+      # restart, verify the "STEP APPLIED" log line, then clear back to null.
+      # Steps are validated against training.asl_schedule (phase window,
+      # hold/freeze epochs, min dwell) and REFUSED if a guard fails.
+      gamma_neg_override: null
       gamma_pos: 0.0        # ASL paper optimal: no focal suppression on positives (preserves scarce positive gradient)
       label_smoothing: 0.0   # Disabled — label smoothing + focal loss corrupts focal weights on sparse multi-label targets
-      clip: 0.2             # Focal-based ASL needs higher margin than CE-based (ASL paper: m=0.2 default for focal variant on MS-COCO)
+      # clip: DELIBERATE deviation from the paper — every asymmetric recipe the
+      # ASL paper shipped used m=0.05 (the old "m=0.2 paper default for the
+      # focal variant" claim overstated Fig. 7's margin-only CE/symmetric-focal
+      # sweep; todos/ASL_plan.md §1). 0.2 is missing-positive armor: FROZEN for
+      # the whole run at the §0-decided value (0.2 default; 0.1 only if the
+      # pre-launch missing-positive measurement clears ρ < ~25%). Never move
+      # clip and gamma_neg in the same step (attribution dies).
+      clip: 0.2
       class_weight_strategy: null  # Removed: redundant with ASL gamma_neg (double-correction risk; ASL paper Table 2: pure ASL > FL+linear weighting)
       class_weight_clip_min: 0.05            # No-op when class_weight_strategy is null
       class_weight_clip_max: 5.0             # No-op when class_weight_strategy is null
       class_weight_beta: 0.9999              # No-op when class_weight_strategy is null
+
+    # ── Unified training phase ────────────────────────────────────────────
+    # 1 = 320px from-scratch | 2 = 448px fine-tune | 3 = optional 512px.
+    # To transition phases: flip this value (plus the resolution/aug/LR keys
+    # marked "Phase N" throughout this file) and resume. The trainer detects
+    # the phase change and loads WEIGHTS ONLY — optimizer/scheduler/scaler
+    # start fresh (re-warmup), epoch counters reset to 0, and gamma_neg is
+    # carried over frozen from the checkpoint's loss state (ASL_plan §3).
+    # Checkpoints that predate this key resume normally (no transition).
+    phase: 2
+
+    # ASL γ_neg drive guards (todos/ASL_plan.md §3). The descent is MANUAL —
+    # stop → set tag_loss.gamma_neg_override → resume — and these are the
+    # safety rails the drive manager enforces on every requested step.
+    asl_schedule:
+      enabled: true
+      min_dwell_epochs: 3   # minimum epochs between unit steps (7→6→5)
+      phase1: { gamma_neg_min: 5.0, gamma_neg_max: 7.0, hold_epochs: 8 }   # hard hold through warmup + early learning; epoch 9 is the EARLIEST unfreeze
+      phase2: { gamma_neg_min: 5.0, gamma_neg_max: 6.0, hold_epochs: 2 }   # frozen through the 2-epoch re-warmup; Option A holds and lands 5
+      phase3: { gamma_neg_min: 5.0, gamma_neg_max: 6.0, hold_epochs: 0 }   # loss unchanged from the P2 landing
+
+    # Always-on telemetry + gates (todos/ASL_plan.md §5) computed on
+    # logits[:, 2:] (PAD/UNK excluded), fp32-upcast, sampled only on
+    # optimizer-update boundaries. Includes the §4 shadow controller
+    # (logging-only — it NEVER sets γ; the manual guarded steps drive).
+    asl_telemetry:
+      enabled: true
+      interval_updates: 100      # EMA sample cadence (optimizer updates)
+      log_every_updates: 500     # TensorBoard + checkpoint-state sync cadence
+      ema_beta: 0.98
+      topk_hard: 10              # Δp_hard = mean(p_pos) − mean(top-K non-GT)
+      num_deciles: 10            # tag-frequency deciles for the EPR tripwire
+      hist_min: 0.05             # non-GT score histogram range…
+      hist_max: 0.95
+      hist_bins: 18
+      watch_band_low: 0.2        # …with the §2 clip-cost watch band [0.2, 0.5]
+      watch_band_high: 0.5
+      epr_alarm_rel_drop: 0.05   # >5% relative EPR drop in any decile…
+      epr_alarm_window_epochs: 2 # …within 2 epochs of a γ step → step back up
+      exclude_rating_tags: true  # §5 hygiene: rating tags inflate mean(p_pos)
+      sibling_groups_path: "./configs/confusable_groups.json"  # sibling-gap groups
+      shadow_controller_enabled: true
+      shadow_lambda: 0.05
+      shadow_delta_p_target: 0.2 # paper Table 3 best-tested target
+
     # Ratings are now encoded as regular tags (rating:general, rating:sensitive, etc.)
     # and trained with the same tag loss. No separate rating_loss section needed.
     # Hardware
