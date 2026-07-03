@@ -29,3 +29,16 @@ nul
 .ruff_cache/
 .vscode/
 sensitive_config.py
+
+# Model exports and release bundles (too large for git)
+exported_model/
+huggingface_release/
+*.onnx
+*.onnx.data
+
+# Local scratch, logs, and launcher shortcuts
+.research/
+tunnel_log*.txt
+*.lnk
+=3.9.0
+Untitled-*.json
