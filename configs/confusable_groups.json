@@ -1,0 +1,22 @@
+{
+  "_comment": "Confusable sibling-tag groups for the ASL sibling-gap telemetry (todos/ASL_plan.md SS5). The metric only uses validation samples with EXACTLY ONE labeled tag per group (score of the labeled sibling minus max score among unlabeled siblings), so multi-membership (multicolored_hair, heterochromia, gradient_hair) never corrupts it and colors are NOT treated as exclusive. Tags missing from the vocabulary are skipped with a debug log.",
+  "hair_color": [
+    "aqua_hair", "black_hair", "blonde_hair", "blue_hair", "brown_hair",
+    "green_hair", "grey_hair", "orange_hair", "pink_hair", "purple_hair",
+    "red_hair", "white_hair", "light_brown_hair", "platinum_blonde_hair",
+    "silver_hair", "dark_blue_hair", "light_blue_hair", "lavender_hair"
+  ],
+  "eye_color": [
+    "aqua_eyes", "black_eyes", "blue_eyes", "brown_eyes", "green_eyes",
+    "grey_eyes", "orange_eyes", "pink_eyes", "purple_eyes", "red_eyes",
+    "yellow_eyes", "amber_eyes", "golden_eyes", "silver_eyes"
+  ],
+  "hair_length": [
+    "very_short_hair", "short_hair", "medium_hair", "long_hair",
+    "very_long_hair", "absurdly_long_hair"
+  ],
+  "breast_size": [
+    "flat_chest", "small_breasts", "medium_breasts", "large_breasts",
+    "huge_breasts", "gigantic_breasts"
+  ]
+}

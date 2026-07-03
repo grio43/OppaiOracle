@@ -33,6 +33,7 @@ import numpy as np
 
 from Monitor_log import MonitorConfig, TrainingMonitor
 from evaluation_metrics import FrequencyBucketMetrics, ThresholdCalibrator
+from asl_telemetry import ASLDriveManager
 
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -905,6 +906,7 @@ def train_with_orientation_tracking(config: FullConfig):
     is_mid_epoch = False
     ckpt_original_batch_size = None  # For batch-size agnostic resume from legacy checkpoints
     ckpt_sampler_state = None  # Saved sampler state (carries dataset-size guard for resume)
+    phase_transition = False  # Set when checkpoint phase != config.training.phase
     # Soft-stop sentinel files (located in log_dir)
     stop_sentinel = Path(config.log_dir) / "STOP_TRAINING"
     save_sentinel = Path(config.log_dir) / "SAVE_CHECKPOINT"
@@ -1017,6 +1019,35 @@ def train_with_orientation_tracking(config: FullConfig):
                     logger.info("Pre-load validation: %s", msg)
             # --- End pre-load validation ---
 
+            # --- Phase-transition detection (unified training.phase key) ---
+            # Flipping config.training.phase (e.g. 1 -> 2 at the 320->448
+            # resolution switch) and resuming triggers a transition: weights
+            # load, but optimizer/scheduler/scaler start FRESH (FixRes-style
+            # re-warmup) and epoch counters reset to 0. gamma_neg carries over
+            # frozen from the checkpoint's loss state (ASL_plan SS3: P1->P2
+            # freeze through re-warmup). Checkpoints predating the phase key
+            # record no phase and resume normally.
+            current_phase = int(getattr(config.training, 'phase', 0) or 0)
+            ckpt_phase_raw = ((ckpt_config_preview or {}).get('training') or {}).get('phase')
+            phase_transition = bool(
+                ckpt_path is not None
+                and current_phase > 0
+                and ckpt_phase_raw is not None
+                and int(ckpt_phase_raw) != current_phase
+            )
+            if phase_transition:
+                logger.info("=" * 70)
+                logger.info(
+                    "PHASE TRANSITION: checkpoint phase %s -> config phase %s",
+                    ckpt_phase_raw, current_phase,
+                )
+                logger.info(
+                    "Model weights load from the checkpoint; optimizer/scheduler/"
+                    "scaler start fresh (re-warmup); epoch counters reset to 0; "
+                    "gamma_neg is carried over frozen from the checkpoint loss state."
+                )
+                logger.info("=" * 70)
+
             if not ckpt_path:
                 logger.info("Resume skipped due to incompatible checkpoint.")
             else:
@@ -1033,10 +1064,12 @@ def train_with_orientation_tracking(config: FullConfig):
                 ckpt = checkpoint_manager.load_checkpoint(
                     checkpoint_path=ckpt_path,
                     model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
+                    # Phase transition: optimizer/scheduler/scaler start fresh
+                    # (re-warmup at the new resolution, ASL_plan SS3 / FixRes)
+                    optimizer=None if phase_transition else optimizer,
+                    scheduler=None if phase_transition else scheduler,
                     device=device,
-                    scaler=scaler,
+                    scaler=None if phase_transition else scaler,
                     expected_vocab_sha256=current_vocab_sha,
                     enforce_vocab_check=True,
                     allow_unverified_vocab_resume=getattr(
@@ -1046,59 +1079,81 @@ def train_with_orientation_tracking(config: FullConfig):
                 if not ckpt:
                     raise RuntimeError(f"Checkpoint returned empty data from {ckpt_path}")
                 training_state = TrainingState.from_dict(ckpt.get('training_state', {}))
-                global_step = ckpt.get('step', 0)
-                # Preserve historical best; only reconcile when explicitly marked as best
-                if ckpt.get('is_best', False):
-                    try:
-                        loaded_best = float(ckpt.get('metrics', {}).get('val_f1_macro', training_state.best_metric))
-                        training_state.best_metric = max(training_state.best_metric, loaded_best)
-                    except (TypeError, ValueError) as e:
-                        logger.warning(f"Could not parse best metric from checkpoint: {e}")
-                # Extract mid-epoch resume info if available
-                resume_batch_idx = getattr(training_state, 'batch_in_epoch', 0)
-                resume_sample_idx = getattr(training_state, 'sample_in_epoch', 0)  # Batch-size agnostic
-                is_mid_epoch = not getattr(training_state, 'is_epoch_boundary', True)
-
-                # Checkpoints store epoch+1 (1-based). Convert to 0-based loop index.
-                # For mid-epoch saves: resume the same epoch (subtract 1, then batch-skip handles the rest)
-                # For epoch-boundary saves: epoch is fully completed, start the NEXT epoch (no -1 needed)
-                if is_mid_epoch:
-                    start_epoch = ckpt.get('epoch', 1) - 1
-                    if start_epoch < 0:
-                        start_epoch = 0
-                    logger.info(f"Mid-epoch resume: continuing epoch {start_epoch} (0-based)")
+                if phase_transition:
+                    # Epochs are phase-local: reset all counters/histories but
+                    # carry the ASL loss state (gamma_neg stays frozen at its
+                    # previous-phase landing value through the re-warmup).
+                    training_state = TrainingState(
+                        phase=current_phase,
+                        loss_state=dict(getattr(training_state, 'loss_state', {}) or {}),
+                    )
+                    global_step = 0
+                    start_epoch = 0
+                    resume_batch_idx = 0
+                    resume_sample_idx = 0
+                    is_mid_epoch = False
+                    ckpt_sampler_state = None
+                    logger.info(
+                        "Phase transition applied: epoch/step counters reset; "
+                        "starting phase %d at epoch 1 with gamma_neg=%s from the "
+                        "checkpoint loss state.",
+                        current_phase,
+                        (training_state.loss_state or {}).get('gamma_neg', '<YAML>'),
+                    )
                 else:
-                    start_epoch = ckpt.get('epoch', 1)  # 1-based completed epoch = correct 0-based next epoch
-                    if start_epoch < 0:
-                        start_epoch = 0
+                    global_step = ckpt.get('step', 0)
+                    # Preserve historical best; only reconcile when explicitly marked as best
+                    if ckpt.get('is_best', False):
+                        try:
+                            loaded_best = float(ckpt.get('metrics', {}).get('val_f1_macro', training_state.best_metric))
+                            training_state.best_metric = max(training_state.best_metric, loaded_best)
+                        except (TypeError, ValueError) as e:
+                            logger.warning(f"Could not parse best metric from checkpoint: {e}")
+                    # Extract mid-epoch resume info if available
+                    resume_batch_idx = getattr(training_state, 'batch_in_epoch', 0)
+                    resume_sample_idx = getattr(training_state, 'sample_in_epoch', 0)  # Batch-size agnostic
+                    is_mid_epoch = not getattr(training_state, 'is_epoch_boundary', True)
 
-                if is_mid_epoch and resume_batch_idx > 0:
-                    logger.info("Resumed from %s (epoch=%s, step=%s, batch_in_epoch=%s) - mid-epoch resume",
-                               ckpt_path, start_epoch, global_step, resume_batch_idx)
-                    # Warn about persistent_workers limitation with mid-epoch resume
-                    # Workers maintain RNG state that cannot be serialized - augmentations will differ
-                    if getattr(config.data, 'persistent_workers', False):
-                        logger.warning(
-                            "Resuming mid-epoch with persistent_workers=True: per-worker RNG state "
-                            "cannot be serialized. Augmentations may differ from original run. "
-                            "Set persistent_workers=False for fully reproducible mid-epoch resume."
-                        )
-                else:
-                    logger.info("Resumed from %s (epoch=%s, step=%s)", ckpt_path, start_epoch, global_step)
+                    # Checkpoints store epoch+1 (1-based). Convert to 0-based loop index.
+                    # For mid-epoch saves: resume the same epoch (subtract 1, then batch-skip handles the rest)
+                    # For epoch-boundary saves: epoch is fully completed, start the NEXT epoch (no -1 needed)
+                    if is_mid_epoch:
+                        start_epoch = ckpt.get('epoch', 1) - 1
+                        if start_epoch < 0:
+                            start_epoch = 0
+                        logger.info(f"Mid-epoch resume: continuing epoch {start_epoch} (0-based)")
+                    else:
+                        start_epoch = ckpt.get('epoch', 1)  # 1-based completed epoch = correct 0-based next epoch
+                        if start_epoch < 0:
+                            start_epoch = 0
 
-                # Extract original batch_size for legacy checkpoint resume (batch-size agnostic)
-                # Note: Critical config validation (architecture_type, num_labels, etc.) was already
-                # performed BEFORE load_checkpoint() via peek_checkpoint_config() to fail fast.
-                ckpt_config = ckpt.get('config', {})
-                if ckpt_config:
-                    ckpt_original_batch_size = ckpt_config.get('data', {}).get('batch_size')
-                    if ckpt_original_batch_size and ckpt_original_batch_size != config.data.batch_size:
-                        logger.info(f"Checkpoint was trained with batch_size={ckpt_original_batch_size}, "
-                                   f"current batch_size={config.data.batch_size} - will use original for resume offset")
+                    if is_mid_epoch and resume_batch_idx > 0:
+                        logger.info("Resumed from %s (epoch=%s, step=%s, batch_in_epoch=%s) - mid-epoch resume",
+                                   ckpt_path, start_epoch, global_step, resume_batch_idx)
+                        # Warn about persistent_workers limitation with mid-epoch resume
+                        # Workers maintain RNG state that cannot be serialized - augmentations will differ
+                        if getattr(config.data, 'persistent_workers', False):
+                            logger.warning(
+                                "Resuming mid-epoch with persistent_workers=True: per-worker RNG state "
+                                "cannot be serialized. Augmentations may differ from original run. "
+                                "Set persistent_workers=False for fully reproducible mid-epoch resume."
+                            )
+                    else:
+                        logger.info("Resumed from %s (epoch=%s, step=%s)", ckpt_path, start_epoch, global_step)
 
-                # Keep sampler state so the mid-epoch resume path can verify the
-                # dataset size hasn't changed before applying a sample offset.
-                ckpt_sampler_state = ckpt.get('sampler_state')
+                    # Extract original batch_size for legacy checkpoint resume (batch-size agnostic)
+                    # Note: Critical config validation (architecture_type, num_labels, etc.) was already
+                    # performed BEFORE load_checkpoint() via peek_checkpoint_config() to fail fast.
+                    ckpt_config = ckpt.get('config', {})
+                    if ckpt_config:
+                        ckpt_original_batch_size = ckpt_config.get('data', {}).get('batch_size')
+                        if ckpt_original_batch_size and ckpt_original_batch_size != config.data.batch_size:
+                            logger.info(f"Checkpoint was trained with batch_size={ckpt_original_batch_size}, "
+                                       f"current batch_size={config.data.batch_size} - will use original for resume offset")
+
+                    # Keep sampler state so the mid-epoch resume path can verify the
+                    # dataset size hasn't changed before applying a sample offset.
+                    ckpt_sampler_state = ckpt.get('sampler_state')
 
                 # Release checkpoint memory after extraction - model/optimizer states already loaded
                 del ckpt
@@ -1111,6 +1166,26 @@ def train_with_orientation_tracking(config: FullConfig):
                 f"Checkpoint loading failed for {ckpt_path}. "
                 f"To start fresh, set training.resume_from='none' in config. Error: {e}"
             ) from e
+
+    # --- ASL gamma_neg drive + always-on telemetry (todos/ASL_plan.md SS3/SS5/SS8) ---
+    # Must run AFTER resume: it reconciles gamma_neg (checkpoint loss state wins
+    # over YAML; gamma_neg_override applies a guarded manual step) and pushes the
+    # result into the live criterion. Its state dict is shared BY REFERENCE with
+    # training_state.loss_state so every checkpoint save persists gamma_neg +
+    # telemetry EMAs (without this, gamma silently reverts to YAML on restart).
+    # Fail-fast: without the drive manager the run degrades to fixed YAML gamma
+    # with no gates - exactly V1's loss (ASL_plan SS8).
+    asl_drive = ASLDriveManager(
+        config=config,
+        criterion=criterion,
+        vocab=vocab,
+        device=device,
+        state=dict(getattr(training_state, 'loss_state', {}) or {}),
+        start_epoch=start_epoch,
+        monitor=monitor,
+    )
+    training_state.loss_state = asl_drive.state
+    training_state.phase = int(getattr(config.training, 'phase', 0) or 0)
 
     def _ensure_conv2d_channels_last(model: torch.nn.Module, logger) -> int:
         """Force all Conv2d weights to channels_last format.
@@ -1596,6 +1671,15 @@ def train_with_orientation_tracking(config: FullConfig):
                     except Exception as sched_exc:
                         # keep training even if a rare scheduler state issue occurs
                         logger.warning(f"Scheduler step failed at global_step={global_step}: {sched_exc}")
+
+                    # ASL telemetry sample (todos/ASL_plan.md SS5): rides the
+                    # already-detached logits of the boundary microbatch, only on
+                    # optimizer-update boundaries (accumulation-window hygiene).
+                    # Internally throttled to every interval_updates updates.
+                    try:
+                        asl_drive.on_update(_saved_tag_logits, tag_labels, global_step, epoch)
+                    except Exception as _asl_exc:
+                        logger.warning(f"ASL telemetry update failed at step {global_step}: {_asl_exc}")
 
                     # Count optimizer updates and handle periodic checkpointing
                     try:
@@ -2217,6 +2301,16 @@ def train_with_orientation_tracking(config: FullConfig):
                         for b, m in bucketed_results.items() if m['num_tags'] > 0
                     )
                     logger.info(f"Bucketed metrics: {bucket_summary}")
+
+                # ASL val telemetry (todos/ASL_plan.md SS5): non-GT score
+                # histogram (clip watch band), sibling-gap per confusable group,
+                # val-side dp_hard and per-decile EPR. Pure consumer of the
+                # already-accumulated CPU prob/target matrices.
+                if cat_probs is not None:
+                    try:
+                        asl_drive.compute_val(cat_probs, cat_targs, global_step, epoch)
+                    except Exception as _asl_exc:
+                        logger.warning(f"ASL val telemetry failed: {_asl_exc}")
 
                 # Threshold calibration (reuses accumulated tensors). Deliberately NOT
                 # gated on use_tensorboard: calibrated_thresholds is a training artifact

@@ -385,6 +385,34 @@ class AsymmetricFocalLoss(nn.Module):
         else:
             return focal_loss
 
+    def set_gamma_neg(self, value: float) -> None:
+        """Update gamma_neg mid-run (todos/ASL_plan.md SS8: the drive knob).
+
+        The loss runs eager (torch.compile wraps only the model), so a plain
+        Python-float attribute is safe. If this module is ever pulled into a
+        compile region, store gamma_neg as a 0-dim tensor/buffer instead --
+        a Python-float mutation would trigger a recompile on every update.
+        """
+        value = float(value)
+        if value < 0:
+            raise ValueError(f"gamma_neg must be non-negative, got {value}")
+        if value > 10:
+            logger.warning(f"gamma_neg={value} is unusually high (typical range 0-7)")
+        old = self.gamma_neg
+        self.gamma_neg = value
+        if old != value:
+            logger.info("AsymmetricFocalLoss: gamma_neg %.3f -> %.3f", old, value)
+
+    def get_loss_state(self) -> Dict[str, float]:
+        """Loss hyperparameters worth persisting in checkpoints (ASL_plan SS8)."""
+        return {
+            'gamma_neg': float(self.gamma_neg),
+            'gamma_pos': float(self.gamma_pos),
+            'clip': float(self.clip),
+            'alpha': float(self.alpha),
+            'label_smoothing': float(self.label_smoothing),
+        }
+
 
 class MultiTaskLoss(nn.Module):
     """
@@ -431,3 +459,19 @@ class MultiTaskLoss(nn.Module):
             'tag_loss': tag_loss,
         }
         return tag_loss, losses
+
+    @property
+    def gamma_neg(self) -> Optional[float]:
+        return getattr(self.tag_loss_fn, 'gamma_neg', None)
+
+    def set_gamma_neg(self, value: float) -> None:
+        """Pass-through to the wrapped tag loss (ASL_plan SS8 setter)."""
+        if not hasattr(self.tag_loss_fn, 'set_gamma_neg'):
+            raise AttributeError(
+                f"{type(self.tag_loss_fn).__name__} does not support set_gamma_neg"
+            )
+        self.tag_loss_fn.set_gamma_neg(value)
+
+    def get_loss_state(self) -> Dict[str, float]:
+        getter = getattr(self.tag_loss_fn, 'get_loss_state', None)
+        return getter() if getter is not None else {}

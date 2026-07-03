@@ -701,7 +701,16 @@ class TrainingState:
     # Checkpoint info
     last_checkpoint_step: int = 0
     checkpoints_saved: List[str] = field(default_factory=list)
-    
+
+    # Unified training phase (config.training.phase) recorded at save time so a
+    # resume can detect a phase transition (0 = pre-phase-key checkpoint)
+    phase: int = 0
+    # ASL loss-state persistence (todos/ASL_plan.md SS8 row 2): gamma_neg,
+    # gamma-step history/dwell bookkeeping, and telemetry EMAs. Owned (and
+    # mutated in place) by asl_telemetry.ASLDriveManager; without this, any
+    # gamma change silently reverts to the YAML value on restart.
+    loss_state: Dict[str, Any] = field(default_factory=dict)
+
     def update_metrics(self, metrics: Dict[str, float]):
         """Update metrics history"""
         for key, value in metrics.items():
