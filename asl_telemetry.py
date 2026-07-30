@@ -23,8 +23,10 @@ Implements the manual-fallback minimum of todos/ASL_plan.md (SS3, SS5, SS8):
 
 Measurement hygiene (SS5): all metrics are computed on columns >= 2 (PAD=0
 and UNK=1 are live, loss-free, drifting outputs), probabilities are fp32
-upcast before sigmoid, and rating tags are excluded from dp/pos-mean style
-metrics by default (they inflate mean(p_pos)).
+upcast before sigmoid, and rating tags are excluded from EVERY column-space
+metric -- dp_mean, dp_hard, the non-GT histogram AND the per-decile EPR.
+Every row carries exactly one rating positive, so leaving them in inflates
+mean(p_pos) and swamps the EPR denominator of whichever decile they sort into.
 
 The golden/Anima set is deliberately NOT wired here: it is evaluation-only,
 via the standalone tools/asl_anima_canary.py script.
@@ -92,7 +94,45 @@ class ASLDriveManager:
     # gamma_neg reconciliation + guarded manual steps (SS3, SS8)
     # ------------------------------------------------------------------
 
+    # State keys whose meaning is PHASE-LOCAL: epoch counters reset to 0 at a
+    # phase transition (train_direct.py), so a value inherited from the previous
+    # phase is not just stale, it is in a different coordinate system. Carrying
+    # `gamma_last_change_epoch` forward makes the dwell guard compute a NEGATIVE
+    # elapsed and refuse every step for `last_change + 3` epochs of the new
+    # phase; carrying `epr_baseline*` compares 448px EPR against a 320px
+    # baseline. `gamma_neg` and `gamma_history` are deliberately NOT in this set:
+    # gamma carries over frozen across a transition (ASL_plan SS3).
+    _PHASE_LOCAL_STATE_KEYS = (
+        "gamma_last_change_epoch",
+        "epr_baseline",
+        "epr_baseline_epoch",
+        "epr_baseline_pending_epoch",
+        "telemetry",
+    )
+
     def _reconcile_gamma(self, tag_loss_cfg, start_epoch: int) -> None:
+        # Must run BEFORE self.state["phase"] is overwritten below.
+        persisted_phase = self.state.get("phase")
+        # `self.phase > 0` mirrors train_direct's phase_transition predicate
+        # exactly. Without it, running with training.phase unset (0) against a
+        # phase-2 checkpoint would drop the dwell bookkeeping even though the
+        # trainer did NOT reset the epoch counters, letting a manual gamma step
+        # land earlier than min_dwell_epochs allows.
+        if (persisted_phase is not None and self.phase > 0
+                and int(persisted_phase) != self.phase):
+            dropped = [k for k in self._PHASE_LOCAL_STATE_KEYS if k in self.state]
+            for key in dropped:
+                self.state.pop(key, None)
+            logger.warning(
+                "ASL drive: PHASE CHANGE %s -> %d detected in the persisted loss state. "
+                "Dropped phase-local keys %s (epoch counters are phase-local; keeping "
+                "them would make the dwell guard refuse every gamma step for the first "
+                "~%d epochs of the new phase and compare EPR against the previous "
+                "phase's baseline). gamma_neg and gamma_history carry over.",
+                persisted_phase, self.phase, dropped or "<none>",
+                int(getattr(self.sched, "min_dwell_epochs", 3)),
+            )
+
         yaml_gamma = float(tag_loss_cfg.gamma_neg)
         persisted = self.state.get("gamma_neg")
 
@@ -216,8 +256,33 @@ class ASLDriveManager:
         # against this baseline for epr_alarm_window_epochs after the step.
         tele_state = self.state.get("telemetry") or {}
         epr = tele_state.get("epr_deciles")
-        self.state["epr_baseline"] = list(epr) if epr else None
+        # A list of all-NaN is truthy but useless as a baseline -- require at
+        # least one finite decile before accepting it.
+        _usable = bool(epr) and any(
+            isinstance(v, (int, float)) and math.isfinite(v) for v in epr
+        )
+        self.state["epr_baseline"] = list(epr) if _usable else None
         self.state["epr_baseline_epoch"] = epoch1
+        # If no EPR has been logged yet there is nothing to snapshot -- which is
+        # the normal case for a step taken at startup (_reconcile_gamma runs
+        # before _init_telemetry) and ALWAYS the case for the first step after a
+        # phase change, since the stale telemetry is dropped there. Without this
+        # flag the baseline would stay None forever and the SS5 trend alarm --
+        # the gate this step is supposed to be watched by -- would be silently
+        # dead. _log_train captures the first available EPR as the baseline.
+        if not self.state["epr_baseline"]:
+            self.state["epr_baseline_pending_epoch"] = epoch1
+            logger.info(
+                "ASL drive: no EPR sample yet, deferring the trend-alarm baseline to "
+                "the first telemetry log after this step (epoch %d). NOTE the deferred "
+                "snapshot is measured AFTER the step, so it anchors the trend rather "
+                "than capturing the step's own immediate effect.", epoch1,
+            )
+        else:
+            # A valid baseline was captured here, so any marker left by an earlier
+            # deferred step is stale; leaving it would let the next _log_train
+            # overwrite this baseline and re-anchor it to the older epoch.
+            self.state.pop("epr_baseline_pending_epoch", None)
         logger.warning(
             "ASL drive: gamma_neg STEP APPLIED %.3f -> %.3f at epoch %d (phase %d, "
             "source=%s). Gates to watch (ASL_plan SS5): per-decile EPR trend, "
@@ -298,6 +363,16 @@ class ASLDriveManager:
                 )
         self.content_mask_cpu = content
         self.content_mask = content.to(self.device)
+        # Float copies for the per-decile EPR column sums. EPR must honour the
+        # same exclusion as dp_mean/dp_hard: every training row carries exactly
+        # one rating positive, so with the rating tags left in they dominate the
+        # denominator of whichever decile they land in (in the shipped vocab they
+        # have no entry in tag_frequencies, so they sort to the RAREST decile and
+        # make up ~87% of its expected-positive mass). That desensitises the
+        # per-decile EPR trend -- the primary always-on over-suppression gate --
+        # in exactly the decile a high gamma_neg is most likely to damage.
+        self.content_mask_f = self.content_mask.float()
+        self.content_mask_f_cpu = content.float()
 
         # --- Confusable sibling groups (val-side sibling-gap metric) ---
         self.sibling_groups: List[Tuple[str, torch.Tensor]] = []
@@ -393,10 +468,12 @@ class ASLDriveManager:
         # Threshold-free EPR components per tag-frequency decile (Cole 2021):
         # EMA numerator (sum p) and denominator (expected positives) separately
         # so rare deciles with zero positives in a single batch stay stable.
+        # Rating columns are zeroed out of both sums (see content_mask_f).
+        mf = self.content_mask_f
         epr_num = torch.zeros(self.num_deciles, device=probs.device)
-        epr_num.scatter_add_(0, self.decile_ids, probs.sum(dim=0))
+        epr_num.scatter_add_(0, self.decile_ids, probs.sum(dim=0) * mf)
         epr_den = torch.zeros(self.num_deciles, device=probs.device)
-        epr_den.scatter_add_(0, self.decile_ids, targs.float().sum(dim=0))
+        epr_den.scatter_add_(0, self.decile_ids, targs.float().sum(dim=0) * mf)
 
         if not self._ema_ready:
             self._dp_mean_ema.copy_(dp_mean)
@@ -447,9 +524,28 @@ class ASLDriveManager:
         # SS5 EPR trend alarm: sustained relative drop in any decile within
         # epr_alarm_window epochs of a gamma step -> step back up.
         alarm = 0.0
+        # Deferred baseline capture: a gamma step taken before any EPR sample
+        # existed left a marker instead of a snapshot. Fill it from the first
+        # real EPR we compute, anchored to the epoch of the step.
+        pending = self.state.pop("epr_baseline_pending_epoch", None)
+        if pending is not None and any(math.isfinite(v) for v in epr):
+            self.state["epr_baseline"] = list(epr)
+            self.state["epr_baseline_epoch"] = int(pending)
+            logger.info(
+                "ASL telemetry: captured deferred EPR trend-alarm baseline for the "
+                "epoch-%d gamma step.", int(pending),
+            )
+        elif pending is not None:
+            self.state["epr_baseline_pending_epoch"] = pending  # still nothing usable
+
         baseline = self.state.get("epr_baseline")
         base_epoch = self.state.get("epr_baseline_epoch")
-        if baseline and base_epoch is not None and (epoch0 + 1) - int(base_epoch) <= self.epr_alarm_window:
+        # `0 <=` matters: without a lower bound a baseline whose epoch is AHEAD of
+        # the current one (only reachable if a phase-local baseline survived a
+        # phase transition) satisfies the window with a negative elapsed and
+        # alarms indefinitely. _reconcile_gamma now drops those, this is belt-and-braces.
+        elapsed_epochs = (epoch0 + 1) - int(base_epoch) if base_epoch is not None else None
+        if baseline and elapsed_epochs is not None and 0 <= elapsed_epochs <= self.epr_alarm_window:
             for d, (cur, ref) in enumerate(zip(epr, baseline)):
                 if (ref is not None and math.isfinite(cur) and math.isfinite(ref)
                         and ref > 1e-9 and (ref - cur) / ref > self.epr_alarm_rel_drop):
@@ -493,6 +589,7 @@ class ASLDriveManager:
 
         n = cat_probs.size(0)
         m = self.content_mask_cpu
+        mf = self.content_mask_f_cpu
         ids = self.decile_ids_cpu
         k = self.topk
 
@@ -503,8 +600,6 @@ class ASLDriveManager:
         top_sum = 0.0
         top_cnt = 0
         hist = torch.zeros(self.hist_bins)
-        hist_total_all = 0
-        hist_gt_total = 0
         epr_num = torch.zeros(self.num_deciles)
         epr_den = torch.zeros(self.num_deciles)
         gap_sums = {name: 0.0 for name, _ in self.sibling_groups}
@@ -521,20 +616,23 @@ class ASLDriveManager:
             neg_sum += float((p * neg).sum())
             neg_cnt += int(neg.sum())
 
+            # Rating columns are pushed to -1, which falls outside [hist_min,
+            # hist_max] so torch.histc drops them, and below the topk floor so
+            # they can never be selected as a hard non-GT capture.
+            p_c = p.masked_fill(~m, -1.0)
+
             kk = min(k, p.size(1))
-            top = p.masked_fill(t | ~m, -1.0).topk(kk, dim=1).values
+            top = p_c.masked_fill(t, -1.0).topk(kk, dim=1).values
             top_sum += float(top.clamp(min=0.0).sum())
             top_cnt += top.numel()
 
             # Non-GT histogram = hist(all) - hist(GT); GT entries are sparse.
-            hist += torch.histc(p, bins=self.hist_bins, min=self.hist_min, max=self.hist_max)
-            gt_scores = p[t]
-            hist -= torch.histc(gt_scores, bins=self.hist_bins, min=self.hist_min, max=self.hist_max)
-            hist_gt_total += gt_scores.numel()
-            hist_total_all += p.numel()
+            hist += torch.histc(p_c, bins=self.hist_bins, min=self.hist_min, max=self.hist_max)
+            hist -= torch.histc(p_c[t], bins=self.hist_bins, min=self.hist_min, max=self.hist_max)
 
-            epr_num.scatter_add_(0, ids, p.sum(dim=0))
-            epr_den.scatter_add_(0, ids, t.float().sum(dim=0))
+            # Same rating exclusion as the train side (see content_mask_f).
+            epr_num.scatter_add_(0, ids, p.sum(dim=0) * mf)
+            epr_den.scatter_add_(0, ids, t.float().sum(dim=0) * mf)
 
             for name, gidx in self.sibling_groups:
                 sub_p = p[:, gidx]

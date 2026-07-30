@@ -93,7 +93,10 @@ def load_and_preprocess(path: Path, image_size: int, mean, std, pad_color):
         w, h = img.size
         scale = min(1.0, min(image_size / float(w), image_size / float(h)))
         nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
-        resized = img.resize((nw, nh), Image.Resampling.BILINEAR)
+        # LANCZOS to match dataset_loader's training-time RESAMPLE_LANCZOS. This
+        # feeds the ASL recall canary, so a preprocessing mismatch here would
+        # show up as a gate signal rather than as the skew it actually is.
+        resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
         canvas = Image.new("RGB", (image_size, image_size), tuple(pad_color))
         canvas.paste(resized, ((image_size - nw) // 2, (image_size - nh) // 2))
 

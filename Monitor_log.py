@@ -1431,10 +1431,17 @@ class TrainingMonitor:
     
     def log_augmentations(self, step: int, stats: Any):
         """Log augmentation statistics to TensorBoard.
-        
+
+        UNREACHABLE as of the orientation-handler removal: the only caller is
+        train_direct.py's stats_queue drain, and nothing pushes to that queue any
+        more (SidecarJsonDataset accepts the queue but never writes to it). The
+        flip_safe / flip_skipped_text / flip_blocked_safety keys below only ever
+        existed for the abandoned direction-sensitive-tag flip design. Kept so the
+        dead chain stays inspectable in one place rather than half-deleted.
+
         Args:
             step: Current training step
-            stats: AugmentationStats object or dict with augmentation statistics
+            stats: dict of augmentation statistics
         """
         # Only log at intervals to avoid overwhelming TensorBoard
         if step - self.last_aug_log_step < self.config.augmentation_stats_interval:

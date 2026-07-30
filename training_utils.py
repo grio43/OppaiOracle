@@ -350,6 +350,52 @@ def _get_nested_value(obj, key_path: str, default=None):
     return current if current is not None else default
 
 
+_STATE_DICT_WRAPPER_PREFIXES = ('module.', '_orig_mod.')
+
+
+def strip_state_dict_prefixes(key: str) -> str:
+    """Strip DDP / torch.compile wrapper prefixes from one state-dict key.
+
+    Training saves ``model.state_dict()`` from the torch.compile'd module
+    (config.training.use_compile defaults to true), so EVERY key in a real
+    checkpoint is prefixed with ``_orig_mod.``; DDP adds ``module.``. Both can be
+    present and either order is possible, hence the loop.
+
+    Uses removeprefix, not str.replace: an unbounded replace would also mangle
+    the substring anywhere later in the key.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _STATE_DICT_WRAPPER_PREFIXES:
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                changed = True
+    return key
+
+
+def normalize_state_dict_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Return ``state_dict`` with DDP/torch.compile wrapper prefixes removed.
+
+    Every consumer that loads a raw checkpoint into a bare (uncompiled) module
+    must call this first, or ``load_state_dict(strict=True)`` fails with a
+    confusing "Missing key(s)" listing every parameter in the model.
+    """
+    if not isinstance(state_dict, dict):
+        return state_dict
+    if not any(
+        isinstance(k, str) and k.startswith(_STATE_DICT_WRAPPER_PREFIXES)
+        for k in state_dict
+    ):
+        return state_dict
+    # isinstance guard: a state dict mixing non-str keys must not raise here.
+    # type(state_dict)(...) preserves OrderedDict and friends.
+    return type(state_dict)(
+        (strip_state_dict_prefixes(k) if isinstance(k, str) else k, v)
+        for k, v in state_dict.items()
+    )
+
+
 def detect_architecture_from_state_dict(state_dict_keys: list[str]) -> Optional[str]:
     """Detect model architecture type from state dict key patterns.
 
@@ -364,14 +410,7 @@ def detect_architecture_from_state_dict(state_dict_keys: list[str]) -> Optional[
         None if architecture cannot be determined.
     """
     # Normalize keys: remove 'module.' prefix (DDP) and '_orig_mod.' prefix (torch.compile)
-    normalized_keys = []
-    for key in state_dict_keys:
-        k = key
-        if k.startswith('module.'):
-            k = k[7:]  # len('module.') = 7
-        if k.startswith('_orig_mod.'):
-            k = k[10:]  # len('_orig_mod.') = 10
-        normalized_keys.append(k)
+    normalized_keys = [strip_state_dict_prefixes(key) for key in state_dict_keys]
 
     # ViT architecture indicators (SimplifiedTagger)
     # ViT models have 'patch_embed', 'blocks', 'cls_token', 'pos_embed' at top level
@@ -665,6 +704,13 @@ class TrainingState:
     optimizer_updates: int = 0
     best_metric: float = float('-inf')
     best_epoch: int = 0
+    # Name of the scalar `best_metric` was measured with (config.training.
+    # selection_metric). best_metric is meaningless without it: macro-F1 and mAP
+    # differ by ~50x in magnitude on this task, so restoring a best_metric
+    # recorded under one metric while selecting on another either freezes
+    # is_best forever or makes the first epoch a guaranteed false "best".
+    # Empty string = a checkpoint predating this field.
+    selection_metric: str = ""
 
     # Epoch tracking for proper resume semantics
     completed_epochs: int = 0
@@ -689,6 +735,16 @@ class TrainingState:
     # Early stopping
     patience_counter: int = 0
     should_stop: bool = False
+    # Burn-in samples collected so far. Persisted because the burn-in baseline is a
+    # summary (median/mean/max) over the WHOLE window: a resume inside the window that
+    # restarted this list empty would compute the baseline from the post-resume subset
+    # only, silently shifting the early-stopping reference point.
+    burn_in_values: List[float] = field(default_factory=list)
+    # global_step of the last validation pass. Persisted so the eval_steps cadence
+    # survives a soft stop; when this reset to 0 on restart,
+    # `global_step - last_validation_step >= eval_steps` was trivially true and the
+    # first post-resume epoch always validated regardless of the configured cadence.
+    last_validation_step: int = 0
     
     # Gradient accumulation
     accumulation_steps: int = 0
@@ -823,6 +879,68 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
             self.cycle = cycle
         if cur_cycle_steps is not None:
             self.cur_cycle_steps = cur_cycle_steps
+
+    def retarget(self, *, max_lr: float, warmup_steps: int, first_cycle_steps: int,
+                 min_lr: Optional[float] = None, gamma: Optional[float] = None):
+        """Re-point the schedule at a new geometry while preserving progress.
+
+        For resuming a run whose LR schedule no longer matches the config. ``state_dict()``
+        is the whole ``__dict__``, so ``load_state_dict`` restores the checkpoint's peak
+        LR, ``base_lrs``, warmup length, cycle length, ``min_lr`` and ``gamma`` - every
+        one of which the current config may have moved. Continuing with them means
+        training on the previous run's schedule while the config claims otherwise.
+
+        Progress is carried across as a FRACTION of the cycle rather than as an absolute
+        update count. That is the only mapping that keeps the cosine landing on
+        ``min_lr`` at the end of training when updates-per-epoch changes; carrying the
+        absolute ``step_in_cycle`` would either truncate the anneal (larger batch) or
+        overrun ``cur_cycle_steps`` and fire an unintended warm restart (smaller batch).
+
+        ``min_lr`` / ``gamma`` are optional because neither depends on batch size, which
+        is what this method was first written for. They are accepted anyway: the caller
+        is now a general LR-schedule guard, and a resume that silently discarded a
+        changed ``lr_end`` would anneal to the OLD floor while the config advertised the
+        new one. Pass None to leave either at its restored value.
+
+        Any gamma decay already earned by completed cycles is re-applied on top of the
+        new peak.
+        """
+        old_cycle = max(1, int(self.cur_cycle_steps))
+        new_cycle = max(int(first_cycle_steps), int(warmup_steps) + 1)
+        progress = min(1.0, max(0.0, self.step_in_cycle / old_cycle))
+
+        # Preserve per-group LR ratios (layer-wise decay / separate head LR) by scaling
+        # base_lrs against the OLD peak rather than overwriting them with the new one.
+        old_peak = float(self.base_max_lr) if self.base_max_lr else float(max_lr)
+        ratio = (float(max_lr) / old_peak) if old_peak else 1.0
+        self.base_lrs = [lr * ratio for lr in self.base_lrs]
+
+        # Both must land BEFORE max_lr is recomputed below, which reads them.
+        if min_lr is not None:
+            self.min_lr = float(min_lr)
+        if gamma is not None:
+            self.gamma = float(gamma)
+
+        self.base_max_lr = float(max_lr)
+        self.max_lr = max(self.base_max_lr * (self.gamma ** self.cycle), self.min_lr)
+        self.warmup_steps = int(warmup_steps)
+        self.first_cycle_steps = int(first_cycle_steps)
+        self.cur_cycle_steps = new_cycle
+        self.step_in_cycle = min(new_cycle - 1, int(round(progress * new_cycle)))
+
+        # Apply immediately: the next optimizer update happens before the next
+        # scheduler.step(), so without this it would run at the stale restored LR.
+        # 'initial_lr' is re-synced too - it is only read by _LRScheduler.__init__, but
+        # it rides along in optimizer.state_dict() into every subsequent checkpoint, and
+        # leaving it at the pre-retarget value plants a contradiction for whoever reads
+        # that checkpoint next.
+        new_lrs = self.get_lr()
+        for group, lr, base in zip(self.optimizer.param_groups, new_lrs, self.base_lrs):
+            group['lr'] = lr
+            if 'initial_lr' in group:
+                group['initial_lr'] = base
+        self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
+        return new_lrs
 
     def step(self, epoch=None):
         if epoch is None:
@@ -1288,6 +1406,10 @@ class CheckpointManager:
                 'warmup_steps': getattr(scheduler, 'warmup_steps', None),
                 'first_cycle_steps': getattr(scheduler, 'first_cycle_steps', None),
                 'max_lr': getattr(scheduler, 'max_lr', None),
+                # base_max_lr is the CONFIGURED peak; max_lr is the live value after any
+                # gamma decay from completed restarts. Only the former is comparable
+                # across runs, so it is what the resume-time diff check reads.
+                'base_max_lr': getattr(scheduler, 'base_max_lr', None),
                 'min_lr': getattr(scheduler, 'min_lr', None),
             }
 
@@ -2067,16 +2189,24 @@ class CheckpointManager:
                 # different values, but the checkpoint values take precedence.
                 saved_params = meta.get('scheduler_params', {})
                 if saved_params:
+                    # base_max_lr / min_lr belong in this list: load_state_dict restores
+                    # the checkpoint's peak LR and base_lrs too, so a run that recomputed
+                    # its LR (e.g. a batch-size change feeding scale_learning_rate) would
+                    # otherwise train at the old rate with no message at all. This is a
+                    # WARNING, not INFO - silently discarding the configured LR is the
+                    # kind of thing that costs a training run.
                     param_diffs = []
-                    for key in ['total_steps', 'warmup_steps', 'first_cycle_steps']:
+                    for key in ['total_steps', 'warmup_steps', 'first_cycle_steps',
+                                'base_max_lr', 'min_lr']:
                         saved_val = saved_params.get(key)
                         current_val = getattr(scheduler, key, None)
                         if saved_val is not None and current_val is not None and saved_val != current_val:
                             param_diffs.append(f"{key}: config={current_val} vs checkpoint={saved_val}")
                     if param_diffs:
-                        logger.info(
+                        logger.warning(
                             f"Scheduler config differs from checkpoint: {', '.join(param_diffs)}. "
-                            f"Using checkpoint values for training continuity."
+                            f"Checkpoint values take precedence for training continuity - the "
+                            f"config values above are NOT applied."
                         )
 
                 scheduler.load_state_dict(saved_sched_state)

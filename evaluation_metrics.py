@@ -38,7 +38,8 @@ class MetricComputer:
     Args:
         num_labels: Total number of labels in the vocabulary.
         threshold: Threshold for converting probabilities to binary predictions.
-            Default is 0.2653, but this may not be optimal for all models. Consider
+            Default is 0.7927 (this model's measured micro P=R break-even), but this
+            may not be optimal for all models. Consider
             using find_optimal_threshold() on validation data to determine the
             best threshold for your specific model and dataset.
         skip_indices: Optional list of label indices to exclude from metric computation
@@ -52,9 +53,12 @@ class MetricComputer:
                           Good compromise for imbalanced multi-label classification.
 
     Note on threshold selection:
-        The default threshold of 0.2653 matches the P=R threshold used by
-        competing v2.0 models for comparable evaluation. Note that this may not
-        be optimal for:
+        The default threshold of 0.7927 is this model's own micro P=R break-even,
+        measured at epoch 7 / step 85517 over 296,056 validation samples and
+        19,292 tags (P=R=0.6987). It replaces 0.2653, which was the P=R point of
+        competing v2.0 models and was never measured against this model — at that
+        value it emitted ~4,158 tags/image against ~36 true tags. Note that
+        0.7927 may still not be optimal for:
         - Imbalanced datasets where positive class is rare
         - Models trained with class weights or focal loss
         - Applications where precision/recall trade-off favors one over the other
@@ -69,7 +73,7 @@ class MetricComputer:
                     between macro and micro approaches.
     """
     num_labels: int
-    threshold: float = 0.2653
+    threshold: float = 0.7927
     skip_indices: Optional[List[int]] = None
     mAP_average: AveragingMode = "macro"
 
@@ -429,7 +433,7 @@ class FrequencyBucketMetrics:
         self,
         predictions: torch.Tensor,
         targets: torch.Tensor,
-        threshold: float = 0.2653,
+        threshold: float = 0.7927,
     ) -> Dict[str, Dict[str, float]]:
         """Compute per-bucket F1 (macro/micro), mAP, tag count, and mean support.
 
@@ -525,7 +529,7 @@ class ThresholdCalibrator:
         search_step: Step size for threshold grid search.
     """
     mode: str = "per_bucket"
-    default_threshold: float = 0.2653
+    default_threshold: float = 0.7927
     search_min: float = 0.1
     search_max: float = 0.9
     search_step: float = 0.02
@@ -690,7 +694,7 @@ class ThresholdCalibrator:
         predictions: torch.Tensor,
         tag_thresholds: Dict[str, float],
         tag_names: List[str],
-        default_threshold: float = 0.2653,
+        default_threshold: float = 0.7927,
     ) -> torch.Tensor:
         """Apply per-tag thresholds to convert probabilities to binary predictions.
 

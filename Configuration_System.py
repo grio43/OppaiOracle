@@ -1117,6 +1117,51 @@ class DataConfig(BaseConfig):
         if self.random_rotation_max_degrees > 45:
             errors.append(f"random_rotation_max_degrees must be <= 45, got {self.random_rotation_max_degrees}")
 
+        # Color jitter: magnitudes are torchvision "factor +/- m" ranges, so m >= 0,
+        # and m > 1 for brightness/contrast/saturation would allow a negative factor.
+        for _name in ("color_jitter_brightness", "color_jitter_contrast", "color_jitter_saturation"):
+            _m = getattr(self, _name)
+            if not (0.0 <= _m <= 1.0):
+                errors.append(f"{_name} must be in [0, 1], got {_m}")
+        for _name in ("color_jitter_brightness_p", "color_jitter_contrast_p", "color_jitter_saturation_p"):
+            _p = getattr(self, _name)
+            if not (0.0 <= _p <= 1.0):
+                errors.append(f"{_name} must be in [0, 1], got {_p}")
+
+        # Random erasing
+        if not (0.0 <= self.random_erasing_p <= 1.0):
+            errors.append(f"random_erasing_p must be in [0, 1], got {self.random_erasing_p}")
+        if not (0.0 < self.random_erasing_scale_min <= self.random_erasing_scale_max <= 1.0):
+            errors.append(
+                "random_erasing scale must satisfy 0 < scale_min <= scale_max <= 1, got "
+                f"[{self.random_erasing_scale_min}, {self.random_erasing_scale_max}]"
+            )
+        if not (0.0 < self.random_erasing_ratio_min <= self.random_erasing_ratio_max):
+            errors.append(
+                "random_erasing ratio must satisfy 0 < ratio_min <= ratio_max, got "
+                f"[{self.random_erasing_ratio_min}, {self.random_erasing_ratio_max}]"
+            )
+
+        # Gaussian blur. Without these, a swapped sigma pair or an even kernel only
+        # surfaces deep inside dataset construction (torchvision raises), long after
+        # config validation has reported the run as healthy.
+        if not (0.0 <= self.gaussian_blur_p <= 1.0):
+            errors.append(f"gaussian_blur_p must be in [0, 1], got {self.gaussian_blur_p}")
+        if self.gaussian_blur_kernel_size < 1:
+            errors.append(
+                f"gaussian_blur_kernel_size must be >= 1, got {self.gaussian_blur_kernel_size}"
+            )
+        elif self.gaussian_blur_kernel_size % 2 == 0:
+            errors.append(
+                "gaussian_blur_kernel_size must be odd (torchvision requirement), got "
+                f"{self.gaussian_blur_kernel_size}"
+            )
+        if not (0.0 < self.gaussian_blur_sigma_min <= self.gaussian_blur_sigma_max):
+            errors.append(
+                "gaussian_blur sigma must satisfy 0 < sigma_min <= sigma_max, got "
+                f"[{self.gaussian_blur_sigma_min}, {self.gaussian_blur_sigma_max}]"
+            )
+
         # Validate additional dtype configurations
         valid_float_dtypes = ["float16", "bfloat16", "float32"]
         if self.tag_vector_dtype not in valid_float_dtypes:
@@ -1384,7 +1429,22 @@ class TrainingConfig(BaseConfig):
     # Set True only to load a legacy checkpoint that predates embedded vocab SHAs
     # (you are then responsible for confirming the vocabulary matches).
     allow_unverified_vocab_resume: bool = False
-    
+    # What to do when a resumed checkpoint's LR geometry no longer matches what this
+    # config computes. _LRScheduler.state_dict() is the whole __dict__, so
+    # scheduler.load_state_dict() restores base_max_lr, base_lrs, warmup_steps,
+    # first_cycle_steps and cur_cycle_steps verbatim - every one of them calibrated for
+    # the OLD run. Continuing blindly trains at the previous calibration with no visible
+    # sign. Originally this only covered a change in EFFECTIVE batch size
+    # (batch_size x gradient_accumulation_steps); it now also covers warmup_steps,
+    # first_cycle_steps and base_max_lr, because a DATASET SIZE change moves
+    # len(train_loader) -> updates_per_epoch -> warmup/cycle length while leaving the
+    # batch size untouched, which the batch-only trigger could not see at all:
+    #   "error"   -> refuse to resume and explain the options (default; safe)
+    #   "rescale" -> retarget peak LR / warmup / cycle length to the CURRENT config,
+    #                preserving progress as a fraction of the cycle
+    #   "keep"    -> keep the checkpoint's LR geometry (old behaviour), warn loudly
+    on_lr_schedule_change: str = "error"
+
     # Loss configuration
     tag_loss: LossConfig = field(default_factory=LossConfig)
 
@@ -1412,6 +1472,16 @@ class TrainingConfig(BaseConfig):
     deterministic: bool = False  # turn on only when seed is set
     benchmark: bool = True
     
+    # Scalar that drives best-checkpoint selection and early stopping.
+    # One of: 'val_mAP', 'val_f1_macro', 'val_f1_micro'.
+    # Default is val_mAP because it is THRESHOLD-FREE. The F1 variants are
+    # evaluated at the single frozen inference.prediction_threshold, which makes
+    # them calibration-coupled: a rank-preserving shift of the probability scale
+    # (exactly what an ASL gamma_neg step produces) moves macro-F1 by far more
+    # than a real epoch's ranking gain, and lowering gamma_neg pushes
+    # probabilities DOWN, so a genuine improvement registers as a large drop.
+    selection_metric: str = "val_mAP"
+
     # Early stopping
     early_stopping_patience: int = 10
     early_stopping_threshold: float = 0.0001
@@ -1495,6 +1565,11 @@ class TrainingConfig(BaseConfig):
         # Early-stopping burn-in
         if self.early_stopping_burn_in_epochs is None or int(self.early_stopping_burn_in_epochs) < 0:
             errors.append("early_stopping_burn_in_epochs must be >= 0")
+        _valid_selection = ("val_mAP", "val_f1_macro", "val_f1_micro")
+        if self.selection_metric not in _valid_selection:
+            errors.append(
+                f"selection_metric must be one of {_valid_selection}, got {self.selection_metric!r}"
+            )
         allowed_es_strategies = {"median", "mean", "last", "max"}
         if str(self.early_stopping_burn_in_strategy).lower() not in allowed_es_strategies:
             errors.append(
@@ -1519,7 +1594,11 @@ class InferenceConfig(BaseConfig):
     model_path: Optional[str] = None
     precision: str = "bf16"  # Options: "fp32", "fp16", "bf16"
     # Prediction
-    prediction_threshold: float = 0.2653
+    # Micro P=R break-even measured on this model (epoch 7 / step 85517,
+    # 296,056 val samples, 19,292 tags): 0.792672, P=R=0.6987. The previous
+    # 0.2653 was borrowed from competing v2.0 models and never measured here.
+    # threshold_calibration.default_threshold must be kept equal to this.
+    prediction_threshold: float = 0.7927
     top_k: Optional[int] = None
     eye_color_exclusive: bool = False  # Enforce mutual exclusivity for eye color tags
 
@@ -1609,8 +1688,10 @@ class ExportConfig(BaseConfig):
     model_description: str = "Anime Image Tagger Model"
     model_author: str = "AnimeTaggers"
     model_version: str = "1.0.0"
-    # Output
-    output_path: str = "./exported_model"
+    # Output: the FILE to write, not a directory (sibling artifacts such as
+    # selected_tags.csv go to its parent). The old "./exported_model" default
+    # collided with the directory of that name in the repo, so every save failed.
+    output_path: str = "./exported_model/model.onnx"
 
     # Which variant(s) to produce. Default is float16 since the model is trained
     # in bf16 — keeping inference at 16-bit roughly halves the file size and is
@@ -1671,7 +1752,7 @@ class ThresholdCalibrationConfig(BaseConfig):
     mode: str = "per_bucket"  # "per_tag" | "per_bucket"
     # Must equal inference.prediction_threshold (single source of truth; enforced
     # in FullConfig.validate()).
-    default_threshold: float = 0.2653
+    default_threshold: float = 0.7927
     search_min: float = 0.1
     search_max: float = 0.9
     search_step: float = 0.02
@@ -1711,10 +1792,51 @@ class ValidationConfig(BaseConfig):
     # Frequency-bin edges for the bucketed validation metrics (val_bucketed/* in
     # train_direct). None = use the built-in default [300, 500, 1000, 5000, 10000, inf].
     frequency_bins: Optional[List[float]] = None
+    # Number of uniform thresholds for MultilabelAveragePrecision's binned mode.
+    #
+    # DO NOT RAISE THIS without measuring. The persistent state is small
+    # (ap_thresholds * num_labels * 32 bytes) but torchmetrics materialises a
+    # (batch, num_labels, ap_thresholds) int64 intermediate on EVERY update, so
+    # the real cost is the transient peak. Measured on an RTX 5090 at B=48,
+    # 19,296 labels:
+    #     200  -> 0.25 GB state,  9.3 GB peak/update,   40 ms/update
+    #     500  -> 0.62 GB state, 23.3 GB peak/update,  105 ms/update
+    #     2000 -> 2.47 GB state, 93.3 GB peak/update, 9906 ms/update
+    # 2000 only "ran" because WDDM spilled to host RAM: a 30K-image validation
+    # pass went from 25 s to ~103 minutes, and on any non-WDDM setup it is a hard
+    # OOM on the first val batch.
+    #
+    # The cost of staying at 200 is a mAP bias of about -0.0031 versus the exact
+    # metric (measured on the epoch-7 validation cache), near-uniform across
+    # support buckets. That bias is not fully constant — it responds slightly to
+    # rank-preserving calibration shifts — so when comparing val_mAP across a
+    # change that moves the probability scale, treat differences below ~0.003 as
+    # noise rather than signal.
+    ap_thresholds: int = 200
 
     def validate(self):
         """Validate validation configuration"""
         errors = []
+        if self.ap_thresholds is None:
+            errors.append("ap_thresholds must be an int >= 2, got null")
+        elif isinstance(self.ap_thresholds, bool) or not isinstance(self.ap_thresholds, int):
+            # Reject floats explicitly: int(3.7) silently truncates to 3.
+            errors.append(f"ap_thresholds must be an int, got {self.ap_thresholds!r}")
+        else:
+            try:
+                _apt = int(self.ap_thresholds)
+            except (TypeError, ValueError):
+                errors.append(f"ap_thresholds must be an int, got {self.ap_thresholds!r}")
+            else:
+                if _apt < 2:
+                    errors.append(f"ap_thresholds must be >= 2, got {_apt}")
+                elif _apt > 500:
+                    errors.append(
+                        f"ap_thresholds={_apt} is above the measured-safe ceiling. The "
+                        f"per-update intermediate is (batch x num_labels x ap_thresholds) "
+                        f"int64: 500 already peaks at ~23 GB on a 48x19.3K batch. Raise "
+                        f"this ceiling only after measuring peak VRAM on your GPU."
+                    )
 
         if self.dataloader.batch_size <= 0:
             errors.append(f"dataloader.batch_size must be positive, got {self.dataloader.batch_size}")
@@ -1849,17 +1971,11 @@ class DebugConfig(BaseConfig):
     # If true, perform a pre-training validation step to check the integrity of the input data.
     validate_input_data: bool = False
 
-    # If true, save intermediate images during the data augmentation process for visual inspection.
-    visualize_augmentations: bool = False
-
     # If true, log statistics (min/mean/max) of input batches.
     log_input_stats: bool = False
 
     # If true, log statistics (min/mean/max) of model activations such as logits.
     log_activation_stats: bool = False
-
-    # Directory to save the visualized augmentation images.
-    augmentation_visualization_path: str = "./aug_visualizations"
 
     def validate(self):
         """Validate debug configuration."""

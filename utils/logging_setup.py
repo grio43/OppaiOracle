@@ -117,7 +117,12 @@ def setup_logging(
             log_path / "training.log",
             maxBytes=10*1024*1024,  # 10 MB
             backupCount=5,
-            compress=True
+            compress=True,
+            # Explicit UTF-8: without it Python uses the locale encoding, which on
+            # a cp932/cp1252 Windows box raises UnicodeEncodeError on any message
+            # containing an em-dash or arrow and DROPS that log line entirely —
+            # including on fatal paths, where the diagnostic matters most.
+            encoding="utf-8",
         )
         file_formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

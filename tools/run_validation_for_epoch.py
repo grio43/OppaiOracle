@@ -181,7 +181,7 @@ def main():
 
     # Metrics — mirror train_direct.py:1374-1388
     tc = getattr(config, 'threshold_calibration', None)
-    threshold = getattr(tc, 'default_threshold', 0.2653) if tc is not None else 0.2653
+    threshold = getattr(tc, 'default_threshold', 0.7927) if tc is not None else 0.7927
     skip_metric_cols = 2  # PAD=0, UNK=1
     num_metric_labels = num_tags - skip_metric_cols
     val_metrics = {
