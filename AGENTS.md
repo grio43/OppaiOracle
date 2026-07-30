@@ -13,7 +13,7 @@ The model is trained with a **two-stage progressive-resolution plan**:
 
 Architecture: ViT-L/16, 18 transformer layers, hidden_size 1024, 16 heads, mlp_dim 4096 (~228M backbone, ~250M total). Training is procedural (no Trainer/Lightning class) via [train_direct.py](train_direct.py).
 
-Design rationale and live status live in [todos/progressive-training-plan.md](todos/progressive-training-plan.md), [TRAINING_PIPELINE_MAP.md](TRAINING_PIPELINE_MAP.md), and [TRAINING_HEALTH_TRACKER.md](TRAINING_HEALTH_TRACKER.md).
+Design rationale and live status live in [todos/v2-plan.md](todos/v2-plan.md) (the authoritative V2 plan; see the Docs section below for the full doc set) and [TRAINING_HEALTH_TRACKER.md](TRAINING_HEALTH_TRACKER.md) (V1 Phase-2 run archive).
 
 ## Repo map
 
@@ -28,7 +28,7 @@ Design rationale and live status live in [todos/progressive-training-plan.md](to
 
 - [train_direct.py](train_direct.py) — **main training entrypoint** (procedural, ~2.5K LOC). `main()` parses args, loads `FullConfig`, dispatches validation-only or training. Core loop is `train_with_orientation_tracking(config)` (name retained for continuity; flip logic is inlined in the dataset). Handles vocab auto-build, dataloaders, ViT setup, AMP (bfloat16), gradient accumulation, checkpointing, metrics (F1-macro, mAP), early stopping, soft-stop, `torch.compile`, NaN/Inf detection.
 - [Start_AI_Training.ps1](Start_AI_Training.ps1) — Windows launcher. Sources `payton_env.ps1`, sets VS Build Tools + Windows SDK paths for `torch.compile`, then runs `train_direct.py`. Args: `-ConfigPath`, `-TrainingArgs`, `-KeepOpenOnError`, `-KeepOpen`.
-- [training_utils.py](training_utils.py) — training core: `TrainingState`, `CosineAnnealingWarmupRestarts`, `EarlyStopping`, `AsyncCheckpointWriter`, `CheckpointManager` (canonical checkpoint lifecycle), `TrainingUtils` (seed/optimizer/param-group/scheduler helpers), `validate_config_compatibility`, `detect_architecture_from_state_dict`.
+- [training_utils.py](training_utils.py) — training core: `TrainingState`, `CosineAnnealingWarmupRestarts`, `AsyncCheckpointWriter`, `CheckpointManager` (canonical checkpoint lifecycle), `TrainingUtils` (seed/optimizer/param-group/scheduler helpers), `validate_config_compatibility`, `detect_architecture_from_state_dict`.
 - [schedulers.py](schedulers.py) — `LinearWarmupCosineLR` (warmup then cosine anneal).
 - [adan_optimizer.py](adan_optimizer.py) — Adan optimizer (arXiv:2208.06677); single-/multi-tensor/CUDA-fused variants.
 - [custom_drop_path.py](custom_drop_path.py) — `SafeDropPath` stochastic-depth layer used in the ViT.
@@ -49,7 +49,7 @@ Design rationale and live status live in [todos/progressive-training-plan.md](to
 
 - [model_architecture.py](model_architecture.py) — `BaseTagger` (abstract), `SimplifiedTagger` (**ViT**, PyTorch 2.5+ Flex Attention with `scaled_dot_product_attention` ONNX fallback), `VisionTransformerConfig` (its config dataclass), `create_model(config, architecture_type='vit')`. Returns `{'tag_logits': ..., 'logits': ...}`.
 - [loss_functions.py](loss_functions.py) — `AsymmetricFocalLoss` (multi-label ASL; `gamma_pos`, `gamma_neg`, `alpha`, `clip`, `label_smoothing`, `ignore_indices=[0]`, per-class weights; log-space math for stability) and `MultiTaskLoss` wrapper (tag loss only).
-- [evaluation_metrics.py](evaluation_metrics.py) — `MetricComputer` (F1 macro/micro, mAP; default threshold **0.2653**; `skip_indices=[0]`), `FrequencyBucketMetrics` (LVIS-style per-frequency buckets), `ThresholdCalibrator` (per-tag/per-bucket threshold search).
+- [evaluation_metrics.py](evaluation_metrics.py) — `MetricComputer` (F1 macro/micro, mAP; default threshold **0.7927**, the measured micro-F1-optimal point that replaced 0.2653; `skip_indices=[0]`), `FrequencyBucketMetrics` (LVIS-style per-frequency buckets), `ThresholdCalibrator` (per-tag/per-bucket threshold search).
 
 ### Inference & export
 
@@ -78,10 +78,11 @@ Design rationale and live status live in [todos/progressive-training-plan.md](to
 
 ### Docs & state
 
-- [TRAINING_PIPELINE_MAP.md](TRAINING_PIPELINE_MAP.md) — current, accurate map of the training pipeline.
-- [TRAINING_HEALTH_TRACKER.md](TRAINING_HEALTH_TRACKER.md) — live Phase 2 runbook: per-epoch validation logs and canary checks.
-- [todos/progressive-training-plan.md](todos/progressive-training-plan.md) — research-grounded two-phase design.
-- [deprecated_candiates.md](deprecated_candiates.md) — review list of possibly-unused helpers (not a removal manifest).
+- [todos/v2-plan.md](todos/v2-plan.md) — the authoritative V2 plan (decisions + config); evidence base in [todos/v2-plan-review-2026-07-28.md](todos/v2-plan-review-2026-07-28.md).
+- [todos/janitor-cleaning-model-plan.md](todos/janitor-cleaning-model-plan.md) — throwaway cleaning-model campaign (one pass over 6.3M, then discard).
+- [todos/v2.1.1-suggestion-engine-buildout.md](todos/v2.1.1-suggestion-engine-buildout.md) — gold-training pipeline buildout; evidence base in [.research/_wf5_v2.1.1_verification.md](.research/_wf5_v2.1.1_verification.md).
+- [.research/golden_set_plan.md](.research/golden_set_plan.md) + [.research/golden_set_collection_targets.md](.research/golden_set_collection_targets.md) — golden-set rubrics, sizing, and Anima provenance (§8).
+- [TRAINING_HEALTH_TRACKER.md](TRAINING_HEALTH_TRACKER.md) — **V1 Phase-2 run archive** (soft-stopped at E5; per-epoch metrics + canary methodology; row format still emitted by `tools/run_validation_for_epoch.py`).
 
 ## Common commands
 
@@ -148,13 +149,13 @@ $env:ANIME_TAGGER_DATA__IMAGE_SIZE = "448"; python train_direct.py --config conf
 - **Effective batch size:** `batch_size (48) * gradient_accumulation_steps (9) [* world_size]` = **432** samples/optimizer step on a single GPU. Note: `FullConfig.compute_effective_batch_size()` multiplies by `self.training.world_size`, which is **not currently a field on `TrainingConfig`** — that method will raise on a single-GPU run; compute 432 directly, or add a `world_size` field (default 1) before calling it.
 - **LR scaling:** base `learning_rate=1.0e-5`, `lr_scaling_mode='sqrt'` → `sqrt(effective_batch/256)` ≈ 1.3× → ~1.4e-5 peak (Phase 2). Modes: `sqrt`/`linear`/`none`.
 - **Weight decay:** fixed at `0.05` (`training.weight_decay`) — no dataset-size scaling, by design.
-- **Loss (Phase 2):** `AsymmetricFocalLoss` with `gamma_pos=0.0`, `gamma_neg=7.0` (hard-negative focus), `clip=0.2`, `label_smoothing=0.0`, `ignore_indices=[0]`. Phase 1 used `gamma_neg=4.0`, `clip=0.05`. Static class weights are removed as redundant with ASL asymmetry. `MetricComputer` default threshold is `0.2653`.
+- **Loss (Phase 2):** `AsymmetricFocalLoss` with `gamma_pos=0.0`, `gamma_neg=7.0` (hard-negative focus), `clip=0.2`, `label_smoothing=0.0`, `ignore_indices=[0]`. Phase 1 used `gamma_neg=4.0`, `clip=0.05`. Static class weights are removed as redundant with ASL asymmetry. `MetricComputer` default threshold is `0.7927` (measured micro-F1 optimum; replaced 0.2653).
 - **AMP:** `amp_dtype = bfloat16` (required on CUDA; float16 not supported). `GradScaler` is disabled for bfloat16.
 - **Optimizers:** `adam`, `adamw`, `adamw8bit`, `sgd`, `rmsprop`, `adan`.
 - **Gradient clipping:** enabled, `max_norm=1.0`. **NaN/Inf checks** run periodically (`NAN_CHECK_INTERVAL_STEPS`, default 50).
 - **Resume:** `training.resume_from` ∈ `none`/`false`/`off` / `latest` / `best` / `<path>`; defaults to `latest` if checkpoints exist. Mid-epoch resume tracks batch/sample-in-epoch. Architecture is `vit` (the only supported architecture), taken from `model.architecture_type` or inferred from state-dict keys (`patch_embed`, `blocks`).
 - **Checkpoints** embed config + preprocessing params (normalize mean/std, image_size, patch_size, color_order) and vocab for reproducible inference. `torch.compile` is deferred until after checkpoint load (preserves tensor strides; requires Triton).
-- **Early stopping** watches `val/f1_macro` (patience 4, burn-in 2). Note: F1 is calibration-floored by the fixed 0.2653 threshold under Phase 2's logit shift; the health tracker recommends moving auto-stop to `val/mAP`.
+- **Early stopping** watches the configured `selection_metric` — currently **`val_mAP`** (`configs/unified_config.yaml:467`; dispatched in `train_direct.py`), patience 4, burn-in 2. The old f1_macro-based auto-stop was replaced per the v2 plan; a cross-metric `best_metric` reset guard handles resuming across the metric change.
 - **Soft-stop:** SIGINT/SIGTERM are queued to the next optimizer-step boundary; a `STOP_TRAINING` sentinel file also triggers a clean stop.
 
 ## Data & vocabulary
@@ -232,7 +233,7 @@ There is no full pytest suite. To sanity-check changes:
   ```powershell
   python -c "from model_architecture import create_model, VisionTransformerConfig; print(create_model(config=VisionTransformerConfig(image_size=448)))"
   python -c "from loss_functions import AsymmetricFocalLoss; print(AsymmetricFocalLoss(gamma_pos=0.0, gamma_neg=7.0, alpha=1.0, clip=0.2))"
-  python -c "from evaluation_metrics import MetricComputer; print(MetricComputer(num_labels=100, threshold=0.2653))"
+  python -c "from evaluation_metrics import MetricComputer; print(MetricComputer(num_labels=100, threshold=0.7927))"
   ```
 
 - **Eval without training:** `python validation_loop.py --checkpoint <path> --mode full ...`, or `tools/run_validation_for_epoch.py` (replicates the in-train validation: metrics, skip indices, 30K subsample seed) and check the row it emits to [TRAINING_HEALTH_TRACKER.md](TRAINING_HEALTH_TRACKER.md).
