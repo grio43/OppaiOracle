@@ -55,6 +55,25 @@ except ImportError:
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent
 _ARROW_CACHE_VERSION = "2.0"  # Arrow IPC format (added json_stem column)
+# Fraction of sidecar JSON files that may fail to parse before _build_arrow_cache
+# refuses to persist the result. Per-file failures are logged and skipped, but the
+# cache is built once and reused for the whole run, so a systematic parse problem
+# would otherwise shrink the training corpus silently and permanently. Sized to
+# absorb a handful of genuinely corrupt sidecars in a multi-million-file corpus
+# without absorbing a naming-convention or filesystem-level failure.
+_MAX_PARSE_DROP_RATIO = 0.001  # 0.1%
+
+
+class ArrowCacheTruncatedError(RuntimeError):
+    """Raised when metadata parsing lost enough rows that the result is unusable.
+
+    Deliberately an exception rather than a falsy return. Returning False here
+    makes ``try_load_arrow_cache`` return None, which ``SidecarJsonDataset``
+    treats as "PyArrow unavailable" and answers by falling back to the sequential
+    JSON parser -- which applies the SAME parse logic with NO drop gate at all.
+    A truncation that this class exists to catch would be silently re-created
+    there, after an expensive full re-parse. It must propagate.
+    """
 # NOTE: newly built caches also include a "filename" column (exact image file
 # name from the sidecar JSON, used to skip per-sample extension probing).
 # Intentionally NOT a version bump: readers treat the column as optional, so
@@ -172,7 +191,7 @@ def _arrow_meta_path(root: Path) -> Path:
 def _parse_json_batch(
     json_files: List[Path],
     logger: logging.Logger
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], int]:
     """Parse a batch of JSON files (worker function).
 
     Args:
@@ -180,7 +199,14 @@ def _parse_json_batch(
         logger: Logger instance
 
     Returns:
-        List of parsed metadata dicts
+        (parsed metadata dicts, count of files skipped for not being dicts).
+
+        The non-dict count is reported separately because those files are not
+        failures -- a list-shaped JSON under the data root is a manifest, not a
+        malformed sidecar. Folding them into the parse-failure total would let
+        the caller's drop gate hard-fail a corpus that is perfectly healthy, and
+        blame it on filename conventions. The sequential fallback in
+        dataset_loader.py excludes them for the same reason.
     """
     # Use orjson if available (5-10x faster than stdlib json)
     if HAS_ORJSON:
@@ -191,11 +217,13 @@ def _parse_json_batch(
             return json.loads(path.read_text(encoding="utf-8"))
 
     items = []
+    non_dict_skips = 0
     for jp in json_files:
         try:
             data = load_json(jp)
             # Skip if data is not a dict (e.g., manifest files are lists)
             if not isinstance(data, dict):
+                non_dict_skips += 1
                 logger.warning(f"Skipping {jp}: expected dict, got {type(data).__name__}")
                 continue
             fname = str(data.get("filename") or jp.with_suffix(".png").name)
@@ -217,7 +245,7 @@ def _parse_json_batch(
             logger.warning(f"Failed to parse {jp}: {e}")
             continue
 
-    return items
+    return items, non_dict_skips
 
 
 # =============================================================================
@@ -320,15 +348,25 @@ def _build_arrow_cache(
         logger.info(f"  Parsing {total_files:,} files in {len(chunks)} chunks using {num_workers} workers...")
         parse_start = time.time()
 
+        failed_chunks = 0
+        non_dict_skips = 0
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = [executor.submit(_parse_json_batch, chunk, logger) for chunk in chunks]
 
             for i, future in enumerate(as_completed(futures)):
                 try:
-                    items = future.result()
+                    items, chunk_non_dict = future.result()
                     all_items.extend(items)
+                    non_dict_skips += chunk_non_dict
                 except Exception as e:
-                    logger.warning(f"Chunk parsing failed: {e}")
+                    # A whole chunk is up to `chunk_size` files. Losing one is a
+                    # different failure class from a per-file parse error and is
+                    # never acceptable: the cache is built once per run and reused,
+                    # so a transient failure here would silently shrink the training
+                    # corpus for this run and every future one. Counted here and
+                    # turned into a hard failure below.
+                    failed_chunks += 1
+                    logger.error(f"Chunk parsing failed (chunk of up to {chunk_size:,} files): {e}")
 
                 # Progress logging
                 if (i + 1) % max(1, len(chunks) // 10) == 0:
@@ -343,14 +381,64 @@ def _build_arrow_cache(
         # (spaces, unicode, parentheses) can silently drop every such image from the
         # cache (and thus from training) with only buried per-file warnings. One
         # aggregate warning makes the loss visible at build time.
-        dropped = total_files - len(all_items)
+        #
+        # Non-dict files (manifests and other list-shaped JSON that the sidecar
+        # glob swept up) are NOT losses — they were never sidecars. They are
+        # removed from both sides of the ratio so the gate below cannot hard-fail
+        # a healthy corpus and blame it on filename conventions. The sequential
+        # fallback in dataset_loader.py treats them the same way.
+        considered = total_files - non_dict_skips
+        dropped = considered - len(all_items)
+        drop_ratio = (dropped / considered) if considered else 0.0
+        if non_dict_skips > 0:
+            logger.info(
+                f"  Ignored {non_dict_skips:,} non-sidecar JSON file(s) (list-shaped, e.g. "
+                f"manifests). These are not counted as parse failures."
+            )
         if dropped > 0:
-            drop_ratio = dropped / total_files if total_files else 0.0
             logger.warning(
-                f"  {dropped:,} of {total_files:,} JSON files ({drop_ratio * 100:.2f}%) were "
+                f"  {dropped:,} of {considered:,} sidecar JSON files ({drop_ratio * 100:.2f}%) were "
                 f"dropped during parse and are absent from the cache (and from training). "
                 f"Common cause: filenames violating the id pattern (spaces/unicode/parentheses). "
                 f"Inspect the per-file 'Failed to parse' warnings above if this ratio is unexpected."
+            )
+
+        # Refuse to persist a materially truncated cache. Warning alone is not
+        # enough: this cache is written once and reused for the whole run (and
+        # subsequent runs), so anything lost here is lost silently from every
+        # epoch that follows. A whole-chunk failure is always fatal; per-file
+        # drops are tolerated only up to _MAX_PARSE_DROP_RATIO, which is sized
+        # to permit a handful of genuinely malformed sidecars but not a
+        # systematic naming-convention or filesystem problem.
+        #
+        # Checked BEFORE the `not all_items` guard below: if every chunk failed,
+        # all_items is empty too, and the generic "no items parsed" message would
+        # hide the actual cause.
+        if failed_chunks > 0:
+            raise ArrowCacheTruncatedError(
+                f"{failed_chunks} of {len(chunks)} metadata parse chunk(s) failed outright, "
+                f"so up to {failed_chunks * chunk_size:,} of {total_files:,} files are missing. "
+                f"Accepting this would silently shrink the training corpus for this run and "
+                f"every run that reuses the cache. Fix the underlying error and rebuild."
+            )
+
+        # The absolute floor matters as much as the ratio. On a small dataset the
+        # ratio is dominated by the single-file quantum -- 1 bad sidecar out of 64
+        # is 1.56%, which a bare ratio test would treat as a systematic failure and
+        # hard-fail permanently. This project keeps several such small corpora (the
+        # Anima canary set and assorted probe splits are 6-64 files). The floor is
+        # the same one the staleness gate and the sequential-parse gate use, so all
+        # three agree on one shape; at production scale it is exactly equivalent to
+        # the bare ratio (both trip at dropped >= 5922 for 5.9M files).
+        if dropped > max(100, int(considered * _MAX_PARSE_DROP_RATIO)):
+            raise ArrowCacheTruncatedError(
+                f"{dropped:,} of {considered:,} sidecar JSON files ({drop_ratio * 100:.2f}%) "
+                f"failed to parse, exceeding the {_MAX_PARSE_DROP_RATIO * 100:.2f}% tolerance "
+                f"(minimum 100 files). "
+                f"This is a systematic data problem, not incidental corruption — inspect the "
+                f"per-file 'Failed to parse' warnings above. Raise "
+                f"utils.metadata_cache._MAX_PARSE_DROP_RATIO only if the loss is understood "
+                f"and intentional."
             )
 
         if not all_items:
@@ -401,6 +489,15 @@ def _build_arrow_cache(
                         for i in range(0, len(table), batch_size):
                             batch = table.slice(i, min(batch_size, len(table) - i))
                             writer.write_table(batch)
+
+                # Drop the previous meta before publishing the new table. The
+                # meta is written in Phase 4, so a kill between the rename below
+                # and that write would otherwise leave the OLD meta describing
+                # the NEW table. Removing it first makes the crash state
+                # "table with no meta", which the caller already treats as
+                # invalid and rebuilds. (Nothing is deleted up front any more —
+                # this runs only once the replacement table is fully written.)
+                cache_path.with_suffix(".arrow.meta").unlink(missing_ok=True)
 
                 # Atomic rename
                 os.replace(temp_path, cache_path)
@@ -455,6 +552,19 @@ def _build_arrow_cache(
             # treat its presence as an active integrity check.
             "file_list_hash": _compute_file_list_hash(json_files),
             "file_count": len(json_files),
+            # Files that failed to parse and are therefore absent from the table.
+            # `file_count` is the INPUT count, so on its own it cannot reveal a
+            # truncated cache to a later run — _is_arrow_cache_stale() compares
+            # it against the current file list and would see a perfect match even
+            # if half the rows were dropped at build time. Recording the drop
+            # explicitly gives the staleness gate something to check.
+            "parsed_count": len(all_items),
+            "dropped_count": dropped,
+            # Sidecars actually eligible to become rows: file_count minus the
+            # list-shaped/manifest JSONs the glob swept up. The staleness gate
+            # must measure truncation against this, not file_count, or a corpus
+            # with manifests looks permanently truncated and rebuilds forever.
+            "considered_count": total_files - non_dict_skips,
             "created_at": time.time(),
         }
         with open(meta_path, 'w', encoding='utf-8') as f:
@@ -467,6 +577,12 @@ def _build_arrow_cache(
         )
         return True
 
+    except ArrowCacheTruncatedError:
+        # Raised by the drop gates above, from inside this same try block.
+        # Letting the generic handler below convert it to `return False` would
+        # defeat the gate entirely: the caller reads False as "cache unavailable"
+        # and falls back to the ungated sequential parser.
+        raise
     except Exception as e:
         logger.error(f"Failed to build Arrow cache: {e}", exc_info=True)
         return False
@@ -519,6 +635,32 @@ def _is_arrow_cache_stale(
                 f"(tolerance: {tolerance})"
             )
             return True
+
+        # Truncation check. `file_count` above is the INPUT file count, so a cache
+        # whose rows were dropped at parse time matches it perfectly and would pass
+        # the drift check forever.
+        #
+        # `count` has always held len(all_items) — the number of rows that actually
+        # made it into the table — so this works on caches written before the
+        # dedicated `parsed_count` key existed. That legacy population is precisely
+        # the one that could be truncated (it predates the build-time gate), so it
+        # must NOT be exempted. `parsed_count` is preferred when present purely
+        # because it is unambiguous.
+        parsed_count = meta.get("parsed_count", meta.get("count"))
+        # Measure against eligible sidecars, not raw file count — see the
+        # considered_count note where the meta is written. Legacy metas lack the
+        # key and fall back to file_count, which is correct for them (the caches
+        # on disk predate manifests being swept up and show zero non-dict files).
+        considered_count = int(meta.get("considered_count", cached_count) or 0)
+        if parsed_count is not None and considered_count > 0:
+            missing = considered_count - int(parsed_count)
+            if missing > max(100, int(considered_count * _MAX_PARSE_DROP_RATIO)):
+                logger.warning(
+                    f"Arrow cache is truncated: {missing:,} of {considered_count:,} sidecar "
+                    f"file(s) ({missing / considered_count * 100:.2f}%) were dropped when it "
+                    f"was built. Rebuilding rather than training on the reduced corpus."
+                )
+                return True
 
         # Sample-based mtime check (reuse existing logic)
         cache_mtime = cache_path.stat().st_mtime
@@ -606,22 +748,23 @@ def try_load_arrow_cache(
 
             logger.info("Arrow cache is stale or invalid, rebuilding...")
 
-        # Build new cache
-        if cache_exists:
-            try:
-                cache_path.unlink()
-                meta_path = cache_path.with_suffix(".arrow.meta")
-                if meta_path.exists():
-                    meta_path.unlink()
-            except Exception:
-                pass
-
+        # Build new cache. The stale cache is deliberately NOT unlinked first:
+        # _build_arrow_cache writes to a .tmp file and os.replace()s it into
+        # position, so the write is already atomic, and deleting up front would
+        # destroy a usable cache in exchange for nothing whenever the rebuild
+        # fails.
         success = _build_arrow_cache(json_files, cache_path, num_workers, logger)
         if success:
             return _load_arrow_cache(cache_path, logger)
         else:
             return None
 
+    except ArrowCacheTruncatedError:
+        # Must NOT be swallowed into `return None`. The caller reads None as
+        # "Arrow unavailable" and falls back to the sequential JSON parser,
+        # which re-applies the same parse logic with no drop gate — silently
+        # reproducing the exact truncation this error exists to prevent.
+        raise
     except Exception as e:
         logger.error(f"Arrow cache error: {e}", exc_info=True)
         return None

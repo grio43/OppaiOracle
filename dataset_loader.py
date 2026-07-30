@@ -69,7 +69,7 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple, Set
+from typing import Callable, Optional, List, Dict, Any, Tuple
 
 # Third-party imports
 import numpy as np
@@ -262,7 +262,8 @@ def _normalize_preserve_dtype(img: torch.Tensor, mean: tuple, std: tuple) -> tor
 def process_image_cpu(
     img: Image.Image,
     target_size: int,
-    pad_color: Tuple[int, int, int]
+    pad_color: Tuple[int, int, int],
+    content_transform: Optional[Callable[[Image.Image], Image.Image]] = None,
 ) -> Tuple[Image.Image, torch.Tensor]:
     """
     Process PIL image on CPU: resizing, letterboxing, and padding mask generation.
@@ -274,6 +275,14 @@ def process_image_cpu(
         target_size: Target dimension (square)
         pad_color: Symmetric (114,114,114) tuple for padding (channel-order
             agnostic).
+        content_transform: Optional callable applied to the DOWNSCALED content
+            just before it is pasted onto the padded canvas. Use this for any
+            augmentation whose strength is defined in target-resolution pixels
+            (e.g. Gaussian blur sigma): applying it to ``img`` beforehand would
+            have its spatial extent shrunk by the downscale factor, and applying
+            it to the finished canvas would bleed pad_color across the
+            content/padding boundary and desync the padding mask. Must preserve
+            image size.
 
     Returns:
         (canvas, pmask): Processed PIL Image (still RGB) and boolean padding
@@ -295,6 +304,15 @@ def process_image_cpu(
     # the inference/serving preprocessor to LANCZOS for any model trained after
     # this change to avoid train/serve skew.
     resized = img.resize((max(1, nw), max(1, nh)), RESAMPLE_LANCZOS)
+
+    # Target-resolution content augmentation (see ``content_transform`` above).
+    if content_transform is not None:
+        before = resized.size
+        resized = content_transform(resized)
+        if resized.size != before:
+            raise ValueError(
+                f"content_transform must preserve image size; got {resized.size} from {before}"
+            )
 
     canvas = Image.new("RGB", (target_size, target_size), pad_color)
     left = (target_size - resized.size[0]) // 2
@@ -351,7 +369,16 @@ class ResumableSampler(DistributedSampler):
         self._start_index = index
 
     def get_state(self) -> dict:
-        """Get sampler state for checkpointing."""
+        """Get sampler state for checkpointing.
+
+        ``start_index`` is the offset still PENDING for the next pass, so it reads 0
+        once iteration has begun (``__iter__`` consumes it up front). It is therefore
+        useless as a mid-epoch resume position and must not be treated as one - the
+        trainer's source of truth is ``TrainingState.sample_in_epoch``, which is
+        recorded at an accumulation boundary and fed back through
+        :meth:`set_start_index`. ``total_size`` is the field the trainer actually
+        reads back, as a dataset-size-change guard.
+        """
         return {
             'epoch': self.epoch,
             'start_index': self._start_index,
@@ -361,7 +388,24 @@ class ResumableSampler(DistributedSampler):
         }
 
     def load_state(self, state: dict):
-        """Restore sampler state from checkpoint."""
+        """Restore the epoch seed (and, if still pending, the offset) from a checkpoint.
+
+        WARNING: this is NOT the mid-epoch resume path and does not restore a training
+        position. Checkpoints record ``start_index`` as captured by :meth:`get_state`,
+        which is 0 for any state saved after iteration began, so this restores the
+        shuffle seed only. train_direct.py resumes via ``TrainingState.sample_in_epoch``
+        -> :meth:`set_start_index` and reads only ``total_size`` from this state dict.
+        """
+        # Docstrings do not fire at runtime. This is the exact signature of a caller
+        # who believes this method restores a mid-epoch position: the checkpoint says
+        # training was mid-epoch, but the offset it carries was already consumed.
+        if state.get('start_index', 0) == 0 and state.get('batch_in_epoch', 0) > 0:
+            logging.getLogger(__name__).warning(
+                "load_state() called with batch_in_epoch=%s but start_index=0: this "
+                "restores the shuffle seed only, NOT the mid-epoch position. Use "
+                "set_start_index(TrainingState.sample_in_epoch) for that.",
+                state.get('batch_in_epoch'),
+            )
         saved_size = state.get('total_size', self.total_size)
         if saved_size != self.total_size:
             logging.getLogger(__name__).warning(
@@ -379,16 +423,27 @@ class ResumableSampler(DistributedSampler):
         # Generate indices using parent's logic
         indices = list(super().__iter__())
 
-        # Skip to start_index for mid-epoch resume
-        for i in range(self._start_index, len(indices)):
-            yield indices[i]
-
-        # Reset for next epoch
+        # Consume the offset up front: it applies to THIS pass only.
+        #
+        # Clearing it after the yield loop instead (the previous behaviour) had two
+        # defects. (1) get_state() kept reporting the already-consumed offset for the
+        # whole epoch, so every mid-epoch checkpoint embedded a stale
+        # sampler_state['start_index']. (2) the trailing statement never runs when the
+        # generator is abandoned rather than exhausted - Python throws GeneratorExit in
+        # at the yield, so the reset is skipped - leaving the offset live and silently
+        # truncating the NEXT epoch by that many samples.
+        start = self._start_index
         self._start_index = 0
 
-    def __len__(self):
-        base_len = super().__len__()
-        return max(0, base_len - self._start_index)
+        for i in range(start, len(indices)):
+            yield indices[i]
+
+    # NOTE: no __len__ override. It used to return `base_len - self._start_index`, which
+    # is only meaningful in the window between set_start_index() and the first next() -
+    # after that the offset is consumed and the override silently disagreed with the
+    # number of items the iterator actually yields. The trainer reads len(train_loader)
+    # exactly once, at startup before any offset is set, to size the LR schedule, so a
+    # full-length __len__ is both correct there and free of the mid-epoch trap.
 
 
 # Guarded DataLoader wrapper:
@@ -1021,9 +1076,10 @@ class DatasetLoader(Dataset):
         # Tag vector dtype
         self._tag_vector_dtype = _canon_dtype(str(tag_vector_dtype).lower())
 
-        # Epoch tracking for future flip support and consistency with SidecarJsonDataset.
-        # Backed by shared memory so DataLoader workers (spawned at first iter()) observe
-        # set_epoch() updates from the main process; a plain int would be frozen at fork/spawn time.
+        # Epoch tracking, for API consistency with SidecarJsonDataset only — manifest
+        # mode applies no augmentation, so nothing reads this. Backed by shared memory
+        # so DataLoader workers (spawned at first iter()) observe set_epoch() updates
+        # from the main process; a plain int would be frozen at fork/spawn time.
         self._current_epoch = mp.Value('i', 0, lock=False)
 
         # --- Pre-created transforms for performance (avoid recreating per sample) ---
@@ -1136,7 +1192,6 @@ class DatasetLoader(Dataset):
         padding_mask: torch.Tensor,
         annotation: Dict[str, Any],
         image_id: str,
-        cached: bool = False,
     ) -> Dict[str, Any]:
         """Build the sample dictionary returned by __getitem__.
 
@@ -1145,7 +1200,6 @@ class DatasetLoader(Dataset):
             padding_mask: Boolean padding mask (H, W)
             annotation: Annotation dict with labels and rating
             image_id: Image identifier
-            cached: Whether data came from cache
 
         Returns:
             Sample dict for training
@@ -1171,7 +1225,6 @@ class DatasetLoader(Dataset):
             "padding_mask": padding_mask.to(torch.bool),
             "tag_labels": tag_vec,
             "image_id": image_id,
-            "cached": cached,
             "error": False,
             "error_reason": "",
         }
@@ -1289,11 +1342,11 @@ class DatasetLoader(Dataset):
         return len(self.annotations)
 
     def set_epoch(self, epoch: int) -> None:
-        """Set the current epoch for potential future flip support.
+        """Record the current epoch. No-op beyond bookkeeping.
 
-        Currently DatasetLoader (manifest mode) does not support flipping,
-        but this method is provided for API consistency with SidecarJsonDataset
-        and future extensibility.
+        Manifest mode applies no augmentation at all, so nothing consumes the
+        epoch here. The method exists only so the training loop's
+        ``hasattr(dataset, 'set_epoch')`` call works for both dataset classes.
 
         Args:
             epoch: Current training epoch (0-indexed)
@@ -1439,9 +1492,7 @@ class DatasetLoader(Dataset):
             self.retry_counts[idx] = 0
 
             # Build sample using helper to avoid duplication
-            return self._build_sample_dict(
-                t, pmask, annotation, safe_image_id, cached=False
-            )
+            return self._build_sample_dict(t, pmask, annotation, safe_image_id)
 
         except Exception as e:
             self.retry_counts[idx] += 1
@@ -1560,21 +1611,16 @@ class DatasetLoader(Dataset):
         if not resolved_image_id:
             resolved_image_id = f"error_{idx}"
         # NOTE: key set must match _build_sample_dict exactly — default_collate
-        # raises KeyError on heterogeneous dicts. Manifest mode has no flip
-        # support, so no flip_applied/flip_mode keys on either path.
+        # raises KeyError on heterogeneous dicts. Manifest mode applies no
+        # augmentation at all, so there is no flip_applied key on either path.
         return {
             "images": torch.zeros((3, sz, sz), dtype=img_dtype),
             "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
             "tag_labels": torch.zeros(self.num_classes, dtype=self._tag_vector_dtype),
             "image_id": resolved_image_id,
-            "cached": False,
             "error": True,
             "error_reason": reason,
         }
-
-class AugmentationStats:
-    """Placeholder class for augmentation statistics."""
-    pass
 
 
 def validate_dataset(*args, **kwargs):
@@ -1590,6 +1636,32 @@ def validate_dataset(*args, **kwargs):
         "is enabled but NO input/label validation is actually performed."
     )
     return {}
+
+
+_FLIP_EPOCH_ODD_MULT = 0x9E3779B1  # odd -> bijective mod 2^32 (golden-ratio constant)
+
+
+def _mix32(x: int) -> int:
+    """lowbias32 avalanche finalizer -- NON-linear over GF(2).
+
+    Needed because zlib.crc32 is affine: crc32(s) as a function of s is linear
+    over GF(2), so for any two fixed-length suffixes A and B,
+    ``crc32(id|A) ^ crc32(id|B)`` is a GLOBAL CONSTANT independent of ``id``.
+    Seeding a per-image coin with ``crc32(f"{id}|epoch{n}")`` therefore makes the
+    epoch-to-epoch change a single constant XOR applied to every image at once.
+    At p=0.5 the decision is exactly "bit31 == 0", and the epoch0->epoch1 delta
+    (0x77073096) leaves bit31 alone -- so consecutive epochs produced the
+    IDENTICAL flip set and epochs 2,3 produced its exact complement. Flipping
+    degenerated from a per-sample coin to a handful of globally-synchronised
+    states, and a run of <=2 epochs got no flip augmentation at all.
+
+    This finalizer destroys that structure: each output bit depends
+    non-linearly on all input bits, so the epoch delta is image-dependent.
+    """
+    x &= 0xFFFFFFFF
+    x = ((x ^ (x >> 16)) * 0x7FEB352D) & 0xFFFFFFFF
+    x = ((x ^ (x >> 15)) * 0x846CA68B) & 0xFFFFFFFF
+    return (x ^ (x >> 16)) & 0xFFFFFFFF
 
 
 class SidecarJsonDataset(Dataset):
@@ -1618,8 +1690,6 @@ class SidecarJsonDataset(Dataset):
         color_order: str = "RGB",
         # --- Horizontal flipping ---
         random_flip_prob: float = 0.0,
-        flip_overrides_path: Optional[str] = None,   # JSON with {"force_flip":[ids], "never_flip":[ids]} (also accepts {"flip":[...]} or a bare list)
-        respect_flip_list: bool = True,
         stats_queue: Optional[mp.Queue] = None,
         # Dtype configuration
         tag_vector_dtype: str = "bfloat16",
@@ -1702,26 +1772,16 @@ class SidecarJsonDataset(Dataset):
         self._tag_vector_dtype = _canon_dtype(str(tag_vector_dtype).lower())
 
         # --- Horizontal flipping state ---
+        # Every tag in the vocabulary is orientation-agnostic, so a flip is an
+        # unconditional per-image coin: there is no per-image allow/deny list and
+        # no label rewriting. (The removed force_flip/never_flip override file was
+        # a leftover from the abandoned direction-sensitive-tag design.)
         self.random_flip_prob = float(random_flip_prob or 0.0)
-        self.respect_flip_list = bool(respect_flip_list)
-        self._force_flip_ids: Set[str] = set()
-        self._never_flip_ids: Set[str] = set()
-        if flip_overrides_path:
-            try:
-                path = Path(flip_overrides_path)
-                if path.exists():
-                    data = orjson.loads(path.read_bytes()) if HAS_ORJSON else json.loads(path.read_text(encoding="utf-8"))
-                    if isinstance(data, dict):
-                        force = data.get("force_flip") or data.get("flip") or []
-                        never = data.get("never_flip") or data.get("no_flip") or []
-                        self._force_flip_ids = {sanitize_identifier(str(x)) for x in force}
-                        self._never_flip_ids = {sanitize_identifier(str(x)) for x in never}
-                    elif isinstance(data, list):
-                        self._force_flip_ids = {sanitize_identifier(str(x)) for x in data}
-            except Exception as e:
-                self.logger.warning(f"Failed to load flip_overrides from {flip_overrides_path}: {e}")
 
-        # Telemetry queue retained for compatibility (no orientation stats are pushed)
+        # Accepted and stored so the constructor signature stays stable, but the
+        # dataset never pushes to it — the augmentation telemetry it fed died with
+        # the orientation handler. train_direct.py still creates and drains this
+        # queue, so its drain loop and Monitor.log_augmentations() are unreachable.
         self._stats_queue = stats_queue
 
         # Epoch tracking for flip variation across epochs.
@@ -1762,13 +1822,23 @@ class SidecarJsonDataset(Dataset):
                 )
 
             if random_erasing_enabled:
-                # Use value=0.5 (mid-gray) which normalizes to 0.0 (center of [-1,1] range)
-                # Note: value='random' was problematic as it samples from N(0,1) producing values outside [0,1]
+                # Erasing runs BEFORE normalization, on the [0,1] tensor, so the fill
+                # must be the PRE-normalization value that maps to 0.0 (the centre of
+                # the normalized range) — that is exactly normalize_mean. Hardcoding
+                # 0.5 was only correct because mean happens to be (0.5,0.5,0.5); it
+                # would have silently become a non-neutral colour under any other
+                # normalization. Erasing also happens before the RGB->BGR reorder, so
+                # the mean (expressed in color_order) is reversed back to RGB here.
+                # (value='random' is NOT usable: it samples N(0,1), i.e. values well
+                # outside [0,1].)
+                _erase_fill = list(self.normalize_mean)
+                if self.color_order == "BGR":
+                    _erase_fill = _erase_fill[::-1]
                 self._random_erasing = T.RandomErasing(
                     p=random_erasing_p,
                     scale=(random_erasing_scale_min, random_erasing_scale_max),
                     ratio=(random_erasing_ratio_min, random_erasing_ratio_max),
-                    value=0.5,
+                    value=_erase_fill,
                 )
 
         # Random rotation augmentation
@@ -1783,7 +1853,8 @@ class SidecarJsonDataset(Dataset):
             )
 
         # Gaussian blur augmentation (DeiT III 3-Augment; Touvron et al. ECCV 2022)
-        # Applied to PIL before letterboxing so padding regions remain at pad_color.
+        # Applied to the DOWNSCALED content inside process_image_cpu, so sigma is
+        # measured in target-resolution pixels and padding stays exactly pad_color.
         self._blur_enabled = bool(gaussian_blur_enabled)
         self._blur_p = float(gaussian_blur_p)
         self._blur = None
@@ -1913,7 +1984,16 @@ class SidecarJsonDataset(Dataset):
 
         # Fallback: sequential parsing (if cache disabled or failed)
         if not metadata_cache_enabled or len(self.items) == 0:
+            # Imported here (not at module scope) to match how the Arrow helpers
+            # are pulled in above, and because this module must stay importable
+            # without PyArrow installed.
+            from utils.metadata_cache import (
+                ArrowCacheTruncatedError,
+                _MAX_PARSE_DROP_RATIO,
+            )
+
             excluded_count = 0
+            parse_failures = 0
             for jp in self.json_files:
                 try:
                     data = orjson.loads(Path(jp).read_bytes()) if HAS_ORJSON else json.loads(Path(jp).read_text(encoding="utf-8"))
@@ -1941,9 +2021,26 @@ class SidecarJsonDataset(Dataset):
                         "filename": Path(fname).name,  # Exact image filename (skips extension probing)
                     })
                 except Exception as e:
+                    parse_failures += 1
                     self.logger.warning(f"Failed to parse {jp}: {e}")
             if excluded_count > 0:
                 self.logger.info(f"Filtered out {excluded_count} excluded images during parsing")
+
+            # Apply the same drop gate the Arrow builder uses. Without it this
+            # path is a silent escape hatch: whatever systematic parse failure
+            # made the Arrow build refuse to write is simply repeated here,
+            # file by file, and training proceeds on the reduced corpus.
+            # `excluded_count` is an intentional filter, not a loss, so it is
+            # excluded from the denominator.
+            considered = len(self.json_files) - excluded_count
+            if considered > 0 and parse_failures > max(100, int(considered * _MAX_PARSE_DROP_RATIO)):
+                raise ArrowCacheTruncatedError(
+                    f"Sequential metadata parse lost {parse_failures:,} of {considered:,} "
+                    f"sidecar JSON files ({parse_failures / considered * 100:.2f}%), exceeding "
+                    f"the {_MAX_PARSE_DROP_RATIO * 100:.2f}% tolerance. Training on this corpus "
+                    f"would silently omit those images. Inspect the 'Failed to parse' warnings "
+                    f"above."
+                )
 
     # ---------- Pickling support for multiprocessing ----------
     def __getstate__(self):
@@ -2030,24 +2127,33 @@ class SidecarJsonDataset(Dataset):
             epoch: Current training epoch (0-indexed)
 
         Note:
-            - Called automatically by the training loop via DataLoader
-            - Affects both training and validation datasets
-            - Essential for proper cache invalidation and augmentation diversity
+            - Called by the training loop once per epoch (train_direct.py)
+            - Backed by shared memory, so it reaches DataLoader workers that were
+              already spawned under persistent_workers=True
+            - Validation datasets run at random_flip_prob=0, so this is a no-op there
         """
         self._current_epoch.value = int(epoch)
         self._epoch_was_set = True
         self.logger.debug(f"Dataset epoch set to {self._current_epoch.value}")
 
-    def _deterministic_coin(self, image_id: str) -> bool:
+    def _should_flip(self, image_id: str) -> bool:
         """Stable per-image, per-epoch coin flip using fast CRC32 hash.
 
         This ensures deterministic yet epoch-varying flip decisions:
-        - Same (image_id, epoch) always produces the same flip decision (reproducible)
+        - Same (image_id, epoch) always produces the same flip decision (reproducible
+          across resumes, and identical in every DataLoader worker)
         - Different epochs produce different flip decisions (augmentation diversity)
-        - Cache-friendly: unflipped versions cached, flipped computed on-demand
 
-        Performance: CRC32 is ~20x faster than SHA256 (~0.1μs vs ~2-5μs per call).
-        At 5.6M samples/epoch, this saves ~11-28 seconds per epoch.
+        The epoch is mixed in ARITHMETICALLY and run through _mix32, not
+        concatenated into the hashed string. CRC32 is affine, so hashing
+        f"{id}|epoch{n}" made the per-epoch delta a global constant XOR and
+        collapsed the augmentation to a few dataset-wide flip states -- see
+        _mix32's docstring. Do not "simplify" this back to a single crc32 of a
+        concatenated string.
+
+        Performance: CRC32 over the id plus a handful of integer ops; still
+        ~20x faster than SHA256 (~0.1us vs ~2-5us per call). At 5.6M
+        samples/epoch, this saves ~11-28 seconds per epoch.
 
         Args:
             image_id: Unique image identifier
@@ -2068,26 +2174,14 @@ class SidecarJsonDataset(Dataset):
                 "start of each epoch for proper augmentation diversity.",
                 self.random_flip_prob
             )
-        # Include epoch in hash to get different flips across epochs
-        # Use zlib.crc32 for speed - deterministic and fast (~20x faster than SHA256)
-        seed_bytes = f"{image_id}|epoch{self._current_epoch.value}".encode("utf-8")
-        h = zlib.crc32(seed_bytes) & 0xFFFFFFFF  # Ensure unsigned 32-bit
+        # Per-image base hash (crc32 is fast); the epoch is folded in via an odd
+        # multiplier and then avalanched, so the epoch->epoch delta differs per
+        # image instead of being a single global XOR.
+        base = zlib.crc32(str(image_id).encode("utf-8")) & 0xFFFFFFFF
+        epoch_salt = (int(self._current_epoch.value) * _FLIP_EPOCH_ODD_MULT) & 0xFFFFFFFF
+        h = _mix32(base ^ epoch_salt)
         v = h / 0xFFFFFFFF  # [0,1]
         return v < float(self.random_flip_prob)
-
-    def _decide_flip_mode(self, image_id: str, tags: List[str]) -> str:
-        """
-        Decide flipping policy: 'none' | 'random' | 'force'
-        Respects flip list first; then applies the per-image deterministic coin.
-        """
-        if self.respect_flip_list:
-            if image_id in self._never_flip_ids:
-                return "none"
-            if image_id in self._force_flip_ids:
-                return "force"
-        if self.random_flip_prob <= 0:
-            return "none"
-        return "random" if self._deterministic_coin(image_id) else "none"
 
     def _build_sample_dict(
         self,
@@ -2096,9 +2190,7 @@ class SidecarJsonDataset(Dataset):
         tag_vec: torch.Tensor,
         rating: Any,
         image_id: str,
-        cached: bool = False,
         flip_applied: bool = False,
-        flip_mode: str = "none",
     ) -> Dict[str, Any]:
         """Build the sample dictionary returned by __getitem__.
 
@@ -2108,9 +2200,7 @@ class SidecarJsonDataset(Dataset):
             tag_vec: Encoded tag vector
             rating: Rating value (to be mapped)
             image_id: Image identifier
-            cached: Whether data came from cache
             flip_applied: Whether horizontal flip was applied
-            flip_mode: Flip mode used ("none", "force", "random")
 
         Returns:
             Sample dict for training
@@ -2135,9 +2225,7 @@ class SidecarJsonDataset(Dataset):
             "padding_mask": padding_mask.to(torch.bool),
             "tag_labels": tag_vec,
             "image_id": image_id,
-            "cached": cached,
             "flip_applied": flip_applied,
-            "flip_mode": flip_mode,
             "error": False,
             "error_reason": "",
         }
@@ -2217,8 +2305,7 @@ class SidecarJsonDataset(Dataset):
 
             # Decide whether to flip; vocabulary has no orientation-sensitive tags,
             # so tags pass through unchanged.
-            mode = self._decide_flip_mode(image_id, original_tags)
-            flip_bit = mode != "none"
+            flip_bit = self._should_flip(image_id)
             tags_now = original_tags
 
             # Resolve image path first (needed for both cache lookup and loading)
@@ -2248,14 +2335,22 @@ class SidecarJsonDataset(Dataset):
                 # Apply color jitter to PIL image BEFORE letterboxing onto canvas.
                 # This ensures jitter only affects actual image content, not padding regions.
                 # (Padding is added by process_image_cpu and should remain at pad_color)
+                # Brightness/contrast/saturation are pointwise, so doing this at the
+                # source resolution is scale-invariant — unlike blur, below.
                 if self._color_jitter is not None:
                     pil = self._color_jitter(pil)
 
-                # Gaussian blur (PIL, pre-letterbox) — keeps padding regions sharp at pad_color
-                if self._blur is not None and random.random() < self._blur_p:
-                    pil = self._blur(pil)
-
-                canvas, pmask = process_image_cpu(pil, self.image_size, self.pad_color)
+                # Gaussian blur runs on the DOWNSCALED content, inside the letterbox
+                # step. Blurring the source image instead would divide the effective
+                # sigma by the downscale factor (the configured sigma is defined in
+                # target-resolution pixels), and blurring the finished canvas would
+                # smear pad_color across the content edge where the padding mask says
+                # the boundary is exact.
+                blur_now = self._blur is not None and random.random() < self._blur_p
+                canvas, pmask = process_image_cpu(
+                    pil, self.image_size, self.pad_color,
+                    content_transform=self._blur if blur_now else None,
+                )
 
                 # Random rotation (image only, mask unchanged — fill matches pad_color)
                 if self._rotation_enabled and random.random() < self._rotation_p:
@@ -2276,8 +2371,8 @@ class SidecarJsonDataset(Dataset):
                 # Note: Color jitter is applied to PIL image BEFORE letterboxing (see above)
                 # to avoid jittering the padding regions.
 
-                # Random erasing BEFORE normalization (fills with 0.5 mid-gray,
-                # which normalizes to 0.0 - the center of [-1,1] range)
+                # Random erasing BEFORE normalization (fill = normalize_mean, so
+                # the erased patch lands at 0.0 after Normalize; see __init__)
                 if self._random_erasing is not None:
                     img = self._random_erasing(img)
 
@@ -2299,8 +2394,7 @@ class SidecarJsonDataset(Dataset):
 
                         # Note: Color jitter is applied to PIL image BEFORE letterboxing (see above)
 
-                        # Random erasing BEFORE normalization (value='random' samples from N(0,1)
-                        # which produces values up to ±4, incompatible with normalized [-1,1] range)
+                        # Random erasing BEFORE normalization (fill = normalize_mean; see __init__)
                         if self._random_erasing is not None:
                             img = self._random_erasing(img)
 
@@ -2316,8 +2410,7 @@ class SidecarJsonDataset(Dataset):
 
                         # Note: Color jitter is applied to PIL image BEFORE letterboxing (see above)
 
-                        # Random erasing BEFORE normalization (value='random' samples from N(0,1)
-                        # which produces values up to ±4, incompatible with normalized [-1,1] range)
+                        # Random erasing BEFORE normalization (fill = normalize_mean; see __init__)
                         if self._random_erasing is not None:
                             img = self._random_erasing(img)
 
@@ -2331,8 +2424,7 @@ class SidecarJsonDataset(Dataset):
 
                     # Note: Color jitter is applied to PIL image BEFORE letterboxing (see above)
 
-                    # Random erasing BEFORE normalization (value='random' samples from N(0,1)
-                    # which produces values up to ±4, incompatible with normalized [-1,1] range)
+                    # Random erasing BEFORE normalization (fill = normalize_mean; see __init__)
                     if self._random_erasing is not None:
                         img = self._random_erasing(img)
 
@@ -2355,9 +2447,7 @@ class SidecarJsonDataset(Dataset):
             self.retry_counts[idx] = 0
             return self._build_sample_dict(
                 img, pmask, tag_vec, ann.get("rating", "unknown"), image_id,
-                cached=False,
                 flip_applied=flip_bit,
-                flip_mode=mode,
             )
 
         except Exception as e:
@@ -2408,8 +2498,8 @@ class SidecarJsonDataset(Dataset):
         # Always use self.image_size for consistency with actual samples
         # This ensures error samples have the same shape as valid samples for batching
         sz = self.image_size  # Already int from __init__
-        # Match image dtype to what cached/non-cached samples use to avoid batch collation issues
-        # Match image dtype to what _to_tensor_v2 produces
+        # Match image dtype to what _to_tensor_v2 produces so error samples collate
+        # into the same batch tensor as real ones.
         img_dtype = self._image_dtype
         resolved_image_id = str(image_id).strip() if image_id else ""
         if not resolved_image_id:
@@ -2419,9 +2509,7 @@ class SidecarJsonDataset(Dataset):
             "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
             "tag_labels": torch.zeros(len(self.vocab.tag_to_index), dtype=self._tag_vector_dtype),
             "image_id": resolved_image_id,
-            "cached": False,
             "flip_applied": False,
-            "flip_mode": "none",
             "error": True,
             "error_reason": reason,
         }
@@ -2484,7 +2572,6 @@ def create_dataloaders(
         'color_order': str(getattr(data_config, "color_order", "RGB")).upper(),
         # Horizontal flip configuration
         'random_flip_prob': float(getattr(data_config, "random_flip_prob", 0.0)),
-        'flip_overrides_path': getattr(data_config, "flip_overrides_path", None),
         'stats_queue': getattr(data_config, "stats_queue", None),
         # DataLoader configuration
         'drop_last': bool(getattr(data_config, "drop_last", False)),
@@ -2551,19 +2638,36 @@ def create_dataloaders(
 
     # Flip configuration
     random_flip_prob = config_cache['random_flip_prob']
-    flip_overrides_path = config_cache['flip_overrides_path']
 
     if manifest_train.exists() and manifest_val.exists() and images_dir.exists():
-        # Manifest mode (back-compat); legacy DatasetLoader does not support flips.
+        # Manifest mode (back-compat). The legacy DatasetLoader implements NO
+        # augmentation at all — its constructor does not even accept the knobs.
+        # Enumerate everything that is about to be silently dropped rather than
+        # warning about flips only; a run that quietly loses its entire
+        # augmentation recipe is indistinguishable from one that kept it.
+        _dropped = []
         if float(getattr(data_config, "random_flip_prob", 0.0) or 0.0) > 0.0:
-            logger.warning(
-                "random_flip_prob > 0 with manifest dataset; legacy DatasetLoader does not "
-                "support flips, disabling."
-            )
+            _dropped.append(f"random_flip_prob={config_cache['random_flip_prob']}")
             try:
                 setattr(data_config, "random_flip_prob", 0.0)
             except Exception:
                 pass
+        if config_cache['color_jitter_enabled']:
+            _dropped.append("color_jitter")
+        if config_cache['random_erasing_enabled']:
+            _dropped.append("random_erasing")
+        if config_cache['random_rotation_enabled']:
+            _dropped.append("random_rotation")
+        if config_cache['gaussian_blur_enabled']:
+            _dropped.append("gaussian_blur")
+        if _dropped:
+            logger.warning(
+                "Manifest mode: the legacy DatasetLoader supports NO augmentation, so the "
+                "following ENABLED augmentation(s) will NOT be applied to this run: %s. "
+                "Training will proceed on un-augmented data. Migrate to per-image JSON "
+                "sidecars to keep the configured augmentation recipe.",
+                ", ".join(_dropped),
+            )
         # Note: Manifest mode uses legacy DatasetLoader which doesn't support sidecar cache.
         # Caching is disabled for manifest mode. Migrate to sidecar JSON mode for caching support.
         logger.warning(
@@ -2684,7 +2788,6 @@ def create_dataloaders(
             normalize_std=std,
             color_order=config_cache['color_order'],
             random_flip_prob=random_flip_prob,
-            flip_overrides_path=flip_overrides_path,
             stats_queue=config_cache['stats_queue'],
             metadata_cache_enabled=config_cache['metadata_cache_enabled'],
             metadata_cache_workers=config_cache['metadata_cache_workers'],
@@ -2727,7 +2830,6 @@ def create_dataloaders(
             normalize_std=std,
             color_order=config_cache['color_order'],
             random_flip_prob=0.0,          # keep val deterministic
-            flip_overrides_path=None,
             stats_queue=config_cache['stats_queue'],
             # Now sharing prebuilt cache properly - no file count mismatch
             metadata_cache_enabled=config_cache['metadata_cache_enabled'],

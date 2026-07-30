@@ -24,7 +24,8 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
-from training_utils import CheckpointManager
+from training_utils import CheckpointManager, normalize_state_dict_keys
+from schemas import canonical_vocab_bytes
 
 try:
     from model_metadata import ModelMetadata
@@ -53,6 +54,10 @@ from vocabulary import TagVocabulary
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+class _SkipNumericCheck(Exception):
+    """Internal signal: skip the numerical comparison, keep the other checks."""
 
 
 MIN_ONNX = Version("1.16.0")
@@ -417,24 +422,31 @@ class ONNXExporter:
         model = create_model(**model_config)
 
         
-        # Handle DDP weights
-        if any(k.startswith('module.') for k in state_dict.keys()):
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-        # Handle torch.compile weights (_orig_mod. prefix)
-        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
-            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        # Strip DDP ('module.') and torch.compile ('_orig_mod.') wrapper prefixes.
+        # removeprefix-based, so a key merely CONTAINING one of these substrings
+        # is left alone (the previous unbounded str.replace would mangle it).
+        state_dict = normalize_state_dict_keys(state_dict)
 
         # Filter out removed rating_head keys from old checkpoints
         state_dict = {k: v for k, v in state_dict.items() if 'rating_head' not in k}
 
-        # Load state dict with strict=False to handle minor mismatches
+        # strict=False tolerates the rating_head removal above, but MISSING keys
+        # are fatal: any parameter absent from the checkpoint keeps its random
+        # trunc_normal_ init and gets baked into the exported artifact. Shipping a
+        # partially-initialised model with only a log warning is not acceptable.
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        
-        if missing_keys:
-            logger.warning(f"Missing keys in state dict: {missing_keys[:5]}...")
+
         if unexpected_keys:
             logger.warning(f"Unexpected keys in state dict: {unexpected_keys[:5]}...")
+        if missing_keys:
+            raise RuntimeError(
+                f"Refusing to export: {len(missing_keys)} model parameter(s) are absent "
+                f"from the checkpoint and would be exported at random initialisation. "
+                f"Missing: {missing_keys[:10]}"
+                f"{' ...' if len(missing_keys) > 10 else ''}. "
+                f"This usually means the checkpoint does not match the configured "
+                f"architecture, or was truncated."
+            )
         
         model.eval()
         
@@ -457,6 +469,25 @@ class ONNXExporter:
                 f"Vocabulary too small ({len(self.vocab.tag_to_index)} tags). "
                 f"This appears to be an invalid vocabulary."
             )
+
+        # export.output_path is a FILE path, not a directory. The repo ships a
+        # directory named `exported_model`, which is also the config default, so
+        # the unedited default made every onnx.save fail with an IsADirectoryError
+        # that the per-variant handler downgraded to "[FAIL]" + exit 0. Sibling
+        # artifacts (selected_tags.csv) are written to output_path.parent, so a
+        # directory here also scatters them into the repo root.
+        _out = Path(self.export_config.output_path)
+        if _out.is_dir():
+            raise ValueError(
+                f"export.output_path={_out} is an existing DIRECTORY. It must be the "
+                f"path of the .onnx file to write, e.g. {_out / 'model.onnx'}."
+            )
+        if _out.suffix.lower() != '.onnx':
+            raise ValueError(
+                f"export.output_path={_out} must end in .onnx (got suffix "
+                f"{_out.suffix!r}); sibling artifacts are written next to it."
+            )
+        _out.parent.mkdir(parents=True, exist_ok=True)
 
         # Determine export variants: check config.export first, then top-level config
         export_variants = getattr(self.config, 'export_variants',
@@ -494,6 +525,14 @@ class ONNXExporter:
         
         return results
     
+    # Batch size of the tracing dummies. MUST be >= 2 when dynamic_batch_size is
+    # on: torch.export specialises a Dim whose example value is 1, so tracing with
+    # a batch-1 dummy silently produces a graph whose INPUTS are fixed at batch 1
+    # ("Got: 3 Expected: 1" from ORT). _repair_dynamic_batch rewrites value_info,
+    # graph outputs and Reshape targets but never graph inputs, so it cannot
+    # recover from this.
+    _EXPORT_DUMMY_BATCH = 2
+
     def _run_onnx_export(self, dummy_input: torch.Tensor, dummy_mask: torch.Tensor, output_path: Path):
         """Run ONNX export using dynamo (default) or legacy TorchScript exporter."""
         use_dynamo = getattr(self.export_config, 'use_dynamo_export', True)
@@ -564,13 +603,14 @@ class ONNXExporter:
             # Dummy input: preprocessed tensor (B, C, H, W) float32
             # Input is always image_size x image_size after external preprocessing
             image_size = self.config.data.image_size
+            dummy_batch = self._EXPORT_DUMMY_BATCH if self.export_config.dynamic_batch_size else 1
             dummy_input = torch.randn(
-                1, 3, image_size, image_size,
+                dummy_batch, 3, image_size, image_size,
                 dtype=torch.float32,
                 device=self.device,
             )
             dummy_mask = torch.zeros(
-                1, image_size, image_size,
+                dummy_batch, image_size, image_size,
                 dtype=torch.bool,
                 device=self.device,
             )
@@ -613,11 +653,16 @@ class ONNXExporter:
             # Export selected_tags.csv for compatibility with tagger UIs
             self._export_selected_tags_csv(output_path.parent)
 
-            # Validate ORT inference on the final model
+            # Validate ORT inference on the final model. A failure here means the
+            # artifact produces wrong outputs (or rejects the declared batch
+            # shape) — it must abort the export, not log and ship the file.
             if self.export_config.validate_export:
                 if not self._validate_ort_inference(output_path):
-                    logger.error("Post-optimization inference validation failed! "
-                                 "The exported model may produce incorrect outputs.")
+                    raise RuntimeError(
+                        f"Post-optimization ORT inference validation FAILED for "
+                        f"{output_path}. Refusing to publish an artifact that does not "
+                        f"reproduce the PyTorch model. See the validation errors above."
+                    )
 
             logger.info(f"[OK] Full model exported to {output_path}")
 
@@ -637,16 +682,42 @@ class ONNXExporter:
 
         try:
             image_size = self.config.data.image_size
+            dummy_batch = self._EXPORT_DUMMY_BATCH if self.export_config.dynamic_batch_size else 1
             dummy_input = torch.randn(
-                1, 3, image_size, image_size,
+                dummy_batch, 3, image_size, image_size,
                 dtype=torch.float16,
                 device=self.device,
             )
             dummy_mask = torch.zeros(
-                1, image_size, image_size,
+                dummy_batch, image_size, image_size,
                 dtype=torch.bool,
                 device=self.device,
             )
+            # Same non-trivial letterbox border as the fp32 path, so the mask
+            # branch is traced with real values instead of being folded away.
+            pad_border = image_size // 8
+            dummy_mask[:, :pad_border, :] = True
+            dummy_mask[:, -pad_border:, :] = True
+            dummy_mask[:, :, :pad_border] = True
+            dummy_mask[:, :, -pad_border:] = True
+
+            # Capture the TRUE fp32 reference BEFORE halving. self.model.half()
+            # is in-place, so the later .float() only re-widens already-rounded
+            # weights: a reference taken after that point is fp16-weights-vs-
+            # fp16-weights and cannot detect weight-rounding damage at all.
+            self._fp16_ref = None
+            if self.export_config.validate_export:
+                try:
+                    with torch.no_grad():
+                        _ref = self.model(dummy_input.float(), dummy_mask)
+                    self._fp16_ref = (
+                        dummy_input.detach().clone(),
+                        dummy_mask.detach().clone(),
+                        (_ref[0] if isinstance(_ref, (tuple, list)) else _ref).float().cpu().numpy(),
+                    )
+                    del _ref
+                except Exception as e:
+                    logger.warning(f"Could not capture fp32 reference for FP16 validation: {e}")
 
             logger.info("Converting model to float16 for export")
             self.model.half()
@@ -677,9 +748,15 @@ class ONNXExporter:
             # Export selected_tags.csv for compatibility with tagger UIs
             self._export_selected_tags_csv(output_path.parent)
 
-            # Validate ORT inference
+            # Validate ORT inference. Must abort on failure — this is the DEFAULT
+            # export variant, so a silently-accepted bad artifact is what ships.
             if self.export_config.validate_export:
-                self._validate_ort_inference_fp16(output_path)
+                if not self._validate_ort_inference_fp16(output_path):
+                    raise RuntimeError(
+                        f"FP16 ORT inference validation FAILED for {output_path}. "
+                        f"Refusing to publish an artifact that does not reproduce the "
+                        f"PyTorch model."
+                    )
 
             logger.info(f"FP16 model exported to {output_path}")
             self._print_model_info(output_path)
@@ -699,8 +776,22 @@ class ONNXExporter:
         try:
             session = ort.InferenceSession(str(model_path), providers=providers)
             image_size = self.config.data.image_size
-            test_input = np.random.randn(1, 3, image_size, image_size).astype(np.float16)
-            test_mask = np.zeros((1, image_size, image_size), dtype=bool)
+            # Reuse the exact inputs the pre-half fp32 reference was taken on, so
+            # the comparison below is apples-to-apples.
+            ref_bundle = getattr(self, '_fp16_ref', None)
+            if ref_bundle is not None:
+                test_input = ref_bundle[0].cpu().numpy().astype(np.float16)
+                test_mask = ref_bundle[1].cpu().numpy()
+            else:
+                test_input = np.random.randn(1, 3, image_size, image_size).astype(np.float16)
+                # Non-trivial letterbox mask, so this exercises the same mask path
+                # the exported graph sees in production, not an all-attend case.
+                test_mask = np.zeros((1, image_size, image_size), dtype=bool)
+                _pb = image_size // 8
+                test_mask[:, :_pb, :] = True
+                test_mask[:, -_pb:, :] = True
+                test_mask[:, :, :_pb] = True
+                test_mask[:, :, -_pb:] = True
 
             input_names = {i.name for i in session.get_inputs()}
             feed = {session.get_inputs()[0].name: test_input}
@@ -718,6 +809,42 @@ class ONNXExporter:
             else:
                 logger.info(f"FP16 inference validation passed "
                            f"(output range: [{onnx_probs.min():.4f}, {onnx_probs.max():.4f}])")
+
+            # NUMERICAL check against the reference PyTorch model. A range check
+            # alone passes on a graph whose fp16 accumulation has silently
+            # collapsed, which is how the DEFAULT export variant shipped
+            # unvalidated. Tolerance is loose (fp16 through an 18-layer ViT) but
+            # a real breakage moves probabilities by far more than this.
+            # Skip the NUMERICAL comparison only — must not early-return, or a
+            # failed reference capture would also skip the dynamic-batch shape
+            # validation further below, which is the check that catches a graph
+            # specialised to a single batch size.
+            if ref_bundle is None:
+                logger.warning(
+                    "No pre-half fp32 reference was captured; skipping the FP16 numerical "
+                    "comparison (structure, range and dynamic-batch checks still applied)."
+                )
+            try:
+                ref_probs = ref_bundle[2] if ref_bundle is not None else None
+                if ref_probs is None:
+                    raise _SkipNumericCheck
+                max_abs = float(np.abs(ref_probs - onnx_probs.astype(np.float32)).max())
+                mean_abs = float(np.abs(ref_probs - onnx_probs.astype(np.float32)).mean())
+                logger.info(
+                    "FP16 vs PyTorch fp32: max|delta|=%.5f mean|delta|=%.6f", max_abs, mean_abs
+                )
+                if not np.isfinite(max_abs) or max_abs > 0.05:
+                    logger.error(
+                        "FP16 export diverges from the PyTorch reference "
+                        "(max|delta|=%.5f > 0.05). Refusing to accept this artifact.",
+                        max_abs,
+                    )
+                    return False
+            except _SkipNumericCheck:
+                pass
+            except Exception as e:
+                logger.error(f"FP16 numerical comparison against PyTorch failed: {e}")
+                return False
 
             # Dynamic-batch sanity (same rationale as the float32 path).
             if self.export_config.dynamic_batch_size:
@@ -1003,11 +1130,16 @@ class ONNXExporter:
         stripped_value_info = len(model.graph.value_info)
         del model.graph.value_info[:]
 
-        # (2) Rewrite literal-1 first-dim on graph outputs to symbolic batch.
+        # (2) Rewrite a concretized first-dim on graph outputs to symbolic batch.
+        # The literal to look for is the TRACING batch, not a hardcoded 1 — the
+        # dummies now use _EXPORT_DUMMY_BATCH, so a concretization would stamp
+        # that value. Both are matched so the repair keeps working for
+        # dynamic_batch_size=False traces and for models exported before this.
+        _traced_batches = {1, self._EXPORT_DUMMY_BATCH}
         fixed_outputs = []
         for out in model.graph.output:
             dims = out.type.tensor_type.shape.dim
-            if dims and dims[0].dim_value == 1 and not dims[0].dim_param:
+            if dims and dims[0].dim_value in _traced_batches and not dims[0].dim_param:
                 dims[0].Clear()
                 dims[0].dim_param = 'batch_size'
                 fixed_outputs.append(out.name)
@@ -1025,7 +1157,7 @@ class ONNXExporter:
             if arr.ndim != 1 or arr.size != 4:
                 continue
             vals = arr.tolist()
-            if vals[0] != 1 or any(v == -1 or v == 1 for v in vals[1:]):
+            if vals[0] not in _traced_batches or any(v == -1 or v == 1 for v in vals[1:]):
                 continue
             new_vals = arr.copy()
             new_vals[0] = -1
@@ -1133,7 +1265,19 @@ class ONNXExporter:
             # Test with preprocessed float32 input: (B, C, H, W) + padding mask
             image_size = self.config.data.image_size
             test_input = np.random.randn(1, 3, image_size, image_size).astype(np.float32)
+            # NON-TRIVIAL letterbox mask. With the all-false mask this used, a
+            # graph that ignores padding_mask entirely returns bit-identical
+            # output (measured torch-vs-ORT max diff 8.9e-08), so neither the
+            # tolerance check nor the gross-divergence gate could ever see a
+            # dropped mask — on the real 448px model a dropped mask moves
+            # probabilities by 0.10-0.23. Exercising the padded path is what
+            # makes the comparison below meaningful.
             test_mask = np.zeros((1, image_size, image_size), dtype=bool)
+            _pb = image_size // 8
+            test_mask[:, :_pb, :] = True
+            test_mask[:, -_pb:, :] = True
+            test_mask[:, :, :_pb] = True
+            test_mask[:, :, -_pb:] = True
 
             # Run ONNX inference — use actual input names from session
             input_names = {i.name for i in session.get_inputs()}
@@ -1175,12 +1319,34 @@ class ONNXExporter:
 
             ok = np.allclose(torch_probs, onnx_probs, rtol=rtol, atol=atol)
 
+            # Two-tier verdict. The strict (rtol, atol) pair is a QUALITY signal,
+            # not a ship/no-ship gate: ORT's CUDA EP uses TF32 matmul while torch
+            # here does not, so a systematic ~1e-4 gap appears that grows with
+            # depth x width and with the fused Attention/LayerNorm kernels the
+            # optimizer inserts. Aborting the export on that would reject
+            # artifacts that are numerically fine. GROSS_MAX_DIFF is the actual
+            # gate — it catches the failures that matter (dropped mask, broken
+            # fusion, collapsed accumulation), which move probabilities by
+            # ~1e-1, not ~1e-4.
+            GROSS_MAX_DIFF = 0.02
+
             if ok:
                 logger.info("[OK] Model inference validation passed (outputs match)")
+            elif np.isfinite(max_diff) and max_diff <= GROSS_MAX_DIFF:
+                logger.warning(
+                    "ORT vs PyTorch exceeds the strict tolerance (rtol=%s, atol=%s) but is "
+                    "within the gross-divergence gate: max diff %.6f, mean diff %.6f. "
+                    "Accepting — this magnitude is consistent with TF32/fused-kernel "
+                    "differences rather than a broken graph.",
+                    rtol, atol, max_diff, mean_diff,
+                )
             else:
-                logger.warning(f"Outputs exceed tolerance (rtol={rtol}, atol={atol})")
-                logger.warning(f"  Max difference: {max_diff:.6f}, Mean difference: {mean_diff:.6f}")
-                logger.error("Model inference validation FAILED — outputs differ beyond acceptable tolerance")
+                logger.error(
+                    "Model inference validation FAILED — ORT output diverges GROSSLY from "
+                    "PyTorch: max diff %.6f (gate %.3f), mean diff %.6f. This is a broken "
+                    "graph, not a precision artifact.",
+                    max_diff, GROSS_MAX_DIFF, mean_diff,
+                )
                 return False
 
             # Verify padding mask actually affects output (catch silent mask-dropping
@@ -1196,10 +1362,17 @@ class ONNXExporter:
                 onnx_padded = session.run(None, feed_padded)[0]
 
                 if np.allclose(onnx_probs, onnx_padded, atol=1e-5):
-                    logger.warning(
-                        "[WARN] Padding mask has NO effect on output — "
-                        "mask may have been dropped during export!"
+                    # FATAL, not a warning. A graph that ignores padding_mask
+                    # silently attends to letterbox padding on every real image;
+                    # on the 448px model that shifts probabilities by 0.10-0.23.
+                    # This is the ONLY check that can detect it (the numerical
+                    # comparison above uses one fixed mask for both sides).
+                    logger.error(
+                        "Model inference validation FAILED — padding_mask has NO effect on "
+                        "the output. The mask was dropped during export (pytorch/pytorch#152018); "
+                        "the artifact would attend to letterbox padding on every image."
                     )
+                    return False
                 else:
                     mask_diff = np.max(np.abs(onnx_probs - onnx_padded))
                     logger.info(f"[OK] Padding mask correctly affects model output (max diff: {mask_diff:.6f})")
@@ -1307,7 +1480,12 @@ class ONNXExporter:
                     vocab_bytes = vocab_json.encode('utf-8')
                     vocab_compressed = gzip.compress(vocab_bytes)
                     vocab_b64 = base64.b64encode(vocab_compressed).decode('utf-8')
-                    vocab_sha = hashlib.sha256(vocab_bytes).hexdigest()
+                    # CANONICAL sha (sorted, compact separators), matching
+                    # schemas.compute_vocab_sha256 / ModelMetadata.embed_vocabulary /
+                    # the checkpoint resume guard. Hashing the raw serialized bytes
+                    # here produced a second, incompatible scheme, so a checkpoint's
+                    # vocab pin and the ONNX artifact's pin could never be compared.
+                    vocab_sha = hashlib.sha256(canonical_vocab_bytes(vocab_data)).hexdigest()
 
                     vocab_embedded_successfully = True
                     logger.info(f"Embedded vocabulary from loaded vocab with {len(self.vocab.tag_to_index)} tags")
@@ -1334,9 +1512,15 @@ class ONNXExporter:
                     if vocab_b64 and vocab_sha:
                         # Validate the embedded vocabulary data
                         try:
-                            # Verify the embedded data is valid and checksum matches
+                            # Verify the embedded data is valid and checksum matches.
+                            # embed_vocabulary stamps the CANONICAL sha, so the
+                            # verification must recompute it the same way — hashing the
+                            # raw decompressed bytes made this comparison fail 100% of
+                            # the time and silently dropped the vocabulary.
                             vocab_bytes = gzip.decompress(base64.b64decode(vocab_b64))
-                            computed_sha = hashlib.sha256(vocab_bytes).hexdigest()
+                            computed_sha = hashlib.sha256(
+                                canonical_vocab_bytes(json.loads(vocab_bytes.decode('utf-8')))
+                            ).hexdigest()
                             if computed_sha == vocab_sha:
                                 vocab_embedded_successfully = True
                                 logger.info(f"\u2713 Vocabulary successfully embedded (SHA256: {vocab_sha[:8]}...)")
@@ -1385,6 +1569,13 @@ class ONNXExporter:
                 'normalize_mean': json.dumps(self.config.data.normalize_mean),
                 'normalize_std': json.dumps(self.config.data.normalize_std),
                 'pad_color': json.dumps(list(self.config.data.pad_color)),
+                # Downscale resampling filter. Part of the preprocessing contract:
+                # the training pipeline uses LANCZOS and a consumer that resizes
+                # with BILINEAR feeds the model off-distribution inputs (measured
+                # mean |delta| ~3.7/255 on line art). Previously undocumented,
+                # which is how onnx_infer drifted to BILINEAR.
+                'resize_filter': 'LANCZOS',
+                'resize_mode': 'letterbox_downscale_only',
                 'color_order': _color_order,
                 'output_activation': 'sigmoid',
                 'input_format': 'BCHW_float32_normalized',
@@ -1424,8 +1615,20 @@ class ONNXExporter:
                 logger.info("[OK] Metadata added to model (external vocabulary required for inference)")
 
         except Exception as e:
-            logger.warning(f"Failed to add metadata: {e}")
-    
+            # Metadata is NOT cosmetic. This block embeds the vocabulary, the
+            # preprocessing contract (image_size, normalize_mean/std, pad_color,
+            # resize_filter) and output_activation. onnx_infer.py treats a model
+            # with no preprocessing metadata as "legacy format" and feeds it a RAW
+            # uint8 HWC array, which silently produces garbage predictions. A
+            # blanket warning here also swallowed the two require_embedded_vocabulary
+            # RuntimeErrors above, making that setting unenforceable.
+            raise RuntimeError(
+                f"Failed to add metadata to {model_path}: {e}. Refusing to publish an "
+                f"artifact without its vocabulary and preprocessing contract — consumers "
+                f"would silently mis-preprocess every image. Set export.add_metadata=false "
+                f"only if you fully control the downstream preprocessing."
+            ) from e
+
     def _validate_model(self, model_path: Path):
         '''Validate ONNX model structure (pre-optimization only)'''
         logger.info("Validating ONNX model...")
@@ -1669,6 +1872,18 @@ def main():
             for variant, path in results.items():
                 if path and path.exists():
                     exporter.benchmark(path, args.benchmark_runs)
+
+        # Exit non-zero if ANY requested variant failed. Previously every path
+        # through export() ended with "[OK] Export complete!" and status 0, even
+        # when the summary above printed "[FAIL]" for every variant, so callers
+        # and CI could not tell a successful export from a total failure.
+        failed = [variant for variant, path in results.items() if not path]
+        if failed or not results:
+            logger.error(
+                "\n[FAIL] Export incomplete — failed variant(s): %s",
+                ", ".join(failed) if failed else "<none requested>",
+            )
+            sys.exit(1)
 
         logger.info("\n[OK] Export complete!")
     finally:

@@ -35,10 +35,16 @@ exported_model/
 huggingface_release/
 *.onnx
 *.onnx.data
+# Vocabulary sidecar emitted next to the exported .onnx. Derived from the
+# (already-ignored) vocabulary/ dir; the root-level copy is a leftover from when
+# export.output_path pointed at a directory instead of a file.
+/selected_tags.csv
 
 # Local scratch, logs, and launcher shortcuts
 .research/
 tunnel_log*.txt
 *.lnk
+# One-off memory-sizing sweep output
+/layer_sweep.csv
 =3.9.0
 Untitled-*.json

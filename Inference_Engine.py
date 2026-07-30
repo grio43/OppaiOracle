@@ -23,7 +23,7 @@ import argparse
 
 import numpy as np
 import torch
-from training_utils import CheckpointManager
+from training_utils import CheckpointManager, normalize_state_dict_keys
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import v2 as transforms_v2
 from PIL import Image, ImageOps
@@ -307,7 +307,10 @@ class ImagePreprocessor:
         ratio = min(target / float(w), target / float(h))
         scale = min(1.0, ratio)
         nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
-        resized = img.resize((nw, nh), Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR)
+        # LANCZOS, not BILINEAR: must match dataset_loader.process_image_cpu
+        # (RESAMPLE_LANCZOS) or every inference image is off-distribution
+        # relative to what the weights were trained on.
+        resized = img.resize((nw, nh), Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS)
         canvas = Image.new("RGB", (target, target), tuple(pad_color))
         left = (target - nw) // 2
         top = (target - nh) // 2
@@ -515,7 +518,13 @@ class ModelWrapper:
             if not checkpoint:
                 raise FileNotFoundError(f"Could not load checkpoint from {model_path}")
 
-            state_dict = checkpoint.pop('state_dict')
+            # Strip DDP ('module.') and torch.compile ('_orig_mod.') wrapper
+            # prefixes before the strict load below. The trainer compiles the
+            # model before saving, so every real checkpoint is fully
+            # '_orig_mod.'-prefixed and would otherwise fail strict loading with
+            # a "Missing key(s)" error that the handler mislabels as an
+            # architecture mismatch.
+            state_dict = normalize_state_dict_keys(checkpoint.pop('state_dict'))
             meta = checkpoint # The rest is meta
 
             # Priority 1: Check for embedded vocabulary in checkpoint
@@ -548,10 +557,6 @@ class ModelWrapper:
 
             # Validate vocabulary contains real tags, not placeholders
             self._verify_vocabulary()
-
-            # Vocabulary has no orientation-sensitive tags, so TTA flip predictions
-            # are averaged elementwise — no index remapping needed.
-            self._tta_index_map = None
 
             # Load preprocessing parameters from checkpoint
             # Store original config values for mismatch detection
@@ -848,44 +853,32 @@ class ModelWrapper:
         if padding_mask is not None:
             padding_mask = padding_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
 
-        outputs = self.model(images, padding_mask=padding_mask)
+        def _logits_of(model_out) -> torch.Tensor:
+            if isinstance(model_out, dict):
+                t = model_out.get('tag_logits', model_out.get('logits'))
+                if t is None:
+                    raise ValueError("Model output missing 'tag_logits' or 'logits' key")
+                return t
+            return model_out
+
+        logits = _logits_of(self.model(images, padding_mask=padding_mask))
+        # Convert to float32 before sigmoid to avoid bfloat16 precision loss at thresholds
+        predictions = torch.sigmoid(logits.float())
+
         if self.config.tta_flip:
+            # Every tag in the vocabulary is orientation-agnostic, so a horizontally
+            # flipped view predicts the same tag set — no index remapping is needed.
             images_flipped = torch.flip(images, dims=[-1])
-            # Flip the padding mask horizontally for TTA (if provided)
             padding_mask_flipped = torch.flip(padding_mask, dims=[-1]) if padding_mask is not None else None
-            outputs_flipped = self.model(images_flipped, padding_mask=padding_mask_flipped)
-            # TTA averaging (elementwise; vocabulary has no orientation-sensitive tags)
-            if isinstance(outputs, dict):
-                if 'tag_logits' in outputs and self._tta_index_map is not None:
-                    # Use advanced indexing to reorder flipped outputs
-                    # self._tta_index_map[i] = index of tag in flipped image that corresponds to tag i in original
-                    # Reorder flipped predictions using index map
-                    # tags_f[b, i] = outputs_flipped[b, index_map[i]]
-                    tags_f = outputs_flipped['tag_logits'][:, self._tta_index_map]
+            logits_flipped = _logits_of(self.model(images_flipped, padding_mask=padding_mask_flipped))
 
-                    # Average original and reordered flipped (rating tags are included in tag_logits)
-                    outputs['tag_logits'] = 0.5 * (outputs['tag_logits'] + tags_f)
-                else:
-                    # Fallback: elementwise average common keys
-                    try:
-                        for k in outputs:
-                            outputs[k] = 0.5 * (outputs[k] + outputs_flipped[k])
-                    except Exception as e:
-                        logger.warning(f"TTA averaging failed for key '{k}', using original outputs: {e}")
-            else:
-                # outputs is a tensor – simple average
-                outputs = 0.5 * (outputs + outputs_flipped)
-
-        # Handle dictionary output from SimplifiedTagger
-        if isinstance(outputs, dict):
-            tag_outputs = outputs.get('tag_logits', outputs.get('logits'))
-            if tag_outputs is None:
-                raise ValueError("Model output missing 'tag_logits' or 'logits' key")
-            # Convert to float32 before sigmoid to avoid bfloat16 precision loss at thresholds
-            predictions = torch.sigmoid(tag_outputs.float())
-        else:
-            # Convert to float32 before sigmoid to avoid bfloat16 precision loss at thresholds
-            predictions = torch.sigmoid(outputs.float())
+            # Average PROBABILITIES, not logits. Averaging logits is a geometric mean
+            # in odds space: it is systematically pulled toward whichever view is less
+            # confident, and it shifts calibration away from the operating point that
+            # per-tag thresholds were tuned at (those are fitted on single-view
+            # sigmoid outputs). The arithmetic mean of the two sigmoids is the
+            # standard flip-TTA estimator and leaves the threshold semantics intact.
+            predictions = 0.5 * (predictions + torch.sigmoid(logits_flipped.float()))
 
         return predictions.cpu()  # Returns float32 for accurate threshold comparison
 

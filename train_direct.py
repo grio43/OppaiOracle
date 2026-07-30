@@ -5,6 +5,7 @@ Training script for the anime image tagger.
 
 import gc
 import logging
+import math
 import os
 import re
 
@@ -48,6 +49,18 @@ logger = logging.getLogger(__name__)
 # Default: 50 steps - balances early detection with minimal GPU sync overhead.
 # Set to 0 to disable periodic checks (GradScaler still catches NaN gradients post-backward).
 NAN_CHECK_EVERY_STEPS = int(os.getenv('NAN_CHECK_INTERVAL_STEPS', '50'))
+
+# Candidate model-selection scalars, keyed by config.training.selection_metric.
+# Each entry maps (val_f1_macro, val_f1_micro, val_mAP) -> the scalar that drives
+# best-checkpoint selection and early stopping. The F1 variants are evaluated at
+# a single frozen global threshold and are therefore calibration-coupled; val_mAP
+# is threshold-free and is the default. See the selection_value comment in the
+# epoch loop for why this matters to the ASL gamma_neg schedule.
+_SELECTION_METRICS = {
+    'val_mAP': lambda f1_macro, f1_micro, mAP: mAP,
+    'val_f1_macro': lambda f1_macro, f1_micro, mAP: f1_macro,
+    'val_f1_micro': lambda f1_macro, f1_micro, mAP: f1_micro,
+}
 
 # Import base modules with error handling
 try:
@@ -271,18 +284,52 @@ def train_with_orientation_tracking(config: FullConfig):
     # Save a checkpoint at the next safe point (optimizer step) and exit.
     # Use threading.Event for signal-safe flag (CR-033)
     soft_stop_event = threading.Event()
+    # Escalation state owned EXCLUSIVELY by the signal handler. It must not be
+    # soft_stop_event: the STOP_TRAINING sentinel poll also sets that event, so
+    # reusing it would make the operator's FIRST Ctrl+C look like a second signal
+    # whenever a sentinel stop was already in flight - hard-aborting the run (and
+    # possibly a torch.save in progress) instead of letting it checkpoint.
+    _signal_seen = threading.Event()
 
     def _soft_stop_handler(signum, frame):
-        """Signal-safe handler - only sets atomic event.
+        """Signal-safe handler - only sets an atomic event (first signal).
 
         IMPORTANT: Do NOT use logging or any non-reentrant functions here.
         Signal handlers can deadlock if they try to acquire locks held by
         the interrupted code. Only atomic operations are safe.
+
+        A SECOND signal escalates to a hard abort. soft_stop_event is only polled
+        inside the training step loop, so between the first signal and the next
+        safe point the process can be uninterruptible for minutes (Arrow/metadata
+        cache build, torch.compile, a full validation pass). Without escalation the
+        operator has no way out short of SIGKILL, which loses the checkpoint.
         """
+        if _signal_seen.is_set():
+            # Restore the default dispositions first so a third signal can never
+            # re-enter this handler, then raise into the interrupted frame (this is
+            # exactly what signal.default_int_handler does) so `finally` blocks and
+            # the checkpoint-writer shutdown still run.
+            try:
+                signal.signal(signal.SIGINT, signal.default_int_handler)
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            except Exception:
+                pass
+            # os.write on fd 2 is async-signal-safe (unlike logging, which takes locks)
+            try:
+                os.write(2, b"\nSecond stop signal received - aborting immediately.\n")
+            except Exception:
+                pass
+            raise KeyboardInterrupt
+        _signal_seen.set()
         soft_stop_event.set()
         # Write to stderr is relatively safe (no locks in Python's signal handling)
         # but even this should be minimal. The actual message will be logged
         # when the training loop checks soft_stop_event.
+        try:
+            os.write(2, b"\nSoft stop requested - will checkpoint at the next safe point. "
+                        b"Signal again to abort immediately.\n")
+        except Exception:
+            pass
 
     try:
         signal.signal(signal.SIGINT, _soft_stop_handler)
@@ -897,15 +944,33 @@ def train_with_orientation_tracking(config: FullConfig):
     # Early-stopping burn-in to avoid first-epoch outlier triggering patience
     burn_in_epochs = int(getattr(config.training, "early_stopping_burn_in_epochs", 0) or 0)
     burn_in_strategy = str(getattr(config.training, "early_stopping_burn_in_strategy", "median")).lower()
-    _burn_in_vals = []  # collect val metric during burn-in window
+    _burn_in_vals = []  # collect val metric during burn-in window (re-seeded from checkpoint below)
     global_step = 0
     _last_image_log_step = -1  # Guard against duplicate image logging within accumulation window
     start_epoch = 0
-    # Track mid-epoch resume info (for resuming from exact batch position)
+    # Track mid-epoch resume info (for resuming from exact batch position).
+    # resume_sample_idx MUST be initialized here even though it is only meaningful
+    # when a checkpoint loads: it is referenced unconditionally in the mid-epoch
+    # resume guard below, and only `is_mid_epoch` short-circuiting kept a fresh run
+    # from raising NameError.
     resume_batch_idx = 0
+    resume_sample_idx = 0
     is_mid_epoch = False
     ckpt_original_batch_size = None  # For batch-size agnostic resume from legacy checkpoints
     ckpt_sampler_state = None  # Saved sampler state (carries dataset-size guard for resume)
+    # (batch_size, gradient_accumulation_steps) recorded in the resumed checkpoint, or
+    # None for a fresh run / phase transition / checkpoint without an embedded config.
+    ckpt_effective_batch = None
+    # True only when load_checkpoint() actually overwrote the live scheduler's __dict__
+    # with the checkpoint's. This is what arms the LR-schedule guard below, and it is
+    # deliberately NOT the same condition as `ckpt_effective_batch is not None`: the
+    # guard now also compares scheduler-derived geometry (warmup_steps,
+    # first_cycle_steps, base_max_lr), which is only meaningful if those attributes came
+    # from the checkpoint. A fresh run, a phase transition (scheduler is passed as None,
+    # so it keeps this config's geometry), or a checkpoint saved with
+    # save_scheduler=False must all leave the guard disarmed - otherwise it would report
+    # "drift" against a scheduler that this very config just constructed.
+    ckpt_scheduler_restored = False
     phase_transition = False  # Set when checkpoint phase != config.training.phase
     # Soft-stop sentinel files (located in log_dir)
     stop_sentinel = Path(config.log_dir) / "STOP_TRAINING"
@@ -926,6 +991,16 @@ def train_with_orientation_tracking(config: FullConfig):
         logger.debug("Could not clear stale STOP_TRAINING sentinel: %s", _stop_sentinel_exc)
     early_exit = False
     soft_stop_pending = False  # defer stop until accumulation completes
+    # A pending soft stop defers the epoch-boundary accumulation flush so the partial
+    # window can be completed at the start of the NEXT epoch. That deferral is allowed
+    # exactly once: without this cap, an epoch that ends with a partial window every
+    # time (or a short/empty epoch) would carry the stop forward indefinitely and the
+    # run could reach the end of training having never written the soft-stop checkpoint.
+    soft_stop_carried = False
+    # Microbatches elapsed since the stop was deferred, used to bound the wait when
+    # repeatedly-skipped batches keep the accumulation window from ever closing.
+    soft_stop_wait_steps = 0
+    save_now_pending = False  # SAVE_CHECKPOINT sentinel latched, waiting for a safe point
     # PERF: Throttle filesystem sentinel checks to reduce syscall overhead in hot loop
     # Check every 10 steps (increased responsiveness)
     SENTINEL_CHECK_INTERVAL = 10
@@ -1079,6 +1154,62 @@ def train_with_orientation_tracking(config: FullConfig):
                 if not ckpt:
                     raise RuntimeError(f"Checkpoint returned empty data from {ckpt_path}")
                 training_state = TrainingState.from_dict(ckpt.get('training_state', {}))
+
+                # best_metric is only comparable against a value measured with the
+                # SAME selection metric. This must run on the restored TrainingState
+                # itself (not just the checkpoint `metrics` dict, and not only when
+                # is_best is set): resuming `last.pt` — which is is_best=False and
+                # carries a macro-F1-scale best_metric ~0.013 — while selecting on
+                # val_mAP (~0.68) would make the very next epoch a guaranteed false
+                # "best" and overwrite best_model.pt with unvetted weights.
+                _sel_now = str(getattr(config.training, 'selection_metric', 'val_mAP'))
+                # An empty recorded metric means the checkpoint predates this
+                # field, and back then selection was hardcoded to val_f1_macro --
+                # so "" is KNOWN to be val_f1_macro, not unknown. Treating it as
+                # unknown would needlessly discard a comparable historical best
+                # for a val_f1_macro run.
+                _sel_ckpt = str(getattr(training_state, 'selection_metric', '') or '') or 'val_f1_macro'
+                if _sel_ckpt != _sel_now and math.isfinite(training_state.best_metric):
+                    _stale_best = training_state.best_metric
+                    training_state.best_metric = float('-inf')
+                    training_state.patience_counter = 0
+                    # Before falling back to -inf (which makes the next validated
+                    # epoch a "best" by construction and overwrites best_model.pt
+                    # regardless of quality), try to recover a correctly-scaled
+                    # best from the sibling best checkpoint, which records all
+                    # metrics by name.
+                    _recovered = None
+                    try:
+                        _best_sib = Path(ckpt_path).parent / 'best_model.pt'
+                        if _best_sib.exists() and _best_sib != Path(ckpt_path):
+                            _sib_metrics = (checkpoint_manager.peek_checkpoint_metrics(_best_sib)
+                                            if hasattr(checkpoint_manager, 'peek_checkpoint_metrics')
+                                            else (torch.load(_best_sib, map_location='meta',
+                                                             weights_only=False).get('metrics') or {}))
+                            if _sel_now in _sib_metrics:
+                                _recovered = float(_sib_metrics[_sel_now])
+                    except Exception as _sib_e:
+                        logger.debug("Could not read sibling best_model.pt metrics: %s", _sib_e)
+                    if _recovered is not None and math.isfinite(_recovered):
+                        training_state.best_metric = _recovered
+                        logger.warning(
+                            "Resume: checkpoint's best_metric=%.6f was measured with %s but this "
+                            "run selects on %s. Re-seeded best_metric=%.6f from the sibling "
+                            "best_model.pt's recorded %s, so it is not overwritten by an "
+                            "arbitrary first epoch.",
+                            _stale_best, _sel_ckpt, _sel_now, _recovered, _sel_now,
+                        )
+                    else:
+                        logger.warning(
+                            "Resume: checkpoint's best_metric=%.6f was measured with %s but this "
+                            "run selects on %s, and no %s value could be recovered from a sibling "
+                            "best checkpoint. best_metric reset to -inf and patience to 0 -- NOTE "
+                            "the first validated epoch will therefore be recorded as best and will "
+                            "overwrite best_model.pt. Back it up first if you need the old one.",
+                            _stale_best, _sel_ckpt, _sel_now, _sel_now,
+                        )
+                training_state.selection_metric = _sel_now
+
                 if phase_transition:
                     # Epochs are phase-local: reset all counters/histories but
                     # carry the ASL loss state (gamma_neg stays frozen at its
@@ -1105,14 +1236,45 @@ def train_with_orientation_tracking(config: FullConfig):
                     # Preserve historical best; only reconcile when explicitly marked as best
                     if ckpt.get('is_best', False):
                         try:
-                            loaded_best = float(ckpt.get('metrics', {}).get('val_f1_macro', training_state.best_metric))
-                            training_state.best_metric = max(training_state.best_metric, loaded_best)
+                            # best_metric must be read back under the SAME metric that
+                            # will drive selection this run. Reading val_f1_macro while
+                            # selecting on val_mAP (or vice versa) seeds best_metric on a
+                            # different scale, which either freezes is_best forever or
+                            # makes every epoch a "new best".
+                            _sel = str(getattr(config.training, 'selection_metric', 'val_mAP'))
+                            _ckpt_metrics = ckpt.get('metrics', {}) or {}
+                            _ckpt_sel = _ckpt_metrics.get('selection_metric')
+                            if _ckpt_sel is not None and _ckpt_sel != _sel:
+                                logger.warning(
+                                    "Checkpoint was selected on %r but this run selects on %r; "
+                                    "discarding the stored best_metric rather than comparing "
+                                    "across scales.", _ckpt_sel, _sel,
+                                )
+                            elif _sel in _ckpt_metrics:
+                                loaded_best = float(_ckpt_metrics[_sel])
+                                training_state.best_metric = max(training_state.best_metric, loaded_best)
+                            else:
+                                logger.warning(
+                                    "Checkpoint metrics carry no %r entry; leaving best_metric "
+                                    "at %s (the first validated epoch will re-seed it).",
+                                    _sel, training_state.best_metric,
+                                )
                         except (TypeError, ValueError) as e:
                             logger.warning(f"Could not parse best metric from checkpoint: {e}")
                     # Extract mid-epoch resume info if available
                     resume_batch_idx = getattr(training_state, 'batch_in_epoch', 0)
                     resume_sample_idx = getattr(training_state, 'sample_in_epoch', 0)  # Batch-size agnostic
                     is_mid_epoch = not getattr(training_state, 'is_epoch_boundary', True)
+
+                    # NOTE: a mid-epoch save taken on (or past) the LAST batch of an epoch
+                    # records batch_in_epoch == steps_per_epoch, and resuming it sets a
+                    # sampler offset at the end of the shuffled index list, so the replayed
+                    # epoch yields ZERO batches. That epoch is deliberately NOT promoted to
+                    # the next one here: the model state is real and its validation /
+                    # best-checkpoint pass is still worth running (skipping it would mean a
+                    # stop on the final epoch resumes into range(N, N) and exits having
+                    # never validated). The only actual damage was avg_train_loss collapsing
+                    # to 0.0, which is handled at the epoch-loss computation below.
 
                     # Checkpoints store epoch+1 (1-based). Convert to 0-based loop index.
                     # For mid-epoch saves: resume the same epoch (subtract 1, then batch-skip handles the rest)
@@ -1144,12 +1306,41 @@ def train_with_orientation_tracking(config: FullConfig):
                     # Extract original batch_size for legacy checkpoint resume (batch-size agnostic)
                     # Note: Critical config validation (architecture_type, num_labels, etc.) was already
                     # performed BEFORE load_checkpoint() via peek_checkpoint_config() to fail fast.
+                    # Arm the LR-schedule guard below. Mirrors load_checkpoint()'s own
+                    # restore condition (`scheduler is not None and
+                    # 'scheduler_state_dict' in meta`); we are already in the
+                    # non-phase-transition branch, so `scheduler` was passed in non-None
+                    # and the only remaining question is whether the checkpoint carried
+                    # scheduler state at all.
+                    ckpt_scheduler_restored = 'scheduler_state_dict' in ckpt
+
                     ckpt_config = ckpt.get('config', {})
                     if ckpt_config:
                         ckpt_original_batch_size = ckpt_config.get('data', {}).get('batch_size')
                         if ckpt_original_batch_size and ckpt_original_batch_size != config.data.batch_size:
-                            logger.info(f"Checkpoint was trained with batch_size={ckpt_original_batch_size}, "
-                                       f"current batch_size={config.data.batch_size} - will use original for resume offset")
+                            # NOTE: this value is a LEGACY fallback only. Checkpoints
+                            # written by current code carry sample_in_epoch, which is
+                            # already batch-size agnostic and is preferred by the
+                            # mid-epoch resume path below; ckpt_original_batch_size is
+                            # consulted solely when sample_in_epoch is absent (0).
+                            logger.info(
+                                "Checkpoint was trained with batch_size=%s, current batch_size=%s "
+                                "(used for the resume offset only if the checkpoint predates "
+                                "sample_in_epoch).",
+                                ckpt_original_batch_size, config.data.batch_size,
+                            )
+
+                        # Record the checkpoint's EFFECTIVE batch for the LR-geometry
+                        # guard below. Only recorded here - the policy is applied
+                        # OUTSIDE this try/except, whose handler rewrites every
+                        # exception as "Checkpoint loading failed", which would bury
+                        # the operator instructions the guard needs to print.
+                        _ckpt_bs = (ckpt_config.get('data', {}) or {}).get('batch_size')
+                        _ckpt_accum = (ckpt_config.get('training', {}) or {}).get(
+                            'gradient_accumulation_steps'
+                        )
+                        if _ckpt_bs and _ckpt_accum:
+                            ckpt_effective_batch = (int(_ckpt_bs), int(_ckpt_accum))
 
                     # Keep sampler state so the mid-epoch resume path can verify the
                     # dataset size hasn't changed before applying a sample offset.
@@ -1166,6 +1357,199 @@ def train_with_orientation_tracking(config: FullConfig):
                 f"Checkpoint loading failed for {ckpt_path}. "
                 f"To start fresh, set training.resume_from='none' in config. Error: {e}"
             ) from e
+
+    # --- LR-schedule change guard -----------------------------------------------
+    # optimizer.load_state_dict() restores the saved per-group lr, and
+    # scheduler.load_state_dict() restores the checkpoint's ENTIRE LR geometry
+    # (base_max_lr, base_lrs, warmup_steps, first_cycle_steps, cur_cycle_steps) because
+    # _LRScheduler.state_dict() is the whole __dict__. So resuming with ANY of the
+    # inputs to that geometry changed silently keeps the OLD calibration: the
+    # effective_learning_rate / warmup_steps / first_cycle_steps computed above are all
+    # discarded, the cosine no longer lands on lr_end at the end of the run, and if the
+    # schedule SHRANK the extra updates can overrun cur_cycle_steps and fire an
+    # unintended SGDR warm restart - which a num_cycles=1 config assumes can never
+    # happen.
+    #
+    # This guard originally fired ONLY on a change in effective batch size
+    # (batch_size x gradient_accumulation_steps). That was too narrow: warmup_steps and
+    # first_cycle_steps are derived from updates_per_epoch, which is derived from
+    # len(train_loader) - so ADDING OR REMOVING TRAINING IMAGES invalidates the schedule
+    # just as thoroughly, at an unchanged batch size, and the batch-only trigger could
+    # not see that axis at all. The narrow scope was a deliberate temporary concession
+    # (broadening it would have hard-errored a then-live resume); that run has since
+    # finished, so all four dimensions are checked now.
+    #
+    # The checkpoint side of the comparison is read off the LIVE scheduler rather than
+    # off the checkpoint dict, because the scheduler object is the thing that will
+    # actually drive training - it is the ground truth for what load_state_dict()
+    # installed, including any key the save path did not record.
+    #
+    # Deliberately outside the try/except above: that handler rewrites everything as
+    # "Checkpoint loading failed", which would bury the instructions printed here.
+    # Armed only when scheduler state was genuinely restored, so a phase transition
+    # (scheduler passed as None, geometry already fresh from this config) never trips it.
+    if ckpt_scheduler_restored:
+        # (human-readable dimension, current-config value, checkpoint/scheduler value)
+        _drifts = []
+        _ckpt_bs = _ckpt_accum = None
+        if ckpt_effective_batch is not None:
+            _ckpt_bs, _ckpt_accum = ckpt_effective_batch
+            _ckpt_effective = _ckpt_bs * _ckpt_accum
+            if _ckpt_effective != effective_batch_size:
+                _drifts.append((
+                    'effective batch size',
+                    f"{config.data.batch_size}x{accum}={effective_batch_size}",
+                    f"{_ckpt_bs}x{_ckpt_accum}={_ckpt_effective}",
+                ))
+        # Each dimension is skipped when the scheduler does not expose it. Older
+        # checkpoints predate base_max_lr, and a missing value is NOT evidence of drift -
+        # treating None as a mismatch would hard-error every legacy resume for a
+        # dimension we simply cannot observe.
+        _sched_warmup = getattr(scheduler, 'warmup_steps', None)
+        if _sched_warmup is not None and int(_sched_warmup) != int(warmup_steps):
+            _drifts.append(('warmup_steps', int(warmup_steps), int(_sched_warmup)))
+        _sched_cycle = getattr(scheduler, 'first_cycle_steps', None)
+        if _sched_cycle is not None and int(_sched_cycle) != int(first_cycle_steps):
+            _drifts.append(('first_cycle_steps', int(first_cycle_steps), int(_sched_cycle)))
+        _sched_peak = getattr(scheduler, 'base_max_lr', None)
+        # math.isclose, not !=: base_max_lr is a float that has been through
+        # scale_learning_rate(), a torch save/load round-trip and possibly a retarget(),
+        # so an exact comparison would report phantom drift on bit-level noise.
+        if _sched_peak is not None and not math.isclose(
+            float(_sched_peak), float(effective_learning_rate), rel_tol=1e-9
+        ):
+            _drifts.append((
+                'base_max_lr (peak LR)',
+                f"{float(effective_learning_rate):.6e}",
+                f"{float(_sched_peak):.6e}",
+            ))
+        # min_lr and gamma are restored by load_state_dict exactly like the four
+        # dimensions above. They were skipped while this guard was scoped to batch-size
+        # changes (neither depends on batch size) - but it is now a general LR-schedule
+        # guard, and leaving them out meant a run that changed training.lr_end or
+        # training.cycle_decay resumed onto the OLD values with the guard silent, the
+        # anneal landing on the previous floor while the config advertised the new one.
+        _cfg_min_lr = float(getattr(config.training, 'lr_end', 1e-6))
+        _sched_min_lr = getattr(scheduler, 'min_lr', None)
+        if _sched_min_lr is not None and not math.isclose(
+            float(_sched_min_lr), _cfg_min_lr, rel_tol=1e-9
+        ):
+            _drifts.append((
+                'min_lr (lr_end)',
+                f"{_cfg_min_lr:.6e}",
+                f"{float(_sched_min_lr):.6e}",
+            ))
+        # Default must match the one the scheduler was CONSTRUCTED with (line ~839).
+        # A different fallback here would report phantom gamma drift the moment the
+        # field went missing, since the two would disagree by construction.
+        _cfg_gamma = float(getattr(config.training, 'cycle_decay', 0.9))
+        _sched_gamma = getattr(scheduler, 'gamma', None)
+        if _sched_gamma is not None and not math.isclose(
+            float(_sched_gamma), _cfg_gamma, rel_tol=1e-9
+        ):
+            _drifts.append(('gamma (cycle_decay)', _cfg_gamma, float(_sched_gamma)))
+
+        if _drifts:
+            _policy = str(getattr(
+                config.training, 'on_lr_schedule_change', 'error'
+            )).strip().lower()
+            _detail = (
+                "LR schedule geometry changed between the checkpoint and this config: "
+                + "; ".join(
+                    f"{_name}: current {_cur} vs checkpoint {_old}"
+                    for _name, _cur, _old in _drifts
+                )
+                + ". The checkpoint's LR geometry (peak LR, warmup length, cycle length) "
+                  "was calibrated for the old values and is restored verbatim by "
+                  "optimizer/scheduler load_state_dict()."
+            )
+            if _policy == 'keep':
+                logger.warning(
+                    "%s Continuing with the CHECKPOINT's LR geometry "
+                    "(training.on_lr_schedule_change='keep'): this run will train on the "
+                    "previous schedule's learning rate and its cosine will not land on "
+                    "lr_end. The configured %.3e peak / %s warmup / %s cycle are discarded.",
+                    _detail, effective_learning_rate, warmup_steps, first_cycle_steps,
+                )
+            elif _policy == 'rescale':
+                try:
+                    # retarget() covers every dimension checked above in one call - peak
+                    # LR, warmup length, cycle length, min_lr and gamma - carrying
+                    # progress across as a FRACTION of the cycle, so there is no
+                    # per-dimension dispatch here.
+                    _new_lrs = scheduler.retarget(
+                        max_lr=effective_learning_rate,
+                        warmup_steps=warmup_steps,
+                        first_cycle_steps=first_cycle_steps,
+                        min_lr=_cfg_min_lr,
+                        gamma=_cfg_gamma,
+                    )
+                except Exception as _rt_e:
+                    raise RuntimeError(
+                        f"Failed to retarget the LR schedule after an LR-schedule "
+                        f"change: {_rt_e}. Set training.on_lr_schedule_change='keep' to "
+                        f"resume with the checkpoint's schedule instead."
+                    ) from _rt_e
+                logger.warning(
+                    "%s Retargeting to the current config "
+                    "(training.on_lr_schedule_change='rescale'): peak LR -> %.3e, "
+                    "warmup -> %s updates, cycle -> %s updates, progress preserved at "
+                    "%.1f%% (step_in_cycle=%s), live LR now %.3e.",
+                    _detail, effective_learning_rate, warmup_steps,
+                    scheduler.cur_cycle_steps,
+                    100.0 * scheduler.step_in_cycle / max(1, scheduler.cur_cycle_steps),
+                    scheduler.step_in_cycle,
+                    _new_lrs[0] if _new_lrs else float('nan'),
+                )
+            else:
+                # "Restore the old values" is only actionable per drifted dimension, so
+                # the hints are built from _drifts rather than hardcoded: telling an
+                # operator to restore a batch size that never moved sends them hunting
+                # for a change that is not there.
+                _restore_hints = ""
+                if _ckpt_bs is not None and any(
+                    _n == 'effective batch size' for _n, _, _ in _drifts
+                ):
+                    _restore_hints += (
+                        f"  restore data.batch_size={_ckpt_bs} and "
+                        f"training.gradient_accumulation_steps={_ckpt_accum}\n"
+                    )
+                if any(_n in ('warmup_steps', 'first_cycle_steps') for _n, _, _ in _drifts):
+                    _restore_hints += (
+                        f"  restore whatever moved updates_per_epoch (currently "
+                        f"{updates_per_epoch}) - the training-set size / dataset filters, "
+                        f"training.num_epochs ({num_epochs}), training.warmup_epochs "
+                        f"({warmup_epochs}) or training.num_cycles ({num_cycles})\n"
+                    )
+                if any(_n.startswith('base_max_lr') for _n, _, _ in _drifts):
+                    _restore_hints += (
+                        f"  restore training.learning_rate / lr_scaling_mode / "
+                        f"lr_base_batch_size so the scaled peak matches the checkpoint\n"
+                    )
+                if any(_n.startswith('min_lr') for _n, _, _ in _drifts):
+                    _restore_hints += (
+                        f"  restore training.lr_end (currently {_cfg_min_lr:.6e})\n"
+                    )
+                if any(_n.startswith('gamma') for _n, _, _ in _drifts):
+                    _restore_hints += (
+                        f"  restore training.cycle_decay (currently {_cfg_gamma})\n"
+                    )
+                raise RuntimeError(
+                    f"{_detail}\n"
+                    f"Refusing to resume: doing so would train on the wrong learning-rate "
+                    f"schedule with no visible sign. Also re-check training.eval_steps "
+                    f"({getattr(config.training, 'eval_steps', 0)}) against the new updates_per_epoch "
+                    f"({updates_per_epoch}) - eval_steps >= updates_per_epoch drops "
+                    f"validation to every other epoch.\n"
+                    f"Choose one of:\n"
+                    f"  training.on_lr_schedule_change: 'rescale'  - retarget peak LR / "
+                    f"warmup / cycle to the current config, preserving progress as a "
+                    f"fraction of the cycle (recommended)\n"
+                    f"  training.on_lr_schedule_change: 'keep'     - keep the "
+                    f"checkpoint's schedule (pre-fix behaviour)\n"
+                    f"{_restore_hints}"
+                    f"  training.resume_from: 'none'               - start fresh"
+                )
 
     # --- ASL gamma_neg drive + always-on telemetry (todos/ASL_plan.md SS3/SS5/SS8) ---
     # Must run AFTER resume: it reconciles gamma_neg (checkpoint loss state wins
@@ -1278,47 +1662,114 @@ def train_with_orientation_tracking(config: FullConfig):
     # next(iter(train_loader)) batch, which spins up all workers early and perturbs
     # restored RNG/data order on resume (and was inactive with use_compile=true).
 
-    # Track optimizer updates (optimizer steps), distinct from micro-steps (batches)
-    # Maintain in training_state for resume compatibility - ensure all required fields exist
-    _state_defaults = {
-        'optimizer_updates': 0,
-        'batch_in_epoch': 0,
-        'is_epoch_boundary': True,
-        'best_metric': float('-inf'),
-    }
-    for attr, default_val in _state_defaults.items():
-        if not hasattr(training_state, attr):
-            setattr(training_state, attr, default_val)
+    # NOTE: no "ensure required TrainingState attrs exist" backfill here. TrainingState
+    # is a dataclass with defaults for every field and TrainingState.from_dict() filters
+    # unknown keys, so optimizer_updates/batch_in_epoch/is_epoch_boundary/best_metric are
+    # always present - the old hasattr() loop could never fire.
+
+    # Burn-in samples and validation cadence are restored from the checkpoint so they
+    # survive a soft stop. Both were previously process-local: last_validation_step
+    # reset to 0 on every restart, making `global_step - last_validation_step >=
+    # eval_steps` trivially true and forcing an off-cadence validation after every
+    # resume; _burn_in_vals restarted empty, so the burn-in baseline was computed from
+    # only the post-resume subset.
+    _burn_in_vals = [float(v) for v in (getattr(training_state, 'burn_in_values', None) or [])]
 
     # Create validation metrics once before training loop (CR-040 fix)
     # These will be reset each epoch instead of being recreated
     # Single source of truth for the prediction threshold (also used by the
     # bucketed metrics below and the standalone validation runner).
     threshold = float(config.inference.prediction_threshold)
+    selection_metric = str(getattr(config.training, 'selection_metric', 'val_mAP'))
+    if selection_metric not in _SELECTION_METRICS:
+        raise ValueError(
+            f"training.selection_metric={selection_metric!r} is not one of "
+            f"{sorted(_SELECTION_METRICS)}"
+        )
+    logger.info(
+        "Model selection / early stopping driven by %s%s",
+        selection_metric,
+        "" if selection_metric == 'val_mAP' else
+        f" (threshold-coupled at prediction_threshold={threshold}; a calibration "
+        f"shift such as an ASL gamma_neg step will move it independently of ranking)",
+    )
+    # Stamp it into the state so every checkpoint records which scale best_metric
+    # is on (see the resume reconciliation above).
+    training_state.selection_metric = selection_metric
     skip_metric_cols = 2  # PAD=0, UNK=1 — consistent with loss ignore_indices and bucketed metrics
     num_metric_labels = num_tags - skip_metric_cols
     # Per-class metrics (average=None) so we can filter classes with zero positives
     # in the validation draw before macro-averaging. Without this, an 18-24K-class
     # long-tailed vocabulary leaves thousands of classes unrepresented in any
     # ~30k-sample draw, each contributing AP=0 and pulling the macro toward zero.
-    # thresholds=200 puts the AP metric in binned mode (constant memory): the
-    # default thresholds=None retains every update's preds/targets on GPU
+    # An integer `thresholds` puts the AP metric in binned mode (constant memory):
+    # the default thresholds=None retains every update's preds/targets on GPU
     # (~7 GB at 30K x 19.3K labels) and concatenates them at compute().
+    # The count is configurable because binning biases mAP DOWN and that bias
+    # responds to rank-preserving calibration shifts — which matters now that
+    # val_mAP is the default selection metric. See ValidationConfig.ap_thresholds.
+    ap_thresholds = int(getattr(config.validation, 'ap_thresholds', None) or 200)
+    # Persistent state; torchmetrics also keeps a deepcopy in _defaults, hence x2.
+    _ap_state_mb = 2 * ap_thresholds * num_metric_labels * 4 * 8 / 1e6
+    # The transient per-update intermediate is what actually constrains this.
+    # _multilabel_precision_recall_curve_update holds several (B, L, T) tensors at
+    # once (preds_t, unique_mapping, a bool mask and the (N,3) index tensor from
+    # the >=0 filter), not one: measured ~50 bytes per element on torchmetrics
+    # 1.8.2 at both T=200 (9.34 GB) and T=500 (23.57 GB). Counting a single int64
+    # understates the peak 6.3x. The AP metric is fed VALIDATION batches.
+    _AP_BYTES_PER_ELEM = 50
+    _ap_val_bs = int(getattr(getattr(config.validation, 'dataloader', None), 'batch_size', 0)
+                     or config.data.batch_size)
+    _ap_peak_gb = (_ap_val_bs * num_metric_labels * ap_thresholds * _AP_BYTES_PER_ELEM) / 1e9
     val_metrics = {
         'f1_macro_per_class': MultilabelF1Score(num_labels=num_metric_labels, average=None, threshold=threshold).to(device),
         'f1_micro': MultilabelF1Score(num_labels=num_metric_labels, average="micro", threshold=threshold).to(device),
-        'map_per_class': MultilabelAveragePrecision(num_labels=num_metric_labels, average=None, thresholds=200).to(device)
+        'map_per_class': MultilabelAveragePrecision(num_labels=num_metric_labels, average=None, thresholds=ap_thresholds).to(device)
     }
     val_pos_counts = torch.zeros(num_metric_labels, dtype=torch.long, device=device)
-    logger.info(f"Validation metrics initialized with {num_metric_labels} labels (skipping {skip_metric_cols} special tokens), threshold={threshold}")
+    logger.info(
+        f"Validation metrics initialized with {num_metric_labels} labels "
+        f"(skipping {skip_metric_cols} special tokens), threshold={threshold}, "
+        f"ap_thresholds={ap_thresholds} (~{_ap_state_mb:.0f} MB resident, "
+        f"~{_ap_peak_gb:.1f} GB transient peak per AP update)"
+    )
+    if _ap_peak_gb > 12.0:
+        logger.warning(
+            "validation.ap_thresholds=%d implies a ~%.1f GB transient allocation per AP "
+            "update at val batch_size=%d. This will thrash or OOM on most GPUs - lower it.",
+            ap_thresholds, _ap_peak_gb, _ap_val_bs,
+        )
 
     # Initialize memory monitor to track RAM usage and prevent OOM
     mem_monitor = MemoryMonitor(warn_threshold_gb=115.0, critical_threshold_gb=125.0)
     logger.info("Memory monitor initialized (warn: 115 GB, critical: 125 GB)")
 
-    # Track last validation step for step-based validation frequency
-    last_validation_step = 0
+    # Track last validation step for step-based validation frequency (restored from
+    # the checkpoint - see the burn-in/cadence note above).
+    last_validation_step = int(getattr(training_state, 'last_validation_step', 0) or 0)
     eval_steps = getattr(config.training, 'eval_steps', 0) or 0  # 0 means validate every epoch
+    # `eval_steps < updates_per_epoch` is what guarantees at least one validation per
+    # epoch. That guarantee used to be unconditional (validation was forced whenever
+    # epoch == start_epoch), so nothing depended on the margin; now it does. Anything
+    # that shrinks updates_per_epoch - a smaller corpus, a larger batch_size, a larger
+    # gradient_accumulation_steps - can silently drop the cadence to every other epoch,
+    # which with early_stopping_burn_in_epochs also starves the burn-in window.
+    if eval_steps > 0 and eval_steps >= updates_per_epoch:
+        logger.warning(
+            "training.eval_steps=%s is >= updates_per_epoch=%s: validation will NOT run "
+            "every epoch (roughly every %.1f epochs). Early stopping then counts validated "
+            "epochs rather than epochs, and the burn-in window (%s epochs) may collect "
+            "fewer samples than configured. Set eval_steps below %s to validate every epoch.",
+            eval_steps, updates_per_epoch, eval_steps / max(1, updates_per_epoch),
+            burn_in_epochs, updates_per_epoch,
+        )
+    else:
+        logger.info(
+            "Validation cadence: eval_steps=%s vs %s optimizer updates/epoch "
+            "(%s per epoch)",
+            eval_steps, updates_per_epoch,
+            "every epoch" if eval_steps == 0 else "at least once",
+        )
 
     # NOTE: use_channels_last is defined earlier (before torch.compile) and cached for use here
 
@@ -1373,6 +1824,20 @@ def train_with_orientation_tracking(config: FullConfig):
         with anomaly_ctx:
             # Mid-epoch resume setup (before creating iterator to avoid double-init)
             start_step = 0
+            # Whether the O(1) sampler offset was actually applied. The slow
+            # batch-skipping fallback below MUST key off this rather than off
+            # `start_step == 0`: when the recorded sample offset is smaller than the
+            # CURRENT batch size (only possible if batch_size grew since the checkpoint),
+            # start_step floors to 0 even though the offset was applied, and the fallback
+            # would then consume resume_batch_idx further batches on top of it - silently
+            # dropping up to new_bs^2/old_bs samples from the replayed epoch.
+            sampler_offset_applied = False
+            # `step` restarts at floor(sample_offset / batch_size), but the sampler starts
+            # at sample_offset exactly. When the two disagree (again, only after a
+            # batch_size change) every later save in this epoch would record a
+            # sample_in_epoch that is `sample_offset % batch_size` samples behind the true
+            # position. This carries the remainder so the recorded position stays exact.
+            sample_pos_correction = 0
             if epoch == start_epoch and is_mid_epoch and (resume_batch_idx > 0 or resume_sample_idx > 0):
                 # Try instant resume via ResumableSampler (O(1) instead of O(n) batch iteration)
                 sampler = getattr(train_loader, 'sampler', None)
@@ -1399,20 +1864,41 @@ def train_with_orientation_tracking(config: FullConfig):
                         sample_offset = resume_sample_idx
                         start_step = sample_offset // train_loader.batch_size
                     else:
-                        # Use original batch_size from checkpoint for legacy checkpoints (batch-size agnostic)
-                        effective_batch_size = ckpt_original_batch_size or train_loader.batch_size
-                        sample_offset = resume_batch_idx * effective_batch_size
+                        # Use original batch_size from checkpoint for legacy checkpoints
+                        # (those predating sample_in_epoch), so the offset is still in
+                        # sample space rather than in the old run's batch units.
+                        # NOTE: deliberately NOT named effective_batch_size - that is a
+                        # function-level local meaning batch_size * accum (samples per
+                        # optimizer update, used for LR scaling and the effective-batch
+                        # guard). Reusing the name here reassigned it to a plain
+                        # batch_size mid-run; harmless only because every reader happens
+                        # to run earlier, which is not a property worth relying on.
+                        legacy_batch_size = ckpt_original_batch_size or train_loader.batch_size
+                        sample_offset = resume_batch_idx * legacy_batch_size
                         start_step = sample_offset // train_loader.batch_size
                     sampler.set_start_index(sample_offset)
-                    logger.info(f"Resuming mid-epoch at batch {start_step} (sample offset {sample_offset}, instant via sampler)")
+                    sampler_offset_applied = True
+                    sample_pos_correction = sample_offset - start_step * train_loader.batch_size
+                    logger.info(
+                        "Resuming mid-epoch at batch %s (sample offset %s, instant via sampler)%s",
+                        start_step, sample_offset,
+                        (f" - offset is not a multiple of batch_size={train_loader.batch_size}; "
+                         f"carrying a {sample_pos_correction}-sample correction so later saves "
+                         f"record the exact position")
+                        if sample_pos_correction else "",
+                    )
 
             # Create iterator (sampler start_index already set if mid-epoch resume)
             # Workers spawn synchronously here; persistent_workers=True keeps them alive for subsequent epochs
             train_iter = iter(train_loader)
 
             # Fallback path for mid-epoch resume without ResumableSampler
-            if epoch == start_epoch and is_mid_epoch and resume_batch_idx > 0 and start_step == 0:
-                # No ResumableSampler - must iterate through batches (slow fallback)
+            if epoch == start_epoch and is_mid_epoch and resume_batch_idx > 0 and not sampler_offset_applied:
+                # No ResumableSampler - must iterate through batches (slow fallback).
+                # This skips resume_batch_idx batches at the CURRENT batch size, so it is
+                # only faithful when batch_size is unchanged; the sampler path above is
+                # the batch-size-agnostic one and handles every configuration this repo
+                # actually builds (create_dataloaders always installs a ResumableSampler).
                 logger.info(f"Resuming mid-epoch: skipping {resume_batch_idx} batches (fallback mode, no ResumableSampler)...")
                 skip_start = time.time()
 
@@ -1429,6 +1915,20 @@ def train_with_orientation_tracking(config: FullConfig):
                 start_step = resume_batch_idx
 
             for step, batch in enumerate(train_iter, start=start_step):
+                # Poll the sentinels FIRST, before any of the `continue` paths below
+                # (failed load / NaN loss / non-finite grad) can skip the rest of the
+                # body. Only the LATCHES live here - the checkpoint saves stay at the end
+                # of the body, where the accumulation window is in a known state and
+                # `step` is safe to record as the resume position. With the polls at the
+                # end, a failure pattern that happened to cover the throttled poll steps
+                # meant the sentinels were never even read, so the request went unnoticed
+                # until the epoch boundary (STOP_TRAINING) or indefinitely (SAVE_CHECKPOINT).
+                if step % SENTINEL_CHECK_INTERVAL == 0:
+                    if stop_sentinel.exists():
+                        soft_stop_event.set()
+                    if save_sentinel.exists():
+                        save_now_pending = True
+
                 # Filter out error samples that failed to load (zero-valued samples corrupt gradients)
                 error_flags = batch.get('error')
                 if error_flags is not None and isinstance(error_flags, torch.Tensor) and error_flags.any():
@@ -1705,8 +2205,11 @@ def train_with_orientation_tracking(config: FullConfig):
                         # soft-stop and one-shot save paths) - recording `step` would
                         # retrain one batch and shift accumulation windows on resume.
                         training_state.batch_in_epoch = step + 1
-                        training_state.sample_in_epoch = (step + 1) * train_loader.batch_size
+                        training_state.sample_in_epoch = (
+                            (step + 1) * train_loader.batch_size + sample_pos_correction
+                        )
                         training_state.is_epoch_boundary = False
+                        training_state.completed_epochs = epoch
 
                         try:
                             checkpoint_manager.save_checkpoint(
@@ -1741,13 +2244,34 @@ def train_with_orientation_tracking(config: FullConfig):
                 # Explicitly delete detached loss to free VRAM
                 del loss_detached
 
-                # Early soft stop check - only stop at safe points after accumulation
-                # Throttled: event check is cheap (atomic), but sentinel.exists() is a syscall
-                # PERF: Check sentinel every SENTINEL_CHECK_INTERVAL steps (default 10) to minimize
-                # filesystem overhead in hot loop while still allowing reasonable responsiveness
-                stop_requested = soft_stop_event.is_set() or (step % SENTINEL_CHECK_INTERVAL == 0 and stop_sentinel.exists())
+                # Early soft stop check - only stop at safe points after accumulation.
+                # The sentinel poll is throttled (exists() is a syscall in the hot loop)
+                # and lives at the TOP of this loop body; its RESULT is latched into
+                # soft_stop_event, which is read here every microbatch. Testing the
+                # throttled expression directly was a real bug: the save below
+                # additionally requires accum_count == 0, i.e.
+                # step % SENTINEL_CHECK_INTERVAL == 0 AND step % accum == accum - 1 in the
+                # same iteration. By CRT that is solvable only when
+                # gcd(SENTINEL_CHECK_INTERVAL, accum) == 1 - at accum=8 or 10 the two
+                # conditions could NEVER coincide, so STOP_TRAINING latched
+                # soft_stop_pending (disabling the epoch-boundary flush) and then never
+                # actually stopped. Latching makes the stop land on the very next
+                # accumulation boundary for any accum.
+                stop_requested = soft_stop_event.is_set()
                 if stop_requested:
-                    if accum_count > 0:
+                    if soft_stop_pending:
+                        soft_stop_wait_steps += 1
+                    # A healthy window closes within `accum` microbatches, so this bound is
+                    # never reached in normal operation. It exists because the four
+                    # `continue` paths above (all-samples-failed batch, NaN loss, non-finite
+                    # grad) skip this check entirely, and two of them RESET accum_count. If
+                    # such failures recur at a period that resonates with `accum`, no window
+                    # ever closes, accum_count never returns to 0, and the stop request would
+                    # be ignored until the epoch boundary - potentially six figures of
+                    # microbatches away. Such a run is making zero optimizer progress anyway,
+                    # so discarding one partial window to honour the stop is strictly better.
+                    stall_limit = max(4 * accum, 32)
+                    if accum_count > 0 and soft_stop_wait_steps <= stall_limit:
                         if not soft_stop_pending:
                             remaining = max(0, accum - accum_count)
                             logger.info(
@@ -1755,7 +2279,20 @@ def train_with_orientation_tracking(config: FullConfig):
                                 remaining
                             )
                             soft_stop_pending = True
+                            soft_stop_wait_steps = 0
                     else:
+                        if accum_count > 0:
+                            logger.warning(
+                                "Soft stop: accumulation window has not closed after %s "
+                                "microbatches (accum=%s, accum_count=%s) - discarding the "
+                                "partial window and stopping now. Repeated skipped batches "
+                                "(failed loads / NaN loss / non-finite gradients) are the "
+                                "usual cause; check train/nan_inf_loss_detected and "
+                                "train/skipped_batches.",
+                                soft_stop_wait_steps, accum, accum_count,
+                            )
+                            optimizer.zero_grad(set_to_none=True)
+                            accum_count = 0
                         logger.info("Soft stop requested - saving checkpoint...")
 
                         # Resume at the next batch to avoid reprocessing partial accumulation windows
@@ -1772,8 +2309,11 @@ def train_with_orientation_tracking(config: FullConfig):
                         training_state.global_step = global_step
                         training_state.train_loss = current_train_loss_value
                         training_state.batch_in_epoch = save_batch_position
-                        training_state.sample_in_epoch = save_batch_position * train_loader.batch_size
+                        training_state.sample_in_epoch = (
+                            save_batch_position * train_loader.batch_size + sample_pos_correction
+                        )
                         training_state.is_epoch_boundary = False
+                        training_state.completed_epochs = epoch
 
                         # CR-043: Clear GPU memory before soft stop checkpoint save
                         gc.collect()
@@ -1804,67 +2344,73 @@ def train_with_orientation_tracking(config: FullConfig):
                         early_exit = True
                         break
 
-                # One-shot save handling (without stopping) - only at safe points after optimizer step
-                # PERF: Throttle save sentinel check to every SENTINEL_CHECK_INTERVAL steps
-                # to reduce filesystem syscalls in hot training loop
-                if accum_count == 0 and global_step > 0 and (step % SENTINEL_CHECK_INTERVAL == 0):
-                    save_now = save_sentinel.exists()
-                    if save_now:
-                        # Freeze running_loss to a Python float at snapshot time so the dict
-                        # is decoupled from the GPU tensor (which keeps mutating in-place).
-                        state_snapshot = {
-                            'epoch': epoch + 1,
-                            'global_step': global_step,
-                            'step': step + 1,
-                            'running_loss': _loss_to_float(running_loss),
-                            'processed_batches': processed_batches,
-                            'total_train_samples': total_train_samples
-                        }
+                # One-shot save handling (without stopping) - only at safe points after
+                # an optimizer step. Same latch-then-act split as the soft stop above:
+                # the throttled poll (hoisted to the top of this loop body) sets a sticky
+                # flag, and the flag - not the throttled expression - gates the save.
+                # Requiring the poll step and the accumulation boundary to coincide meant
+                # SAVE_CHECKPOINT was never honored, and never unlinked so the file
+                # lingered, for any accum sharing a factor with SENTINEL_CHECK_INTERVAL.
+                if accum_count == 0 and global_step > 0 and save_now_pending:
+                    save_now_pending = False
+                    # Freeze running_loss to a Python float at snapshot time so the dict
+                    # is decoupled from the GPU tensor (which keeps mutating in-place).
+                    state_snapshot = {
+                        'epoch': epoch + 1,
+                        'global_step': global_step,
+                        'step': step + 1,
+                        'running_loss': _loss_to_float(running_loss),
+                        'processed_batches': processed_batches,
+                        'total_train_samples': total_train_samples
+                    }
 
-                        try:
-                            current_train_loss = state_snapshot['running_loss'] / max(1, state_snapshot['total_train_samples'])
-                        except Exception:
-                            current_train_loss = float('nan')
+                    try:
+                        current_train_loss = state_snapshot['running_loss'] / max(1, state_snapshot['total_train_samples'])
+                    except Exception:
+                        current_train_loss = float('nan')
 
-                        current_train_loss_value = _loss_to_float(current_train_loss)
-                        # Update training state using frozen snapshot
-                        training_state.epoch = state_snapshot['epoch']
-                        training_state.global_step = state_snapshot['global_step']
-                        training_state.train_loss = current_train_loss_value
-                        # Track mid-epoch position for resume
-                        training_state.batch_in_epoch = step + 1  # Next batch to process (consistent with soft stop)
-                        training_state.sample_in_epoch = (step + 1) * train_loader.batch_size
-                        training_state.is_epoch_boundary = False
+                    current_train_loss_value = _loss_to_float(current_train_loss)
+                    # Update training state using frozen snapshot
+                    training_state.epoch = state_snapshot['epoch']
+                    training_state.global_step = state_snapshot['global_step']
+                    training_state.train_loss = current_train_loss_value
+                    # Track mid-epoch position for resume
+                    training_state.batch_in_epoch = step + 1  # Next batch to process (consistent with soft stop)
+                    training_state.sample_in_epoch = (
+                        (step + 1) * train_loader.batch_size + sample_pos_correction
+                    )
+                    training_state.is_epoch_boundary = False
+                    training_state.completed_epochs = epoch
 
-                        # CR-043: Clear GPU memory before one-shot checkpoint save
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                    # CR-043: Clear GPU memory before one-shot checkpoint save
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-                        # Save checkpoint (updates last.pt atomically)
-                        try:
-                            checkpoint_manager.save_checkpoint(
-                                model=model,
-                                optimizer=optimizer,
-                                scheduler=scheduler,
-                                epoch=state_snapshot['epoch'],
-                                step=state_snapshot['global_step'],
-                                metrics={'train_loss': current_train_loss_value},
-                                training_state=training_state,
-                                is_best=False,
-                                config=config.to_dict(),
-                                train_loader=train_loader,
-                                scaler=scaler,
-                            )
-                            logger.info("One-shot save: checkpoint written at step %s.", state_snapshot['global_step'])
-                        except Exception as e:
-                            logger.warning("One-shot save: failed to write checkpoint: %s", e)
+                    # Save checkpoint (updates last.pt atomically)
+                    try:
+                        checkpoint_manager.save_checkpoint(
+                            model=model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            epoch=state_snapshot['epoch'],
+                            step=state_snapshot['global_step'],
+                            metrics={'train_loss': current_train_loss_value},
+                            training_state=training_state,
+                            is_best=False,
+                            config=config.to_dict(),
+                            train_loader=train_loader,
+                            scaler=scaler,
+                        )
+                        logger.info("One-shot save: checkpoint written at step %s.", state_snapshot['global_step'])
+                    except Exception as e:
+                        logger.warning("One-shot save: failed to write checkpoint: %s", e)
 
-                        # Clear the one-shot save sentinel
-                        try:
-                            save_sentinel.unlink()
-                        except Exception:
-                            pass
+                    # Clear the one-shot save sentinel
+                    try:
+                        save_sentinel.unlink()
+                    except Exception:
+                        pass
 
                 # Log every N optimizer updates (throttled) and ensure first-update write.
                 # should_log is True only on the boundary microbatch of a qualifying
@@ -1986,8 +2532,15 @@ def train_with_orientation_tracking(config: FullConfig):
             # carried into the next epoch - see the epoch-boundary handler below),
             # but on the FINAL epoch there is no next epoch: flush here so the
             # accumulated work is not lost and the soft-stop checkpoint still saves.
+            # The same applies once we have ALREADY carried a window across one
+            # boundary (soft_stop_carried): carrying again would let the stop request
+            # ride to the end of training without ever checkpointing, and would keep
+            # `carry_accum` suppressing the per-epoch reset of running_loss /
+            # total_train_samples / processed_batches, turning avg_train_loss into a
+            # cumulative average over every epoch since the request.
             is_final_epoch = (epoch + 1 >= config.training.num_epochs)
-            if accum_count > 0 and (not soft_stop_pending or is_final_epoch):
+            defer_flush = soft_stop_pending and not is_final_epoch and not soft_stop_carried
+            if accum_count > 0 and not defer_flush:
                 logger.info(
                     "Epoch %s: flushing %s/%s accumulated micro-batches at epoch boundary",
                     epoch + 1, accum_count, accum,
@@ -2047,8 +2600,10 @@ def train_with_orientation_tracking(config: FullConfig):
                 break
 
             if accum_count > 0:
-                if not soft_stop_pending:
-                    soft_stop_pending = True
+                # Only reachable when the flush above deferred (defer_flush): on the
+                # final epoch, or after one carry, accum_count is already 0 here.
+                soft_stop_pending = True
+                soft_stop_carried = True
                 logger.info(
                     "Soft stop detected at epoch boundary with %s accumulated microbatches. "
                     "Continuing into next epoch to finish accumulation before stopping.",
@@ -2070,6 +2625,7 @@ def train_with_orientation_tracking(config: FullConfig):
             training_state.batch_in_epoch = 0
             training_state.sample_in_epoch = 0
             training_state.is_epoch_boundary = True
+            training_state.completed_epochs = epoch + 1
 
             # CR-043: Clear GPU memory before soft stop checkpoint save
             gc.collect()
@@ -2103,7 +2659,31 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.info(f"Completed resumed epoch {epoch + 1} - cleared mid-epoch flag")
             is_mid_epoch = False
 
-        avg_train_loss = _loss_to_float(running_loss / max(1, total_train_samples))  # Per-sample average; sync OK at epoch end
+        force_validate = False
+        if total_train_samples > 0:
+            avg_train_loss = _loss_to_float(running_loss / total_train_samples)  # Per-sample average; sync OK at epoch end
+        else:
+            # Zero batches trained this epoch. Usually this means we resumed from a
+            # checkpoint whose batch_in_epoch lands at/after the end of the epoch: the
+            # sampler offset consumes the whole index list, so the replayed epoch yields
+            # nothing. (It is also reachable if every batch took a `continue` path -
+            # all-samples-failed or NaN loss - which is a data/numerics incident, not a
+            # resume artefact.) Dividing by max(1, 0) reported a train_loss of 0.0 that
+            # was never measured, and overwrote training_state.train_loss and the
+            # TensorBoard series with it. Carry the checkpoint's value forward instead.
+            avg_train_loss = float(getattr(training_state, 'train_loss', 0.0) or 0.0)
+            # Force validation. A zero-batch epoch does not advance global_step, so the
+            # eval_steps cadence below cannot fire on its own and this replayed epoch
+            # would produce no training, no validation and no checkpoint at all - on the
+            # final epoch that means the resumed process exits having done nothing. The
+            # validation pass on the restored model is the entire point of replaying it.
+            force_validate = True
+            logger.warning(
+                "Epoch %s processed 0 training batches (%s skipped). Reusing the "
+                "checkpoint's train_loss=%.4f rather than reporting 0.0, and forcing "
+                "validation so the restored model is still evaluated.",
+                epoch + 1, skipped_batches, avg_train_loss,
+            )
 
         # Log skipped batch statistics for monitoring
         if skipped_batches > 0:
@@ -2117,7 +2697,12 @@ def train_with_orientation_tracking(config: FullConfig):
         has_val_loader = val_loader is not None
         should_validate = has_val_loader and (
             eval_steps == 0  # 0 means always validate at epoch end
-            or epoch == start_epoch  # Always validate first epoch
+            # Always validate the first epoch of a FRESH run, so the selection metric has
+            # a seed value. `epoch == start_epoch` alone also fired on every resume, which
+            # made restoring last_validation_step pointless: the resumed epoch validated
+            # unconditionally and then re-anchored the cadence to that global_step.
+            or (epoch == start_epoch and last_validation_step == 0)
+            or force_validate  # zero-batch replayed epoch: global_step cannot advance
             or global_step - last_validation_step >= eval_steps
         )
 
@@ -2140,6 +2725,10 @@ def train_with_orientation_tracking(config: FullConfig):
                 )
         else:
             last_validation_step = global_step
+            # Mirror into training_state at the point of change so every checkpoint
+            # written afterwards (periodic, one-shot, soft stop, best) carries the
+            # cadence forward - see TrainingState.last_validation_step.
+            training_state.last_validation_step = last_validation_step
             # Validation loop
             model.eval()
             val_loss = torch.tensor(0.0, device=device)  # Keep on GPU to avoid per-batch sync
@@ -2374,28 +2963,60 @@ def train_with_orientation_tracking(config: FullConfig):
         training_state.val_mAP = val_mAP
         training_state.learning_rates.append(current_lr)
 
+        # Model-selection scalar. Configurable because val_f1_macro is evaluated
+        # at a single FROZEN global threshold (config.inference.prediction_threshold)
+        # and is therefore calibration-coupled: any change that shifts the global
+        # probability scale without changing ranking -- notably an ASL gamma_neg
+        # step -- moves it by far more than a real epoch's ranking improvement,
+        # and in the wrong direction (lowering gamma_neg pushes probabilities down,
+        # so a genuine gain reads as a large drop, burning patience). val_mAP is
+        # threshold-free and is the default. See selection_metric in the config.
+        selection_value = _SELECTION_METRICS[selection_metric](
+            val_f1_macro, val_f1_micro, val_mAP
+        )
+
         # --- TensorBoard: periodic flush ---
         try:
             monitor.flush()
         except Exception:
             pass
 
-        # Checkpointing and early stopping based on macro F1
+        # Checkpointing and early stopping on the configured selection metric
         is_best = False
         # Handle burn-in (ignore early-stopping decisions for first N epochs)
         if burn_in_epochs > 0 and (epoch + 1) <= burn_in_epochs:
-            _burn_in_vals.append(val_f1_macro)
+            # Only record epochs where validation actually ran. On a skipped epoch
+            # selection_value is a stale cached metric re-read from training_state, so
+            # appending it double-counts the previous epoch and drags the baseline
+            # toward it - and now that the window is checkpointed, that duplicate would
+            # survive restarts instead of dying with the process.
+            if should_validate:
+                _burn_in_vals.append(float(selection_value))
+                # Mirror into training_state at the point of change so a soft stop inside
+                # the burn-in window resumes with the full window, not just the tail.
+                training_state.burn_in_values = list(_burn_in_vals)
             prev_best_for_log = training_state.best_metric  # Capture before any modifications
             # Track best during burn-in to avoid losing a great model. Only act on
             # epochs where validation actually ran; on a validation-skipped epoch
-            # val_f1_macro is a stale cached value and must not move best/patience.
-            if should_validate and val_f1_macro > training_state.best_metric + es_threshold:
-                training_state.best_metric = val_f1_macro
+            # the selection metric is a stale cached value and must not move best/patience.
+            if should_validate and selection_value > training_state.best_metric + es_threshold:
+                training_state.best_metric = selection_value
                 training_state.best_epoch = epoch + 1
                 # Don't save is_best during burn-in: early metrics are unreliable and
                 # best_metric gets reset at burn-in end, leaving a stale "best" checkpoint.
-            # On the last burn-in epoch, reset baseline to a robust summary
-            if (epoch + 1) == burn_in_epochs:
+            # On the last burn-in epoch, reset baseline to a robust summary.
+            # `_burn_in_vals` can be empty if no epoch in the window ever validated
+            # (eval_steps cadence, or no val_loader): np.max([]) raises and np.median([])
+            # is nan, either of which would corrupt best_metric. Leave the baseline alone
+            # in that case - the first validated epoch re-seeds it.
+            if (epoch + 1) == burn_in_epochs and not _burn_in_vals:
+                logger.warning(
+                    "Early-stopping burn-in ended (epochs=%d) with no validated epoch; "
+                    "leaving best_metric at %s and zeroing patience.",
+                    burn_in_epochs, training_state.best_metric,
+                )
+                training_state.patience_counter = 0
+            elif (epoch + 1) == burn_in_epochs:
                 try:
                     if burn_in_strategy == "last":
                         baseline = float(_burn_in_vals[-1])
@@ -2426,12 +3047,12 @@ def train_with_orientation_tracking(config: FullConfig):
             lr_ratio = current_lr / cycle_max_lr if cycle_max_lr > 0 else 1.0
 
             # Only update best/patience on epochs where validation actually ran.
-            # When validation is skipped (eval_steps cadence), val_f1_macro is a
-            # stale cached value: it never beats best, so without this guard the
+            # When validation is skipped (eval_steps cadence), the selection metric
+            # is a stale cached value: it never beats best, so without this guard the
             # `elif lr_ratio < 0.5` branch would advance patience toward the early-
             # stop limit on an epoch that produced no new metric.
-            if should_validate and val_f1_macro > training_state.best_metric + es_threshold:
-                training_state.best_metric = val_f1_macro
+            if should_validate and selection_value > training_state.best_metric + es_threshold:
+                training_state.best_metric = selection_value
                 training_state.patience_counter = 0
                 training_state.best_epoch = epoch + 1
                 is_best = True
@@ -2454,13 +3075,21 @@ def train_with_orientation_tracking(config: FullConfig):
             training_state.is_epoch_boundary = True
             training_state.batch_in_epoch = 0
             training_state.sample_in_epoch = 0
+            training_state.completed_epochs = epoch + 1
             checkpoint_manager.save_checkpoint(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 epoch=epoch + 1,
                 step=global_step,
-                metrics={'train_loss': avg_train_loss, 'val_loss': avg_val_loss, 'val_f1_macro': val_f1_macro, 'val_mAP': val_mAP},
+                metrics={
+                    'train_loss': avg_train_loss, 'val_loss': avg_val_loss,
+                    'val_f1_macro': val_f1_macro, 'val_f1_micro': val_f1_micro,
+                    'val_mAP': val_mAP,
+                    # Records WHICH scalar made this the best checkpoint, so a
+                    # resume can refuse to compare across metric scales.
+                    'selection_metric': selection_metric,
+                },
                 training_state=training_state,
                 is_best=True,
                 config=config.to_dict(),
@@ -2469,8 +3098,21 @@ def train_with_orientation_tracking(config: FullConfig):
             )
 
         if patience and training_state.patience_counter >= patience:
-            logger.info("Early stopping triggered: no improvement in val_f1_macro for %s epochs", patience)
+            logger.info("Early stopping triggered: no improvement in %s for %s epochs", selection_metric, patience)
             break
+
+    # Clear the one-shot SAVE_CHECKPOINT sentinel on every exit path. It is normally
+    # unlinked when consumed, but a soft stop / early stop that breaks out while the
+    # latch is still pending would leave the file on disk, and the NEXT run would then
+    # write a checkpoint at its first safe point for no reason. (STOP_TRAINING has the
+    # equivalent guard at startup; this one is cheaper to do on the way out.)
+    try:
+        save_sentinel.unlink()
+        logger.info("Cleared pending SAVE_CHECKPOINT sentinel on exit.")
+    except FileNotFoundError:
+        pass
+    except Exception as _save_sentinel_exc:
+        logger.debug("Could not clear SAVE_CHECKPOINT sentinel: %s", _save_sentinel_exc)
 
     # --- TensorBoard: final hparams snapshot ---
     try:
@@ -2481,7 +3123,7 @@ def train_with_orientation_tracking(config: FullConfig):
             final_metrics["final/val_loss"] = float(avg_val_loss)
         if 'avg_train_loss' in locals():
             final_metrics["final/train_loss"] = float(avg_train_loss)
-        final_metrics["final/best_val_f1_macro"] = float(training_state.best_metric)
+        final_metrics[f"final/best_{selection_metric}"] = float(training_state.best_metric)
         monitor.log_hyperparameters(hparams, final_metrics if final_metrics else {"final/placeholder": 1})
     except Exception:
         pass

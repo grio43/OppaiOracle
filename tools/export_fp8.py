@@ -98,8 +98,11 @@ def preprocess(image: np.ndarray):
     scale = min(target / w, target / h, 1.0)
     new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
     if (new_w, new_h) != (w, h):
+        # LANCZOS to match training (dataset_loader) and onnx_infer. Calibration
+        # data preprocessed differently from serving data biases the activation
+        # ranges the static quantizer derives.
         image = np.asarray(
-            Image.fromarray(image).resize((new_w, new_h), Image.BILINEAR), dtype=np.uint8
+            Image.fromarray(image).resize((new_w, new_h), Image.LANCZOS), dtype=np.uint8
         )
     canvas = np.full((target, target, 3), PAD_COLOR, dtype=np.uint8)
     top, left = (target - new_h) // 2, (target - new_w) // 2

@@ -66,6 +66,7 @@ from training_utils import (
     CheckpointManager,
     InvalidCheckpointError,
     detect_architecture_from_state_dict,
+    normalize_state_dict_keys,
 )
 from model_architecture import create_model, VisionTransformerConfig
 from model_metadata import ModelMetadata
@@ -503,9 +504,11 @@ class ValidationRunner:
             else:
                 state_dict = checkpoint
             
-            # Handle DDP wrapped models
-            if any(key.startswith('module.') for key in state_dict.keys()):
-                state_dict = {key.replace('module.', ''): value for key, value in state_dict.items()}
+            # Strip DDP ('module.') AND torch.compile ('_orig_mod.') wrapper
+            # prefixes. Real training checkpoints are 100% '_orig_mod.'-prefixed
+            # because the trainer compiles the model before saving; without this
+            # the strict load below fails on every one of them.
+            state_dict = normalize_state_dict_keys(state_dict)
 
             # Filter out removed rating_head keys from old checkpoints
             state_dict = {k: v for k, v in state_dict.items() if 'rating_head' not in k}
@@ -712,7 +715,65 @@ class ValidationRunner:
                 logger.warning(f"Error closing log queue: {e}")
             finally:
                 self._log_queue = None
-     
+
+    @staticmethod
+    def _drop_error_samples(batch: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], int]:
+        """Strip loader-produced error samples from a batch.
+
+        ``DatasetLoader``/``ArrowDatasetLoader`` return a placeholder sample --
+        an all-zero image with an all-zero label vector and ``error=True`` --
+        whenever a sample cannot be produced. That covers unreadable files AND
+        the "empty label list / unknown rating" guard, which re-fires every
+        epoch because it never persists an exclusion. Folding those into the
+        metrics scores the model against black images labelled with zero of
+        every tag, which silently inflates every negative-dominated statistic.
+
+        The training and background-validation loops have always filtered these
+        (see ``train_direct.py`` and ``tools/run_validation_for_epoch.py``);
+        this runner must do the same or its numbers are not comparable.
+
+        Returns:
+            (filtered_batch, num_dropped). ``filtered_batch`` is None when every
+            sample in the batch was an error sample.
+        """
+        error_flags = batch.get('error')
+        if not isinstance(error_flags, torch.Tensor) or not bool(error_flags.any()):
+            return batch, 0
+
+        num_errors = int(error_flags.sum().item())
+        valid_mask = ~error_flags
+        if int(valid_mask.sum().item()) == 0:
+            return None, num_errors
+
+        batch_len = len(error_flags)
+        filtered = {
+            k: v[valid_mask] if isinstance(v, torch.Tensor) and v.size(0) == batch_len else v
+            for k, v in batch.items()
+        }
+        # Non-tensor per-sample collations must be filtered too, or metadata
+        # desyncs from prediction rows. default_collate turns a per-sample str
+        # field (image_id, error_reason) into a list of str.
+        keep = [i for i, is_err in enumerate(error_flags.tolist()) if not is_err]
+        for k, v in batch.items():
+            if isinstance(v, (list, tuple)) and len(v) == batch_len:
+                # list/tuple only — a namedtuple would not accept a generator.
+                filtered[k] = type(v)(v[i] for i in keep)
+            elif isinstance(v, dict):
+                # validate_full supports a dict-of-per-sample-sequences 'metadata'
+                # field (see _metadata_dict_to_list). Nothing in the current
+                # collate path emits one, but leaving it unfiltered would shift
+                # every image ID after the first error sample if one ever did.
+                filtered[k] = {
+                    kk: (
+                        type(vv)(vv[i] for i in keep)
+                        if isinstance(vv, (list, tuple)) and len(vv) == batch_len
+                        else vv[valid_mask]
+                        if isinstance(vv, torch.Tensor) and vv.size(0) == batch_len
+                        else vv
+                    )
+                    for kk, vv in v.items()
+                }
+        return filtered, num_errors
 
     def validate_full(self, dataloader: DataLoader) -> Dict[str, Any]:
         """Complete validation with all metrics"""
@@ -727,6 +788,9 @@ class ValidationRunner:
         # Track skipped batches for transparency
         skipped_batches = 0
         total_batches = 0
+        # Loader-produced error samples dropped before scoring (see _drop_error_samples)
+        dropped_error_samples = 0
+        fully_dropped_batches = 0
 
         # Measure inference time with CUDA events (non-blocking until end)
         inference_times = []
@@ -739,6 +803,16 @@ class ValidationRunner:
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validating")):
                 total_batches += 1
+
+                # Drop error samples BEFORE anything reads images/labels — they
+                # are black images with all-zero targets and would otherwise be
+                # scored as real validation rows.
+                batch, num_errors = self._drop_error_samples(batch)
+                dropped_error_samples += num_errors
+                if batch is None:
+                    fully_dropped_batches += 1
+                    continue
+
                 tag_labels = batch['tag_labels']
                 # Validate tag_labels is on CPU (expected from dataloader for later cat())
                 if tag_labels is not None and tag_labels.device.type != 'cpu':
@@ -868,6 +942,18 @@ class ValidationRunner:
                 "Validation metrics are computed on remaining data only."
             )
 
+        # Error samples are excluded from metrics, but silently excluding a large
+        # slice of the validation set is its own reporting failure — surface it.
+        if dropped_error_samples > 0:
+            logger.warning(
+                "Excluded %d loader error sample(s) from validation metrics "
+                "(%d batch(es) were entirely error samples). These are unreadable "
+                "images or rows rejected by the empty-label/unknown-rating guard; "
+                "they are NOT scored. Check the dataset if this count is large.",
+                dropped_error_samples,
+                fully_dropped_batches,
+            )
+
         # Process CUDA timing events (single sync at end, not per-batch)
         # This deferred synchronization improves throughput by ~20-30%
         if timing_events:
@@ -888,6 +974,12 @@ class ValidationRunner:
             error_msg = "Validation dataloader is empty - no batches to process"
             if skipped_batches > 0:
                 error_msg = f"All {skipped_batches} batches were skipped due to dimension mismatch"
+            elif fully_dropped_batches > 0 and fully_dropped_batches == total_batches:
+                error_msg = (
+                    f"Every one of the {total_batches} validation batches consisted "
+                    f"entirely of loader error samples ({dropped_error_samples} samples). "
+                    "No image could be read or passed the label/rating guard"
+                )
             logger.error(error_msg)
             raise ValueError(
                 f"{error_msg}. This indicates a data loading issue or vocabulary mismatch. "
@@ -955,10 +1047,15 @@ class ValidationRunner:
             }
 
         # Add batch statistics for transparency
+        # Error-sample exclusions are reported here as well as logged, so a
+        # consumer can tell how much of the validation set was actually scored
+        # without scraping warnings out of the log.
         metrics['batch_stats'] = {
             'total_batches': total_batches,
             'skipped_batches': skipped_batches,
-            'processed_batches': total_batches - skipped_batches,
+            'fully_dropped_batches': fully_dropped_batches,
+            'processed_batches': total_batches - skipped_batches - fully_dropped_batches,
+            'dropped_error_samples': dropped_error_samples,
             'total_samples': len(all_predictions)
         }
         
@@ -1057,9 +1154,21 @@ class ValidationRunner:
         # Collect predictions for specific tags
         all_predictions = []
         all_targets = []
+        dropped_error_samples = 0
+        fully_dropped_batches = 0
+        total_batches = 0
 
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Validating specific tags"):
+                total_batches += 1
+                # Same rationale as validate_full: error samples are black
+                # images with all-zero targets and must not reach the metrics.
+                batch, num_errors = self._drop_error_samples(batch)
+                dropped_error_samples += num_errors
+                if batch is None:
+                    fully_dropped_batches += 1
+                    continue
+
                 images = batch['images'].to(self.device)
                 tag_labels = batch['tag_labels']
                 # Validate tag_labels is on CPU (expected from dataloader for later cat())
@@ -1099,6 +1208,31 @@ class ValidationRunner:
 
         # Free GPU tensor after validation loop
         del tag_indices  # Free GPU memory after validation loop
+
+        # torch.cat([]) raises a bare "expected a non-empty list of Tensors" that
+        # says nothing about why. Fail with the actual cause instead — and do not
+        # blame error samples when the dataloader simply yielded nothing, which
+        # hits this same branch with both counters at zero.
+        if not all_predictions:
+            if fully_dropped_batches > 0 and fully_dropped_batches == total_batches:
+                raise ValueError(
+                    f"No validation samples survived loading: all {total_batches} "
+                    f"batch(es) consisted entirely of loader error samples "
+                    f"({dropped_error_samples} samples). Every image either failed to load "
+                    f"or was rejected by the empty-label/unknown-rating guard. Check that "
+                    f"the validation dataset paths are correct and the annotations are "
+                    f"populated."
+                )
+            raise ValueError(
+                "Validation dataloader is empty - no batches to process. This indicates a "
+                "data loading issue: check that the validation split is non-empty and that "
+                "max_samples is not set to zero."
+            )
+        if dropped_error_samples > 0:
+            logger.warning(
+                "Excluded %d loader error sample(s) from specific-tag validation.",
+                dropped_error_samples,
+            )
 
         # Concatenate (already on CPU)
         all_predictions = torch.cat(all_predictions, dim=0)
@@ -1168,9 +1302,21 @@ class ValidationRunner:
         # Collect predictions by group
         group_predictions = defaultdict(list)
         group_targets = defaultdict(list)
-        
+        dropped_error_samples = 0
+        fully_dropped_batches = 0
+        total_batches = 0
+
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Validating hierarchical"):
+                total_batches += 1
+                # Same rationale as validate_full: error samples are black
+                # images with all-zero targets and must not reach the metrics.
+                batch, num_errors = self._drop_error_samples(batch)
+                dropped_error_samples += num_errors
+                if batch is None:
+                    fully_dropped_batches += 1
+                    continue
+
                 images = batch['images'].to(self.device)
                 # Collate does not provide hierarchical labels; use flat tag labels
                 flat_labels = batch.get('tag_labels')
@@ -1224,10 +1370,35 @@ class ValidationRunner:
                     group_targets[g].append(labels_h[:, g, :].cpu())
                 del predictions, flat_labels, labels_h  # Free GPU memory
         
+        # With no surviving batches this function would otherwise return
+        # {'groups': {}} with no summary and no error — a success-shaped result
+        # that actually means "nothing was validated". As above, an empty
+        # dataloader lands here too and must not be blamed on error samples.
+        if not group_predictions:
+            if fully_dropped_batches > 0 and fully_dropped_batches == total_batches:
+                raise ValueError(
+                    f"No validation samples survived loading: all {total_batches} "
+                    f"batch(es) consisted entirely of loader error samples "
+                    f"({dropped_error_samples} samples). Every image either failed to load "
+                    f"or was rejected by the empty-label/unknown-rating guard. Check that "
+                    f"the validation dataset paths are correct and the annotations are "
+                    f"populated."
+                )
+            raise ValueError(
+                "Validation dataloader is empty - no batches to process. This indicates a "
+                "data loading issue: check that the validation split is non-empty and that "
+                "max_samples is not set to zero."
+            )
+        if dropped_error_samples > 0:
+            logger.warning(
+                "Excluded %d loader error sample(s) from hierarchical validation.",
+                dropped_error_samples,
+            )
+
         # Compute metrics per group
         results = {'groups': {}}
         group_f1_scores = []
-        
+
         for g in range(len(group_predictions)):
             if not group_predictions[g]:
                 continue

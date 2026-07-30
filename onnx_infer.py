@@ -16,10 +16,14 @@ import onnxruntime as ort
 from Configuration_System import ConfigManager, ConfigType
 
 from vocabulary import TagVocabulary, verify_vocabulary_integrity
-from schemas import RunMetadata, TagPrediction, ImagePrediction, PredictionOutput
+from schemas import RunMetadata, TagPrediction, ImagePrediction, PredictionOutput, canonical_vocab_bytes
 
 
 logger = logging.getLogger('onnx_infer')
+
+
+class _SkipThresholds(Exception):
+    """Internal signal: the thresholds file exists but is not a usable map."""
 
 
 def _load_metadata(session: ort.InferenceSession):
@@ -49,15 +53,33 @@ def _load_metadata(session: ort.InferenceSession):
         # Decompress gzip
         vocab_bytes = gzip.decompress(vocab_b64_decoded)
 
-        # Verify checksum
-        sha = hashlib.sha256(vocab_bytes).hexdigest()
-        if vocab_sha256 != sha:
-            raise RuntimeError(f'Vocabulary checksum mismatch: expected {vocab_sha256}, got {sha}')
-
         # Decode UTF-8 and parse JSON
         vocab_json = vocab_bytes.decode('utf-8')
         if not vocab_json.strip():
             raise ValueError("Embedded vocabulary JSON is empty")
+
+        # Verify checksum. Two schemes are in circulation and BOTH must be
+        # accepted: released V1.x artifacts stamp sha256 of the raw serialized
+        # blob, while checkpoints, ModelMetadata.embed_vocabulary and the current
+        # exporter stamp the CANONICAL form (sorted keys, compact separators) so
+        # the pin survives re-serialization. Accepting only one scheme rejects
+        # every artifact produced by the other.
+        _raw_sha = hashlib.sha256(vocab_bytes).hexdigest()
+        try:
+            _canon_sha = hashlib.sha256(
+                canonical_vocab_bytes(json.loads(vocab_json))
+            ).hexdigest()
+        except Exception:
+            _canon_sha = None
+        if vocab_sha256 == _raw_sha:
+            logger.debug("Embedded vocabulary checksum verified (raw scheme).")
+        elif _canon_sha is not None and vocab_sha256 == _canon_sha:
+            logger.debug("Embedded vocabulary checksum verified (canonical scheme).")
+        else:
+            raise RuntimeError(
+                f'Vocabulary checksum mismatch: metadata says {vocab_sha256}, '
+                f'computed raw={_raw_sha} canonical={_canon_sha}'
+            )
 
         vocab = TagVocabulary.from_json(vocab_json)
 
@@ -187,10 +209,14 @@ def _preprocess_for_model(
     new_w = max(1, round(w * scale))
     new_h = max(1, round(h * scale))
 
-    # Resize with PIL (BILINEAR matches training pipeline)
+    # Resize with PIL. MUST be LANCZOS to match the training pipeline
+    # (dataset_loader.process_image_cpu uses RESAMPLE_LANCZOS). This was BILINEAR,
+    # which is a train/serve skew on every single inference image: measured on
+    # high-frequency line art, mean |delta| 3.69/255 and p99 10/255 versus the
+    # LANCZOS result the weights were trained on.
     if new_w != w or new_h != h:
         pil_img = Image.fromarray(image)
-        pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
+        pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
         image = np.asarray(pil_img, dtype=np.uint8)
 
     # Create canvas and center the image
@@ -295,11 +321,54 @@ def main():
         # Load calibrated thresholds if available (supports both per-tag and per-bucket)
         calibrated_thresholds = None
         model_dir = Path(args.model).parent
-        thresholds_path = model_dir / "thresholds.json"
+        # Accept both names: ThresholdCalibrator writes "thresholds.json" but the
+        # published release artifacts ship "pr_thresholds.json", so only looking
+        # for the former meant releases silently fell back to the single default
+        # threshold with no warning.
+        thresholds_path = next(
+            (p for p in (model_dir / "thresholds.json", model_dir / "pr_thresholds.json")
+             if p.exists()),
+            model_dir / "thresholds.json",
+        )
         if thresholds_path.exists():
             try:
                 with open(thresholds_path, 'r') as f:
                     raw_thresholds = json.load(f)
+
+                # Structural validation BEFORE use. The released pr_thresholds.json
+                # is a REPORT, not a threshold map: its top level is
+                # {checkpoint, checkpoint_epoch, ..., per_tag} and per_tag itself
+                # holds {min_support, pr_summary, f1_summary}. Feeding that in as a
+                # tag->threshold map yields a dict that misses on every lookup
+                # (a silent no-op that logs "Loaded per-tag thresholds") and will
+                # raise TypeError on `score < tag_thresh` the moment a vocabulary
+                # tag happens to collide with one of its key names.
+                def _is_threshold_map(obj):
+                    return (
+                        isinstance(obj, dict) and obj
+                        and all(isinstance(k, str) for k in obj)
+                        and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                for v in obj.values())
+                    )
+
+                if not _is_threshold_map(raw_thresholds):
+                    nested = raw_thresholds.get('per_tag') if isinstance(raw_thresholds, dict) else None
+                    if _is_threshold_map(nested):
+                        raw_thresholds = nested
+                    else:
+                        logger.warning(
+                            "%s is not a tag->threshold map (top-level keys: %s); ignoring it "
+                            "and using the single default threshold %.4f. This file looks like "
+                            "a PR-analysis report rather than calibrated thresholds.",
+                            thresholds_path,
+                            list(raw_thresholds)[:6] if isinstance(raw_thresholds, dict) else type(raw_thresholds).__name__,
+                            args.threshold,
+                        )
+                        raw_thresholds = None
+
+                if raw_thresholds is None:
+                    raise _SkipThresholds
+
                 # Detect per-bucket mode: keys look like "300-499" or "10000+"
                 sample_key = next(iter(raw_thresholds)) if raw_thresholds else ""
                 is_bucket_mode = bool(sample_key and (sample_key[-1] == '+' or '-' in sample_key) and sample_key[0].isdigit())
@@ -326,7 +395,21 @@ def main():
                     logger.info(f"Loaded per-bucket thresholds from {thresholds_path}, expanded to {len(calibrated_thresholds)} tags")
                 else:
                     calibrated_thresholds = raw_thresholds
-                    logger.info(f"Loaded per-tag thresholds from {thresholds_path} ({len(calibrated_thresholds)} entries)")
+                    _known = sum(1 for k in calibrated_thresholds if k in vocab.tag_to_index) if vocab else 0
+                    logger.info(
+                        f"Loaded per-tag thresholds from {thresholds_path} "
+                        f"({len(calibrated_thresholds)} entries, {_known} matching vocabulary tags)"
+                    )
+                    if vocab is not None and _known == 0:
+                        logger.warning(
+                            "None of the %d threshold entries match a vocabulary tag — every "
+                            "lookup will fall back to the default %.4f. Check that this file "
+                            "is a tag->threshold map for THIS vocabulary.",
+                            len(calibrated_thresholds), args.threshold,
+                        )
+                        calibrated_thresholds = None
+            except _SkipThresholds:
+                calibrated_thresholds = None
             except Exception as e:
                 logger.warning(f"Failed to load thresholds from {thresholds_path}: {e}")
 
@@ -335,6 +418,16 @@ def main():
         model_input_names = {i.name for i in session.get_inputs()}
         has_mask_input = "padding_mask" in model_input_names
         logger.info(f"Model expects input '{input_name}' with type: {input_info.type}")
+        # Map the ONNX tensor type string to a numpy dtype for the feed cast below.
+        _ORT_TYPE_TO_NP = {
+            'tensor(float)': np.float32,
+            'tensor(float16)': np.float16,
+            'tensor(double)': np.float64,
+            'tensor(bfloat16)': np.float32,  # numpy has no bf16; ORT accepts fp32 here
+        }
+        _input_np_dtype = _ORT_TYPE_TO_NP.get(input_info.type, np.float32)
+        if _input_np_dtype != np.float32:
+            logger.info(f"Casting preprocessed input to {np.dtype(_input_np_dtype).name} to match the graph")
         if has_mask_input:
             logger.info("Model accepts padding_mask input")
 
@@ -370,7 +463,12 @@ def main():
                 continue
 
             try:
-                feed = {input_name: inp}
+                # Cast to the dtype the graph actually declares. The preprocessor
+                # always builds float32, but the configured DEFAULT export variant
+                # is fp16, and feeding a float32 tensor to an fp16 input raises
+                # InvalidArgument — the project's own inference script could not
+                # run the project's own default artifact.
+                feed = {input_name: inp.astype(_input_np_dtype, copy=False)}
                 if has_mask_input and is_new_format:
                     feed["padding_mask"] = padding_mask
                 outputs = session.run(None, feed)
