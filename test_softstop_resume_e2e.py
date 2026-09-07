@@ -128,9 +128,8 @@ def build_fixture(run_dir: Path):
 
     Layout is per-image JSON sidecars next to their images, which is what
     `create_dataloaders` falls into when the directory has no train.json/val.json/images/
-    manifest triple. Each sidecar needs `filename`, `tags` and a RECOGNISED `rating` --
-    an unknown rating makes the Arrow keep-mask drop the row entirely, which would
-    silently shrink the dataset instead of failing.
+    manifest triple. This fixture supplies known ratings; missing ratings are
+    also supported and mask only the four rating labels, retaining the image.
     """
     from PIL import Image
     import numpy as np
@@ -187,10 +186,18 @@ def build_config(run_dir: Path, spec: dict):
         {"path": str(run_dir / "data"), "priority": 0, "type": "local", "enabled": True}
     ]
     cfg.data.image_size = IMAGE_SIZE
+    # This fixture deliberately exercises legacy cosine resume on tiny data.
+    cfg.data.preparation_manifest = None
+    cfg.training.scheduler = 'cosine'
+    cfg.training.phase = 2
+    cfg.training.warmup_steps = None
+    cfg.training.fp32_head_optimizer = False
     cfg.model.image_size = IMAGE_SIZE
     cfg.model.patch_size = PATCH
     cfg.data.patch_size = PATCH
     cfg.model.hidden_size = 32
+    cfg.model.qk_norm = False
+    cfg.model.layer_scale_init = 0.0
     cfg.model.num_hidden_layers = 2
     cfg.model.num_attention_heads = 2
     cfg.model.intermediate_size = 64
@@ -215,6 +222,8 @@ def build_config(run_dir: Path, spec: dict):
     cfg.training.use_amp = True          # see module docstring: CPU is not an option
     cfg.training.use_compile = False
     cfg.training.num_epochs = EPOCHS
+    # This short fixture tests resume, not the production stop-window budget.
+    cfg.training.early_stopping_mode = "off"
     cfg.training.warmup_epochs = 1
     cfg.training.gradient_accumulation_steps = ACCUM
     cfg.training.eval_steps = 10 ** 9    # keep epoch-end validation off the hot path
@@ -302,6 +311,7 @@ def run_child(spec: dict):
         def forward(self, tag_logits, tag_targets, *a, **kw):
             if torch.is_grad_enabled():
                 consumed["n"] += int(tag_targets.shape[0])
+                result.setdefault("effective_loss", self.tag_loss_fn.get_loss_state())
             return super().forward(tag_logits, tag_targets, *a, **kw)
 
     train_direct.MultiTaskLoss = _CountingLoss
@@ -644,6 +654,7 @@ def test_soft_stop_writes_a_mid_epoch_checkpoint(p1, ckpt_dir):
     check(ck["step"] == n_served // (BATCH * ACCUM),
           f"global_step ({ck['step']}) equals completed optimizer updates "
           f"({n_served // (BATCH * ACCUM)})")
+    check(ts['loss_state']['gamma_neg'] == 7., "soft-stop checkpoint preserves fixed gamma_neg=7")
     # The stop must land inside epoch 0, not at its boundary -- otherwise the mid-epoch
     # resume path this whole file exercises is never taken.
     check(n_served < 190,
@@ -659,6 +670,11 @@ def test_resume_lands_at_the_recorded_offset(p1, p2, ck, stop_sample):
     """
     check(p2["returned"] and p2["error"] is None,
           "resumed run completes without error")
+    effective_loss = p2.get('effective_loss', {})
+    check(effective_loss.get('gamma_neg') == 7.
+          and effective_loss.get('clip') == .05
+          and effective_loss.get('detach_focal_weight') is True,
+          "resumed live criterion retains fixed gamma=7, clip=.05 and detached focal weights")
 
     epochs = per_epoch_indices(p2)
     check(len(epochs) == EPOCHS,
@@ -683,23 +699,21 @@ def test_resume_lands_at_the_recorded_offset(p1, p2, ck, stop_sample):
     first = marks[0] if marks else {}
 
     # The scheduler's position is compared against the value the CHECKPOINT saved, not
-    # against global_step. `_LRScheduler.__init__` calls step() once, so a freshly
-    # constructed scheduler already sits at step_in_cycle == 1 and the standing
-    # invariant is `step_in_cycle == global_step + 1`. Asserting equality with
-    # global_step would encode an off-by-one as the expectation; asserting equality
-    # with the saved value is what "continues off the restored schedule" actually means.
+    # against a newly constructed schedule. The constructor now initializes at
+    # -1 so its inherited probe lands on 0. In this first-cycle fixture the
+    # saved position equals the number of committed optimizer updates.
     saved_sic = (ck.get("scheduler_state_dict") or {}).get("step_in_cycle")
     check(saved_sic is not None and first.get("step_in_cycle") == saved_sic,
           f"resumed scheduler continues at the checkpoint's step_in_cycle={saved_sic} "
           f"(observed {first.get('step_in_cycle')})")
-    check(saved_sic == ck["step"] + 1,
+    check(saved_sic == ck["step"],
           f"checkpoint's scheduler position tracks global_step "
-          f"(step_in_cycle {saved_sic} == global_step {ck['step']} + 1)")
-    # A scheduler that had restarted would read exactly 1 -- the post-construction
+          f"(step_in_cycle {saved_sic} == global_step {ck['step']})")
+    # A scheduler that had restarted would read exactly 0 -- the post-construction
     # value -- so this is what separates "restored" from "rebuilt".
-    check(first.get("step_in_cycle", 0) > 1,
+    check(first.get("step_in_cycle", 0) > 0,
           f"restored scheduler did NOT restart at the fresh-construction position "
-          f"(step_in_cycle={first.get('step_in_cycle')} > 1)")
+          f"(step_in_cycle={first.get('step_in_cycle')} > 0)")
     check(first.get("lr") is not None and first["lr"] > 0,
           f"resumed run starts with a live LR off the restored schedule "
           f"(lr={first.get('lr')})")

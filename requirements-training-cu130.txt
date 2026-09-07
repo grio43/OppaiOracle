@@ -1,0 +1,6 @@
+# Install this first on the Windows/NVIDIA training machine, then requirements.txt.
+# Keep versions aligned with requirements.txt. Use an explicit index so pip cannot
+# silently replace the training environment with a CPU-only PyTorch wheel.
+--index-url https://download.pytorch.org/whl/cu130
+torch==2.14.0+cu130
+torchvision==0.29.0+cu130

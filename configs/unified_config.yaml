@@ -1,285 +1,133 @@
-# Unified Configuration for Anime Image Tagger
-# This consolidates all previously scattered configs into the Configuration_System.py structure
-# Generated from: augmentation, dataloader, dataset_prep, export, inference, logging, paths, runtime, training, validation, vocabulary configs
-
-# Global Settings
+# OppaiOracle V2 Phase 1 — adopted recipe: todos/v2-plan.md sections 3–8.
+# Prepare after every subset has arrived:
+#   python tools/prepare_v2_dataset.py --config configs/unified_config.yaml
+# Then launch with Start_AI_Training.ps1. Preparation does not start training.
 project_name: "anime-image-tagger"
-# NOTE: train_direct.py normalizes this name against model.architecture_type by
-# STRIPPING the arch token and re-appending it, so "vit_run1" silently becomes
-# "run1_vit" -- the FINISHED run's directory. Keep the arch token last ("<name>_vit")
-# so the resolved name equals what is written here and the checkpoint directory is
-# the one you expect. See experiments/<resolved>/checkpoints.
-experiment_name: "run2_vit"
+experiment_name: "v2_phase1_vit"
 output_root: "./experiments"
 log_level: "INFO"
 log_format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-# Set a target for total system RAM usage. This is a guideline and not strictly enf
-max_memory_gb: 120.0 # Adjusted for 128GB system (leaves 13GB headroom)
+max_memory_gb: 120.0
 max_gpu_memory_gb: null
-
-# --------------------------------------------------------------------
-# Back-compat: migrated from legacy configs/paths.yaml
-# These allow older scripts to read from a single unified place.
-vocab_path: "./vocabulary.json"
-log_dir: "./logs"
+vocab_path: "./vocabulary/v2/vocabulary.json"
+log_dir: "./logs/v2_phase1"
 default_output_dir: "./outputs"
 
-# Model Configuration
 model:
-    # Architecture type: only "vit" is supported (hard-asserted in validate()).
     architecture_type: "vit"
-
-    # ViT parameters
-    hidden_size: 1024
-    num_hidden_layers: 18  # Phase 1: SoViT-150m validated 18L at 880-width (Alabdulmohsin et al., NeurIPS 2023)
-    num_attention_heads: 16
-    intermediate_size: 4096
-    image_size: 448  # Auto-synced from data.image_size at startup — change data.image_size instead
-    patch_size: 16  # ViT uses patch_size=16
+    hidden_size: 896
+    num_hidden_layers: 18
+    num_attention_heads: 14
+    intermediate_size: 2320
+    image_size: 320  # Synced from data.image_size.
+    patch_size: 16
     num_channels: 3
-    hidden_dropout_prob: 0.10  # Phase 2 (revised): held at Phase 1 value. Phase 1 stopped at 33/40 (under-converged) — FixRes/DeiT III aug-reduction recipe assumes a fully-converged base; EfficientNetV2 (Tan & Le ICML 2021) regime applies instead (regularization scales UP with resolution in from-scratch progressive training).
-    pos_dropout: 0.0  # Position embedding dropout (0.0 = modern best practice; drop_path handles regularization)
-    attention_dropout: 0.05  # Phase 2 (revised): held at Phase 1 value. Same rationale as hidden_dropout_prob — under-converged Phase 1 + EfficientNetV2 regime.
-    # Drop path rate for ViT (stochastic depth regularization)
-    drop_path_rate: 0.20   # Phase 2 (revised): held at Phase 1 value. DeiT III ViT-L pretraining uses 0.4; AugReg (Steiner TMLR 2022) uses up to 0.5 for ViT-L from-scratch — 0.10 (planned) was below any literature recipe given Phase 1 stopped at 33/40 (under-converged base).
+    hidden_dropout_prob: 0.0
+    pos_dropout: 0.0
+    attention_dropout: 0.0
+    drop_path_rate: 0.20
+    qk_norm: true
+    layer_scale_init: 0.1
     initializer_range: 0.02
     layer_norm_eps: 1.0e-6
     use_flex_attention: true
     attention_bias: true
-    flex_block_size: 128  # Block size for Flex Attention sparse computation
+    flex_block_size: 128
     token_ignore_threshold: 0.9
-    num_labels: 0  # Auto-detect from vocabulary
+    num_labels: 0
     num_groups: 20
     tags_per_group: 10000
     gradient_checkpointing: true
-    checkpoint_every_n_layers: 4   # Checkpoint every 4th layer/block (1 = every layer = max memory savings)
-    # End of ViT-specific parameters
+    checkpoint_every_n_layers: 4
 
-# Data Configuration (consolidates dataloader.yaml, train_config.yaml, augmentation.yaml)
 data:
-  # Storage locations
-  # Add the path to your raw training data (images and JSONs) here.
-  # The script will look for .json files in this directory and then find the
-  # corresponding images based on the "filename" field in each JSON.
-  # WARNING: Update this path! Currently set to Linux path but running on Windows.
-  # Example Windows path: "Z:/path/to/your/dataset/" or "C:/Users/YourName/datasets/"
+  # All top-level subsets below this root are included recursively.
+  # Discovery ignores environments, updater state JSONs and unpaired JSONs.
   storage_locations:
-    - path: "L:/Dab/Dab"
+    - path: "E:/Dataset"
       priority: 0
       type: "local"
       enabled: true
-  
-  # Paths (from paths.yaml)
-  vocab_dir: "./vocabulary"
+  preparation_manifest: "./logs/v2_phase1/dataset_manifest.json"
+  vocab_dir: "./vocabulary/v2"
   output_dir: "./outputs"
-  
-  # Image processing
-  # >>> SINGLE SOURCE OF TRUTH for resolution. model.image_size and
-  # >>> validation.preprocessing.image_size are auto-synced from this value.
-  # Phase 2 ACTIVE: 448 (fine-tune, 15 epochs). Phase 1 used 320 (from-scratch, 40 epochs).
-  image_size: 448
-  # Channel order of the image tensor produced by the dataloader and consumed
-  # by the model. All per-channel values below (normalize_mean, normalize_std)
-  # are interpreted in this same order. RGB is the project default (matches the
-  # V1.x releases); set to "BGR" only if you deliberately train a BGR pipeline.
+  image_size: 320
   color_order: "RGB"
-  # IMPORTANT: Normalization values depend on training approach!
-  #   - Training from scratch (current): [0.5, 0.5, 0.5] is fine (anime-optimized)
-  #   - Pretrained ViT from ImageNet: Use ImageNet normalization
-  #     (channel order matches ``color_order``):
-  #       BGR: normalize_mean: [0.406, 0.456, 0.485]; std: [0.225, 0.224, 0.229]
-  #       RGB: normalize_mean: [0.485, 0.456, 0.406]; std: [0.229, 0.224, 0.225]
-  #     Pretrained weights were trained with ImageNet stats; using different
-  #     normalization can degrade pretrained feature quality.
-  normalize_mean: [0.5, 0.5, 0.5]  # Anime-optimized; channel-symmetric so RGB/BGR identical
-  normalize_std: [0.5, 0.5, 0.5]   # Anime-optimized; channel-symmetric so RGB/BGR identical
+  normalize_mean: [0.5, 0.5, 0.5]
+  normalize_std: [0.5, 0.5, 0.5]
   pad_color: [114, 114, 114]
-
-  # Data loading (from dataloader.yaml)
-  # IMPORTANT: batch_size depends on GPU memory!
-  #   - ViT (vit, vit_wide_shallow): batch_size=32 is safe on 16GB GPU
-  batch_size: 48  # Phase 2 (448px, 18 layers): 48 with 9 grad-accum -> effective 432. Phase 1 used 96.
-  num_workers: 6  # Arrow mmap shares metadata (~500MB/worker overhead), 32-core system
-  pin_memory: true   # Enables async DMA transfer for PCIe 4.0/5.0
-  prefetch_factor: 3  # 6 workers × 3 batches × 48 = 864 samples prefetched
-  persistent_workers: true  # NOTE: auto-forced to false when num_workers == 0
+  # Provisional microbatch; profile on the target GPU before the long run.
+  # 64 x 16 accumulation = 1024; sqrt scaling gives stable LR 5.4e-4.
+  batch_size: 64
+  num_workers: 6
+  pin_memory: true
+  prefetch_factor: 3
+  persistent_workers: true
   drop_last: false
-  worker_log_level: WARNING  # Worker log level: WARNING allows debugging, CRITICAL minimizes overhead
-  
-  # Vocabulary
+  worker_log_level: WARNING
   vocab_min_frequency: 500
-
-  # Validation split limiting — this is the IN-TRAINING validation cap.
-  # Limits validation set size at split time (before Arrow cache loading), so it
-  # is what bounds the validation pass inside train_direct.py. The separate
-  # validation.max_samples key below applies only to the standalone
-  # validation_loop.py runner.
-  # Set to null to use the full 5% validation split (~276k for 5.5M dataset).
   max_val_samples: 30000
-
   preload_files: 0
-
-  # Metadata Cache (JSON parsing cache)
-  # Caches parsed JSON metadata to avoid re-parsing millions of files on every run.
-  # First run: ~3-5 minutes to build cache with parallel processing
-  # Subsequent runs: ~2-5 seconds to load from cache (940× speedup)
-  # Cache size: ~1.8 GB for 5.6M images
   metadata_cache_enabled: true
-  metadata_cache_workers: 20  # Number of parallel workers for cache creation
-  force_rebuild_metadata_cache: false  # Set true to force cache rebuild
-  metadata_cache_staleness_check_samples: 100  # Base sample size (scaled dynamically by dataset size)
-
-  # Cache Validation Settings (v2.0)
-  # New in v2.0: Improved cache validation and staleness detection
-  split_cache_version: "2.0"  # Don't change unless format changes
-  metadata_cache_version: "2.0"  # Don't change unless format changes
-  metadata_cache_use_dynamic_sampling: true  # Scale sample size with dataset (100→10K for 5.6M files)
-  metadata_cache_use_stratified_sampling: true  # Sample across directories for better coverage
-  cache_count_tolerance_percent: 0.1  # 0.1% tolerance (down from 1%, stricter validation)
-  cache_count_tolerance_min: 100  # Minimum absolute tolerance
-
-  # Augmentation
-  random_flip_prob: 0.5  # Horizontal flip probability per sample
-
-  # Color jitter augmentation (applied before normalization)
-  # Phase 1 values raised toward DeiT III's validated from-scratch ViT recipe,
-  # with saturation held well below brightness/contrast because it is the only
-  # axis that directly attacks color-named tag identity (e.g. blue_eyes, pink_skin).
-  #   brightness 0.30 — DeiT III (--color-jitter 0.3, ECCV 2022); pure luminance, no chroma harm
-  #   contrast   0.20 — one-step safety margin below DeiT III's 0.30 (luminance-driven chroma compression risk)
-  #   saturation 0.08 — derived from BYOL's asymmetry (NeurIPS 2020): saturation ≈ ¼ of brightness/contrast
-  #                     when color identity must be preserved. Kirichenko et al. (NeurIPS 2023, arXiv:2401.01764)
-  #                     confirms color jitter preferentially harms color-distinguished class pairs.
-  # Phase 2 ACTIVE (revised): brightness 0.22, contrast 0.15, saturation 0.06 (~¼ reduction
-  # from Phase 1, not the originally-planned ½ halving). Phase 1 stopped at 33/40 epochs
-  # (~82.5%, under-converged); FixRes/DeiT III ½-reduction assumes fully-converged base.
-  # EfficientNetV2 (Tan & Le ICML 2021) regime applies instead — regularization scales UP
-  # with resolution in from-scratch progressive training (V2-L: RandAugment 5→25, Dropout
-  # 0.1→0.5 across resolution stages). Conservative ¼ reduction balances the two regimes.
+  metadata_cache_workers: 20
+  force_rebuild_metadata_cache: false
+  metadata_cache_staleness_check_samples: 100
+  split_cache_version: "3.0"
+  metadata_cache_version: "3.0"
+  metadata_cache_use_dynamic_sampling: true
+  metadata_cache_use_stratified_sampling: true
+  cache_count_tolerance_percent: 0.1
+  cache_count_tolerance_min: 100
+  # Adopted P1 augmentation; pending review proposals are not enabled.
+  random_flip_prob: 0.5
   color_jitter_enabled: true
-  color_jitter_brightness: 0.22
+  color_jitter_brightness: 0.30
   color_jitter_brightness_p: 0.5
-  color_jitter_contrast: 0.15
+  color_jitter_contrast: 0.20
   color_jitter_contrast_p: 0.5
-  color_jitter_saturation: 0.06
+  color_jitter_saturation: 0.08
   color_jitter_saturation_p: 0.5
-
-  # Random erasing augmentation. Applied BEFORE normalization, on the [0,1]
-  # tensor; the fill value is derived from normalize_mean so the erased patch
-  # lands at 0.0 (centre of the normalized range) whatever the normalization is.
   random_erasing_enabled: false
   random_erasing_p: 0.35
   random_erasing_scale_min: 0.007
   random_erasing_scale_max: 0.03
   random_erasing_ratio_min: 0.3
   random_erasing_ratio_max: 2.0
-
-  # Random rotation augmentation (applied after letterboxing, image only)
-  # Phase 1: enabled (0-8 deg @ p=0.50, bicubic). Phase 2: disable (spatial precision at 448px).
-  # Scholarly basis:
-  #   - RandAugment (Cubuk 2020 NeurIPS-W): rotation magnitude M=9 → ±9° in original mapping;
-  #     used in DeiT (Touvron 2021 ICML) and AugReg (Steiner 2022 TMLR) for from-scratch ViT.
-  #   - Kirichenko 2024 NeurIPS ("Detrimental Class-level Effects of Data Augmentation"):
-  #     raising augmentation FREQUENCY (p) is safer for fine-grained discrimination than
-  #     raising MAGNITUDE — supports p=0.50 with capped 8° over higher max with lower p.
-  #   - Tags are not orientation-sensitive in this dataset, so the main fine-grained risk
-  #     (orientation-correlated label features) does not apply at the label level.
-  #   - Corner pad-fill at 8° is ~6.1% (closed form: tan(θ/2)(1-tan(θ/2))/(1+tan(θ/2))),
-  #     well within the letterbox padding distribution the model already sees.
-  #   - Bicubic resampling (Thévenaz/Blu/Unser 2000 IEEE TIP) preserves 3-5px features
-  #     (eye highlights, single hair strands) much better than bilinear at any rotation.
-  # Effective range is ±[min, max] (sampled in [min,max] then sign flipped 50%): so [-8°,-2°] ∪ [+2°,+8°].
-  # min=2.0 ensures every fired event is perceptibly rotated — sub-2° rotations are
-  # nearly invisible and waste an augmentation event behind the p=0.50 gate.
-  # Phase 2 ACTIVE (revised): KEPT, narrower range and lower frequency (±[2°,5°] @ p=0.30).
-  # Originally planned to disable (FixRes-style spatial-precision argument), but Phase 1
-  # stopped at 33/40 — under-converged base + reduced aug raises overfitting risk
-  # (Steiner TMLR 2022 §4.4: AugReg helps when training is incomplete). Narrower max angle
-  # (5° vs 8°) preserves spatial precision at 448px while retaining rotational invariance signal.
   random_rotation_enabled: true
-  random_rotation_p: 0.30
+  random_rotation_p: 0.50
   random_rotation_min_degrees: 2.0
-  random_rotation_max_degrees: 5.0
-
-  # Gaussian blur augmentation. Applied to the DOWNSCALED content inside the
-  # letterbox step, so sigma below is measured in TARGET-RESOLUTION pixels and
-  # the padding region stays exactly pad_color. (It used to run on the source
-  # image before the downscale, which divided the effective sigma by the
-  # downscale factor -- ~1.14x for this 512px-long-side corpus, but 3-4x for
-  # full-resolution sources, which would have made the blur a near no-op.)
-  # Scholarly basis: DeiT III 3-Augment (Touvron et al., ECCV 2022) showed Gaussian blur
-  # outperforms RandAugment for supervised ViT. Phase 1 (320x320) only -- drop for Phase 2 (448x448).
-  # p=0.30: modest raise from 0.25 toward DeiT III's structural 1/3 (that value is an
-  # artifact of uniform 3-way selection, not a tuned optimum -- no paper ablates it).
-  # Kernel=3 with sigma<=1.5 caps effective blur to preserve fine-grained anime features
-  # (eye highlights, accessories, small details). Kirichenko 2024 (arXiv:2401.01764):
-  # raising intensity widens fine-grained class-pair confusion; raising frequency of a
-  # weak transform does not. BYOL's asymmetric blur (p=1.0/0.1 across views) further
-  # supports keeping unblurred samples in the mix.
-  # Phase 2 ACTIVE (revised): KEPT at reduced strength (p=0.15, σ∈[0.1,1.0]).
-  # Originally planned to disable, but Phase 1 stopped at 33/40 (under-converged) — the
-  # DeiT III "drop blur at higher res" recipe assumes a fully-converged base. With reduced
-  # color jitter and rotation, removing blur entirely strips too much input-space variability.
-  # Halved frequency (0.30 → 0.15) and tighter sigma cap (1.5 → 1.0) preserve fine-grained
-  # features while keeping a residual blur signal for regularization.
+  random_rotation_max_degrees: 8.0
   gaussian_blur_enabled: true
-  gaussian_blur_p: 0.15
+  gaussian_blur_p: 0.30
   gaussian_blur_kernel_size: 3
   gaussian_blur_sigma_min: 0.1
-  gaussian_blur_sigma_max: 1.0
+  gaussian_blur_sigma_max: 1.5
 
-# Training Configuration (from training_config.yaml)
 training:
-    memory_format: "channels_last"
-    num_epochs: 15
-    # IMPORTANT: learning_rate is the BASE rate (tuned for lr_base_batch_size=256).
-    # It is automatically scaled at runtime based on effective batch size and lr_scaling_mode.
-    #
-    # Current setup (Phase 2, 448px fine-tune):
-    #   - Architecture: ViT-L/16, 18 layers
-    #   - Effective batch size: batch_size (48) * gradient_accumulation_steps (9) = 432 samples/step
-    #   - Dataset: 5.4M images, 15 epochs
-    #   - Scaling: sqrt(432/256) ≈ 1.299x → effective LR ≈ 1.0e-5 * 1.299 ≈ 1.30e-5 peak
-    #
-    # ViT-L specific: Dosovitskiy (2021) used 4e-4 for ViT-L vs 8e-4 for ViT-B at batch 4096.
-    # muP theory (Wortsman 2024) confirms LR decreases with model width.
-    # Phase 1 used 2.5e-4 base (from-scratch).
-    learning_rate: 1.0e-5  # Phase 2 base rate (sqrt-scales to ~1.30e-5 peak at effective batch 432)
-    lr_scaling_mode: "sqrt"  # "sqrt" (recommended for AdamW), "linear", or "none"
-    lr_base_batch_size: 256  # Reference batch size that learning_rate was tuned for
-
-    weight_decay: 0.05  # Phase 2 (revised): ¼ reduction from Phase 1 (0.10), not the originally-planned 10× cut. The 0.01 value followed DeiT III's converged-base resolution-FT recipe; Phase 1 stopped at 33/40 (under-converged), so EfficientNetV2 regime applies (regularization scales up with resolution). DeiT III ViT-L pretraining itself uses WD 0.02 — the 0.01 plan was below pretraining-regime norms.
-    gradient_accumulation_steps: 9  # Phase 2 effective batch: 48 * 9 = 432
-
-    # Optimizer
-    # NOTE: Using "adamw8bit" for memory-efficient 8-bit quantized optimizer states
-    # (~3 GB savings vs standard adamw). What actually happens at runtime:
-    #   - learning_rate IS scaled by effective batch size per lr_scaling_mode above
-    #     (training_config.scale_learning_rate, the only live auto-scaling helper)
-    #   - weight_decay is FIXED at the value above — no dataset-size scaling
-    #   - the scheduler is exactly what training.scheduler below says — no auto-selection
+    memory_format: "contiguous"
+    phase: 1
+    num_epochs: 60  # User ceiling, INCLUDING terminal cooldown.
+    learning_rate: 2.7e-4
+    lr_scaling_mode: "sqrt"
+    lr_base_batch_size: 256
+    weight_decay: 0.05
+    gradient_accumulation_steps: 16
     optimizer: "adamw8bit"
+    fp32_head_optimizer: true
     adam_beta1: 0.9
-    adam_beta2: 0.999  # DeiT convention; standard AdamW for ViT
+    adam_beta2: 0.999
     adan_beta3: 0.99
-    adam_epsilon: 1.0e-7  # 1e-7 is safer for bfloat16 (coarser dynamic range than fp32)
-
-    # Scheduler
-    scheduler: "cosine"  # Phase 2: cosine decay to lr_end after 2-epoch re-warmup.
-    # Phase 2: 2-epoch re-warmup at the resolution switch. NOTE (2026-07-28):
-    # this is generic phase-transition hygiene, NOT a FixRes prescription — the
-    # old "(FixRes recommendation)" label was wrong. FixRes (arXiv:1906.06423)
-    # is a BatchNorm-CNN method whose discrepancy comes from RandomResizedCrop;
-    # our pipeline is downscale-only letterbox (dataset_loader.py:282-306), so
-    # there is no apparent-size discrepancy to correct and its BN re-adaptation
-    # recipe does not transfer to a LayerNorm ViT. Cite FixRes only for the
-    # high-level "train low-res, fine-tune at target res helps" finding; the
-    # pos-embed interpolation is from ViT (arXiv:2010.11929), not FixRes.
-    # V2 raises this to ~10K steps in Phase 1 (todos/v2-plan.md §6).
-    warmup_epochs: 2
-    num_cycles: 1  # Single cosine decay (no restarts)
-    cycle_decay: 0.9  # SGDR per-restart LR decay (gamma); inert at num_cycles=1
-    lr_end: 1.0e-6
+    adam_epsilon: 1.0e-7
+    scheduler: "wsd"
+    warmup_steps: 10000
+    warmup_epochs: 0  # Explicit update count above takes precedence.
+    wsd_cooldown_fraction: 0.15
+    # Review stable-phase jitter over the first ~10 evaluations before arming.
+    # Budget-triggered cooldown remains automatic even with this gate disabled.
+    wsd_plateau_enabled: false
+    num_cycles: 1
+    cycle_decay: 0.9
+    lr_end: 0.0
 
     # Mixed precision
     # Enabled by default to reduce VRAM usage and improve performance.
@@ -301,33 +149,13 @@ training:
     #   "none" | "latest" | "best" | "/path/to/checkpoint.pt"
     # Tip: use "latest" while iterating, "best" for polishing/finetune,
     # or point to an exact checkpoint to branch experiments safely.
-    resume_from: "latest"
-    # What to do if the resumed checkpoint's LR geometry no longer matches what this
-    # config computes. The optimizer/scheduler state dicts carry the OLD peak LR, warmup
-    # length and cycle length, so resuming blindly trains at the previous calibration and
-    # the cosine no longer lands on lr_end (and, if the effective batch shrank, can fire
-    # an unintended warm restart). Checked dimensions:
-    #   effective batch size (batch_size x gradient_accumulation_steps)
-    #   warmup_steps, first_cycle_steps  <- these move when the DATASET SIZE changes,
-    #       because len(train_loader) -> updates_per_epoch -> both of them. Adding or
-    #       removing images silently invalidates the schedule even at an identical batch
-    #       size; the original batch-only trigger was blind to that whole axis.
-    #   base_max_lr (the scheduler's restored peak LR)
-    #   min_lr (lr_end) and gamma (cycle_decay) <- restored wholesale like everything
-    #       else; neither depends on batch size, which is why the original batch-scoped
-    #       trigger skipped them, but changing lr_end and resuming used to anneal to the
-    #       OLD floor with nothing reported.
-    # Policies:
-    #   "error"   -> refuse and print the options (default)
-    #   "rescale" -> retarget peak LR / warmup / cycle / lr_end / cycle_decay to this
-    #                config, preserving progress as a fraction of the cycle
-    #   "keep"    -> keep the checkpoint's schedule (pre-fix behaviour), warn loudly
-    # NOTE: also re-check eval_steps below - a larger batch shrinks updates_per_epoch,
-    # and eval_steps >= updates_per_epoch silently drops validation to every other epoch.
+    resume_from: "latest"  # Fresh V2 directory; subsequent starts safely resume V2.
+    # Legacy cosine resume policy. WSD always rejects geometry changes so
+    # warmup/cooldown progress cannot be silently rewritten after a pause.
     on_lr_schedule_change: "error"
 
-    eval_steps: 11538  # Phase 2: ~0.92 epoch at effective batch 432 (full epoch ≈ 12499 steps). Tighter cadence justified by shorter 15-epoch fine-tune and re-enabled early stopping.
-    logging_steps: 10000  # Reduced TensorBoard overhead (was 3000)
+    eval_steps: 0  # Validate every completed epoch and at terminal cooldown.
+    logging_steps: 500
     # Resume-aware reseeding: avoid replaying the same early-epoch order after resume
     resume_reseed: true
     # Vocab-resume safety: refuse to resume unless the current vocabulary's SHA256
@@ -339,88 +167,27 @@ training:
     # Loss configuration
     tag_loss:
       alpha: 1.0            # 1.0 = disabled (pure ASL, no alpha weighting: pos_loss + neg_loss)
-      # gamma_neg is the FRESH-START value only. On resume the checkpoint's
-      # persisted gamma_neg wins (asl_telemetry.ASLDriveManager); to take a
-      # manual guarded step, set gamma_neg_override below and restart.
-      # V2 plan (todos/v2-plan.md §4): gamma_neg is FIXED at 7.0 for all
-      # phases. The old 7→6→5 guarded descent is WITHDRAWN — do not
-      # re-introduce it.
-      # CITATION CORRECTED 2026-07-28: 7.0 is ASL's own ASSUME-NEGATIVE value
-      # at 5.4-9.6K classes — Ridnik et al. arXiv:2009.14119 Appendix F: "we
-      # set all untagged labels as negative ... we increased the level of loss
-      # asymmetry: For ASL, we trained with gamma- = 7, gamma+ = 0." That
-      # recipe also pairs it with margin m=0.05 (see clip below).
-      # Corroborated by RAM (arXiv:2306.03514), which tags 6,449 categories
-      # from incomplete labels with plain ASL at gamma_neg=7 / gamma_pos=0 /
-      # clip=0.05, and by SINR (arXiv:2306.02564) at 47,000 positive-only
-      # classes. Our imbalance is ~530-640:1, more extreme still.
-      # The earlier P-ASL citation (arXiv:2110.10955) was WRONG for this
-      # regime: P-ASL is a partial-annotation method and ~49% of its gain
-      # comes from decoupling gamma- from gamma_u, which requires the 37.7M
-      # human-verified negatives OpenImages has and booru has none of. Its
-      # gamma_u=7 is the value for the branch it DISTRUSTS (Fig. 8 shows
-      # gamma-=7 on the signal-carrying branch is the worst config tested),
-      # and its Ignore-mode prior estimator is degenerate at N=0.
-      # There is NO selective-ignore set in V2 — see todos/v2-plan.md §4.
-      # HISTORY NOTE (RESOLVED 2026-07-28): checkpoint-verified — V1-P1 ran
-      # gamma_neg=4.0 @320px (New folder/last.pt, epoch 33) and only V1-P2 ran
-      # 7.0 @448px (best_model.pt, epoch 5). The earlier comment was correct;
-      # ASL_plan §1's "7.0 for the entire run" framing was not.
+      # V2 fixed loss, verified after checkpoint loading.
       gamma_neg: 7.0
-      # Manual γ step (todos/ASL_plan.md §3): set to the target (e.g. 6.0),
-      # restart, verify the "STEP APPLIED" log line, then clear back to null.
-      # Steps are validated against training.asl_schedule (phase window,
-      # hold/freeze epochs, min dwell) and REFUSED if a guard fails.
+      # Retired override: must remain null.
       gamma_neg_override: null
       gamma_pos: 0.0        # ASL paper optimal: no focal suppression on positives (preserves scarce positive gradient)
       label_smoothing: 0.0   # Disabled — label smoothing + focal loss corrupts focal weights on sparse multi-label targets
-      # clip: DELIBERATE deviation from the paper — every asymmetric recipe the
-      # ASL paper shipped used m=0.05 (the old "m=0.2 paper default for the
-      # focal variant" claim overstated Fig. 7's margin-only CE/symmetric-focal
-      # sweep; todos/ASL_plan.md §1). 0.2 is missing-positive armor.
-      # V2 TARGET = 0.05, and the justification is now direct rather than
-      # conditional (todos/v2-plan.md §4). CORRECTED 2026-07-28: the earlier
-      # "clip 0.05 once P-ASL selective ignore lands" reasoning is retired
-      # along with the ignore set itself (see gamma_neg above). The actual
-      # ground is ASL Appendix F (arXiv:2009.14119): its assume-negative
-      # OpenImages recipe at 5.4-9.6K classes is gamma-=7 / gamma+=0 / m=0.05,
-      # i.e. 0.05 IS the paper's margin for exactly this regime — no ignore-set
-      # coverage check required. RAM (arXiv:2306.03514) ships the same triple
-      # at 6,449 tags. The old "rho < 25% -> 0.1" decision rule stays retired.
-      # NOT YET APPLIED: still 0.2 pending the todos/v2-plan.md §8 instrument
-      # work, because a clip change is unmeasurable on the current val set.
-      # Frozen for the whole run once set; never move clip and gamma_neg in the
-      # same step (attribution dies).
-      clip: 0.2
+      clip: 0.05
+      detach_focal_weight: true
       class_weight_strategy: null  # Removed: redundant with ASL gamma_neg (double-correction risk; ASL paper Table 2: pure ASL > FL+linear weighting)
       class_weight_clip_min: 0.05            # No-op when class_weight_strategy is null
       class_weight_clip_max: 5.0             # No-op when class_weight_strategy is null
       class_weight_beta: 0.9999              # No-op when class_weight_strategy is null
 
-    # ── Unified training phase ────────────────────────────────────────────
-    # 1 = 320px from-scratch | 2 = 448px fine-tune | 3 = optional 512px.
-    # To transition phases: flip this value (plus the resolution/aug/LR keys
-    # marked "Phase N" throughout this file) and resume. The trainer detects
-    # the phase change and loads WEIGHTS ONLY — optimizer/scheduler/scaler
-    # start fresh (re-warmup), epoch counters reset to 0, and gamma_neg is
-    # carried over frozen from the checkpoint's loss state (ASL_plan §3).
-    # Checkpoints that predate this key resume normally (no transition).
-    phase: 2
-
-    # ASL γ_neg drive guards (todos/ASL_plan.md §3). The descent is MANUAL —
-    # stop → set tag_loss.gamma_neg_override → resume — and these are the
-    # safety rails the drive manager enforces on every requested step.
+    # Fixed-loss policy: retired schedule has no mutation authority.
     asl_schedule:
-      enabled: true
-      min_dwell_epochs: 3   # minimum epochs between unit steps (7→6→5)
-      phase1: { gamma_neg_min: 5.0, gamma_neg_max: 7.0, hold_epochs: 8 }   # hard hold through warmup + early learning; epoch 9 is the EARLIEST unfreeze
-      phase2: { gamma_neg_min: 5.0, gamma_neg_max: 6.0, hold_epochs: 2 }   # frozen through the 2-epoch re-warmup; Option A holds and lands 5
-      phase3: { gamma_neg_min: 5.0, gamma_neg_max: 6.0, hold_epochs: 0 }   # loss unchanged from the P2 landing
+      enabled: false
 
-    # Always-on telemetry + gates (todos/ASL_plan.md §5) computed on
+    # Always-on telemetry + gates (todos/v2-plan.md Appendix A) computed on
     # logits[:, 2:] (PAD/UNK excluded), fp32-upcast, sampled only on
     # optimizer-update boundaries. Includes the §4 shadow controller
-    # (logging-only — it NEVER sets γ; the manual guarded steps drive).
+    # (logging-only — it NEVER sets gamma; the loss remains fixed).
     asl_telemetry:
       enabled: true
       interval_updates: 100      # EMA sample cadence (optimizer updates)
@@ -461,26 +228,79 @@ training:
     deterministic: false
     benchmark: true
 
-    # Scalar driving best-checkpoint selection AND early stopping.
-    # One of: val_mAP | val_f1_macro | val_f1_micro.
-    # val_mAP is threshold-free. Do NOT switch to an F1 variant while the ASL
-    # gamma_neg ladder is being driven: those are evaluated at the single frozen
-    # inference.prediction_threshold, so a rank-preserving calibration shift (what
-    # a gamma_neg step is) moves them far more than a real ranking gain — measured
-    # on the epoch-7 val cache, a -0.25 logit shift moved macro-F1 by +0.0092 while
-    # the largest genuine epoch-to-epoch gain in the whole run was +0.00066. The
-    # sign is also wrong: lowering gamma_neg pushes probabilities down, so a real
-    # improvement reads as a large drop and burns early-stopping patience.
+    # Frozen-list binned macro-mAP drives checkpoint selection and plateau advice.
+    # Oracle F1 and exact mAP remain reporting-only diagnostics.
     selection_metric: val_mAP
 
-    # Early stopping
-    # Phase 2: re-enabled with patience=4, burn_in=2 (mature fine-tune phase). Phase 1 used patience=8, burn_in=8.
+    # --- Best-checkpoint selection (NOT the stop rule) ---
+    # These two now govern only whether an epoch overwrites best_model.pt.
+    # Keep the threshold near zero so the argmax checkpoint is always retained;
+    # the noise-floor question belongs to the stop rule, not to which weights we
+    # keep. `early_stopping_patience` is no longer read for stopping.
     early_stopping_patience: 4
     early_stopping_threshold: 0.0000005
-    # Ignore first N epochs for early-stopping to avoid initial instability
+    # Epochs excluded from stop decisions entirely (initial instability).
     early_stopping_burn_in_epochs: 2
-    # One of: median, mean, last, max
+    # One of: median, mean, last, max. This is now actually honored — the old
+    # code did `max(baseline, max(burn_in_values))`, which is always the max, so
+    # every strategy silently behaved as `max` and the post-burn-in bar was the
+    # burn-in high-water mark. A lucky spike then set a bar the real curve needed
+    # many epochs to clear.
     early_stopping_burn_in_strategy: median
+
+    # --- Stop system (stop_conditions.py) ---
+    # All rules are pure functions of training_state.eval_history, so they are
+    # unchanged by a soft stop / resume. See stop_conditions.py's module docstring
+    # for what each rule replaces.
+    #
+    # advise = trip is logged + recorded, run continues to the epoch budget.
+    # halt   = trip ends the run.  off = evaluate and log only.
+    # 'advise' is the default deliberately: in V1-P2 the one mechanical red flag
+    # was overridden by the operator and the operator was right (mAP kept rising
+    # for the rest of the run). Every band below is V1-calibrated and must be
+    # re-derived on V2's own val curve before it is trusted to end a run.
+    early_stopping_mode: advise
+    # Plateau: required gain of best(last `window` validated epochs) over
+    # best(previous `window`), confirmed on `confirm` consecutive evaluations.
+    # 3e-3 is the MEASURED resolution floor of this val instrument (see the
+    # ap_thresholds note below and todos/v2-plan.md §8.3): binning bias -0.0031,
+    # 30K sampling CI ±0.0027. It STRADDLES a single epoch's real gain — V1-P2's
+    # per-epoch gains were +0.0041 +0.0045 +0.0015 +0.0031 +0.0022, two of five
+    # below it — which is why the test is window-over-window and not per-epoch.
+    # Replay check (test_stop_conditions.py): V1-P2's E0–E5 mAP
+    # (.6591 .6631 .6676 .6691 .6722 .6744) gives a window gain of +0.0067, so
+    # this rule would NOT have stopped that run. Canary #1's ≥1.01×/epoch band
+    # flagged it from E2 onward.
+    early_stopping_min_delta: 0.003
+    early_stopping_window: 3
+    early_stopping_confirm: 2
+    # Explicit floor on validated epochs before any rule may fire. The old code
+    # had no such key; it inherited a floor from `lr < 0.5 * scheduler.max_lr`,
+    # which on num_cycles=1 is false until the midpoint of the anneal — so the
+    # auto-stop could not fire before ~epoch 8.5 of P2's 15 and, with patience=4,
+    # the earliest possible stop was ~epoch 13. State the floor, don't inherit it.
+    early_stopping_min_epochs: 4
+    # Peak-and-decline: metric sitting this far below its all-time best for this
+    # many consecutive validated epochs. 2× min_delta so a decline must clear the
+    # noise floor twice over.
+    early_stopping_regression_delta: 0.006
+    early_stopping_regression_confirm: 2
+    # Overfitting (canary #6): consecutive validated epochs with val_loss rising
+    # while train_loss falls. This is the only rule here that reads directly on
+    # the thing V1 was trying to avoid — and it never fired at either V1 stop
+    # (val_loss fell monotonically E0→E5 alongside train_loss).
+    early_stopping_overfit_confirm: 3
+    # Per-phase plateau geometry, keyed like asl_schedule. The plateau rule cannot
+    # confirm before burn_in + 2*window + confirm - 1 validated epochs, so a
+    # ~55-epoch from-scratch phase and a 3-4 epoch detail phase cannot share one
+    # setting: at window=3/confirm=2 the latter can NEVER confirm — the same
+    # silent-no-op class as the LR gate this system replaced. Values follow
+    # todos/v2-plan.md §7's phase table. Omitted keys inherit the values above;
+    # `null` means inherit.
+    early_stopping_phases:
+      phase1: { window: 3, confirm: 2 }   # ~55 epochs: full geometry is affordable
+      phase2: { window: 2, confirm: 1 }   # ~12 epochs: window=3/confirm=2 leaves only ~4 of coverage
+      phase3: { mode: "off" }             # 3-4 epochs, "run it, don't gate it" (§7)
 
 # Inference Configuration (from inference_config.yaml)
 inference:
@@ -558,15 +378,33 @@ validation:
   # override; default shown below (.inf = open-ended top bucket).
   # frequency_bins: [300, 500, 1000, 5000, 10000, .inf]
   # Uniform threshold count for the binned mAP metric. DO NOT RAISE without
-  # measuring: torchmetrics allocates a (batch x num_labels x ap_thresholds)
+  # measuring: torchmetrics allocates a (chunk x num_labels x ap_thresholds)
   # int64 intermediate per update, so the transient peak dominates.
-  # Measured on RTX 5090 @ B=48, 19.3K labels — 200: 9.3 GB peak, 40 ms/update;
+  # Historical unchunked RTX 5090 @ B=48, 19.3K labels — 200: 9.3 GB peak;
   # 500: 23.3 GB peak; 2000: 93 GB peak and ~103 min per validation pass.
   # Cost of 200 is a mAP bias of ~-0.0031 vs the exact metric, near-uniform
   # across support buckets — treat val_mAP differences below ~0.003 as noise.
   ap_thresholds: 200
+  # Slice only metric updates, preserving model batch size and the 200-bin score.
+  # Eight rows: 1.18 GiB additional peak vs 8.46 GiB for 48, identical counts.
+  ap_update_chunk_size: 8
+  # Freeze the macro-average tag list at the first validated epoch of the phase.
+  # The per-epoch `val_pos_counts > 0` denominator drifts (the per-batch error
+  # filter drops different samples on different epochs), and the stop rules
+  # compare mAP across epochs at a 3e-3 scale, so drift there is not harmless.
+  # The frozen index list is persisted in the checkpoint, so it survives a soft
+  # stop and stays identical for the whole phase.
+  freeze_macro_tag_list: true
+  # Advisory missing-positive / memorization fingerprints, computed streaming per
+  # val batch (no full-matrix retention, so they stay affordable at the full
+  # ~276K val split). Logged to TensorBoard as val_fingerprint/* and flagged
+  # after 2 consecutive moves in the problem direction. NEVER a stop cause —
+  # see todos/v2-monitoring.md "Missing-positive bias diagnostics".
+  log_memorization_fingerprints: true
+  fingerprint_topk: 10
+  fingerprint_rank_window: [11, 50]
   dataloader:
-    batch_size: 48  # Matches training batch_size — val has lower per-step VRAM (no_grad, no optimizer state, no grad-ckpt recompute)
+    batch_size: 48  # Model inference batch; AP updates use ap_update_chunk_size rows.
     num_workers: 6  # Increased for smoother validation throughput
     pin_memory: true  # Enables async DMA transfer for faster CPU-GPU transfer
     prefetch_factor: 3  # 6 workers × 3 batches × 48 = 864 samples prefetched
@@ -574,7 +412,7 @@ validation:
   preprocessing:
     # Uses data.normalize_mean/std by default; keep in sync with
     # training/inference unless intentionally different.
-    image_size: 448  # Auto-synced from data.image_size at startup
+    image_size: 320  # Auto-synced from data.image_size at startup
     patch_size: 16   # Auto-synced from model.patch_size at startup
 
 # ──────────────────────────────────────────────────────────────────────────────

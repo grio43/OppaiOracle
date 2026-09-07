@@ -5,11 +5,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple, Union
 from torchmetrics.functional.classification import (
-    multilabel_f1_score,
+    binary_average_precision,
     multilabel_average_precision,
 )
 # Type alias for averaging modes
 AveragingMode = Literal["micro", "macro", "weighted"]
+
+
+def update_binned_average_precision(metric, probabilities, targets, chunk_size: int = 8) -> None:
+    """Bound AP's batch x labels x thresholds scratch space without changing bins.
+
+    Integer confusion counts add exactly across slices, including unknown (-1)
+    targets. Model inference can keep its independently configured batch size.
+    """
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError('AP update chunk_size must be a positive integer')
+    for start in range(0, probabilities.shape[0], chunk_size):
+        metric.update(probabilities[start:start + chunk_size], targets[start:start + chunk_size])
 
 
 def _ensure_full_frequency_coverage(bins: List[float]) -> List[float]:
@@ -29,6 +41,27 @@ def _ensure_full_frequency_coverage(bins: List[float]) -> List[float]:
     if out[-1] != float('inf'):
         out = out + [float('inf')]
     return out
+
+
+class ValidationBuffer:
+    """One fp32/int8 host allocation; targets preserve -1 for unknown labels."""
+
+    def __init__(self, capacity: int, num_labels: int):
+        self.probabilities = torch.empty((capacity, num_labels), dtype=torch.float32)
+        self.targets = torch.empty((capacity, num_labels), dtype=torch.int8)
+        self.rows = 0
+
+    def append(self, probabilities: torch.Tensor, targets: torch.Tensor) -> None:
+        end = self.rows + len(probabilities)
+        if end > len(self.probabilities):
+            raise ValueError("Validation buffer exceeded dataset size")
+        # Blocking D2H: CPU consumers must never see an unfinished transfer.
+        self.probabilities[self.rows:end].copy_(probabilities.detach())
+        self.targets[self.rows:end].copy_(targets.detach())
+        self.rows = end
+
+    def tensors(self):
+        return self.probabilities[:self.rows], self.targets[:self.rows]
 
 
 @dataclass
@@ -118,10 +151,10 @@ class MetricComputer:
         # Accept probabilities or logits; TorchMetrics will sigmoid if logits are detected.
         # Cast to fp32 for stable thresholding and PR-curve accumulation.
         preds = predictions.detach().float()
-        # TorchMetrics (multilabel) requires integer {0,1} targets; binarize if floats.
+        # Keep -1 unobserved targets for TorchMetrics ignore_index handling.
         targs = targets.detach()
         if targs.dtype.is_floating_point:
-            targs = (targs > 0.5).to(torch.long)
+            targs = torch.where(targs < 0, -1, (targs > 0.5).long())
         else:
             targs = targs.to(torch.long)
 
@@ -136,50 +169,41 @@ class MetricComputer:
             preds = preds[:, self._keep_mask]
             targs = targs[:, self._keep_mask]
 
-        # Zero-positive-class filtering is only meaningful for MACRO averaging:
-        # torchmetrics returns AP/F1=0 for unsupported classes, dragging the macro
-        # mean toward vocabulary sparsity. Micro-F1 aggregates TP/FP/FN across all
-        # classes, so dropping guaranteed-FP columns would INFLATE it; and non-macro
-        # mAP must see the full class set. Use the filtered tensors only for macro.
-        full_labels = preds.size(1)
-        preds_drop, targs_drop, effective_labels = self._drop_zero_positive_classes(preds, targs)
+        return self._compute_masked_scores(preds, targs, self.threshold)
 
-        f1_macro = multilabel_f1_score(
-            preds_drop, targs_drop, num_labels=effective_labels, average="macro", threshold=self.threshold
-        ).item()
-        f1_micro = multilabel_f1_score(
-            preds, targs, num_labels=full_labels, average="micro", threshold=self.threshold
-        ).item()
-        if self.mAP_average == "macro":
-            mAP = multilabel_average_precision(
-                preds_drop, targs_drop, num_labels=effective_labels, average=self.mAP_average
-            ).item()
+    def _compute_masked_scores(self, preds, targs, threshold):
+        """Keep unknown labels out of counts, including empty/single-label draws."""
+        if preds.numel() == 0:
+            return {"f1_macro": 0.0, "f1_micro": 0.0, "mAP": 0.0}
+        # Match TorchMetrics' logits-or-probabilities convention.
+        if bool(((preds < 0) | (preds > 1)).any()):
+            preds = preds.sigmoid()
+        observed = targs >= 0
+        positive = targs == 1
+        predicted = (preds > threshold) & observed
+        support = positive.sum(dim=0)
+        tp = (predicted & positive).sum(dim=0)
+        denominator = predicted.sum(dim=0) + support
+        supported = support > 0
+        class_f1 = 2 * tp.float() / denominator.clamp_min(1)
+        f1_macro = class_f1[supported].mean().item() if bool(supported.any()) else 0.0
+        f1_micro = (2 * tp.sum().float() / denominator.sum().clamp_min(1)).item()
+        # Exact AP cannot process an entirely unobserved column (empty PR curve).
+        # Macro omits zero-support labels; micro/weighted retain observed negatives.
+        ap_cols = supported if self.mAP_average == "macro" else observed.any(dim=0)
+        count = int(ap_cols.sum())
+        if not bool(supported.any()):
+            ap = 0.0
+        elif count == 1:
+            col = int(ap_cols.nonzero()[0, 0])
+            known = observed[:, col]
+            ap = binary_average_precision(preds[known, col], targs[known, col]).item()
         else:
-            mAP = multilabel_average_precision(
-                preds, targs, num_labels=full_labels, average=self.mAP_average
+            ap = multilabel_average_precision(
+                preds[:, ap_cols], targs[:, ap_cols], num_labels=count,
+                average=self.mAP_average, ignore_index=-1,
             ).item()
-        return {"f1_macro": f1_macro, "f1_micro": f1_micro, "mAP": mAP}
-
-    @staticmethod
-    def _drop_zero_positive_classes(
-        preds: torch.Tensor, targs: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Remove classes with zero positive targets in this draw.
-
-        torchmetrics returns AP=0 for any class with no positives, so under macro
-        averaging across an 18-24K-class long-tailed vocabulary, a 30k-sample
-        validation draw leaves thousands of unrepresented classes contributing
-        zeros. The macro score then reflects vocabulary sparsity rather than
-        model quality. Filtering keeps macro averaging meaningful.
-        """
-        if targs.numel() == 0:
-            return preds, targs, preds.size(1)
-        positive_per_class = targs.sum(dim=0)
-        keep = positive_per_class > 0
-        effective = int(keep.sum().item())
-        if effective == 0 or effective == preds.size(1):
-            return preds, targs, preds.size(1)
-        return preds[:, keep], targs[:, keep], effective
+        return {"f1_macro": f1_macro, "f1_micro": f1_micro, "mAP": ap}
 
     def compute_all_metrics_at_threshold(
         self,
@@ -204,7 +228,7 @@ class MetricComputer:
         preds = predictions.detach().float()
         targs = targets.detach()
         if targs.dtype.is_floating_point:
-            targs = (targs > 0.5).to(torch.long)
+            targs = torch.where(targs < 0, -1, (targs > 0.5).long())
         else:
             targs = targs.to(torch.long)
 
@@ -216,25 +240,7 @@ class MetricComputer:
             preds = preds[:, self._keep_mask]
             targs = targs[:, self._keep_mask]
 
-        # Filter zero-positive classes for MACRO metrics only (see compute_all_metrics).
-        full_labels = preds.size(1)
-        preds_drop, targs_drop, effective_labels = self._drop_zero_positive_classes(preds, targs)
-
-        f1_macro = multilabel_f1_score(
-            preds_drop, targs_drop, num_labels=effective_labels, average="macro", threshold=threshold
-        ).item()
-        f1_micro = multilabel_f1_score(
-            preds, targs, num_labels=full_labels, average="micro", threshold=threshold
-        ).item()
-        if self.mAP_average == "macro":
-            mAP = multilabel_average_precision(
-                preds_drop, targs_drop, num_labels=effective_labels, average=self.mAP_average
-            ).item()
-        else:
-            mAP = multilabel_average_precision(
-                preds, targs, num_labels=full_labels, average=self.mAP_average
-            ).item()
-        return {"f1_macro": f1_macro, "f1_micro": f1_micro, "mAP": mAP}
+        return self._compute_masked_scores(preds, targs, threshold)
 
     def find_optimal_threshold(
         self,
@@ -310,7 +316,7 @@ class MetricComputer:
         preds = predictions.detach()
         targs = targets.detach()
         if targs.dtype.is_floating_point:
-            targs = (targs > 0.5).to(torch.long)
+            targs = torch.where(targs < 0, -1, (targs > 0.5).long())
         else:
             targs = targs.to(torch.long)
 
@@ -337,7 +343,9 @@ class MetricComputer:
         # that would each redundantly compute the same confusion matrix internally.
 
         # Binarize predictions using threshold
-        preds_binary = (preds_filtered > self.threshold).to(torch.long)
+        observed = targs_filtered >= 0
+        preds_binary = ((preds_filtered > self.threshold) & observed).to(torch.long)
+        targs_filtered = targs_filtered.clamp_min(0)
 
         # Compute confusion matrix components per label (sum over samples, dim=0)
         # TP: predicted positive AND actually positive
@@ -446,60 +454,46 @@ class FrequencyBucketMetrics:
             Dict mapping bucket name to {f1_macro, f1_micro, mAP, num_tags,
             num_supported_tags, mean_support}.
         """
-        targs = targets.detach()
-        if targs.dtype.is_floating_point:
-            targs = (targs > 0.5).to(torch.long)
-        else:
-            targs = targs.to(torch.long)
-        # fp32 cast to match compute_all_metrics: bf16 preds lose precision near
-        # the threshold, making bucketed F1/mAP inconsistent with the headline.
-        preds = predictions.detach().float()
-
+        # Bound scratch memory by columns, never cast the whole N x L target
+        # matrix to int64. Exact AP remains a diagnostic, distinct from the
+        # headline binned estimator. Counts aggregate before micro averaging.
+        preds, targs = predictions.detach(), targets.detach()
         results: Dict[str, Dict[str, float]] = {}
         for bucket_name, indices in self._bucket_assignments.items():
             num_tags = len(indices)
-            if num_tags == 0:
-                results[bucket_name] = {
-                    "f1_macro": 0.0, "f1_micro": 0.0, "mAP": 0.0,
-                    "num_tags": 0, "num_supported_tags": 0, "mean_support": 0.0,
-                }
-                continue
-
-            idx_tensor = torch.tensor(indices, dtype=torch.long, device=preds.device)
-            bucket_preds = preds[:, idx_tensor]
-            bucket_targs = targs[:, idx_tensor]
-
-            # Drop zero-support columns before MACRO metrics, mirroring the headline
-            # metrics (_drop_zero_positive_classes): torchmetrics returns F1/AP=0 for
-            # classes with no positives in the draw, dragging rare buckets toward 0
-            # and measuring draw sparsity rather than model quality. Micro-F1 keeps
-            # the full bucket (see compute_all_metrics).
-            support_per_tag = bucket_targs.sum(dim=0)
-            num_supported = int((support_per_tag > 0).sum().item())
-            preds_drop, targs_drop, effective_tags = MetricComputer._drop_zero_positive_classes(
-                bucket_preds, bucket_targs
-            )
-
-            f1_macro = multilabel_f1_score(
-                preds_drop, targs_drop, num_labels=effective_tags,
-                average="macro", threshold=threshold,
-            ).item()
-            f1_micro = multilabel_f1_score(
-                bucket_preds, bucket_targs, num_labels=num_tags,
-                average="micro", threshold=threshold,
-            ).item()
-            mAP = multilabel_average_precision(
-                preds_drop, targs_drop, num_labels=effective_tags, average="macro",
-            ).item()
-            mean_support = support_per_tag.float().mean().item()
-
+            tp_sum = fp_sum = fn_sum = support_sum = 0
+            f1_sum = ap_sum = 0.0
+            num_supported = 0
+            for start in range(0, num_tags, 32):
+                cols = indices[start:start + 32]
+                p = preds[:, cols].float()
+                observed = targs[:, cols] >= 0
+                t = targs[:, cols] > 0.5
+                positive = (p > threshold) & observed
+                support = t.sum(dim=0)
+                tp = (positive & t).sum(dim=0)
+                fp = positive.sum(dim=0) - tp
+                fn = support - tp
+                supported = support > 0
+                denom = 2 * tp + fp + fn
+                f1 = (2 * tp).double() / denom.clamp_min(1)
+                f1_sum += f1[supported].sum().item()
+                num_supported += supported.sum().item()
+                support_sum += support.sum().item()
+                tp_sum += tp.sum().item()
+                fp_sum += fp.sum().item()
+                fn_sum += fn.sum().item()
+                for col in torch.where(supported)[0].tolist():
+                    known = observed[:, col]
+                    ap_sum += binary_average_precision(p[known, col], t[known, col].long()).item()
+            denom = 2 * tp_sum + fp_sum + fn_sum
             results[bucket_name] = {
-                "f1_macro": f1_macro,
-                "f1_micro": f1_micro,
-                "mAP": mAP,
+                "f1_macro": f1_sum / num_supported if num_supported else 0.0,
+                "f1_micro": 2 * tp_sum / denom if denom else 0.0,
+                "mAP": ap_sum / num_supported if num_supported else 0.0,
                 "num_tags": num_tags,
                 "num_supported_tags": num_supported,
-                "mean_support": mean_support,
+                "mean_support": support_sum / num_tags if num_tags else 0.0,
             }
 
         return results
@@ -561,7 +555,7 @@ class ThresholdCalibrator:
         preds_np = predictions.detach().cpu().float().numpy()
         targs_np = targets.detach().cpu().numpy()
         if targs_np.dtype != np.int64:
-            targs_np = (targs_np > 0.5).astype(np.int64)
+            targs_np = np.where(targs_np < 0, -1, targs_np > 0.5).astype(np.int64)
 
         skip_set = set(skip_indices) if skip_indices else set()
         thresholds = np.arange(self.search_min, self.search_max + self.search_step / 2, self.search_step)
@@ -592,11 +586,12 @@ class ThresholdCalibrator:
         is algebraically identical (2*tp + fp + fn == pred_pos + support), so
         the grid matches the loop version's F1 values exactly.
         """
-        targ_bool = targs.astype(bool)
-        support = targs.sum(axis=0)  # tp + fn; invariant in threshold
+        observed = targs >= 0
+        targ_bool = targs > 0.5
+        support = targ_bool.sum(axis=0)  # tp + fn; invariant in threshold
         f1_grid = np.empty((len(thresholds), preds.shape[1]), dtype=np.float64)
         for ti, t in enumerate(thresholds):
-            pred_bin = preds > t  # bool (N, C); transient, freed each iteration
+            pred_bin = (preds > t) & observed
             tp = (pred_bin & targ_bool).sum(axis=0)
             pred_pos = pred_bin.sum(axis=0)
             f1_grid[ti] = 2 * tp / (pred_pos + support + 1e-8)
@@ -670,10 +665,12 @@ class ThresholdCalibrator:
             if count:
                 macro_f1 = f1_grid[:, supported].sum(axis=1) / count
             else:
-                macro_f1 = np.zeros(len(thresholds))
+                # No observed positive evidence (e.g. an entirely unrated
+                # rating bucket): do not "calibrate" it to the search minimum.
+                result[bucket_name] = self.default_threshold
+                continue
             # np.argmax returns the FIRST max, matching the old loop's strict `>`
-            # tie-break (including count == 0: an all-zero macro-F1 picks
-            # thresholds[0], as the old loop did).
+            # tie-break for buckets with positive support.
             result[bucket_name] = float(thresholds[np.argmax(macro_f1)])
         return result
 

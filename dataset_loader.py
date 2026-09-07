@@ -327,26 +327,71 @@ def process_image_cpu(
 
 def apply_random_rotation(
     canvas: Image.Image,
+    pmask: torch.Tensor,
     min_degrees: float,
     max_degrees: float,
     pad_color: Tuple[int, int, int],
-) -> Image.Image:
-    """Rotate canvas by a random angle from [-max,-min] ∪ [+min,+max].
+) -> Tuple[Image.Image, torch.Tensor]:
+    """Rotate canvas AND its padding mask by a random angle from [-max,-min] ∪ [+min,+max].
 
-    Padding mask is intentionally NOT rotated — corner pixels filled with
-    pad_color follow f(θ) = tan(θ/2)·(1−tan(θ/2))/(1+tan(θ/2)), e.g. ~6.1% at
-    8° and ~10.1% at 15°, well within the letterbox padding distribution the
-    model already learns to ignore.
+    The mask must rotate with the image. Rotating the canvas tilts the whole
+    letterbox, so a static mask is wrong in both directions — measured on 400
+    corpus images at the active ±[2°,5°] range, at the mean 3.5° angle:
 
-    Uses bicubic resampling to better preserve fine-grained features (eye
+      - 1.02% of tokens are pad_color but marked content (attended flat gray)
+      - 1.83% of tokens hold real content but are marked pad (content dropped)
+
+    The second term dominates and is the one an "extra corner padding is
+    harmless" argument does not cover: content rotates *up into* the region a
+    static mask still calls a letterbox bar, and `pixel_to_token_ignore` then
+    drops it from attention entirely. Both terms scale with angle (at 8° they
+    are 3.80% / 3.26%) and the pixel-level disagreement is 3.66% at 3.5°.
+
+    Note this does not — and cannot — recover content rotated off a
+    non-expanded canvas (~13px per side at 5° for the median 0.713 aspect).
+    That clipping is the intended semantics of rotate-in-place; the mask fix
+    only stops us mislabelling what remains.
+
+    Image resampling stays bicubic to preserve fine-grained features (eye
     highlights, hair strands, accessories). Per Thévenaz/Blu/Unser (2000,
     IEEE TIP), bicubic frequency response stays >0.85 at Nyquist for typical
-    sub-pixel offsets vs. ~0.64 for bilinear.
+    sub-pixel offsets vs. ~0.64 for bilinear. The mask uses nearest-neighbour
+    (bicubic on a binary mask would ring); pad_color is then re-asserted
+    wherever the rotated mask says pad, because bicubic's negative lobes
+    otherwise smear ringing across the content edge — the same hazard that
+    keeps Gaussian blur out of the finished-canvas step (see process_image_cpu
+    call site) — and it restores the invariant that the padding region is
+    exactly pad_color.
     """
     angle = random.uniform(min_degrees, max_degrees)
     if random.random() < 0.5:
         angle = -angle
-    return canvas.rotate(angle, resample=RESAMPLE_BICUBIC, expand=False, fillcolor=pad_color)
+
+    rotated = canvas.rotate(
+        angle, resample=RESAMPLE_BICUBIC, expand=False, fillcolor=pad_color
+    )
+
+    # Mask is (H,W) bool, True=PAD. Corners exposed by the rotation are pad,
+    # hence fillcolor=255. NEAREST keeps the mask image strictly {0,255}, so it
+    # doubles as an exact paste stencil below with no alpha blending.
+    mask_img = Image.fromarray(
+        (pmask.numpy().astype(np.uint8) * 255), mode="L"
+    ).rotate(angle, resample=Image.NEAREST, expand=False, fillcolor=255)
+
+    # Re-assert exact pad_color under the rotated mask: bicubic's negative lobes
+    # ring at the content/pad boundary, and this restores the process_image_cpu
+    # invariant that the padding region is exactly pad_color. It also makes the
+    # mask and the pixels agree by construction — which is why the geometry has
+    # to be verified against an independent ground truth (see
+    # test_rotation_mask.py [3]) and not by checking pixels against the mask.
+    #
+    # Cost note: PIL paste (~0.85 ms at 448px) vs in-place numpy boolean
+    # indexing (~0.80 ms) is a wash; both are <10% of this function, which is
+    # dominated by the bicubic canvas rotate (~7.9 ms of ~8.9 ms). Whole-op
+    # overhead vs. the old canvas-only rotation is ~+2.2 ms per rotated sample,
+    # i.e. ~+0.7 ms/sample amortized at p=0.30.
+    rotated.paste(pad_color, mask=mask_img)
+    return rotated, torch.from_numpy(np.array(mask_img) > 127)
 
 
 class ResumableSampler(DistributedSampler):
@@ -461,7 +506,9 @@ class DataLoader(_TorchDataLoader):  # keep public name the same
 
 # --- JSON sidecar split caching to reduce startup I/O -----------------------
 _PROJ_ROOT = Path(__file__).resolve().parent
-_SPLIT_CACHE_VERSION = "2.0"
+_SPLIT_CACHE_VERSION = "3.0"
+from utils.sidecar_discovery import discover_sidecars, subset_signature
+from utils.metadata_ingestion import rating_to_tag, encode_rating_targets, sidecar_image_id
 _EXCLUSION_PATTERNS = ["train.json", "val.json"]  # Manifest files excluded from sidecar mode
 
 def _compute_exclusion_hash() -> str:
@@ -582,6 +629,16 @@ def _try_load_cached_split(root: Path, seed: int = 42) -> Optional[tuple[list[Pa
                 return None
 
             # Stratified sampling: check files from beginning, end, and random middle
+            if train_header.get("SUBSETS") != subset_signature(root):
+                discovered = set(discover_sidecars(root))
+                previous = set(train_list) | set(val_list)
+                if not previous.issubset(discovered):
+                    raise RuntimeError("Dataset membership changed; prepare a new frozen dataset before training")
+                # Adding a top-level subset must not reshuffle the frozen holdout.
+                train_list.extend(sorted(discovered - previous))
+                _write_cached_split(root, train_list, val_list, seed=seed)
+
+            # Stratified sampling: check files from beginning, end, and random middle
             # This catches orphan files anywhere in the list, not just at the start
             sample_paths = []
 
@@ -680,6 +737,7 @@ def _write_cached_split(root: Path, train_list: list[Path], val_list: list[Path]
             f"# EXCLUSION_HASH={exclusion_hash}\n"
             f"# FILE_COUNT={total_count}\n"
             f"# SEED={seed}\n"
+            f"# SUBSETS={subset_signature(root)}\n"
         )
 
         # Write with header
@@ -809,8 +867,7 @@ class ArrowMetadataAccessor:
         """Initialize accessor.
 
         Args:
-            table: PyArrow Table — must already be filtered to ``row_indices``
-                (i.e. ``full_table.take(row_indices)``) when indices are given
+            table: Full memory-mapped PyArrow table, never a selected copy.
             cache_path: Path to the Arrow IPC file (for pickling)
             row_indices: Row indices into the FULL on-disk cache that this
                 accessor represents (split/exclusion/bad-row filters), or None
@@ -822,7 +879,8 @@ class ArrowMetadataAccessor:
         self._table = table
         self._cache_path = cache_path
         self._row_indices = row_indices
-        self._len = len(table)
+        self._full_len = len(table)
+        self._len = len(row_indices) if row_indices is not None else len(table)
 
     def __len__(self) -> int:
         return self._len
@@ -846,15 +904,12 @@ class ArrowMetadataAccessor:
                     "The cache file may be missing, corrupted, or locked. "
                     "Try deleting the cache file and restarting training."
                 )
-            # Re-apply the row selection computed in the main process — the
-            # on-disk cache contains ALL rows (train+val, pre-exclusion).
-            # Skipping this would alias the splits and leak val into train.
-            if self._row_indices is not None:
-                table = table.take(self._row_indices)
-            if len(table) != self._len:
+            # Keep the full mmap; translate individual indices on access instead
+            # of allocating a private selected metadata table in every worker.
+            if len(table) != self._full_len:
                 raise RuntimeError(
                     f"Arrow metadata cache row count mismatch after reload: "
-                    f"expected {self._len}, got {len(table)} ({self._cache_path}). "
+                    f"expected {self._full_len}, got {len(table)} ({self._cache_path}). "
                     "The on-disk cache changed since the dataset was created; "
                     "restart training so the cache and row selection are rebuilt."
                 )
@@ -869,6 +924,12 @@ class ArrowMetadataAccessor:
         """
         # Lazy-load table on first access (enables parallel worker spawn)
         self._ensure_table()
+        if idx < 0:
+            idx += self._len
+        if not 0 <= idx < self._len:
+            raise IndexError(idx)
+        if self._row_indices is not None:
+            idx = int(self._row_indices[idx])
         # Slice single row - Arrow handles this efficiently
         row = self._table.slice(idx, 1)
         result = {
@@ -891,6 +952,7 @@ class ArrowMetadataAccessor:
         return {
             "_cache_path": self._cache_path,
             "_len": self._len,
+            "_full_len": self._full_len,
             "_row_indices": self._row_indices,
         }
 
@@ -907,6 +969,7 @@ class ArrowMetadataAccessor:
         """
         self._cache_path = state["_cache_path"]
         self._len = state["_len"]
+        self._full_len = state["_full_len"]
         # Row selection into the full on-disk cache (None = unfiltered).
         # .get() tolerates accessors pickled before this field existed.
         self._row_indices = state.get("_row_indices")
@@ -1206,12 +1269,8 @@ class DatasetLoader(Dataset):
         """
         tag_vec = self._encode_labels(annotation)
 
-        # Encode rating as a tag in the multi-hot vector
-        rating_tag = _map_rating_to_tag(annotation.get("rating", "unknown"))
-        if rating_tag and hasattr(self, 'vocab') and self.vocab is not None:
-            rating_idx = self.vocab.tag_to_index.get(rating_tag)
-            if rating_idx is not None and 0 <= rating_idx < tag_vec.shape[0]:
-                tag_vec[rating_idx] = 1.0
+        if getattr(self, 'vocab', None) is not None:
+            encode_rating_targets(tag_vec, self.vocab.tag_to_index, annotation.get('rating'))
 
         # Ensure tensors are contiguous before returning for efficient pin_memory
         # Non-contiguous tensors force implicit copies during DataLoader collation/pinning
@@ -1405,17 +1464,10 @@ class DatasetLoader(Dataset):
                     self.failed_samples.add(idx)
                 return self._create_error_sample(idx, f"Excluded: {safe_image_id}", image_id=safe_image_id)
 
-            # Drop samples whose targets would be all-(or near-all-)negative — the
-            # train/val loops filter these via the `error` flag, so they never
-            # reach the loss. Without this guard the model would be trained that
-            # such images have zero of every tag (and zero of every rating).
+            # Missing ratings mask only their four labels; empty content is still invalid.
             label_list = annotation.get('labels') or []
-            if (not label_list) or _map_rating_to_tag(annotation.get('rating')) is None:
-                reason = (
-                    "empty label list" if not label_list
-                    else f"missing/unknown rating ({annotation.get('rating')!r})"
-                )
-                return self._create_error_sample(idx, reason, image_id=safe_image_id)
+            if not label_list:
+                return self._create_error_sample(idx, 'empty label list', image_id=safe_image_id)
 
             # --- Load + transform (confined path) ---
             # Use the sanitized image identifier we derived above.
@@ -1699,6 +1751,7 @@ class SidecarJsonDataset(Dataset):
         force_rebuild_metadata_cache: bool = False,
         metadata_cache_staleness_check_samples: int = 100,
         prebuilt_arrow_table: Optional[Any] = None,  # Pre-loaded Arrow table to avoid rebuild
+        preserve_membership: bool = False,  # Prepared splits keep excluded sample positions for resume
         # Color jitter augmentation (applied before normalization)
         color_jitter_enabled: bool = False,
         color_jitter_brightness: float = 0.1,
@@ -1714,7 +1767,7 @@ class SidecarJsonDataset(Dataset):
         random_erasing_scale_max: float = 0.20,
         random_erasing_ratio_min: float = 0.3,
         random_erasing_ratio_max: float = 3.3,
-        # Random rotation augmentation (applied after letterboxing, image only)
+        # Random rotation augmentation (applied after letterboxing, to canvas AND mask)
         random_rotation_enabled: bool = False,
         random_rotation_p: float = 0.3,
         random_rotation_min_degrees: float = 5.0,
@@ -1728,6 +1781,7 @@ class SidecarJsonDataset(Dataset):
     ):
         self.root = Path(root_dir)
         self.json_files = list(json_files)
+        self.preserve_membership = bool(preserve_membership)
         self.vocab = vocab
         self.transform = transform
         self.joint_transforms = joint_transforms
@@ -1745,7 +1799,13 @@ class SidecarJsonDataset(Dataset):
             exclusion_path,
             reload_interval_seconds=_EXCLUSION_RELOAD_INTERVAL
         )
-        self.excluded_image_ids = self._exclusion_manager.load()
+        if self.preserve_membership:
+            # Prepared runs only report failures in the parent trainer; no
+            # worker blacklist I/O and no removal from the frozen sample space.
+            self._exclusion_manager = None
+            self.excluded_image_ids = set()
+        else:
+            self.excluded_image_ids = self._exclusion_manager.load()
         if self.excluded_image_ids:
             self.logger.info(f"Loaded {len(self.excluded_image_ids)} excluded image IDs from {exclusion_path}")
         # Counter to avoid checking exclusion staleness on every sample access
@@ -1930,7 +1990,7 @@ class SidecarJsonDataset(Dataset):
                     )
 
                 # (b) Exclusions (vectorized: O(n) Arrow ops vs O(n*m) Python)
-                if self.excluded_image_ids:
+                if self.excluded_image_ids and not self.preserve_membership:
                     self.logger.info(
                         f"Filtering {len(self.excluded_image_ids)} exclusions from Arrow cache..."
                     )
@@ -1940,29 +2000,15 @@ class SidecarJsonDataset(Dataset):
                     not_excluded = pc.invert(is_excluded)  # Keep items NOT in exclusion set
                     keep_mask = not_excluded if keep_mask is None else pc.and_(keep_mask, not_excluded)
 
-                # (c) Known-bad rows: empty tag lists or missing/unknown ratings
-                # only ever produce error samples (see the __getitem__ guard,
-                # kept as fallback for the non-Arrow path) — drop them once
-                # here instead of re-discovering them every epoch. The rating
-                # set must mirror _map_rating_to_tag()'s string mapping.
+                # Empty tag lists are invalid; unrated images keep content supervision.
                 has_tags = pc.greater(pc.list_value_length(arrow_table.column("tags")), 0)
-                known_ratings = pa.array(
-                    ["g", "general", "safe", "sensitive", "q", "questionable", "e", "explicit"]
-                )
-                rating_ok = pc.is_in(
-                    pc.utf8_lower(pc.utf8_trim_whitespace(arrow_table.column("rating"))),
-                    value_set=known_ratings,
-                )
-                good_rows = pc.and_(has_tags, rating_ok)
-                keep_mask = good_rows if keep_mask is None else pc.and_(keep_mask, good_rows)
+                keep_mask = has_tags if keep_mask is None else pc.and_(keep_mask, has_tags)
 
                 # Materialize the row selection. uint32 is plenty (<4.3B rows)
                 # and keeps the per-worker pickle payload compact (~4 bytes/row).
                 keep_mask = pc.fill_null(keep_mask, False)
                 row_indices = pc.indices_nonzero(keep_mask).to_numpy().astype(np.uint32)
-                if len(row_indices) != full_len:
-                    arrow_table = arrow_table.take(row_indices)
-                else:
+                if len(row_indices) == full_len:
                     row_indices = None  # Nothing filtered — workers can use the on-disk table as-is
 
                 self.items = ArrowMetadataAccessor(
@@ -2002,15 +2048,15 @@ class SidecarJsonDataset(Dataset):
                         self.logger.warning(f"Skipping {jp}: expected dict, got {type(data).__name__}")
                         continue
                     fname = str(data.get("filename") or jp.with_suffix(".png").name)
-                    image_id = sanitize_identifier(Path(fname).stem)
-
-                    # Skip excluded images by image_id (format-agnostic)
-                    if self.excluded_image_ids and image_id in self.excluded_image_ids:
-                        excluded_count += 1
-                        continue
-
                     tags_raw = data.get("tags")
                     tags_list = parse_tags_field(tags_raw)
+                    image_id = sidecar_image_id(jp, fname, tags_list)
+                    # Match the same subset-qualified identity as Arrow/getitem.
+                    # Prepared datasets retain the row; __getitem__ returns an
+                    # error sample that training filters before forward/backward.
+                    if not self.preserve_membership and image_id in self.excluded_image_ids:
+                        excluded_count += 1
+                        continue
                     rating = data.get("rating", "unknown")
                     # Remember the shard folder this pair lives in for image resolution
                     self.items.append({
@@ -2071,6 +2117,10 @@ class SidecarJsonDataset(Dataset):
     def __setstate__(self, state):
         """Restore from pickle in worker process."""
         self.__dict__.update(state)
+        if self.preserve_membership:
+            self._exclusion_manager = None
+            self.excluded_image_ids = set()
+            return
         # These will be lazily recreated when needed:
         # - _stats_queue stays None in workers (telemetry only from main process)
         # - ArrowMetadataAccessor re-opens the memory-mapped file automatically
@@ -2205,12 +2255,7 @@ class SidecarJsonDataset(Dataset):
         Returns:
             Sample dict for training
         """
-        # Encode rating as a tag in the multi-hot vector
-        rating_tag = _map_rating_to_tag(rating)
-        if rating_tag:
-            rating_tag_idx = self.vocab.tag_to_index.get(rating_tag)
-            if rating_tag_idx is not None and 0 <= rating_tag_idx < tag_vec.shape[0]:
-                tag_vec[rating_tag_idx] = 1.0
+        encode_rating_targets(tag_vec, self.vocab.tag_to_index, rating)
 
         # Ensure tensors are contiguous before returning for efficient pin_memory
         # torch.flip() returns a view (non-contiguous), which forces implicit copies during
@@ -2228,6 +2273,7 @@ class SidecarJsonDataset(Dataset):
             "flip_applied": flip_applied,
             "error": False,
             "error_reason": "",
+            "error_path": "",
         }
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
@@ -2269,7 +2315,7 @@ class SidecarJsonDataset(Dataset):
         # Track retries with memory bounds to prevent unbounded growth
         # PERF: Using OrderedDict for O(1) FIFO eviction via popitem(last=False)
         # instead of O(n) list(dict.keys()) conversion
-        if idx not in self.retry_counts:
+        if not self.preserve_membership and idx not in self.retry_counts:
             # Evict oldest entries if at capacity (simple FIFO eviction)
             # Remove 20% of entries to reduce eviction frequency and amortize cost
             if len(self.retry_counts) >= _MAX_RETRY_COUNTS:
@@ -2288,20 +2334,9 @@ class SidecarJsonDataset(Dataset):
             # Use original tags directly for read-only operations (avoid unnecessary copy)
             original_tags = ann["tags"]  # No copy - read-only reference
 
-            # Filter samples that would inject false negatives into the loss:
-            #   - Empty tag list → encode_tags() returns all-zero, training the model
-            #     to predict "no tags" for an arbitrary image.
-            #   - Missing/unknown rating → none of the four rating:* indices are set,
-            #     teaching the model that no rating applies. With ASL gamma_neg high,
-            #     this systematically biases toward "no rating".
-            # Both classes of bad data are routed to the existing error-sample path,
-            # which the train/val loops already filter via the `error` flag.
-            if not original_tags or _map_rating_to_tag(ann.get("rating")) is None:
-                reason = (
-                    "empty tag list" if not original_tags
-                    else f"missing/unknown rating ({ann.get('rating')!r})"
-                )
-                return self._error_sample(idx, reason, image_id=image_id)
+            # Empty tags remain invalid. Unknown ratings are masked in _build_sample_dict.
+            if not original_tags:
+                return self._error_sample(idx, 'empty tag list', image_id=image_id)
 
             # Decide whether to flip; vocabulary has no orientation-sensitive tags,
             # so tags pass through unchanged.
@@ -2352,10 +2387,13 @@ class SidecarJsonDataset(Dataset):
                     content_transform=self._blur if blur_now else None,
                 )
 
-                # Random rotation (image only, mask unchanged — fill matches pad_color)
+                # Random rotation (canvas AND mask — rotating the canvas tilts
+                # the whole letterbox, so a static mask both drops real content
+                # and attends flat gray; see apply_random_rotation)
                 if self._rotation_enabled and random.random() < self._rotation_p:
-                    canvas = apply_random_rotation(
-                        canvas, self._rotation_min_deg, self._rotation_max_deg, self.pad_color
+                    canvas, pmask = apply_random_rotation(
+                        canvas, pmask, self._rotation_min_deg, self._rotation_max_deg,
+                        self.pad_color
                     )
 
             # NOTE: Flip is applied AFTER joint_transforms to ensure correct ordering
@@ -2444,13 +2482,16 @@ class SidecarJsonDataset(Dataset):
                 img = torch.flip(img, dims=[2])  # Flip width dimension (CHW format)
                 pmask = torch.flip(pmask, dims=[1])  # Flip width dimension (HW format)
 
-            self.retry_counts[idx] = 0
+            if not self.preserve_membership:
+                self.retry_counts[idx] = 0
             return self._build_sample_dict(
                 img, pmask, tag_vec, ann.get("rating", "unknown"), image_id,
                 flip_applied=flip_bit,
             )
 
         except Exception as e:
+            if self.preserve_membership:
+                return self._error_sample(idx, str(e), image_id=image_id)
             self.retry_counts[idx] += 1
             self._sample_error_log_count += 1
             # Rate-limit warning logs: log first, then every 100th
@@ -2504,6 +2545,11 @@ class SidecarJsonDataset(Dataset):
         resolved_image_id = str(image_id).strip() if image_id else ""
         if not resolved_image_id:
             resolved_image_id = f"error_{idx}"
+        try:
+            ann = self.items[idx]
+            error_path = str(Path(ann.get('dir', self.root)) / ann['filename'])
+        except Exception:
+            error_path = str(self.root / resolved_image_id)
         return {
             "images": torch.zeros((3, sz, sz), dtype=img_dtype),
             "padding_mask": torch.ones((sz, sz), dtype=torch.bool),
@@ -2512,40 +2558,13 @@ class SidecarJsonDataset(Dataset):
             "flip_applied": False,
             "error": True,
             "error_reason": reason,
+            "error_path": error_path,
         }
 
 
 def _map_rating_to_tag(rating: Any) -> Optional[str]:
-    """Map dataset rating field to a rating tag string.
-
-    Returns the rating tag name (e.g., "rating:general") or None for unknown.
-    Unknown ratings produce no rating tag, so the model learns nothing for
-    that sample's rating (all rating tag positions stay 0 in the multi-hot vector).
-
-    Args:
-        rating: Rating value from dataset (int or str)
-
-    Returns:
-        Rating tag string, or None for unknown/invalid ratings
-    """
-    _IDX_TO_TAG = {
-        0: "rating:general",
-        1: "rating:sensitive",
-        2: "rating:questionable",
-        3: "rating:explicit",
-    }
-
-    if isinstance(rating, int):
-        return _IDX_TO_TAG.get(int(rating))
-
-    r = str(rating).strip().lower()
-    _STR_TO_TAG = {
-        "g": "rating:general", "general": "rating:general", "safe": "rating:general",
-        "sensitive": "rating:sensitive",
-        "q": "rating:questionable", "questionable": "rating:questionable",
-        "e": "rating:explicit", "explicit": "rating:explicit",
-    }
-    return _STR_TO_TAG.get(r)
+    """Map Danbooru/legacy ratings; unknown values receive masked rating targets."""
+    return rating_to_tag(rating)
 
 
 def create_dataloaders(
@@ -2582,6 +2601,7 @@ def create_dataloaders(
         'metadata_cache_staleness_check_samples': int(getattr(data_config, "metadata_cache_staleness_check_samples", 100)),
         # Validation split limiting
         'max_val_samples': getattr(data_config, "max_val_samples", None),
+        'preserve_membership': bool(getattr(data_config, "preparation_manifest", None)),
         # Color jitter augmentation
         'color_jitter_enabled': bool(getattr(data_config, "color_jitter_enabled", False)),
         'color_jitter_brightness': float(getattr(data_config, "color_jitter_brightness", 0.1)),
@@ -2709,7 +2729,7 @@ def create_dataloaders(
         if cached is not None:
             train_list, val_list = cached
         else:
-            all_jsons = sorted(root.rglob("*.json")) if root.exists() else []
+            all_jsons = discover_sidecars(root) if root.exists() else []
             all_jsons_before_filter = len(all_jsons)
 
             # Exclude manifest files from sidecar parsing (uses _EXCLUSION_PATTERNS constant)
@@ -2745,17 +2765,18 @@ def create_dataloaders(
             val_list = all_jsons[n_train:]
             _write_cached_split(root, train_list, val_list, seed=int(seed))
 
-        # Limit validation samples at split time if configured
-        # Excess validation samples are moved to training (not discarded)
+        # The user-selected validation cap is the actual holdout budget.
+        # Return excess candidates to training; no extra CALIB/TEST reservation.
+        all_jsons_combined = train_list + val_list
         max_val_samples = config_cache['max_val_samples']
         if max_val_samples and len(val_list) > max_val_samples:
             original_val_size = len(val_list)
             excess_val = val_list[max_val_samples:]
             val_list = val_list[:max_val_samples]
-            train_list = train_list + excess_val  # Move excess to training
+            train_list = train_list + excess_val
             logger.info(
                 f"Validation limited to {max_val_samples:,} samples at split time "
-                f"(was {original_val_size:,}, moved {len(excess_val):,} to training)"
+                f"(was {original_val_size:,}; {len(excess_val):,} returned to training)"
             )
 
         # Build Arrow metadata cache ONCE from ALL files (train + val combined)
@@ -2763,7 +2784,6 @@ def create_dataloaders(
         # Individual datasets will filter to their subset.
         prebuilt_arrow_table = None
         if config_cache['metadata_cache_enabled']:
-            all_jsons_combined = train_list + val_list  # Full dataset
             from utils.metadata_cache import try_load_arrow_cache
             logger.info(f"Building/loading Arrow cache from {len(all_jsons_combined):,} total files...")
             prebuilt_arrow_table = try_load_arrow_cache(
@@ -2794,6 +2814,7 @@ def create_dataloaders(
             force_rebuild_metadata_cache=False,  # Already built above
             metadata_cache_staleness_check_samples=config_cache['metadata_cache_staleness_check_samples'],
             prebuilt_arrow_table=prebuilt_arrow_table,
+            preserve_membership=config_cache['preserve_membership'],
             # Augmentation (training only)
             color_jitter_enabled=config_cache['color_jitter_enabled'],
             color_jitter_brightness=config_cache['color_jitter_brightness'],
@@ -2837,6 +2858,7 @@ def create_dataloaders(
             force_rebuild_metadata_cache=False,  # Already built above
             metadata_cache_staleness_check_samples=config_cache['metadata_cache_staleness_check_samples'],
             prebuilt_arrow_table=prebuilt_arrow_table,
+            preserve_membership=config_cache['preserve_membership'],
             # No augmentation for validation (deterministic evaluation)
             color_jitter_enabled=False,
             random_erasing_enabled=False,

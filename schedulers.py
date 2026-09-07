@@ -8,6 +8,81 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 
 
+class WarmupStableDecayLR(_LRScheduler):
+    """Optimizer-update WSD with a bounded, persisted 1-sqrt cooldown.
+
+    total_steps is a ceiling including cooldown. The fraction is measured
+    against elapsed pre-cooldown updates, as specified by the V2 plan.
+    """
+    def __init__(self, optimizer, *, warmup_steps, total_steps,
+                 cooldown_fraction=0.15, min_lr=0.0, last_epoch=-1):
+        if not 0.1 <= cooldown_fraction <= 0.2:
+            raise ValueError("WSD cooldown fraction must be in [0.10, 0.20]")
+        self.warmup_steps = int(warmup_steps)
+        self.total_steps = int(total_steps)
+        self.cooldown_fraction = float(cooldown_fraction)
+        self.budget_cooldown_start = int(self.total_steps / (1 + self.cooldown_fraction))
+        if not 0 <= self.warmup_steps < self.budget_cooldown_start:
+            raise ValueError("WSD budget must contain warmup, stable training and cooldown")
+        self.min_lr = float(min_lr)
+        self.base_max_lr = max(group['lr'] for group in optimizer.param_groups)
+        if not 0 <= self.min_lr <= min(group['lr'] for group in optimizer.param_groups):
+            raise ValueError("WSD lr_end must lie between zero and the stable LR")
+        self.cooldown_start = None
+        self.cooldown_steps = None
+        self.cooldown_reason = None
+        self.cooldown_best_metric = float('-inf')
+        super().__init__(optimizer, last_epoch)
+
+    @property
+    def phase(self):
+        if self.cooldown_start is not None:
+            return 'complete' if self.finished else 'cooldown'
+        return 'warmup' if self.last_epoch < self.warmup_steps else 'stable'
+
+    @property
+    def finished(self):
+        return (self.cooldown_start is not None
+                and self.last_epoch >= self.cooldown_start + self.cooldown_steps)
+
+    def start_cooldown(self, reason='plateau'):
+        if self.cooldown_start is not None:
+            return False
+        if self.last_epoch < self.warmup_steps:
+            raise ValueError("Cannot begin cooldown during warmup")
+        self.cooldown_start = self.last_epoch
+        self.cooldown_steps = min(
+            max(1, math.ceil(self.cooldown_fraction * self.last_epoch)),
+            self.total_steps - self.last_epoch,
+        )
+        if self.cooldown_steps < 1:
+            raise ValueError("No budget remains for cooldown")
+        self.cooldown_reason = reason
+        return True
+
+    def get_lr(self):
+        if self.cooldown_start is None and self.last_epoch >= self.budget_cooldown_start:
+            self.start_cooldown('budget')
+        if self.cooldown_start is not None:
+            progress = min(1.0, max(0.0, (self.last_epoch - self.cooldown_start) / self.cooldown_steps))
+            factor = 1 - math.sqrt(progress)
+        elif self.warmup_steps and self.last_epoch < self.warmup_steps:
+            # The first update is nonzero; warmup_steps updates reach stable LR.
+            factor = (self.last_epoch + 1) / self.warmup_steps
+        else:
+            factor = 1.0
+        return [self.min_lr + (base - self.min_lr) * factor for base in self.base_lrs]
+
+    def load_state_dict(self, state_dict):
+        # An accidental reconfiguration must not silently rewrite an active run.
+        for key in ('warmup_steps', 'total_steps', 'cooldown_fraction', 'min_lr', 'base_lrs'):
+            if state_dict.get(key) != getattr(self, key):
+                raise ValueError(f"WSD resume geometry changed: {key}; restore the prepared run configuration")
+        super().load_state_dict(state_dict)
+        for group, lr in zip(self.optimizer.param_groups, self.get_last_lr()):
+            group['lr'] = lr
+
+
 class LinearWarmupCosineLR(_LRScheduler):
     """
     Linearly warms up from `warmup_start_lr` to each param group's base_lr over `warmup_epochs`,
@@ -90,4 +165,3 @@ class LinearWarmupCosineLR(_LRScheduler):
     def _get_closed_form_lr(self):
         # Provide closed-form for compatibility with some PyTorch internals
         return self.get_lr()
-

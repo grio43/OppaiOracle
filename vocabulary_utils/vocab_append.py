@@ -30,7 +30,8 @@ from typing import Dict, List, Tuple
 
 from Configuration_System import load_config
 from vocabulary import TagVocabulary, verify_vocabulary_integrity
-from utils.metadata_ingestion import parse_tags_field
+from utils.metadata_ingestion import parse_tags_field, annotation_tags
+from utils.sidecar_discovery import discover_sidecars
 from vocab_utils import compute_vocab_hash
 
 logger = logging.getLogger("vocab_append")
@@ -176,12 +177,7 @@ def _scan_tags(root: Path) -> Counter:
         logger.warning(f"Dataset root does not exist: {root}")
         return counts
 
-    # Scan subdirectories only (skip root-level files like train.json, val.json)
-    json_files: List[Path] = []
-    for subdir in root.iterdir():
-        if subdir.is_dir():
-            json_files.extend(subdir.rglob("*.json"))
-    json_files.sort()
+    json_files = discover_sidecars(root)
 
     if not json_files:
         logger.warning(f"No JSON files found in {root}")
@@ -208,7 +204,7 @@ def _scan_tags(root: Path) -> Counter:
             if isinstance(data, dict):
                 tags_raw = data.get("tags")
                 if tags_raw is not None:
-                    tags = parse_tags_field(tags_raw)
+                    tags = annotation_tags(data)
                     if tags:
                         file_had_tags = True
                         for t in tags:
@@ -218,7 +214,7 @@ def _scan_tags(root: Path) -> Counter:
             elif isinstance(data, list):
                 for entry in data:
                     if isinstance(entry, dict) and ("tags" in entry):
-                        tags = parse_tags_field(entry.get("tags"))
+                        tags = annotation_tags(entry)
                         if tags:
                             file_had_tags = True
                             for t in tags:

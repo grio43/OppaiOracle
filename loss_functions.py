@@ -45,6 +45,7 @@ class AsymmetricFocalLoss(nn.Module):
         label_smoothing: float = 0.05,
         ignore_indices: Optional[Union[int, List[int]]] = 0,
         class_weights: Optional[List[float]] = None,
+        detach_focal_weight: bool = True,
     ):
         """
         Initialize the Asymmetric Focal Loss.
@@ -88,6 +89,7 @@ class AsymmetricFocalLoss(nn.Module):
                 computation. Default: 0 (ignores the PAD token at index 0).
             class_weights: Optional list of per-class weights for handling class
                 imbalance. Applied after focal loss computation.
+            detach_focal_weight: Stop gradients through focal weights (V2 default).
         """
         super().__init__()
 
@@ -116,6 +118,7 @@ class AsymmetricFocalLoss(nn.Module):
             logger.warning(f"gamma_neg={gamma_neg} is unusually high (typical range 0-4)")
 
         self.gamma_pos = gamma_pos
+        self.detach_focal_weight = detach_focal_weight
         self.gamma_neg = gamma_neg
         self.alpha = alpha
         self.clip = clip
@@ -155,7 +158,8 @@ class AsymmetricFocalLoss(nn.Module):
 
         Args:
             logits: (B, num_classes) raw logits.
-            targets: (B, num_classes) binary targets or (B,) class indices.
+            targets: (B, num_classes) targets (0/1, -1 for unobserved labels)
+                or (B,) class indices.
             sample_weights: (B,) optional per‑sample weights.
 
         Returns:
@@ -262,6 +266,16 @@ class AsymmetricFocalLoss(nn.Module):
                 # Save for reuse in class_weights filtering
                 ignore_keep_mask = keep
 
+        # Probability/log/focal math must precede bf16 rounding, including under
+        # autocast. Casting the final loss cannot recover saturated gradients.
+        logits = logits.float()
+        targets = targets.float()
+        # Unrated images still supervise content tags. Mask unknown entries
+        # before probability math and reduction so they have exactly zero gradient.
+        observed = targets >= 0
+        logits = logits.masked_fill(~observed, 0.0)
+        targets = targets.clamp_min(0.0)
+
         # Save binary targets before smoothing for focal weight masks.
         # Focal gating must use clean {0,1} masks so absent tags contribute zero
         # to pos_weights and present tags contribute zero to neg_weights.
@@ -328,6 +342,10 @@ class AsymmetricFocalLoss(nn.Module):
         neg_exp = torch.clamp(self.gamma_neg * log_probs_neg, min=-MAX_EXP, max=MAX_EXP)
         neg_weights = (1 - targets_for_focal) * torch.exp(neg_exp)
 
+        if self.detach_focal_weight:
+            pos_weights = pos_weights.detach()
+            neg_weights = neg_weights.detach()
+
         # Apply focal weights with separate positive/negative weighting.
         # Negatives use the clip-shifted log term (bce_neg); positives keep the
         # stable BCE-with-logits value (the clip does not apply to positives).
@@ -373,20 +391,21 @@ class AsymmetricFocalLoss(nn.Module):
                     )
             focal_loss = focal_loss * weights.unsqueeze(0)
 
+        focal_loss = focal_loss.masked_fill(~observed, 0.0)
+
         # Reduction
         if self.reduction == 'mean':
-            # When sample_weights are provided, focal_loss already contains loss * weight
-            # from the sample-weight multiplication above. We take the regular mean to
-            # preserve relative weighting
-            # This gives: mean(loss * weight), not sum(loss * weight) / sum(weight)
-            return focal_loss.mean()
+            # Average each image's observed labels, then images. This preserves
+            # sample weighting (no division by sum of weights) and batch-size-
+            # weighted validation aggregation.
+            return (focal_loss.sum(dim=1) / observed.sum(dim=1).clamp_min(1)).mean()
         elif self.reduction == 'sum':
             return focal_loss.sum()
         else:
             return focal_loss
 
     def set_gamma_neg(self, value: float) -> None:
-        """Update gamma_neg mid-run (todos/ASL_plan.md SS8: the drive knob).
+        """Set gamma for generic callers; the training manager enforces fixed ASL.
 
         The loss runs eager (torch.compile wraps only the model), so a plain
         Python-float attribute is safe. If this module is ever pulled into a
@@ -411,6 +430,7 @@ class AsymmetricFocalLoss(nn.Module):
             'clip': float(self.clip),
             'alpha': float(self.alpha),
             'label_smoothing': float(self.label_smoothing),
+            'detach_focal_weight': bool(self.detach_focal_weight),
         }
 
 
@@ -439,7 +459,7 @@ class MultiTaskLoss(nn.Module):
 
         Args:
             tag_logits: (B, num_tags) logits for tag prediction.
-            tag_targets: (B, num_tags) binary targets for tags.
+            tag_targets: (B, num_tags) 0/1 targets; -1 labels are unobserved.
             sample_weights: Optional per-sample weights.
         """
         if tag_logits is None:

@@ -36,6 +36,9 @@ def _check_triton_available() -> bool:
 
 # Cache the Triton availability check at module load time
 _TRITON_AVAILABLE = _check_triton_available()
+# PyTorch 2.14 deprecates create_block_mask(_compile=True). Reuse the public
+# compiled callable; compilation remains lazy until the first forward pass.
+_CREATE_BLOCK_MASK = torch.compile(create_block_mask) if _TRITON_AVAILABLE else create_block_mask
 
 
 class BaseTagger(ABC, nn.Module):
@@ -69,6 +72,7 @@ def initialize_tag_head_bias(
     total_samples: int,
     min_prior: float = 1e-5,
     max_prior: float = 0.99,
+    rated_samples: Optional[int] = None,
 ) -> None:
     """Initialize tag_head bias with log-prior for focal loss (RetinaNet technique).
 
@@ -85,7 +89,11 @@ def initialize_tag_head_bias(
         for idx in range(num_tags):
             tag = index_to_tag.get(idx, "")
             freq = tag_frequencies.get(tag, 0)
-            prior = max(min_prior, min(max_prior, freq / max(1, total_samples)))
+            denominator = (rated_samples if tag.startswith('rating:') and rated_samples is not None
+                           else total_samples)
+            # An entirely unrated corpus provides no rating prior evidence.
+            empirical = 0.25 if denominator == 0 and tag.startswith('rating:') else freq / max(1, denominator)
+            prior = max(min_prior, min(max_prior, empirical))
             bias[idx] = math.log(prior / (1 - prior))
 
         bias_vals = bias.tolist()
@@ -133,6 +141,8 @@ class VisionTransformerConfig:
     dropout: float = 0.1
     pos_dropout: float = 0.0  # Position embedding dropout (0.0 = modern standard; drop_path handles regularization)
     attention_dropout: float = 0.1
+    qk_norm: bool = False  # Legacy checkpoints omit this; V2 explicitly enables it.
+    layer_scale_init: float = 0.0  # Zero disables LayerScale for legacy checkpoints.
     layer_norm_eps: float = 1e-6
     use_flex_attention: bool = True  # Use Flex Attention (PyTorch 2.5+)
     flex_block_size: int = 128  # Block size for Flex Attention sparse computation
@@ -238,6 +248,12 @@ class TransformerBlock(nn.Module):
         self.qkv = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=config.attention_bias)
         self.proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
         self.attn_dropout = config.attention_dropout
+        self.q_norm = LayerNormFp32(self.head_dim, eps=config.layer_norm_eps, use_fp32=True) if config.qk_norm else nn.Identity()
+        self.k_norm = LayerNormFp32(self.head_dim, eps=config.layer_norm_eps, use_fp32=True) if config.qk_norm else nn.Identity()
+        self.ls1 = nn.Parameter(torch.full((config.hidden_size,), config.layer_scale_init)) if config.layer_scale_init > 0 else None
+        self.ls2 = nn.Parameter(torch.full((config.hidden_size,), config.layer_scale_init)) if config.layer_scale_init > 0 else None
+        self.capture_attention_stats = False
+        self.max_attention_logit = None
 
         # Drop path and MLP
         self.drop_path = SafeDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -249,6 +265,25 @@ class TransformerBlock(nn.Module):
             nn.Linear(config.intermediate_size, config.hidden_size),
             nn.Dropout(config.dropout)
         )
+
+    def _normalize_qk(self, q, k):
+        q, k = self.q_norm(q), self.k_norm(k)
+        if self.capture_attention_stats:
+            # Chunked exact maximum: bounded scratch rather than retaining L x L
+            # scores for every layer. Only enabled for the diagnostic forward.
+            with torch.no_grad(), torch.autocast(device_type=q.device.type, enabled=False):
+                maximum = q.new_zeros((), dtype=torch.float32)
+                for start in range(0, q.shape[-2], 64):
+                    scores = q[:, :, start:start + 64].float() @ k.float().transpose(-2, -1)
+                    maximum = torch.maximum(maximum, scores.abs().amax() * self.scale)
+                self.max_attention_logit = maximum
+        return q, k
+
+    def _residual(self, x, attn_out):
+        attention = self.proj(attn_out)
+        x = x + self.drop_path(attention if self.ls1 is None else attention * self.ls1.to(attention.dtype))
+        mlp = self.mlp(self.norm2(x))
+        return x + self.drop_path(mlp if self.ls2 is None else mlp * self.ls2.to(mlp.dtype))
 
     def forward(self, x: torch.Tensor, block_mask: Optional[BlockMask] = None) -> torch.Tensor:
         """Forward pass using Flex Attention.
@@ -278,6 +313,7 @@ class TransformerBlock(nn.Module):
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
+        q, k = self._normalize_qk(q, k)
 
         # flex_attention has no native attention-weight dropout, so apply V-dropout
         # before the call. Zeroing random value tokens removes their contribution to
@@ -299,8 +335,7 @@ class TransformerBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D).contiguous()
 
         # Residual connections
-        x = x + self.drop_path(self.proj(attn_out))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = self._residual(x, attn_out)
 
         return x
 
@@ -335,6 +370,7 @@ class TransformerBlock(nn.Module):
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
+        q, k = self._normalize_qk(q, k)
 
         # Pass the boolean mask straight through. SDPA accepts a bool key-padding mask
         # broadcastable to (B, num_heads, L_q, L_k); we broadcast (B, L) -> (B, 1, 1, L).
@@ -360,10 +396,29 @@ class TransformerBlock(nn.Module):
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D).contiguous()
 
         # Residual connections
-        x = x + self.drop_path(self.proj(attn_out))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = self._residual(x, attn_out)
 
         return x
+
+
+@torch.no_grad()
+def sample_attention_logits(model, images, padding_mask=None):
+    """Exact absolute score maximum on a small diagnostic batch, without RNG drift."""
+    model = getattr(model, '_orig_mod', model)
+    old_mode = model._onnx_mode
+    devices = [images.device.index] if images.is_cuda else []
+    try:
+        model._onnx_mode = True  # Eager SDPA avoids compiling a diagnostic graph.
+        for block in model.blocks:
+            block.capture_attention_stats = True
+        with torch.random.fork_rng(devices=devices):
+            model(images, padding_mask=padding_mask)
+        return torch.stack([block.max_attention_logit for block in model.blocks]).amax().item()
+    finally:
+        model._onnx_mode = old_mode
+        for block in model.blocks:
+            block.capture_attention_stats = False
+            block.max_attention_logit = None
 
 
 class SimplifiedTagger(BaseTagger):
@@ -513,11 +568,15 @@ class SimplifiedTagger(BaseTagger):
                     f"(clamped downstream in eval mode only; max abs value: {tag_logits.abs().max():.2f})"
                 )
 
+    @torch.compiler.disable(recursive=False)
     def _create_block_mask(self, key_padding_mask: torch.Tensor, seq_len: int) -> BlockMask:
         """Create BlockMask for padding-aware attention.
 
         This method creates the mask once per forward pass, which is then shared
         across all transformer layers for efficiency (instead of creating per-layer).
+        Keep its host dispatch outside the model graph: PyTorch 2.14 can raise
+        Inductor CantSplit when block-mask reductions are fused with dynamic image
+        shapes. recursive=False lets the inner mask builder remain compiled.
 
         Args:
             key_padding_mask: (B, L) bool, True=IGNORE (padding tokens)
@@ -538,8 +597,7 @@ class SimplifiedTagger(BaseTagger):
         # Use first block's config for flex_block_size
         flex_block_size = self._config.flex_block_size
 
-        # Use _compile=True for faster mask creation when Triton is available
-        return create_block_mask(
+        return _CREATE_BLOCK_MASK(
             mask_mod,
             B=B,
             H=None,  # Broadcast across heads - mask is head-independent (saves memory)
@@ -547,7 +605,6 @@ class SimplifiedTagger(BaseTagger):
             KV_LEN=seq_len,
             device=key_padding_mask.device,
             BLOCK_SIZE=min(flex_block_size, seq_len),
-            _compile=_TRITON_AVAILABLE,  # Requires Triton for compilation
         )
 
     def forward(

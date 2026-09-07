@@ -25,16 +25,19 @@ scipy>=1.11
 safetensors>=0.4.2
 seaborn>=0.13.2
 tensorboard>=2.14,<2.21
-bitsandbytes>=0.41.0  # for 8-bit AdamW optimizer (memory efficient)
-# Upgrade PyTorch stack for modern APIs and CUDA 13.0 / SM_120 support
-torch>=2.9.1
-torchvision>=0.24.1
+bitsandbytes==0.50.2  # CUDA 13 / Blackwell 8-bit AdamW; fp32 head state stays enabled
+# Upgrade these together with requirements-training-cu130.txt (Windows CUDA wheels).
+# Pin the tested compiler/optimizer stack so an install cannot mix minor versions.
+torch==2.14.0
+torchvision==0.29.0
 tqdm>=4.66.4
 uvicorn>=0.35.0  # for API
 wordcloud>=1.9.3  # optional
 
-# Triton for torch.compile optimization (15-35% training speedup)
-triton-windows>=3.5.1
+# PyTorch 2.14 pairs with Triton 3.8. Windows post28 includes SM120 fixes.
+# Kernel speedups depend on model shapes and hardware; measure with -CheckTrainingStack.
+triton-windows==3.8.0.post28; sys_platform == "win32" and platform_machine == "AMD64"
+# On Linux, PyTorch selects its matching upstream Triton dependency.
 
 # New training stack dependencies
 torchmetrics>=1.3.0

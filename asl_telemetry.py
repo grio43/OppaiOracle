@@ -1,32 +1,17 @@
-"""ASL gamma_neg drive machinery + always-on telemetry.
+"""Fixed ASL contract and training/validation telemetry.
 
-Implements the manual-fallback minimum of todos/ASL_plan.md (SS3, SS5, SS8):
-
-- Guarded manual gamma_neg steps (phase clamps, hold windows, min dwell) --
-  the operative driver per the 2026-07-02 adversarial review. Steps are
-  requested by editing ``training.tag_loss.gamma_neg_override`` in the YAML
-  and restarting (stop / edit / resume); this module validates and applies
-  them at startup.
-- Loss-state persistence: the manager owns a plain-dict ``state`` that the
-  trainer attaches to ``TrainingState.loss_state``, so every checkpoint save
-  carries gamma_neg + telemetry EMAs and a resume restores them, OVERRIDING
-  the YAML value (SS8 row 2 -- without this, any gamma change silently
-  reverts to YAML on restart).
-- Always-on telemetry (SS5): dp_mean, dp_hard (top-K non-GT gap),
-  threshold-free per-decile EPR (Cole 2021 formulation), non-GT score
-  histogram with the [0.2, 0.5] clip watch band, and per-confusable-group
-  sibling-gap. Train-side samples ride the already-computed detached logits
-  at optimizer-update boundaries; val-side variants consume the accumulated
-  probability/target matrices.
-- Shadow controller (SS4, demoted 2026-07-02): logs the gamma the paper's
-  adaptive-asymmetry law WOULD set next to the actual gamma. Zero authority.
+The V2 objective is checked after checkpoint loading. Gamma is fixed at 7,
+focal weights are detached, clip is .05, and checkpoint state cannot override
+the configured objective. The old manual gamma driver has no authority.
+Telemetry state is checkpointed; the shadow controller is diagnostic only.
 
 Measurement hygiene (SS5): all metrics are computed on columns >= 2 (PAD=0
 and UNK=1 are live, loss-free, drifting outputs), probabilities are fp32
 upcast before sigmoid, and rating tags are excluded from EVERY column-space
 metric -- dp_mean, dp_hard, the non-GT histogram AND the per-decile EPR.
-Every row carries exactly one rating positive, so leaving them in inflates
+Every rated row carries one rating positive, so leaving them in inflates
 mean(p_pos) and swamps the EPR denominator of whichever decile they sort into.
+Unknown targets are always excluded, even when rating diagnostics are enabled.
 
 The golden/Anima set is deliberately NOT wired here: it is evaluation-only,
 via the standalone tools/asl_anima_canary.py script.
@@ -58,7 +43,7 @@ def _window_for_phase(schedule_cfg, phase: int):
 
 
 class ASLDriveManager:
-    """Owns mutable gamma_neg + its persisted state + the SS5 telemetry set.
+    """Verifies fixed ASL and owns the checkpointed telemetry state.
 
     The ``state`` dict is shared BY REFERENCE with TrainingState.loss_state:
     every mutation here lands in the next checkpoint automatically. Only
@@ -94,14 +79,7 @@ class ASLDriveManager:
     # gamma_neg reconciliation + guarded manual steps (SS3, SS8)
     # ------------------------------------------------------------------
 
-    # State keys whose meaning is PHASE-LOCAL: epoch counters reset to 0 at a
-    # phase transition (train_direct.py), so a value inherited from the previous
-    # phase is not just stale, it is in a different coordinate system. Carrying
-    # `gamma_last_change_epoch` forward makes the dwell guard compute a NEGATIVE
-    # elapsed and refuse every step for `last_change + 3` epochs of the new
-    # phase; carrying `epr_baseline*` compares 448px EPR against a 320px
-    # baseline. `gamma_neg` and `gamma_history` are deliberately NOT in this set:
-    # gamma carries over frozen across a transition (ASL_plan SS3).
+    # Telemetry counters/baselines are phase-local and reset at transitions.
     _PHASE_LOCAL_STATE_KEYS = (
         "gamma_last_change_epoch",
         "epr_baseline",
@@ -111,190 +89,41 @@ class ASLDriveManager:
     )
 
     def _reconcile_gamma(self, tag_loss_cfg, start_epoch: int) -> None:
-        # Must run BEFORE self.state["phase"] is overwritten below.
-        persisted_phase = self.state.get("phase")
-        # `self.phase > 0` mirrors train_direct's phase_transition predicate
-        # exactly. Without it, running with training.phase unset (0) against a
-        # phase-2 checkpoint would drop the dwell bookkeeping even though the
-        # trainer did NOT reset the epoch counters, letting a manual gamma step
-        # land earlier than min_dwell_epochs allows.
-        if (persisted_phase is not None and self.phase > 0
-                and int(persisted_phase) != self.phase):
-            dropped = [k for k in self._PHASE_LOCAL_STATE_KEYS if k in self.state]
-            for key in dropped:
-                self.state.pop(key, None)
-            logger.warning(
-                "ASL drive: PHASE CHANGE %s -> %d detected in the persisted loss state. "
-                "Dropped phase-local keys %s (epoch counters are phase-local; keeping "
-                "them would make the dwell guard refuse every gamma step for the first "
-                "~%d epochs of the new phase and compare EPR against the previous "
-                "phase's baseline). gamma_neg and gamma_history carry over.",
-                persisted_phase, self.phase, dropped or "<none>",
-                int(getattr(self.sched, "min_dwell_epochs", 3)),
-            )
-
-        yaml_gamma = float(tag_loss_cfg.gamma_neg)
+        """Enforce the fixed V2 objective after checkpoint loading."""
+        expected = dict(gamma_neg=7.0, gamma_pos=0.0, clip=0.05, alpha=1.0,
+                        label_smoothing=0.0, detach_focal_weight=True)
+        mismatches = []
+        loss_fn = self.criterion.tag_loss_fn
+        if loss_fn.reduction != 'mean' or sorted(loss_fn.ignore_indices) != [0, 1]:
+            mismatches.append("loss must use mean reduction and ignore exactly PAD/UNK [0, 1]")
+        for name, value in expected.items():
+            for origin, obj in (("config", tag_loss_cfg), ("criterion", loss_fn)):
+                if getattr(obj, name, None) != value:
+                    mismatches.append(f"{origin}.{name}={getattr(obj, name, None)!r}, expected {value!r}")
+        if getattr(tag_loss_cfg, "gamma_neg_override", None) is not None:
+            mismatches.append("gamma_neg_override must be null (fixed loss)")
+        if self.sched is not None and self.sched.enabled:
+            mismatches.append("asl_schedule.enabled must be false (fixed loss)")
+        if loss_fn.class_weights is not None or tag_loss_cfg.class_weight_strategy is not None:
+            mismatches.append("class weighting must be disabled (plain ASL)")
         persisted = self.state.get("gamma_neg")
-
-        if persisted is None:
-            self.gamma = yaml_gamma
-            logger.info(
-                "ASL drive: gamma_neg=%.3f from YAML (no persisted loss state: "
-                "fresh run, or a checkpoint predating loss-state persistence).",
-                self.gamma,
-            )
-        else:
-            self.gamma = float(persisted)
-            if abs(self.gamma - yaml_gamma) > 1e-9:
-                logger.warning(
-                    "ASL drive: gamma_neg=%.3f RESTORED from checkpoint loss state, "
-                    "overriding YAML value %.3f (ASL_plan SS8: the checkpoint wins on "
-                    "resume; use training.tag_loss.gamma_neg_override for a manual step).",
-                    self.gamma,
-                    yaml_gamma,
-                )
-            else:
-                logger.info(
-                    "ASL drive: gamma_neg=%.3f restored from checkpoint (matches YAML).",
-                    self.gamma,
-                )
-
-        self.state["gamma_neg"] = float(self.gamma)
-        self.state["phase"] = self.phase
+        if persisted is not None and float(persisted) != 7.0:
+            mismatches.append(f"checkpoint gamma_neg={persisted}, expected 7.0")
+        if mismatches:
+            raise ValueError("Fixed ASL contract violated: " + "; ".join(mismatches))
+        if self.state.get("phase") != self.phase:
+            for key in self._PHASE_LOCAL_STATE_KEYS:
+                self.state.pop(key, None)
+        self.gamma = 7.0
+        self.state.update(gamma_neg=self.gamma, phase=self.phase)
         self.state.setdefault("gamma_history", [])
-
-        override = getattr(tag_loss_cfg, "gamma_neg_override", None)
-        if override is not None:
-            override = float(override)
-            if abs(override - self.gamma) <= 1e-9:
-                logger.info(
-                    "ASL drive: gamma_neg_override=%.3f equals current gamma_neg -- no-op "
-                    "(clear the override in the YAML once the step has been taken).",
-                    override,
-                )
-            else:
-                self.request_gamma_step(override, start_epoch, source="yaml_override")
-
-        if self.window is not None:
-            lo, hi = float(self.window.gamma_neg_min), float(self.window.gamma_neg_max)
-            if not (lo - 1e-9 <= self.gamma <= hi + 1e-9):
-                logger.warning(
-                    "ASL drive: gamma_neg=%.3f is OUTSIDE the phase %d window [%.1f, %.1f]. "
-                    "Existing value is kept (windows constrain steps, not the inherited "
-                    "value), but review todos/ASL_plan.md SS3.",
-                    self.gamma, self.phase, lo, hi,
-                )
-
-        # Push the reconciled value into the live criterion (overrides whatever
-        # the criterion was constructed with from YAML).
         self.criterion.set_gamma_neg(self.gamma)
+        logger.info("Fixed ASL verified: gamma_neg=7, gamma_pos=0, clip=.05, detached focal weights")
 
     def request_gamma_step(self, target: float, epoch0: int, source: str = "manual") -> bool:
-        """Apply a guarded gamma_neg step. Returns True if applied.
-
-        epoch0 is the 0-based epoch about to run; guards use 1-based epochs
-        (phase-local -- phase transitions reset epoch counters).
-        """
-        epoch1 = int(epoch0) + 1
-        target = float(target)
-
-        if self.sched is not None and getattr(self.sched, "enabled", True):
-            w = self.window
-            if w is not None:
-                hold = int(getattr(w, "hold_epochs", 0))
-                if epoch1 <= hold:
-                    logger.error(
-                        "ASL drive: REFUSING gamma_neg step %.3f -> %.3f at epoch %d: "
-                        "phase %d holds gamma frozen through epoch %d (ASL_plan SS3 "
-                        "hold/re-warmup window). Clear gamma_neg_override or wait.",
-                        self.gamma, target, epoch1, self.phase, hold,
-                    )
-                    return False
-
-            last = self.state.get("gamma_last_change_epoch")
-            dwell = int(getattr(self.sched, "min_dwell_epochs", 3))
-            if last is not None and (epoch1 - int(last)) < dwell:
-                logger.error(
-                    "ASL drive: REFUSING gamma_neg step %.3f -> %.3f at epoch %d: "
-                    "last change was at epoch %d and min dwell is %d epochs "
-                    "(ASL_plan SS3). Clear gamma_neg_override or wait.",
-                    self.gamma, target, epoch1, int(last), dwell,
-                )
-                return False
-
-            if w is not None:
-                lo, hi = float(w.gamma_neg_min), float(w.gamma_neg_max)
-                clamped = min(max(target, lo), hi)
-                if abs(clamped - target) > 1e-9:
-                    logger.warning(
-                        "ASL drive: requested gamma_neg %.3f clamped to %.3f "
-                        "(phase %d window [%.1f, %.1f]).",
-                        target, clamped, self.phase, lo, hi,
-                    )
-                    target = clamped
-                    if abs(target - self.gamma) <= 1e-9:
-                        logger.error("ASL drive: step is a no-op after clamping; refused.")
-                        return False
-
-            if abs(target - self.gamma) > 1.0 + 1e-9:
-                logger.warning(
-                    "ASL drive: step |%.3f -> %.3f| exceeds 1 unit; ASL_plan SS3 "
-                    "prescribes unit steps (7 -> 6 -> 5) with >=%d-epoch dwell.",
-                    self.gamma, target, int(getattr(self.sched, "min_dwell_epochs", 3)),
-                )
-
-        old = self.gamma
-        self.gamma = target
-        self.criterion.set_gamma_neg(self.gamma)
-        self.state["gamma_neg"] = float(self.gamma)
-        self.state["gamma_last_change_epoch"] = epoch1
-        self.state["gamma_history"] = list(self.state.get("gamma_history", [])) + [
-            {"epoch": epoch1, "phase": self.phase, "from": float(old),
-             "to": float(self.gamma), "source": source}
-        ]
-        # Snapshot the per-decile EPR at step time: the SS5 trend alarm compares
-        # against this baseline for epr_alarm_window_epochs after the step.
-        tele_state = self.state.get("telemetry") or {}
-        epr = tele_state.get("epr_deciles")
-        # A list of all-NaN is truthy but useless as a baseline -- require at
-        # least one finite decile before accepting it.
-        _usable = bool(epr) and any(
-            isinstance(v, (int, float)) and math.isfinite(v) for v in epr
-        )
-        self.state["epr_baseline"] = list(epr) if _usable else None
-        self.state["epr_baseline_epoch"] = epoch1
-        # If no EPR has been logged yet there is nothing to snapshot -- which is
-        # the normal case for a step taken at startup (_reconcile_gamma runs
-        # before _init_telemetry) and ALWAYS the case for the first step after a
-        # phase change, since the stale telemetry is dropped there. Without this
-        # flag the baseline would stay None forever and the SS5 trend alarm --
-        # the gate this step is supposed to be watched by -- would be silently
-        # dead. _log_train captures the first available EPR as the baseline.
-        if not self.state["epr_baseline"]:
-            self.state["epr_baseline_pending_epoch"] = epoch1
-            logger.info(
-                "ASL drive: no EPR sample yet, deferring the trend-alarm baseline to "
-                "the first telemetry log after this step (epoch %d). NOTE the deferred "
-                "snapshot is measured AFTER the step, so it anchors the trend rather "
-                "than capturing the step's own immediate effect.", epoch1,
-            )
-        else:
-            # A valid baseline was captured here, so any marker left by an earlier
-            # deferred step is stale; leaving it would let the next _log_train
-            # overwrite this baseline and re-anchor it to the older epoch.
-            self.state.pop("epr_baseline_pending_epoch", None)
-        logger.warning(
-            "ASL drive: gamma_neg STEP APPLIED %.3f -> %.3f at epoch %d (phase %d, "
-            "source=%s). Gates to watch (ASL_plan SS5): per-decile EPR trend, "
-            "dp_hard holds-or-widens, sibling-gap, Anima recall canary "
-            "(tools/asl_anima_canary.py before/after the step).",
-            old, self.gamma, epoch1, self.phase, source,
-        )
-        return True
-
-    # ------------------------------------------------------------------
-    # Telemetry (SS5)
-    # ------------------------------------------------------------------
+        """The retired gamma controller has no mutation authority."""
+        logger.error("Refusing gamma step: the training loss is fixed at gamma_neg=7")
+        return False
 
     def _init_telemetry(self, vocab) -> None:
         t = self.tele
@@ -363,14 +192,9 @@ class ASLDriveManager:
                 )
         self.content_mask_cpu = content
         self.content_mask = content.to(self.device)
-        # Float copies for the per-decile EPR column sums. EPR must honour the
-        # same exclusion as dp_mean/dp_hard: every training row carries exactly
-        # one rating positive, so with the rating tags left in they dominate the
-        # denominator of whichever decile they land in (in the shipped vocab they
-        # have no entry in tag_frequencies, so they sort to the RAREST decile and
-        # make up ~87% of its expected-positive mass). That desensitises the
-        # per-decile EPR trend -- the primary always-on over-suppression gate --
-        # in exactly the decile a high gamma_neg is most likely to damage.
+        # EPR uses the same configured rating exclusion as dp_mean/dp_hard.
+        # Rated images have one rating positive; unknown labels are masked per
+        # image below even when rating diagnostics are explicitly enabled.
         self.content_mask_f = self.content_mask.float()
         self.content_mask_f_cpu = content.float()
 
@@ -385,6 +209,7 @@ class ASLDriveManager:
                     for name, tags in raw.items():
                         if str(name).startswith("_") or not isinstance(tags, list):
                             continue  # metadata keys like "_comment"
+                        tags = [f"gen:{tag}" if f"gen:{tag}" in vocab.tag_to_index else tag for tag in tags]
                         idx = [
                             vocab.tag_to_index[tag] - SKIP_COLS
                             for tag in tags
@@ -447,8 +272,9 @@ class ASLDriveManager:
 
         probs = torch.sigmoid(tag_logits[:, SKIP_COLS:].float())  # fp32 upcast (SS5)
         targs = tag_labels[:, SKIP_COLS:] > 0.5
+        observed = tag_labels[:, SKIP_COLS:] >= 0
 
-        m = self.content_mask
+        m = self.content_mask & observed
         pos = targs & m
         neg = (~targs) & m
         pos_cnt = pos.sum()
@@ -471,7 +297,7 @@ class ASLDriveManager:
         # Rating columns are zeroed out of both sums (see content_mask_f).
         mf = self.content_mask_f
         epr_num = torch.zeros(self.num_deciles, device=probs.device)
-        epr_num.scatter_add_(0, self.decile_ids, probs.sum(dim=0) * mf)
+        epr_num.scatter_add_(0, self.decile_ids, probs.masked_fill(~observed, 0).sum(dim=0) * mf)
         epr_den = torch.zeros(self.num_deciles, device=probs.device)
         epr_den.scatter_add_(0, self.decile_ids, targs.float().sum(dim=0) * mf)
 
@@ -581,11 +407,16 @@ class ASLDriveManager:
 
     @torch.no_grad()
     def compute_val(self, cat_probs: torch.Tensor, cat_targs: torch.Tensor,
-                    global_step: int, epoch0: int, chunk_rows: int = 2048) -> None:
+                    global_step: int, epoch0: int,
+                    chunk_rows: int = 2048) -> Dict[str, float]:
         """Val-side SS5 set: consumes the accumulated CPU prob/target matrices
-        (full-width, PAD/UNK included). Pure consumer -- no extra GPU work."""
+        (full-width, PAD/UNK included). Pure consumer -- no extra GPU work.
+
+        Returns the scalar dict it logged (empty when disabled), so callers can
+        read a value directly; see the note at the return statement.
+        """
         if not self.enabled or cat_probs is None or cat_targs is None:
-            return
+            return {}
 
         n = cat_probs.size(0)
         m = self.content_mask_cpu
@@ -607,10 +438,11 @@ class ASLDriveManager:
 
         for i in range(0, n, chunk_rows):
             p = cat_probs[i:i + chunk_rows, SKIP_COLS:].float()
-            t = cat_targs[i:i + chunk_rows, SKIP_COLS:].bool()
+            t = cat_targs[i:i + chunk_rows, SKIP_COLS:] > 0.5
+            observed = cat_targs[i:i + chunk_rows, SKIP_COLS:] >= 0
 
             pos = t & m
-            neg = (~t) & m
+            neg = (~t) & m & observed
             pos_sum += float((p * pos).sum())
             pos_cnt += int(pos.sum())
             neg_sum += float((p * neg).sum())
@@ -619,7 +451,7 @@ class ASLDriveManager:
             # Rating columns are pushed to -1, which falls outside [hist_min,
             # hist_max] so torch.histc drops them, and below the topk floor so
             # they can never be selected as a hard non-GT capture.
-            p_c = p.masked_fill(~m, -1.0)
+            p_c = p.masked_fill(~m | ~observed, -1.0)
 
             kk = min(k, p.size(1))
             top = p_c.masked_fill(t, -1.0).topk(kk, dim=1).values
@@ -631,13 +463,13 @@ class ASLDriveManager:
             hist -= torch.histc(p_c[t], bins=self.hist_bins, min=self.hist_min, max=self.hist_max)
 
             # Same rating exclusion as the train side (see content_mask_f).
-            epr_num.scatter_add_(0, ids, p.sum(dim=0) * mf)
+            epr_num.scatter_add_(0, ids, p.masked_fill(~observed, 0).sum(dim=0) * mf)
             epr_den.scatter_add_(0, ids, t.float().sum(dim=0) * mf)
 
             for name, gidx in self.sibling_groups:
                 sub_p = p[:, gidx]
                 sub_t = t[:, gidx]
-                one = sub_t.sum(dim=1) == 1
+                one = (sub_t.sum(dim=1) == 1) & observed[:, gidx].all(dim=1)
                 cnt = int(one.sum())
                 if cnt == 0:
                     continue
@@ -705,3 +537,11 @@ class ASLDriveManager:
                      "asl_val/sibling_gap_macro")
         )
         logger.info("ASL val telemetry (gamma_neg=%.3f): %s", self.gamma, summary or "n/a")
+        # Returned so the caller can consume a scalar without re-reading
+        # TensorBoard. The stop system takes `asl_val/sibling_gap_macro` from here
+        # as its clean-label arbiter: a sibling-positive label is reliable
+        # evidence of negativity for the rest of the group, so the gap is a
+        # low-noise ranking margin, immune to the missing-positive bias that makes
+        # val_mAP fall as the model outgrows the annotation (v2-plan.md SS9.1/SS9.2).
+        # Callers that ignore the return value are unaffected.
+        return scalars

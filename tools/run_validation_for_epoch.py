@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Run validation against a single checkpoint and emit a TRAINING_HEALTH_TRACKER row.
 
-Replicates train_direct.py's validation logic (same metrics, same threshold,
-same skip indices, same 30K val subsample seed) without spinning up an
-optimizer, scheduler, torch.compile, train loader, or TB monitor — so it
-can score a saved checkpoint quickly when the in-loop validation event
-was missed.
+Replicates train_direct.py's validation logic — same metrics, same threshold, same
+skip indices, same binned-AP estimator (validation.ap_thresholds), same validation
+split (data.max_val_samples, applied inside create_dataloaders) — without spinning
+up an optimizer, scheduler, torch.compile, train loader, or TB monitor, so it can
+score a saved checkpoint quickly when the in-loop validation event was missed.
+
+Comparability caveats that remain, both of which the tool warns about at runtime:
+  * setting validation.max_samples below data.max_val_samples makes this score a
+    different subset than the training loop;
+  * rows computed at a different inference.prediction_threshold than the historical
+    rows are not comparable in the F1 / mean_active columns.
 """
 
 import argparse
@@ -27,7 +33,7 @@ from torchmetrics.classification import MultilabelF1Score, MultilabelAveragePrec
 
 from Configuration_System import load_config
 from dataset_loader import create_dataloaders
-from evaluation_metrics import FrequencyBucketMetrics
+from evaluation_metrics import FrequencyBucketMetrics, update_binned_average_precision
 from loss_functions import AsymmetricFocalLoss, MultiTaskLoss
 from model_architecture import create_model
 
@@ -98,10 +104,22 @@ def main():
     if val_loader is None:
         raise RuntimeError('create_dataloaders returned no validation loader.')
 
-    # Apply the same deterministic 30K subset the training loop uses, so the
-    # number we report is comparable to historical val/* tracker rows.
+    # The training loop does NOT subsample here: it caps validation at split time
+    # via data.max_val_samples (a head-of-list trim inside create_dataloaders), so
+    # val_loader.dataset already has that many samples. validation.max_samples is a
+    # separate knob belonging to the standalone runners, and applying it on top with
+    # a seeded random draw would score a DIFFERENT subset than the training loop
+    # while this tool claims comparability. Only kick in when it is genuinely
+    # smaller, and say so loudly when it is.
     val_max_samples = getattr(config.validation, 'max_samples', None)
     if val_max_samples and val_max_samples < len(val_loader.dataset):
+        print(
+            f'[warn] validation.max_samples={val_max_samples} < dataset '
+            f'({len(val_loader.dataset)} after data.max_val_samples). Taking a seeded '
+            f'random subset: the emitted row is NOT comparable to in-loop val/* rows, '
+            f'which score the full data.max_val_samples split. Set them equal for a '
+            f'comparable row.', flush=True,
+        )
         val_subset_seed = getattr(config.training, 'seed', 42)
         rng = np.random.RandomState(val_subset_seed)
         idx = np.sort(rng.choice(len(val_loader.dataset), val_max_samples, replace=False))
@@ -184,10 +202,18 @@ def main():
     threshold = getattr(tc, 'default_threshold', 0.7927) if tc is not None else 0.7927
     skip_metric_cols = 2  # PAD=0, UNK=1
     num_metric_labels = num_tags - skip_metric_cols
+    # MUST match train_direct.py's binned mode. This metric is fed per-batch here
+    # exactly as it is in the training loop, so the binning is affordable — and
+    # without it this tool computed EXACT average precision while the training loop
+    # computed the 200-bin approximation (which biases mAP down), making every row
+    # this tool emits incomparable to the in-loop val/mAP rows it is meant to fill in.
+    ap_thresholds = int(getattr(config.validation, 'ap_thresholds', None) or 200)
     val_metrics = {
-        'f1_macro_per_class': MultilabelF1Score(num_labels=num_metric_labels, average=None, threshold=threshold).to(device),
-        'f1_micro': MultilabelF1Score(num_labels=num_metric_labels, average='micro', threshold=threshold).to(device),
-        'map_per_class': MultilabelAveragePrecision(num_labels=num_metric_labels, average=None).to(device),
+        'f1_macro_per_class': MultilabelF1Score(num_labels=num_metric_labels, average=None, threshold=threshold, ignore_index=-1).to(device),
+        'f1_micro': MultilabelF1Score(num_labels=num_metric_labels, average='micro', threshold=threshold, ignore_index=-1).to(device),
+        'map_per_class': MultilabelAveragePrecision(
+            num_labels=num_metric_labels, average=None, ignore_index=-1, thresholds=ap_thresholds,
+        ).to(device),
     }
     val_pos_counts = torch.zeros(num_metric_labels, dtype=torch.long, device=device)
 
@@ -233,8 +259,10 @@ def main():
             mt_ = targs[:, skip_metric_cols:]
             val_metrics['f1_macro_per_class'].update(mp_, mt_)
             val_metrics['f1_micro'].update(mp_, mt_)
-            val_metrics['map_per_class'].update(mp_, mt_)
-            val_pos_counts += mt_.sum(dim=0)
+            update_binned_average_precision(
+                val_metrics['map_per_class'], mp_, mt_, config.validation.ap_update_chunk_size,
+            )
+            val_pos_counts += (mt_ == 1).sum(dim=0)
             all_probs.append(probs.to('cpu', non_blocking=True))
             all_targs.append(targs.to('cpu', non_blocking=True))
             if step % 25 == 0:

@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
   [string]$ConfigPath = "",
+  [switch]$CheckTrainingStack,
   [switch]$KeepOpenOnError,
   [switch]$KeepOpen,
   [Parameter(ValueFromRemainingArguments = $true)]
@@ -88,7 +89,11 @@ try {
     throw "Config not found: $ConfigPath"
   }
 
-  $trainScript = Join-Path $scriptRoot "train_direct.py"
+  $trainScript = if ($CheckTrainingStack) {
+    Join-Path $scriptRoot "tools/check_training_stack.py"
+  } else {
+    Join-Path $scriptRoot "train_direct.py"
+  }
   if (-not (Test-Path $trainScript)) {
     throw "Training script not found: $trainScript"
   }

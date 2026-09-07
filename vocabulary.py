@@ -30,6 +30,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Union
 import torch
+from utils.metadata_ingestion import annotation_tags
+from utils.sidecar_discovery import discover_sidecars, subset_signature
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +98,8 @@ def _load_ignore_tags(ignore_file: Optional[Path] = None) -> Set[str]:
                     continue
 
                 ignored.add(tag)
+                if ":" in tag:
+                    ignored.add(tag.split(":", 1)[1])
 
         logger.info(f"Loaded {len(ignored)} ignored tags from {ignore_file}")
     except Exception as e:
@@ -132,18 +136,7 @@ def _count_tags_in_files(file_paths: List[str], ignored_tags: Set[str]) -> Dict[
                 if not isinstance(entry, dict):
                     continue
 
-                tags_field = entry.get('tags')
-                if not tags_field:
-                    continue
-
-                if isinstance(tags_field, str):
-                    tags_list = [tag.strip() for tag in tags_field.split(',') if tag.strip()]
-                elif isinstance(tags_field, list):
-                    tags_list = [str(tag).strip() for tag in tags_field if str(tag).strip()]
-                else:
-                    continue
-
-                for tag in tags_list:
+                for tag in annotation_tags(entry):
                     if tag in ignored_tags:
                         continue
                     tag_counts[tag] += 1
@@ -159,6 +152,18 @@ def _count_tags_in_files(file_paths: List[str], ignored_tags: Set[str]) -> Dict[
 def _compute_dataset_hash(dataset_path: Path) -> str:
     """Compute a stable hash for the dataset path."""
     return hashlib.sha1(str(dataset_path.resolve()).encode()).hexdigest()[:16]
+
+
+def _ignore_hash() -> str:
+    return hashlib.sha256("\n".join(sorted(_load_ignore_tags())).encode()).hexdigest()
+
+
+def _file_list_hash(paths) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(str(path).encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def _validate_file_list_cache(cached_files: List[str], sample_size: int = 1000) -> bool:
@@ -223,7 +228,7 @@ def _get_cached_file_list(
             with open(cache_file, 'r', encoding='utf-8') as f:
                 # Skip header line
                 header = f.readline().strip()
-                if header.startswith("# vocab_cache v1"):
+                if header == f"# vocab_cache v2 | subsets={subset_signature(data_dir)}":
                     cached_files = [line.strip() for line in f if line.strip()]
 
                     # Validate cache
@@ -240,7 +245,7 @@ def _get_cached_file_list(
 
     # Discover files via parallel directory scanning
     start = time.perf_counter()
-    json_files = _parallel_scan_directories(data_dir)
+    json_files = [str(p) for p in discover_sidecars(data_dir)]
     elapsed = time.perf_counter() - start
     logger.info(f"Discovered {len(json_files):,} JSON files in {elapsed:.2f}s")
 
@@ -253,7 +258,7 @@ def _get_cached_file_list(
                 mode='w', encoding='utf-8', dir=VOCAB_CACHE_DIR,
                 delete=False, suffix='.tmp'
             ) as tmp:
-                tmp.write(f"# vocab_cache v1 | count={len(json_files)} | path={data_dir}\n")
+                tmp.write(f"# vocab_cache v2 | subsets={subset_signature(data_dir)}\n")
                 for path in json_files:
                     tmp.write(f"{path}\n")
                 tmp_path = tmp.name
@@ -369,6 +374,11 @@ def _get_cached_frequencies(
             with open(cache_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
+        # Reject counts made by the old occurrence counter or old ignore policy.
+        if data.get('_version') != 2 or data.get('_ignore_hash') != _ignore_hash():
+            return None
+        if data.get('_files_hash') != _file_list_hash(file_list):
+            return None
         # Validate file count matches (within 0.1% tolerance)
         cached_count = data.get('_file_count', 0)
         current_count = len(file_list)
@@ -400,7 +410,8 @@ def _get_cached_frequencies(
 def _save_frequency_cache(
     dataset_path: Path,
     tag_counts: Counter,
-    file_count: int
+    file_count: int,
+    file_list: Optional[List[str]] = None,
 ) -> None:
     """Save tag frequencies to cache.
 
@@ -421,7 +432,9 @@ def _save_frequency_cache(
         cache_data = dict(tag_counts)
         cache_data['_file_count'] = file_count
         cache_data['_timestamp'] = time.time()
-        cache_data['_version'] = 1
+        cache_data['_version'] = 2
+        cache_data['_ignore_hash'] = _ignore_hash()
+        cache_data['_files_hash'] = _file_list_hash(file_list or [])
 
         # Write to temp file first, then atomically rename
         if HAS_ORJSON:
@@ -708,21 +721,7 @@ class TagVocabulary:
                         logger.debug(f"Skipping non-dict entry in {json_file}")
                         continue
 
-                    tags_field = entry.get('tags')
-                    if not tags_field:
-                        continue
-
-                    # Accept both comma‑delimited strings and lists
-                    tags_list: List[str]
-                    if isinstance(tags_field, str):
-                        tags_list = [tag.strip() for tag in tags_field.split(',') if tag.strip()]
-                    elif isinstance(tags_field, list):
-                        tags_list = [str(tag).strip() for tag in tags_field if str(tag).strip()]
-                    else:
-                        logger.debug(f"Skipping entry with non-string/list tags in {json_file}")
-                        continue
-
-                    for tag in tags_list:
+                    for tag in annotation_tags(entry):
                         # Skip ignored tags entirely when building the vocabulary
                         if tag in self.ignored_tags:
                             continue
@@ -743,7 +742,9 @@ class TagVocabulary:
             top_k: Maximum number of tags to keep (sorted by frequency)
         """
         sorted_tags = sorted(
-            [t for t, c in tag_counts.items() if c >= self.min_frequency],
+            [t for t, c in tag_counts.items()
+             if c >= self.min_frequency and t not in self.ignored_tags
+             and t not in (self.pad_token, self.unk_token)],
             key=lambda x: (-tag_counts[x], x)
         )
 
@@ -753,6 +754,8 @@ class TagVocabulary:
         self.tag_to_index = {self.pad_token: 0, self.unk_token: 1}
         self.index_to_tag = {0: self.pad_token, 1: self.unk_token}
         self.unk_index = 1
+
+        self.tag_frequencies = {}
 
         for idx, tag in enumerate(sorted_tags, start=2):
             self.tag_to_index[tag] = idx
@@ -768,6 +771,9 @@ class TagVocabulary:
 
         # Ensure rating tags are always present in the vocabulary
         self._ensure_rating_tags()
+        for tag in self.RATING_TAGS:
+            self.tag_frequencies[tag] = tag_counts.get(tag, 0)
+        self.tags = [self.index_to_tag[i] for i in range(2, len(self.index_to_tag))]
 
         # Track and log tags that were dropped due to min_frequency threshold
         self._dropped_tag_counts = {
@@ -1198,6 +1204,7 @@ def create_vocabulary_from_datasets(
     num_workers: int = 20,
     chunk_size: int = 10_000,
     use_cache: bool = True,
+    output_path: Optional[Union[str, Path]] = None,
 ):
     """Create vocabulary from datasets (for training).
 
@@ -1222,10 +1229,15 @@ def create_vocabulary_from_datasets(
         raise ValueError("dataset_path is required and must contain at least one path")
 
     total_start = time.perf_counter()
-    data_dir = Path(dataset_path[0])
+    roots = sorted({Path(p).resolve() for p in dataset_path})
+    for i, root in enumerate(roots):
+        if any(root.is_relative_to(parent) for parent in roots[:i]):
+            raise ValueError(f"Overlapping dataset roots would double-count images: {root}")
+    data_dir = roots[0]
 
     # Step 1: Get file list (from cache or parallel scan)
-    json_files = _get_cached_file_list(data_dir, use_cache=use_cache)
+    json_files = sorted({p for root in roots
+                         for p in _get_cached_file_list(root, use_cache=use_cache)})
 
     if not json_files:
         raise ValueError(f"No JSON files found in {data_dir}")
@@ -1248,15 +1260,16 @@ def create_vocabulary_from_datasets(
 
         # Save frequencies to cache for future runs
         if use_cache:
-            _save_frequency_cache(data_dir, tag_counts, len(json_files))
+            _save_frequency_cache(data_dir, tag_counts, len(json_files), json_files)
 
     # Step 4: Build vocabulary from frequencies
     vocab.build_from_tag_counts(tag_counts, top_k=top_k)
-    vocab.save_vocabulary(VOCAB_PATH)
+    destination = Path(output_path) if output_path is not None else VOCAB_PATH
+    vocab.save_vocabulary(destination)
 
     total_elapsed = time.perf_counter() - total_start
     logger.info(
-        f"Created vocabulary with {len(vocab)} tags at {VOCAB_PATH} "
+        f"Created vocabulary with {len(vocab)} tags at {destination} "
         f"(total: {total_elapsed:.2f}s)"
     )
 

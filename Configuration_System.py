@@ -762,6 +762,8 @@ class ModelConfig(BaseConfig):
     hidden_dropout_prob: float = 0.1
     pos_dropout: float = 0.0  # Position embedding dropout (0.0 = modern best practice)
     attention_dropout: float = 0.1
+    qk_norm: bool = False
+    layer_scale_init: float = 0.0
     drop_path_rate: float = 0.1
     
     # Initialization
@@ -944,6 +946,7 @@ class DataConfig(BaseConfig):
     
     # Vocabulary
     vocab_min_frequency: int = 125
+    preparation_manifest: Optional[str] = None
 
     # Worker logging (WARNING allows debugging, CRITICAL minimizes queue overhead)
     worker_log_level: str = field(default="WARNING", metadata={"help": "Log level for DataLoader workers (DEBUG, INFO, WARNING, ERROR, CRITICAL)"})
@@ -959,8 +962,8 @@ class DataConfig(BaseConfig):
     metadata_cache_workers: int = 16
     force_rebuild_metadata_cache: bool = False
     metadata_cache_staleness_check_samples: int = 100
-    split_cache_version: str = "2.0"
-    metadata_cache_version: str = "2.0"
+    split_cache_version: str = "3.0"
+    metadata_cache_version: str = "3.0"
     metadata_cache_use_dynamic_sampling: bool = True
     metadata_cache_use_stratified_sampling: bool = True
     cache_count_tolerance_percent: float = 0.1
@@ -1185,15 +1188,12 @@ class GradientClippingConfig(BaseConfig):
 @dataclass
 class LossConfig(BaseConfig):
     """Hyperparameters for loss functions."""
-    alpha: float = 0.5
-    gamma_neg: float = 3.0
-    # Manual guarded gamma_neg step (todos/ASL_plan.md SS3): set to the target
-    # value and restart; the ASL drive manager validates the step against the
-    # phase window / hold / dwell guards and applies it, then this key should
-    # be cleared back to null. When null, the checkpoint's persisted gamma_neg
-    # wins over the gamma_neg value above on resume.
+    alpha: float = 1.0
+    gamma_neg: float = 7.0
+    # Retired field retained for parsing old configs; fixed training requires null.
     gamma_neg_override: Optional[float] = None
-    gamma_pos: float = 1.0
+    gamma_pos: float = 0.0
+    detach_focal_weight: bool = True
     label_smoothing: float = 0.0
     clip: float = 0.05
     class_weights: Optional[List[float]] = None  # Manual per-class weight override
@@ -1257,16 +1257,61 @@ class ASLPhaseWindowConfig(BaseConfig):
 
 
 @dataclass
-class ASLScheduleConfig(BaseConfig):
-    """Guards for MANUAL gamma_neg steps (todos/ASL_plan.md SS3).
+class EarlyStoppingPhaseConfig(BaseConfig):
+    """Per-phase override of the stop geometry. ``None`` = inherit the top level."""
+    mode: Optional[str] = None          # 'advise' | 'halt' | 'off'
+    window: Optional[int] = None
+    confirm: Optional[int] = None
+    min_epochs: Optional[int] = None
 
-    The descent is driven by hand (stop / edit gamma_neg_override / resume);
-    this config only enforces the plan's safety rails: per-phase clamp windows,
-    hold/freeze windows, and the minimum dwell between unit steps. The SS4
-    adaptive controller has zero authority (shadow/logging-only, see
-    ASLTelemetryConfig).
+    def validate(self):
+        errors = []
+        if self.mode is not None and str(self.mode).lower() not in {"advise", "halt", "off"}:
+            errors.append(f"mode must be advise|halt|off, got {self.mode!r}")
+        if self.window is not None and int(self.window) < 1:
+            errors.append("window must be >= 1")
+        if self.confirm is not None and int(self.confirm) < 1:
+            errors.append("confirm must be >= 1")
+        if self.min_epochs is not None and int(self.min_epochs) < 0:
+            errors.append("min_epochs must be >= 0")
+        if errors:
+            raise ConfigValidationError("; ".join(errors))
+
+
+@dataclass
+class EarlyStoppingPhasesConfig(BaseConfig):
+    """Stop geometry per training phase, keyed the same way as ASLScheduleConfig.
+
+    Defaults follow todos/v2-plan.md §7's phase table: phase 1 is long
+    (~55 epochs) so it can afford window=3/confirm=2; phase 2 is a ~12-epoch
+    fine-tune, where that geometry leaves only ~4 epochs of coverage, so it drops
+    to window=2/confirm=1; phase 3 is 3-4 epochs and the plan says "run it, don't
+    gate it", so it is off.
     """
-    enabled: bool = True
+    phase1: EarlyStoppingPhaseConfig = field(default_factory=lambda: EarlyStoppingPhaseConfig(
+        window=3, confirm=2))
+    phase2: EarlyStoppingPhaseConfig = field(default_factory=lambda: EarlyStoppingPhaseConfig(
+        window=2, confirm=1))
+    phase3: EarlyStoppingPhaseConfig = field(default_factory=lambda: EarlyStoppingPhaseConfig(
+        mode="off"))
+
+    def validate(self):
+        errors = []
+        for name in ("phase1", "phase2", "phase3"):
+            try:
+                getattr(self, name).validate()
+            except ConfigValidationError as e:
+                errors.append(f"{name}: {e}")
+        if errors:
+            raise ConfigValidationError(
+                "early_stopping_phases validation failed:\n" + "\n".join(errors)
+            )
+
+
+@dataclass
+class ASLScheduleConfig(BaseConfig):
+    """Legacy gamma schedule fields; fixed training requires enabled=False."""
+    enabled: bool = False
     min_dwell_epochs: int = 3
     phase1: ASLPhaseWindowConfig = field(default_factory=lambda: ASLPhaseWindowConfig(
         gamma_neg_min=5.0, gamma_neg_max=7.0, hold_epochs=8))
@@ -1387,6 +1432,10 @@ class TrainingConfig(BaseConfig):
     # Scheduler
     scheduler: str = "cosine"
     warmup_epochs: int = 5  # Linear LR warmup over this many epochs
+    warmup_steps: Optional[int] = None  # Overrides epoch-derived warmup when set.
+    wsd_cooldown_fraction: float = 0.15  # Fraction of elapsed pre-cooldown updates.
+    wsd_plateau_enabled: bool = False  # Arm after stable-phase jitter review.
+    fp32_head_optimizer: bool = False
     # Number of cosine cycles (integer COUNT, as consumed by train_direct's
     # int(num_cycles)): 1 = single cosine decay (no restarts), >1 = SGDR restarts.
     # NOT the HuggingFace "fraction of a cosine wave" float semantics.
@@ -1483,6 +1532,13 @@ class TrainingConfig(BaseConfig):
     selection_metric: str = "val_mAP"
 
     # Early stopping
+    # DEPRECATED as a stop rule. `early_stopping_patience` and
+    # `early_stopping_threshold` now drive BEST-CHECKPOINT selection only:
+    # threshold is the improvement needed to overwrite best_model.pt, and it
+    # should stay near zero so the argmax checkpoint is always kept. The stop
+    # DECISION is made by stop_conditions.py from the persisted eval history --
+    # see early_stopping_min_delta below. Retained because they are still read
+    # for is_best and because old checkpoints/configs carry them.
     early_stopping_patience: int = 10
     early_stopping_threshold: float = 0.0001
     # Ignore the first N epochs for early-stopping decisions.
@@ -1491,6 +1547,46 @@ class TrainingConfig(BaseConfig):
     early_stopping_burn_in_epochs: int = 0
     # One of: 'median', 'mean', 'last', 'max'
     early_stopping_burn_in_strategy: str = "median"
+
+    # --- Stop system (stop_conditions.py) ---
+    # 'advise' = trip is logged loudly and recorded, training continues to the
+    #            epoch budget (the operator decides). 'halt' = trip ends the run.
+    # 'off'    = evaluate and log, never act.
+    # Default 'advise' because V1's one mechanical red flag was correctly
+    # overridden by the operator, and every band here is V1-calibrated and must
+    # be re-derived for V2 before it is trusted to end a run.
+    early_stopping_mode: str = "advise"
+    # Plateau rule: required improvement of best(last window) over
+    # best(previous window). 3e-3 is the MEASURED resolution floor of the val
+    # instrument, not a guess -- three independent sources agree (v2-plan.md
+    # SS8.3): 200-bin AP bias -0.0031, 30K sampling CI +-0.0027, and the
+    # ap_thresholds note's "treat val_mAP differences below ~0.003 as noise".
+    # It is larger than one good epoch's gain by design; that is why the test is
+    # window-over-window and not per-epoch.
+    early_stopping_min_delta: float = 3e-3
+    early_stopping_window: int = 3
+    early_stopping_confirm: int = 2
+    # Explicit floor on validated epochs before any rule may fire. Replaces the
+    # accidental floor the old code got from `lr / scheduler.max_lr < 0.5`,
+    # which on a single cosine cycle silently suppressed the auto-stop until the
+    # midpoint of the anneal.
+    early_stopping_min_epochs: int = 4
+    # Peak-and-decline rule: how far below the all-time best the metric must sit
+    # (2x min_delta, so a decline must clear the noise floor twice over) and for
+    # how many consecutive validated epochs.
+    early_stopping_regression_delta: float = 6e-3
+    early_stopping_regression_confirm: int = 2
+    # Overfitting rule (canary #6): consecutive validated epochs of rising
+    # val_loss while train_loss falls.
+    early_stopping_overfit_confirm: int = 3
+    # Per-phase overrides for the plateau geometry, keyed like asl_schedule.
+    # The plateau rule cannot confirm before burn_in + 2*window + confirm - 1
+    # validated epochs, so a long from-scratch phase and a 3-4 epoch detail phase
+    # cannot share one geometry: at window=3/confirm=2 the latter can NEVER
+    # confirm, which is the same silent no-op class as the LR gate this replaced.
+    early_stopping_phases: "EarlyStoppingPhasesConfig" = field(
+        default_factory=lambda: EarlyStoppingPhasesConfig()
+    )
 
     # Knowledge distillation (from training_config.yaml comments)
     use_distillation: bool = False
@@ -1523,7 +1619,13 @@ class TrainingConfig(BaseConfig):
         if self.optimizer not in valid_optimizers:
             errors.append(f"Unknown optimizer: {self.optimizer}. Must be one of {valid_optimizers}")
 
-        valid_schedulers = ["cosine", "cosine_restarts", "step", "multistep", "plateau", "exponential"]
+        valid_schedulers = ["wsd", "cosine", "cosine_restarts", "step", "multistep", "plateau", "exponential"]
+        if self.warmup_steps is not None and self.warmup_steps < 0:
+            errors.append("warmup_steps must be nonnegative")
+        if not 0.10 <= self.wsd_cooldown_fraction <= 0.20:
+            errors.append("wsd_cooldown_fraction must be between 0.10 and 0.20")
+        if self.scheduler == 'wsd' and self.phase != 1:
+            errors.append("WSD pipeline currently supports Phase 1 only")
         if self.scheduler not in valid_schedulers:
             errors.append(f"Unknown scheduler: {self.scheduler}. Must be one of {valid_schedulers}")
 
@@ -1574,6 +1676,61 @@ class TrainingConfig(BaseConfig):
         if str(self.early_stopping_burn_in_strategy).lower() not in allowed_es_strategies:
             errors.append(
                 f"early_stopping_burn_in_strategy must be one of {sorted(allowed_es_strategies)}"
+            )
+
+        # --- Stop system ---
+        allowed_stop_modes = {"advise", "halt", "off"}
+        if str(self.early_stopping_mode).lower() not in allowed_stop_modes:
+            errors.append(
+                f"early_stopping_mode must be one of {sorted(allowed_stop_modes)}, "
+                f"got {self.early_stopping_mode!r}"
+            )
+        if int(self.early_stopping_window) < 1:
+            errors.append("early_stopping_window must be >= 1")
+        if int(self.early_stopping_confirm) < 1:
+            errors.append("early_stopping_confirm must be >= 1")
+        if float(self.early_stopping_min_delta) < 0:
+            errors.append("early_stopping_min_delta must be >= 0")
+        if float(self.early_stopping_regression_delta) < 0:
+            errors.append("early_stopping_regression_delta must be >= 0")
+        if int(self.early_stopping_regression_confirm) < 1:
+            errors.append("early_stopping_regression_confirm must be >= 1")
+        if int(self.early_stopping_overfit_confirm) < 1:
+            errors.append("early_stopping_overfit_confirm must be >= 1")
+        if int(self.early_stopping_min_epochs) < 0:
+            errors.append("early_stopping_min_epochs must be >= 0")
+        try:
+            self.early_stopping_phases.validate()
+        except ConfigValidationError as e:
+            errors.append(f"early_stopping_phases: {e}")
+
+        # The plateau rule needs 2*window + confirm - 1 validated epochs past
+        # burn-in before it can ever confirm. If the epoch budget cannot supply
+        # them the rule is dead weight and the run has no convergence detector
+        # at all -- which is exactly the silent-no-op class of bug this system
+        # replaces, so say so at config-load time rather than at epoch 12.
+        #
+        # Checked against the EFFECTIVE geometry for training.phase, since the
+        # per-phase override is what will actually run.
+        _phase_cfg = getattr(self.early_stopping_phases, f"phase{int(self.phase)}", None)
+        _eff_mode = str(
+            (getattr(_phase_cfg, "mode", None) or self.early_stopping_mode)
+        ).lower()
+        _eff_window = int(
+            getattr(_phase_cfg, "window", None) or self.early_stopping_window
+        )
+        _eff_confirm = int(
+            getattr(_phase_cfg, "confirm", None) or self.early_stopping_confirm
+        )
+        needed = int(self.early_stopping_burn_in_epochs) + 2 * _eff_window + _eff_confirm - 1
+        if _eff_mode != "off" and int(self.num_epochs) < needed:
+            errors.append(
+                f"early stopping cannot fire within the epoch budget: num_epochs="
+                f"{self.num_epochs} but the plateau rule needs {needed} validated epochs at "
+                f"the effective phase-{self.phase} geometry (burn_in "
+                f"{self.early_stopping_burn_in_epochs} + 2*window {_eff_window} + confirm "
+                f"{_eff_confirm} - 1). Lower early_stopping_phases.phase{self.phase}."
+                f"window/confirm, raise num_epochs, or set that phase's mode to off."
             )
 
         # bf16-only invariant: enforce in the config layer (fail-fast) instead of
@@ -1796,8 +1953,8 @@ class ValidationConfig(BaseConfig):
     #
     # DO NOT RAISE THIS without measuring. The persistent state is small
     # (ap_thresholds * num_labels * 32 bytes) but torchmetrics materialises a
-    # (batch, num_labels, ap_thresholds) int64 intermediate on EVERY update, so
-    # the real cost is the transient peak. Measured on an RTX 5090 at B=48,
+    # (chunk, num_labels, ap_thresholds) int64 intermediate on EVERY update, so
+    # the real cost is the transient peak. Historical unchunked RTX 5090 at B=48,
     # 19,296 labels:
     #     200  -> 0.25 GB state,  9.3 GB peak/update,   40 ms/update
     #     500  -> 0.62 GB state, 23.3 GB peak/update,  105 ms/update
@@ -1813,10 +1970,51 @@ class ValidationConfig(BaseConfig):
     # change that moves the probability scale, treat differences below ~0.003 as
     # noise rather than signal.
     ap_thresholds: int = 200
+    # Bound the AP scratch tensors independently of model inference batch size.
+    # At 200 thresholds / 19.3K labels, eight rows measured 1.18 GiB additional
+    # peak allocation versus 8.46 GiB for 48 rows, with identical confusion counts.
+    ap_update_chunk_size: int = 8
+
+    # Freeze the set of tag columns the macro metrics average over, at the first
+    # validated epoch of the phase, and reuse it for the rest of the phase.
+    # Otherwise the denominator is `val_pos_counts > 0`, recomputed per epoch:
+    # ~958 of 19,292 tags sit at zero support on the 30K draw, and the per-batch
+    # error filter drops different samples on different epochs, so the tag set
+    # drifts. The stop rules compare metric values across epochs at a 3e-3
+    # decision scale, which a drifting denominator corrupts silently.
+    freeze_macro_tag_list: bool = True
+
+    # Streaming missing-positive / memorization fingerprints (v2-monitoring.md
+    # "Missing-positive bias diagnostics"). Computed per batch from the
+    # probabilities already on GPU -- no full-matrix retention -- so they stay
+    # affordable when max_val_samples grows to the full ~276K split.
+    # ADVISORY ONLY: they are logged and flagged, never a stop cause.
+    log_memorization_fingerprints: bool = True
+    # K for mean_sigmoid_topK_unlabeled (mean sigmoid over the top-K logits NOT
+    # in the GT label set) and the rank window for logit_std_rank_11_50.
+    fingerprint_topk: int = 10
+    fingerprint_rank_window: Tuple[int, int] = (11, 50)
 
     def validate(self):
         """Validate validation configuration"""
         errors = []
+        if int(self.fingerprint_topk) < 1:
+            errors.append("fingerprint_topk must be >= 1")
+        try:
+            _lo, _hi = (int(v) for v in self.fingerprint_rank_window)
+        except (TypeError, ValueError):
+            errors.append(
+                f"fingerprint_rank_window must be a 2-tuple of ints, got {self.fingerprint_rank_window!r}"
+            )
+        else:
+            if _lo < 1 or _hi <= _lo:
+                errors.append(
+                    f"fingerprint_rank_window must satisfy 1 <= lo < hi, got ({_lo}, {_hi})"
+                )
+        if (isinstance(self.ap_update_chunk_size, bool)
+                or not isinstance(self.ap_update_chunk_size, int)
+                or self.ap_update_chunk_size < 1):
+            errors.append(f"ap_update_chunk_size must be a positive integer, got {self.ap_update_chunk_size!r}")
         if self.ap_thresholds is None:
             errors.append("ap_thresholds must be an int >= 2, got null")
         elif isinstance(self.ap_thresholds, bool) or not isinstance(self.ap_thresholds, int):
@@ -1965,8 +2163,13 @@ class DebugConfig(BaseConfig):
     # Enable PyTorch's anomaly detection for debugging gradients.
     detect_anomaly: bool = False
 
-    # If true, log the gradient norm of the model's parameters to TensorBoard.
-    log_gradient_norm: bool = False
+    # If true, log train/grad_norm (canary #11) to TensorBoard. Defaults to TRUE:
+    # the trainer logs the pre-clip norm that clip_grad_norm_ already computes on
+    # every optimizer update, so this costs nothing and there is no reason for a
+    # config that omits the key to lose the canary. It previously defaulted to False
+    # AND required debug.enabled, which is how V1 ran whole phases with no gradient
+    # data at all. Set explicitly to false only to silence the scalar.
+    log_gradient_norm: bool = True
 
     # If true, perform a pre-training validation step to check the integrity of the input data.
     validate_input_data: bool = False
@@ -1974,7 +2177,8 @@ class DebugConfig(BaseConfig):
     # If true, log statistics (min/mean/max) of input batches.
     log_input_stats: bool = False
 
-    # If true, log statistics (min/mean/max) of model activations such as logits.
+    # If true, log statistics (min/mean/max) of model activations such as logits
+    # (train/tag_logits_*, canary #13).
     log_activation_stats: bool = False
 
     def validate(self):
@@ -1985,10 +2189,22 @@ class DebugConfig(BaseConfig):
             logger.warning("`dump_tensors_on_error` is true but debug mode is disabled.")
         if self.log_batch_info_on_error and not self.enabled:
             logger.warning("`log_batch_info_on_error` is true but debug mode is disabled.")
-        if self.log_input_stats and not self.enabled:
-            logger.warning("`log_input_stats` is true but debug mode is disabled.")
-        if self.log_activation_stats and not self.enabled:
-            logger.warning("`log_activation_stats` is true but debug mode is disabled.")
+        # NO "…but debug mode is disabled" warnings for the three TensorBoard logging
+        # flags. They used to warn here, and the warning became actively false once
+        # the trainer stopped gating those blocks on debug.enabled: the operator was
+        # told the scalar was inert while it was in fact being written. Telling
+        # someone a working knob is dead is the same failure mode as the dead knob.
+        if not self.log_gradient_norm:
+            logger.warning(
+                "`debug.log_gradient_norm` is false - train/grad_norm will not be "
+                "written and canary #11 (gradient-norm stability) is unevaluable. "
+                "It is free to log; there is rarely a reason to disable it."
+            )
+        if not self.log_activation_stats:
+            logger.info(
+                "`debug.log_activation_stats` is false - train/tag_logits_* will not "
+                "be written and canary #13 (logit drift) is unevaluable."
+            )
 
 
 # NOTE: AdamW8bitConfig / SchedulerType / SchedulerConfig sub-configs were removed

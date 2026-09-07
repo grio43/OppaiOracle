@@ -857,12 +857,25 @@ class TrainingMonitor:
         self.metrics = ThreadSafeMetricsTracker(config)
         self.last_step_time = self.start_time
         self.last_logged_step = 0
+        # step_time is a *rate* (seconds per optimizer update), so the first log_step
+        # of a process has no valid denominator: `last_step_time` spans process
+        # startup, dataloader warmup and torch.compile (minutes), and on a RESUME
+        # `step - last_logged_step` is the absolute step count rather than the steps
+        # since the last write - which understated step_time by the resume step / the
+        # log interval (~9x at step 81822 with logging_steps=10000) and made the
+        # `step_time > 60` "Slow Training" alert fire spuriously at step 1. Seed the
+        # baseline on the first call and emit nothing for it.
+        self._step_timer_seeded = False
         self.last_loss = None
         self.steps_without_improvement = 0
         # Higher-is-better, matching the checkpoint/early-stopping criterion
-        # (val/f1_macro). Was float('inf') with a lower-is-better loss compare,
-        # which inverted the monitor's "best" vs the real selection metric.
+        # (training.selection_metric, see best_metric_key). Was float('inf') with a
+        # lower-is-better loss compare, which inverted the monitor's "best" vs the
+        # real selection metric.
         self.best_val_metric = float('-inf')
+        # Key within log_validation's metrics dict that best_val_metric tracks.
+        # Overwritten by the trainer from config.training.selection_metric.
+        self.best_metric_key = 'mAP'
         self._graph_logged = False
 
         # Determine primary rank with proper error handling
@@ -1087,15 +1100,24 @@ class TrainingMonitor:
         self.metrics.increment_counter('batches_processed')
         self.metrics.increment_counter('images_processed', batch_size)
         
-        # Calculate per-step time (elapsed / steps since last log)
+        # Calculate per-step time (elapsed / steps since last log). Skipped on the
+        # first call of the process, where neither term is meaningful - see
+        # _step_timer_seeded in __init__.
         current_time = time.time()
-        elapsed = current_time - self.last_step_time
-        steps_since_last_log = step - self.last_logged_step
-        step_time = elapsed / max(steps_since_last_log, 1)
-        self.metrics.add_metric('step_time', step_time, step)
+        step_time = None
+        # getattr, matching the self.metrics guard above: a monitor instance restored
+        # by a path that bypasses __init__ would not have the attribute, and defaulting
+        # to "not seeded" is the safe branch (it emits nothing and seeds).
+        if getattr(self, '_step_timer_seeded', False):
+            elapsed = current_time - self.last_step_time
+            steps_since_last_log = step - self.last_logged_step
+            step_time = elapsed / max(steps_since_last_log, 1)
+            self.metrics.add_metric('step_time', step_time, step)
+        else:
+            self._step_timer_seeded = True
         self.last_step_time = current_time
         self.last_logged_step = step
-        
+
         # Check for issues and send alerts
         if self.alerts:
             self._check_training_health(step, loss, step_time)
@@ -1108,12 +1130,14 @@ class TrainingMonitor:
         self.last_loss = loss
         
         # Log to visualization backends
-        self._log_to_backends(step, {
+        backend_metrics = {
             'train/loss': loss,
             'train/learning_rate': learning_rate,
-            'train/step_time': step_time,
             **{f'train/{k}': v for k, v in metrics.items()}
-        })
+        }
+        if step_time is not None:
+            backend_metrics['train/step_time'] = step_time
+        self._log_to_backends(step, backend_metrics)
         
         # System metrics - use configurable interval to avoid overhead
         system_log_interval = getattr(self.config, 'system_metrics_log_interval_steps', 3000)
@@ -1146,18 +1170,26 @@ class TrainingMonitor:
         """Log validation metrics"""
         for name, value in metrics.items():
             self.metrics.add_metric(f'val_{name}', value, step)
-        
-        # Track best model on the same higher-is-better metric used for
-        # checkpoint selection / early stopping (val/f1_macro).
-        if 'f1_macro' in metrics and metrics['f1_macro'] > self.best_val_metric:
-            self.best_val_metric = metrics['f1_macro']
+
+        # Track best model on the same higher-is-better metric the trainer actually
+        # selects on. This was hardcoded to 'f1_macro', which stopped being the
+        # selection metric when training.selection_metric defaulted to val_mAP - so
+        # best_val_metric in training_summary.json and every "New Best Model" alert
+        # tracked a scalar evaluated at one frozen threshold, which the health tracker
+        # explicitly says must not be read as a progress signal. The trainer sets
+        # best_metric_key (see selection_metric in train_direct.py); 'mAP' is the
+        # fallback for callers that never set it.
+        best_key = getattr(self, 'best_metric_key', None) or 'mAP'
+        if best_key in metrics and metrics[best_key] > self.best_val_metric:
+            self.best_val_metric = metrics[best_key]
             if self.alerts:
                 self.alerts.send_alert(
                     "New Best Model",
-                    f"Validation F1(macro) improved to {metrics['f1_macro']:.4f}",
+                    f"Validation {best_key} improved to {metrics[best_key]:.4f}",
                     severity="success"
                 )
-        
+
+
         # Log to backends
         self._log_to_backends(step, {f'val/{k}': v for k, v in metrics.items()})
     
@@ -1560,8 +1592,12 @@ class TrainingMonitor:
         except Exception as e:
             logger.error(f"Failed to log augmentation images: {e}")
     
-    def _check_training_health(self, step: int, loss: float, step_time: float):
-        """Check training health and send alerts if needed"""
+    def _check_training_health(self, step: int, loss: float, step_time: Optional[float]):
+        """Check training health and send alerts if needed.
+
+        ``step_time`` is None on the first log_step of the process (no valid rate
+        yet); the timing-based checks below are skipped in that case.
+        """
         # Defense: ensure loss is a plain float so np.isnan / comparisons work
         # even if the caller passes None or a non-numeric type.
         if loss is None:
@@ -1583,6 +1619,9 @@ class TrainingMonitor:
                 severity="warning"
             )
         
+        if step_time is None:
+            return
+
         # Training stuck
         if self.steps_without_improvement > 100:
             minutes_stuck = self.steps_without_improvement * step_time / 60
@@ -1592,7 +1631,7 @@ class TrainingMonitor:
                     f"No improvement for {minutes_stuck:.1f} minutes",
                     severity="warning"
                 )
-        
+
         # Slow training
         if step_time > 60:  # More than 1 minute per step
             self.alerts.send_alert(

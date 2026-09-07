@@ -723,7 +723,7 @@ class ValidationRunner:
         ``DatasetLoader``/``ArrowDatasetLoader`` return a placeholder sample --
         an all-zero image with an all-zero label vector and ``error=True`` --
         whenever a sample cannot be produced. That covers unreadable files AND
-        the "empty label list / unknown rating" guard, which re-fires every
+        the "empty label list" guard, which re-fires every
         epoch because it never persists an exclusion. Folding those into the
         metrics scores the model against black images labelled with zero of
         every tag, which silently inflates every negative-dominated statistic.
@@ -948,7 +948,7 @@ class ValidationRunner:
             logger.warning(
                 "Excluded %d loader error sample(s) from validation metrics "
                 "(%d batch(es) were entirely error samples). These are unreadable "
-                "images or rows rejected by the empty-label/unknown-rating guard; "
+                "images or rows rejected by the empty-label guard; "
                 "they are NOT scored. Check the dataset if this count is large.",
                 dropped_error_samples,
                 fully_dropped_batches,
@@ -978,7 +978,7 @@ class ValidationRunner:
                 error_msg = (
                     f"Every one of the {total_batches} validation batches consisted "
                     f"entirely of loader error samples ({dropped_error_samples} samples). "
-                    "No image could be read or passed the label/rating guard"
+                    "No image could be read or passed the empty-label guard"
                 )
             logger.error(error_msg)
             raise ValueError(
@@ -1219,7 +1219,7 @@ class ValidationRunner:
                     f"No validation samples survived loading: all {total_batches} "
                     f"batch(es) consisted entirely of loader error samples "
                     f"({dropped_error_samples} samples). Every image either failed to load "
-                    f"or was rejected by the empty-label/unknown-rating guard. Check that "
+                    f"or was rejected by the empty-label guard. Check that "
                     f"the validation dataset paths are correct and the annotations are "
                     f"populated."
                 )
@@ -1244,6 +1244,8 @@ class ValidationRunner:
         for i, tag in enumerate(found_tag_names):
             tag_preds = all_predictions[:, i]
             tag_targets = all_targets[:, i]
+            known = tag_targets >= 0
+            tag_preds, tag_targets = tag_preds[known], tag_targets[known]
             
             # Skip if tag never appears
             if tag_targets.sum() == 0:
@@ -1380,7 +1382,7 @@ class ValidationRunner:
                     f"No validation samples survived loading: all {total_batches} "
                     f"batch(es) consisted entirely of loader error samples "
                     f"({dropped_error_samples} samples). Every image either failed to load "
-                    f"or was rejected by the empty-label/unknown-rating guard. Check that "
+                    f"or was rejected by the empty-label guard. Check that "
                     f"the validation dataset paths are correct and the annotations are "
                     f"populated."
                 )
@@ -1432,7 +1434,7 @@ class ValidationRunner:
                 'precision': precision,
                 'recall': recall,
                 'f1': f1,
-                'support': int(g_targets_flat.sum()),
+                'support': int((g_targets_flat == 1).sum()),
                 'num_samples': len(g_preds)
             }
             
@@ -1453,7 +1455,7 @@ class ValidationRunner:
     def _compute_tag_frequencies(self, targets: torch.Tensor) -> np.ndarray:
         """Compute tag frequencies from targets"""
         # Sum across samples to get frequency counts
-        tag_counts = targets.sum(dim=0).numpy()
+        tag_counts = (targets == 1).sum(dim=0).numpy()
         return tag_counts
     
     def _create_visualizations(self, predictions: torch.Tensor, targets: torch.Tensor, 
@@ -1655,7 +1657,7 @@ class ValidationRunner:
             
             # Process each image
             for i in range(len(predictions)):
-                pred_binary = predictions[i] > self.config.prediction_threshold
+                pred_binary = (predictions[i] > self.config.prediction_threshold) & (targets[i] >= 0)
                 target_binary = targets[i] > 0.5
                 
                 # Count predictions and actuals

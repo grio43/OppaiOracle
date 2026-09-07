@@ -4,6 +4,7 @@ Training script for the anime image tagger.
 """
 
 import gc
+import json
 import logging
 import math
 import os
@@ -33,7 +34,7 @@ import numpy as np
 
 
 from Monitor_log import MonitorConfig, TrainingMonitor
-from evaluation_metrics import FrequencyBucketMetrics, ThresholdCalibrator
+from evaluation_metrics import FrequencyBucketMetrics, ThresholdCalibrator, ValidationBuffer, update_binned_average_precision
 from asl_telemetry import ASLDriveManager
 
 # Project paths
@@ -41,6 +42,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 from Configuration_System import load_config, create_config_parser, FullConfig
 from utils.logging_setup import setup_logging
+import stop_conditions
 
 # Paths will be loaded from the unified config in the main function.
 logger = logging.getLogger(__name__)
@@ -105,6 +107,35 @@ Please ensure loss_functions.py exists in the current directory with MultiTaskLo
 Import error: {e}"""
     )
     raise ImportError(error_msg)
+
+
+MEASUREMENT_CONTRACT = "fp32_scores_fixed_detached_asl_masked_ratings_v3"
+
+
+def _reconcile_measurement_contract(state, scheduler):
+    """Discard incompatible comparisons without changing training/scheduler progress."""
+    if state.measurement_contract == MEASUREMENT_CONTRACT:
+        return False
+    state.best_metric = float('-inf')
+    state.best_epoch = 0
+    state.patience_counter = 0
+    state.should_stop = False
+    state.burn_in_values = []
+    state.eval_history = []
+    state.stop_advisories_seen = []
+    state.frozen_macro_tag_indices = []
+    state.val_loss = state.val_f1_macro = state.val_f1_micro = state.val_mAP = 0.0
+    # Zero requests a new initial evaluation via the existing start_epoch guard.
+    state.last_validation_step = 0
+    # Reset telemetry before ASLDriveManager restores its EMA. Keep gamma/phase
+    # state so the fixed-loss checkpoint compatibility checks still run.
+    state.loss_state = dict(state.loss_state or {})
+    for key in ('telemetry', 'epr_baseline', 'epr_baseline_epoch', 'epr_baseline_pending_epoch'):
+        state.loss_state.pop(key, None)
+    if hasattr(scheduler, 'cooldown_best_metric'):
+        scheduler.cooldown_best_metric = float('-inf')
+    state.measurement_contract = MEASUREMENT_CONTRACT
+    return True
 
 
 def assert_finite(*tensors, names=None, batch=None, outputs=None, config=None):
@@ -467,6 +498,12 @@ def train_with_orientation_tracking(config: FullConfig):
 
     logger.info(f"Using active data path: {active_data_path} (validated)")
 
+    prepared_manifest = None
+    if config.data.preparation_manifest:
+        from utils.v2_preparation import verify_preparation, verify_phase1_recipe
+        verify_phase1_recipe(config)
+        prepared_manifest = verify_preparation(config)
+
     # --- Prompt to (re)build vocabulary at startup ---------------------------------
     # Decide where the vocabulary should live and whether we already have one
     vocab_dest = Path(getattr(config, "vocab_path", str(DEFAULT_VOCAB_PATH)))
@@ -510,7 +547,7 @@ def train_with_orientation_tracking(config: FullConfig):
         return bool(default) if default is not None else False
 
     # Default choice: build if missing, otherwise skip
-    rebuild = _ask_yes_no(
+    rebuild = False if prepared_manifest else _ask_yes_no(
         "Build a new tag vocabulary from dataset JSONs?",
         default=(not has_vocab)
     )
@@ -529,7 +566,8 @@ def train_with_orientation_tracking(config: FullConfig):
             # Scans recursively for *.json sidecars
             rebuilt_vocab = create_vocabulary_from_datasets(
                 [active_data_path],
-                min_frequency=getattr(config.data, 'vocab_min_frequency', 125)
+                min_frequency=getattr(config.data, 'vocab_min_frequency', 125),
+                output_path=check_path,
             )
             vocab_file = (vocab_dest / "vocabulary.json") if vocab_dest.is_dir() else vocab_dest
             rebuilt_vocab.save_vocabulary(vocab_file)
@@ -559,6 +597,13 @@ def train_with_orientation_tracking(config: FullConfig):
         architecture_type=config.model.architecture_type,
         patch_size=getattr(config.model, 'patch_size', None),
     )
+
+    # NOTE: in-train validation subsampling is controlled by data.max_val_samples
+    if prepared_manifest:
+        verify_preparation(config)  # Catch a loader-triggered split-cache rebuild.
+        if (len(train_loader.dataset) != prepared_manifest['train_count']
+                or len(val_loader.dataset) != prepared_manifest['validation_count']):
+            raise RuntimeError('Loaded sample counts differ from the frozen V2 preparation manifest')
 
     # NOTE: in-train validation subsampling is controlled by data.max_val_samples
     # (applied inside create_dataloaders). validation.max_samples is only consumed
@@ -627,7 +672,10 @@ def train_with_orientation_tracking(config: FullConfig):
         model,
         index_to_tag=vocab.index_to_tag,
         tag_frequencies=vocab.tag_frequencies,
-        total_samples=len(train_loader.dataset),
+        total_samples=(prepared_manifest["train_count"] + prepared_manifest["validation_count"]
+                       if prepared_manifest else len(train_loader.dataset)),
+        rated_samples=(sum(entry['rated'] for entry in prepared_manifest['rating_counts'].values())
+                       if prepared_manifest else None),
     )
 
     # Move model to device first, then apply dtype conversion
@@ -716,8 +764,8 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.info(f"Triton {triton.__version__} available for torch.compile")
         except ImportError:
             logger.warning("torch.compile() requires Triton but it's not installed")
-            logger.warning("Install with: pip install triton-windows (Windows) or pip install triton (Linux)")
-            logger.warning("Training will proceed without compilation - expect ~15-35% slower training")
+            logger.warning("Install the matched stack with payton_env.ps1 -InstallDeps (Windows) or pip install -r requirements.txt (Linux)")
+            logger.warning("Training will proceed without compilation; benchmark to measure the performance impact")
             use_compile = False
 
     # Save compile settings - actual compilation happens after checkpoint loading
@@ -748,6 +796,7 @@ def train_with_orientation_tracking(config: FullConfig):
             label_smoothing=tag_loss_cfg.label_smoothing,
             ignore_indices=[0, 1],  # Ignore <PAD> (0) and <UNK> (1) for tags
             class_weights=class_weights,
+            detach_focal_weight=tag_loss_cfg.detach_focal_weight,
         ),
     )
     criterion = criterion.to(device)
@@ -782,7 +831,8 @@ def train_with_orientation_tracking(config: FullConfig):
         learning_rate=effective_learning_rate,
         weight_decay=config.training.weight_decay,
         betas=betas,
-        eps=config.training.adam_epsilon
+        eps=config.training.adam_epsilon,
+        fp32_head_optimizer=config.training.fp32_head_optimizer,
     )
 
     # ---- LR scheduler: STEP-BASED semantics ----
@@ -833,7 +883,8 @@ def train_with_orientation_tracking(config: FullConfig):
         f"({total_updates} total updates)"
     )
     warmup_epochs = int(getattr(config.training, "warmup_epochs", 5))
-    warmup_steps = warmup_epochs * updates_per_epoch
+    warmup_steps = (config.training.warmup_steps if config.training.warmup_steps is not None
+                    else warmup_epochs * updates_per_epoch)
     logger.info(f"Warmup: {warmup_epochs} epochs = {warmup_steps} optimizer updates")
     num_cycles = int(getattr(config.training, "num_cycles", 1))
     cycle_decay = float(getattr(config.training, "cycle_decay", 0.9))
@@ -842,15 +893,22 @@ def train_with_orientation_tracking(config: FullConfig):
     # This ensures each cycle is roughly equal in length
     first_cycle_steps = total_updates // num_cycles if num_cycles > 1 else total_updates
 
-    scheduler = CosineAnnealingWarmupRestarts(
-        optimizer,
-        first_cycle_steps=first_cycle_steps,
-        cycle_mult=1.0,  # Equal cycle lengths
-        max_lr=effective_learning_rate,  # Scaled base learning rate
-        min_lr=getattr(config.training, "lr_end", 1e-6),
-        warmup_steps=warmup_steps,
-        gamma=cycle_decay,  # Decay max_lr by this factor after each restart
-    )
+    from schedulers import WarmupStableDecayLR
+    is_wsd = config.training.scheduler == 'wsd'
+    if is_wsd:
+        scheduler = WarmupStableDecayLR(
+            optimizer, warmup_steps=warmup_steps, total_steps=total_updates,
+            cooldown_fraction=config.training.wsd_cooldown_fraction,
+            min_lr=config.training.lr_end,
+        )
+    elif config.training.scheduler in ('cosine', 'cosine_restarts'):
+        scheduler = CosineAnnealingWarmupRestarts(
+            optimizer, first_cycle_steps=first_cycle_steps, cycle_mult=1.0,
+            max_lr=effective_learning_rate, min_lr=config.training.lr_end,
+            warmup_steps=warmup_steps, gamma=cycle_decay,
+        )
+    else:
+        raise ValueError(f"train_direct supports wsd/cosine/cosine_restarts, got {config.training.scheduler}")
 
     if num_cycles > 1:
         logger.info(
@@ -939,14 +997,38 @@ def train_with_orientation_tracking(config: FullConfig):
     )
 
     training_state = TrainingState()
-    patience = getattr(config.training, "early_stopping_patience", None)
+    # `early_stopping_threshold` now governs BEST-CHECKPOINT selection only (does
+    # this epoch overwrite best_model.pt). The STOP decision is made by
+    # stop_conditions.evaluate() from training_state.eval_history; see
+    # stop_policy below. `early_stopping_patience` is no longer read for
+    # stopping -- patience_counter is derived for reporting only.
     es_threshold = getattr(config.training, "early_stopping_threshold", 0.0)
-    # Early-stopping burn-in to avoid first-epoch outlier triggering patience
+    # Early-stopping burn-in to avoid first-epoch outlier setting the baseline
     burn_in_epochs = int(getattr(config.training, "early_stopping_burn_in_epochs", 0) or 0)
     burn_in_strategy = str(getattr(config.training, "early_stopping_burn_in_strategy", "median")).lower()
     _burn_in_vals = []  # collect val metric during burn-in window (re-seeded from checkpoint below)
+    stop_policy = stop_conditions.StopPolicy.from_config(config.training)
     global_step = 0
     _last_image_log_step = -1  # Guard against duplicate image logging within accumulation window
+    # Same guard for the per-step diagnostic scalars. Gating them on the accumulation
+    # boundary is not sufficient on its own: they are written BEFORE we know the window
+    # will actually commit, so if the boundary microbatch of a qualifying window hits a
+    # NaN loss or a non-finite grad norm, that window is discarded, accum_count resets,
+    # and the RETRIED window reaches the same anticipated_step and writes a second event
+    # at the same step. Two separate latches, because the two groups are written at
+    # different points in the window:
+    #   _last_diag_log_step     -> train/image_*, train/tag_logits_* (pre/post forward)
+    #   _last_gradnorm_log_step -> train/grad_norm (after unscale_/clip, pre-commit)
+    # Splitting them matters for the NaN-LOSS abort specifically: that aborts before
+    # the grad-norm write, so a shared latch would let the aborted attempt's activation
+    # write suppress the retried window's grad_norm. (For a non-finite-grad abort the
+    # split alone would not help, since the aborted attempt reaches the grad_norm write
+    # itself - that case is handled by not logging, and not latching, a non-finite norm.)
+    # First write wins within a step: on an aborted-then-retried window the retained
+    # tag_logits describe the ABORTED microbatch. "Same step as train/loss" therefore
+    # means the same step number, not necessarily the same source microbatch.
+    _last_diag_log_step = -1
+    _last_gradnorm_log_step = -1
     start_epoch = 0
     # Track mid-epoch resume info (for resuming from exact batch position).
     # resume_sample_idx MUST be initialized here even though it is only meaningful
@@ -1048,7 +1130,7 @@ def train_with_orientation_tracking(config: FullConfig):
         if try_path.exists():
             ckpt_path = try_path
         else:
-            logger.warning("Requested resume_from path does not exist: %s; starting fresh.", try_path)
+            raise FileNotFoundError(f"Requested resume checkpoint does not exist: {try_path}")
 
     if ckpt_path is None and legacy_experiment and resume_opt in ("latest", "best"):
         legacy_dir = Path(config.output_root) / legacy_experiment / "checkpoints"
@@ -1080,15 +1162,10 @@ def train_with_orientation_tracking(config: FullConfig):
                     state_dict_keys=ckpt_state_dict_keys
                 )
             except ValueError as e:
-                if resume_opt in ("latest", "best"):
-                    logger.warning(
-                        "Skipping incompatible checkpoint %s; starting fresh. Error: %s",
-                        ckpt_path,
-                        e
-                    )
-                    ckpt_path = None
-                else:
-                    raise
+                raise ValueError(
+                    f"Requested resume checkpoint {ckpt_path} is incompatible: {e}. "
+                    "Use an explicit fresh run and a separate output directory to restart."
+                ) from e
             if ckpt_path and messages:
                 for msg in messages:
                     logger.info("Pre-load validation: %s", msg)
@@ -1119,7 +1196,7 @@ def train_with_orientation_tracking(config: FullConfig):
                 logger.info(
                     "Model weights load from the checkpoint; optimizer/scheduler/"
                     "scaler start fresh (re-warmup); epoch counters reset to 0; "
-                    "gamma_neg is carried over frozen from the checkpoint loss state."
+                    "the fixed ASL contract is verified against checkpoint loss state."
                 )
                 logger.info("=" * 70)
 
@@ -1551,14 +1628,15 @@ def train_with_orientation_tracking(config: FullConfig):
                     f"  training.resume_from: 'none'               - start fresh"
                 )
 
-    # --- ASL gamma_neg drive + always-on telemetry (todos/ASL_plan.md SS3/SS5/SS8) ---
-    # Must run AFTER resume: it reconciles gamma_neg (checkpoint loss state wins
-    # over YAML; gamma_neg_override applies a guarded manual step) and pushes the
-    # result into the live criterion. Its state dict is shared BY REFERENCE with
-    # training_state.loss_state so every checkpoint save persists gamma_neg +
-    # telemetry EMAs (without this, gamma silently reverts to YAML on restart).
-    # Fail-fast: without the drive manager the run degrades to fixed YAML gamma
-    # with no gates - exactly V1's loss (ASL_plan SS8).
+    if ckpt_path:
+        if _reconcile_measurement_contract(training_state, scheduler):
+            logger.warning("Resume measurement contract changed: resetting score comparisons, "
+                           "macro support and telemetry; training progress is preserved.")
+    else:
+        training_state.measurement_contract = MEASUREMENT_CONTRACT
+
+    # Verify the fixed ASL objective after loading checkpoint state. Telemetry
+    # is persisted, but no checkpoint or controller may replace this objective.
     asl_drive = ASLDriveManager(
         config=config,
         criterion=criterion,
@@ -1675,6 +1753,65 @@ def train_with_orientation_tracking(config: FullConfig):
     # only the post-resume subset.
     _burn_in_vals = [float(v) for v in (getattr(training_state, 'burn_in_values', None) or [])]
 
+    # The stop system's entire input, restored from the checkpoint. Every rule is
+    # re-reduced from this list each validated epoch, so a soft stop cannot leave
+    # a stop decision half-made: there is no counter to be stale, and a replayed
+    # epoch replaces its own record instead of adding a second one.
+    _eval_history = [dict(r) for r in (getattr(training_state, 'eval_history', None) or [])]
+    _advisories_seen = set(str(k) for k in (getattr(training_state, 'stop_advisories_seen', None) or []))
+    # JSONL audit trail, one line per stop-check. Append mode: a resumed run adds
+    # to the same file, so the record spans soft stops the way the decision does.
+    stop_log_path = Path(config.log_dir) / "stop_decisions.jsonl"
+    logger.info(
+        "Stop system: %s (phase %s geometry)",
+        stop_policy.describe(), getattr(config.training, 'phase', '?'),
+    )
+    if _eval_history:
+        logger.info(
+            "Stop system: restored %d validated-epoch record(s) from the checkpoint "
+            "(epochs %s). Stop rules resume with full history.",
+            len(_eval_history),
+            ", ".join(str(r.get('epoch')) for r in _eval_history[-6:]),
+        )
+    if stop_policy.mode == 'halt':
+        logger.warning(
+            "early_stopping_mode=halt: a confirmed stop trigger will END this run. Bands are "
+            "V1-calibrated (todos/v2-monitoring.md) -- 'advise' is the safer default until they "
+            "are re-derived on this run's own val curve."
+        )
+    elif stop_policy.mode == 'off':
+        logger.warning(
+            "early_stopping_mode=off: stop conditions are evaluated and logged but never acted on. "
+            "The epoch budget (num_epochs=%s) is the only thing that will end this run.",
+            getattr(config.training, 'num_epochs', '?'),
+        )
+    if stop_policy.mode != 'off' and stop_policy.max_epochs > 0:
+        # The plateau rule cannot confirm before this many validated epochs. On a
+        # short fine-tune phase that leaves it only a few epochs of coverage at
+        # the very end -- structurally the same class of silent no-op as the LR
+        # gate it replaced, so state the coverage rather than let it be inferred.
+        _first_possible = stop_policy.first_confirmable_epoch()
+        _coverage = stop_policy.max_epochs - _first_possible + 1
+        if _coverage < 3:
+            logger.warning(
+                "Plateau rule coverage is thin: it cannot confirm before validated epoch %d, and "
+                "the budget is %d epochs -- only %d epoch(s) of coverage. On a short phase lower "
+                "early_stopping_window/confirm (e.g. window=2, confirm=1) or accept that the "
+                "budget, not the rule, will end this run.",
+                _first_possible, stop_policy.max_epochs, max(0, _coverage),
+            )
+        else:
+            logger.info(
+                "Plateau rule can first confirm at validated epoch %d; %d epoch(s) of coverage "
+                "within the %d-epoch budget.",
+                _first_possible, _coverage, stop_policy.max_epochs,
+            )
+
+    # Frozen macro-average tag list (validation.freeze_macro_tag_list). Restored
+    # as a tensor mask below once the device/label count are known.
+    freeze_macro_tags = bool(getattr(config.validation, 'freeze_macro_tag_list', True))
+    _frozen_macro_indices = [int(i) for i in (getattr(training_state, 'frozen_macro_tag_indices', None) or [])]
+
     # Create validation metrics once before training loop (CR-040 fix)
     # These will be reset each epoch instead of being recreated
     # Single source of truth for the prediction threshold (also used by the
@@ -1696,6 +1833,10 @@ def train_with_orientation_tracking(config: FullConfig):
     # Stamp it into the state so every checkpoint records which scale best_metric
     # is on (see the resume reconciliation above).
     training_state.selection_metric = selection_metric
+    # Point the monitor's own best-model tracking (training_summary.json's
+    # best_val_metric and the "New Best Model" alerts) at the same scalar. Keys in
+    # log_validation's metrics dict are unprefixed ('mAP', 'f1_macro', 'f1_micro').
+    monitor.best_metric_key = selection_metric[len('val_'):] if selection_metric.startswith('val_') else selection_metric
     skip_metric_cols = 2  # PAD=0, UNK=1 — consistent with loss ignore_indices and bucketed metrics
     num_metric_labels = num_tags - skip_metric_cols
     # Per-class metrics (average=None) so we can filter classes with zero positives
@@ -1709,6 +1850,7 @@ def train_with_orientation_tracking(config: FullConfig):
     # responds to rank-preserving calibration shifts — which matters now that
     # val_mAP is the default selection metric. See ValidationConfig.ap_thresholds.
     ap_thresholds = int(getattr(config.validation, 'ap_thresholds', None) or 200)
+    ap_update_chunk_size = config.validation.ap_update_chunk_size
     # Persistent state; torchmetrics also keeps a deepcopy in _defaults, hence x2.
     _ap_state_mb = 2 * ap_thresholds * num_metric_labels * 4 * 8 / 1e6
     # The transient per-update intermediate is what actually constrains this.
@@ -1720,24 +1862,68 @@ def train_with_orientation_tracking(config: FullConfig):
     _AP_BYTES_PER_ELEM = 50
     _ap_val_bs = int(getattr(getattr(config.validation, 'dataloader', None), 'batch_size', 0)
                      or config.data.batch_size)
-    _ap_peak_gb = (_ap_val_bs * num_metric_labels * ap_thresholds * _AP_BYTES_PER_ELEM) / 1e9
+    _ap_update_rows = min(_ap_val_bs, ap_update_chunk_size)
+    _ap_peak_gb = (_ap_update_rows * num_metric_labels * ap_thresholds * _AP_BYTES_PER_ELEM) / 1e9
     val_metrics = {
-        'f1_macro_per_class': MultilabelF1Score(num_labels=num_metric_labels, average=None, threshold=threshold).to(device),
-        'f1_micro': MultilabelF1Score(num_labels=num_metric_labels, average="micro", threshold=threshold).to(device),
-        'map_per_class': MultilabelAveragePrecision(num_labels=num_metric_labels, average=None, thresholds=ap_thresholds).to(device)
+        'f1_macro_per_class': MultilabelF1Score(num_labels=num_metric_labels, average=None, threshold=threshold, ignore_index=-1).to(device),
+        'f1_micro': MultilabelF1Score(num_labels=num_metric_labels, average="micro", threshold=threshold, ignore_index=-1).to(device),
+        'map_per_class': MultilabelAveragePrecision(num_labels=num_metric_labels, average=None, ignore_index=-1, thresholds=ap_thresholds).to(device)
     }
     val_pos_counts = torch.zeros(num_metric_labels, dtype=torch.long, device=device)
+    # Frozen macro-average mask. None until the first validated epoch of the phase
+    # freezes it (or immediately, when restored from a checkpoint). Indices are
+    # relative to the post-PAD/UNK-skip column space, i.e. the same space as
+    # val_pos_counts and per_class_ap.
+    frozen_macro_mask = None
+    if freeze_macro_tags and _frozen_macro_indices:
+        _idx = torch.as_tensor(_frozen_macro_indices, dtype=torch.long, device=device)
+        if int(_idx.numel()) == 0 or int(_idx.max().item()) >= num_metric_labels:
+            logger.warning(
+                "Checkpoint's frozen macro tag list is incompatible with this run's label count "
+                "(%d indices, max %s, num_metric_labels=%d) -- discarding it and re-freezing at "
+                "the next validated epoch. mAP levels before and after this point are NOT "
+                "comparable.",
+                int(_idx.numel()), _idx.max().item() if _idx.numel() else 'n/a', num_metric_labels,
+            )
+            _frozen_macro_indices = []
+        else:
+            frozen_macro_mask = torch.zeros(num_metric_labels, dtype=torch.bool, device=device)
+            frozen_macro_mask[_idx] = True
+            logger.info(
+                "Restored frozen macro-average tag list from the checkpoint: %d of %d tags. "
+                "The stop rules' metric denominator is unchanged across this resume.",
+                int(frozen_macro_mask.sum().item()), num_metric_labels,
+            )
+
+    # Streaming memorization fingerprints (advisory diagnostics)
+    fingerprints_enabled = bool(getattr(config.validation, 'log_memorization_fingerprints', True))
+    fingerprint_topk = int(getattr(config.validation, 'fingerprint_topk', 10) or 10)
+    _fp_window = getattr(config.validation, 'fingerprint_rank_window', (11, 50)) or (11, 50)
+    fingerprint_rank_lo, fingerprint_rank_hi = int(_fp_window[0]), int(_fp_window[1])
+    if fingerprints_enabled and fingerprint_rank_hi > num_metric_labels:
+        logger.warning(
+            "validation.fingerprint_rank_window upper bound %d exceeds the label count %d; "
+            "clamping.", fingerprint_rank_hi, num_metric_labels,
+        )
+        fingerprint_rank_hi = num_metric_labels
+    logger.info(
+        "Memorization fingerprints: %s (advisory only, never a stop cause)%s",
+        "enabled" if fingerprints_enabled else "disabled",
+        f"; topK={fingerprint_topk}, rank window {fingerprint_rank_lo}-{fingerprint_rank_hi}"
+        if fingerprints_enabled else "",
+    )
     logger.info(
         f"Validation metrics initialized with {num_metric_labels} labels "
         f"(skipping {skip_metric_cols} special tokens), threshold={threshold}, "
-        f"ap_thresholds={ap_thresholds} (~{_ap_state_mb:.0f} MB resident, "
+        f"ap_thresholds={ap_thresholds}, ap_update_chunk_size={ap_update_chunk_size} "
+        f"(~{_ap_state_mb:.0f} MB resident, "
         f"~{_ap_peak_gb:.1f} GB transient peak per AP update)"
     )
     if _ap_peak_gb > 12.0:
         logger.warning(
             "validation.ap_thresholds=%d implies a ~%.1f GB transient allocation per AP "
-            "update at val batch_size=%d. This will thrash or OOM on most GPUs - lower it.",
-            ap_thresholds, _ap_peak_gb, _ap_val_bs,
+            "update at %d rows. Reduce validation.ap_update_chunk_size to lower memory use.",
+            ap_thresholds, _ap_peak_gb, _ap_update_rows,
         )
 
     # Initialize memory monitor to track RAM usage and prevent OOM
@@ -1785,9 +1971,23 @@ def train_with_orientation_tracking(config: FullConfig):
     processed_batches = 0  # Excludes skipped batches for accurate loss averaging
     total_train_samples = 0  # Track total samples for proper per-sample loss averaging
     skipped_batches = 0
+    # Microbatches that DID produce a finite loss (so they are in processed_batches
+    # and running_loss) but whose gradients were thrown away with their accumulation
+    # window - NaN loss mid-window, non-finite window norm, or a discarded
+    # epoch-boundary flush. Disjoint from skipped_batches, which counts microbatches
+    # that never produced a measurement at all.
+    discarded_batches = 0
     accum_count = 0  # Tracks accumulated batches (handles skipped batches)
 
+    from utils.bad_image_report import BadImageReporter
+    bad_image_reporter = BadImageReporter(Path(config.log_dir) / 'bad_images.txt')
+
     for epoch in range(start_epoch, config.training.num_epochs):
+        attention_probe_done = False
+        if is_wsd and scheduler.finished:
+            logger.info("WSD cooldown already complete; no further optimizer updates")
+            break
+
         # Ensure distinct shuffles across epochs in distributed mode
         # CRITICAL: This must succeed in distributed training or gradients will be corrupted
         if isinstance(getattr(train_loader, "sampler", None), DistributedSampler):
@@ -1818,6 +2018,7 @@ def train_with_orientation_tracking(config: FullConfig):
             processed_batches = 0  # Excludes skipped batches for accurate loss averaging
             total_train_samples = 0  # Track total samples for proper per-sample loss averaging
             skipped_batches = 0
+            discarded_batches = 0
             optimizer.zero_grad(set_to_none=True)  # Use set_to_none for memory efficiency
             accum_count = 0  # Tracks accumulated batches (handles skipped batches)
 
@@ -1932,6 +2133,7 @@ def train_with_orientation_tracking(config: FullConfig):
                 # Filter out error samples that failed to load (zero-valued samples corrupt gradients)
                 error_flags = batch.get('error')
                 if error_flags is not None and isinstance(error_flags, torch.Tensor) and error_flags.any():
+                    bad_image_reporter.record_batch(batch)
                     valid_mask = ~error_flags
                     num_errors = error_flags.sum().item()
                     if valid_mask.sum() == 0:
@@ -1974,28 +2176,74 @@ def train_with_orientation_tracking(config: FullConfig):
                 if config.debug.enabled:
                     assert_finite(images, tag_labels, names=['images', 'tag_labels'], batch=batch, config=config)
 
-                if config.debug.enabled and getattr(config.debug, 'log_input_stats', False) and (global_step % config.training.logging_steps == 0):
+                # --- Periodic-logging gate (hoisted above every diagnostic block) ---
+                # global_step only increments on optimizer updates, so it is CONSTANT
+                # across the `accum` microbatches of an accumulation window. Any
+                # periodic work keyed on `global_step % logging_steps` alone therefore
+                # fires once per MICROBATCH of a qualifying window, writing `accum`
+                # events that all carry the same step number. That is what happened to
+                # train/tag_logits_* (9 events per logged step at accum=9, which the
+                # health tracker then read as epoch-wide sampling when it was really
+                # one accumulation window). Gate on the update boundary and stamp with
+                # the anticipated post-increment step so every train/* scalar written
+                # in this iteration lands on the same step as train/loss.
+                is_update_boundary = (accum_count + 1 >= accum)
+                anticipated_step = (global_step + 1) if is_update_boundary else global_step
+                should_log = is_update_boundary and (
+                    anticipated_step == 1 or anticipated_step % config.training.logging_steps == 0
+                )
+                should_check_nan = is_update_boundary and (
+                    NAN_CHECK_EVERY_STEPS > 0 and anticipated_step % NAN_CHECK_EVERY_STEPS == 0
+                )
+                # Diagnostics additionally latch on the step (see _last_diag_log_step):
+                # a discarded-then-retried window would otherwise write two events at the
+                # same anticipated_step. Latched here, once per iteration, so all three
+                # diagnostic blocks below agree and land on the same step.
+                should_log_diag = should_log and anticipated_step != _last_diag_log_step
+                if should_log_diag:
+                    _last_diag_log_step = anticipated_step
+
+                # Input/activation stats are gated on their own sub-flags, NOT on
+                # debug.enabled. debug.enabled additionally turns on the per-microbatch
+                # assert_finite calls above and below (two full-tensor reductions plus a
+                # host sync each, 2*accum syncs per optimizer update), so requiring it
+                # made the stability canaries unaffordable in practice - and it is
+                # `false` in every committed config, which silently disabled
+                # train/grad_norm and train/tag_logits_* for whole runs while
+                # log_gradient_norm/log_activation_stats read `true`.
+                if should_log_diag and getattr(config.debug, 'log_input_stats', False):
                     # OPTIMIZED: Single GPU sync via .tolist() instead of multiple .item() calls
                     with torch.no_grad():
                         img_stats = torch.stack([images.min(), images.max(), images.mean()]).cpu().tolist()
                     img_min, img_max, img_mean = img_stats
-                    monitor.log_scalar('train/image_min', img_min, global_step)
-                    monitor.log_scalar('train/image_max', img_max, global_step)
-                    monitor.log_scalar('train/image_mean', img_mean, global_step)
+                    monitor.log_scalar('train/image_min', img_min, anticipated_step)
+                    monitor.log_scalar('train/image_max', img_max, anticipated_step)
+                    monitor.log_scalar('train/image_mean', img_mean, anticipated_step)
                     logger.debug(f"Input stats - min: {img_min:.6f}, mean: {img_mean:.6f}, max: {img_max:.6f}")
+
+                if is_wsd and (not attention_probe_done or should_log_diag):
+                    from model_architecture import sample_attention_logits
+                    with amp_autocast():
+                        max_attention = sample_attention_logits(
+                            model, images[:2], pmask[:2] if pmask is not None else None,
+                        )
+                    attention_probe_done = True
+                    monitor.log_scalar('train/max_attention_logit_sampled', max_attention, global_step)
+                    if not math.isfinite(max_attention) or max_attention > 1e4:
+                        raise FloatingPointError(f"V2 attention divergence: max absolute logit={max_attention}")
 
                 with nullcontext():
                     with amp_autocast():
                         outputs = model(images, padding_mask=pmask)
 
-                        if config.debug.enabled and getattr(config.debug, 'log_activation_stats', False) and (global_step % config.training.logging_steps == 0):
+                        if should_log_diag and getattr(config.debug, 'log_activation_stats', False):
                             tag_logits = outputs.get('tag_logits')
                             with torch.no_grad():
                                 if tag_logits is not None:
                                     t_min, t_max, t_mean = torch.stack([tag_logits.min(), tag_logits.max(), tag_logits.mean()]).cpu().tolist()
-                                    monitor.log_scalar('train/tag_logits_min', t_min, global_step)
-                                    monitor.log_scalar('train/tag_logits_max', t_max, global_step)
-                                    monitor.log_scalar('train/tag_logits_mean', t_mean, global_step)
+                                    monitor.log_scalar('train/tag_logits_min', t_min, anticipated_step)
+                                    monitor.log_scalar('train/tag_logits_max', t_max, anticipated_step)
+                                    monitor.log_scalar('train/tag_logits_mean', t_mean, anticipated_step)
                                     logger.debug(f"Tag logits stats - min: {t_min:.6f}, mean: {t_mean:.6f}, max: {t_max:.6f}")
 
                         # Assert that model outputs are finite before loss calculation (only when debug enabled to avoid GPU sync)
@@ -2010,24 +2258,23 @@ def train_with_orientation_tracking(config: FullConfig):
 
                         loss, losses = criterion(outputs['tag_logits'], tag_labels)
 
-                    # global_step only increments on optimizer updates, so all periodic
-                    # per-step work below is gated on the update boundary (the microbatch
-                    # that completes the accumulation window). Without this gate, every
-                    # microbatch of a qualifying window fires the same event ~accum times
-                    # (duplicate TB writes, GPU syncs, psutil scans).
-                    is_update_boundary = (accum_count + 1 >= accum)
-                    # Anticipated post-increment step: losses dict is deleted before
-                    # global_step increments, so we predict the final step value here
-                    # to align extraction with the logging check below.
-                    anticipated_step = (global_step + 1) if is_update_boundary else global_step
+                    # is_update_boundary / anticipated_step / should_log / should_check_nan
+                    # are computed once per iteration above the diagnostic blocks (see the
+                    # periodic-logging gate comment) and reused here. They gate all
+                    # periodic per-step work on the microbatch that completes the
+                    # accumulation window; without that gate every microbatch of a
+                    # qualifying window fires the same event ~accum times (duplicate TB
+                    # writes, GPU syncs, psutil scans).
 
                     # Periodic pre-backward NaN/Inf check on GPU tensor (avoids per-step sync overhead)
                     # This catches NaN loss early before backward pass corrupts gradients.
                     # The check runs every N updates (configurable via NAN_CHECK_INTERVAL_STEPS env var).
                     # Set NAN_CHECK_EVERY_STEPS=0 to disable (GradScaler still catches NaN gradients post-backward).
-                    if NAN_CHECK_EVERY_STEPS > 0 and is_update_boundary and anticipated_step % NAN_CHECK_EVERY_STEPS == 0:
+                    if is_wsd or (NAN_CHECK_EVERY_STEPS > 0 and is_update_boundary and anticipated_step % NAN_CHECK_EVERY_STEPS == 0):
                         # Use torch.isfinite on GPU - this triggers a sync but only periodically
                         if not torch.isfinite(loss):
+                            if is_wsd:
+                                raise FloatingPointError("Non-finite loss: aborting V2 before optimizer update")
                             # Log with available info before potentially crashing .item() call
                             logger.error(
                                 f"Pre-backward NaN/Inf loss detected at step {global_step} (periodic check). "
@@ -2044,6 +2291,12 @@ def train_with_orientation_tracking(config: FullConfig):
                             # requires a preceding unscale_/step). Skipping the batch and
                             # zeroing gradients is sufficient.
                             optimizer.zero_grad(set_to_none=True)
+                            # The accum_count microbatches already in this window had a
+                            # finite loss, were counted in processed_batches and are in
+                            # running_loss, but their gradients die here. skipped_batches
+                            # counts only THIS microbatch (never measured), so without
+                            # this the discarded work is under-reported up to accum-fold.
+                            discarded_batches += accum_count
                             accum_count = 0
                             skipped_batches += 1
                             del loss, losses, outputs
@@ -2055,13 +2308,10 @@ def train_with_orientation_tracking(config: FullConfig):
                     loss_detached = loss.detach()
                     batch_size_current = images.size(0)
                     
-                    # Optimization: Avoid per-step CPU-GPU sync (loss.item())
-                    # Only sync when strictly necessary (logging or periodic NaN check),
-                    # and only on the update boundary so each event fires exactly once
-                    # per qualifying optimizer update (see is_update_boundary above).
-                    should_log = is_update_boundary and (anticipated_step == 1 or anticipated_step % config.training.logging_steps == 0)
-                    should_check_nan = is_update_boundary and (NAN_CHECK_EVERY_STEPS > 0 and anticipated_step % NAN_CHECK_EVERY_STEPS == 0)
-                    
+                    # Optimization: Avoid per-step CPU-GPU sync (loss.item()).
+                    # should_log / should_check_nan (computed above) are true only on the
+                    # update boundary, so each event fires exactly once per qualifying
+                    # optimizer update.
                     loss_item = None
                     losses_items = {}
                     
@@ -2083,6 +2333,10 @@ def train_with_orientation_tracking(config: FullConfig):
                                     f"Discarding {accum_count} accumulated gradient steps due to NaN/Inf loss."
                                 )
                             optimizer.zero_grad(set_to_none=True)
+                            # See the pre-backward NaN path: the already-accumulated
+                            # microbatches lose their gradients but stay in
+                            # processed_batches / running_loss.
+                            discarded_batches += accum_count
                             accum_count = 0
                             skipped_batches += 1
                             del loss, losses, outputs, loss_detached
@@ -2114,18 +2368,6 @@ def train_with_orientation_tracking(config: FullConfig):
                     if use_scaler:
                         scaler.unscale_(optimizer)
 
-                    if config.debug.enabled and getattr(config.debug, 'log_gradient_norm', False) and (global_step % config.training.logging_steps == 0):
-                        # Compute gradient norm using foreach operations (avoids memory spike from concatenation)
-                        grads = [p.grad for p in model.parameters() if p.grad is not None]
-                        if grads:
-                            # Use _foreach_norm for efficient per-tensor norms, then combine
-                            norms = torch._foreach_norm(grads, ord=2)
-                            total_norm = torch.stack(norms).norm(2).item()
-                            del norms, grads
-                        else:
-                            total_norm = 0.0
-                        monitor.log_scalar('train/grad_norm', total_norm, global_step)
-
                     # Gradient clipping and non-finite gradient detection.
                     # clip_grad_norm_ returns the total gradient norm BEFORE clipping,
                     # which we use to detect NaN/Inf gradients. This works regardless
@@ -2138,13 +2380,47 @@ def train_with_orientation_tracking(config: FullConfig):
                         max_norm = float('inf')  # No clipping, but still compute norm
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
-                    if not torch.isfinite(grad_norm):
+                    # train/grad_norm rides the norm clip_grad_norm_ ALREADY computed on
+                    # every update, rather than a second _foreach_norm pass over every
+                    # parameter. That makes it free (the isfinite check below forces the
+                    # host sync regardless) and independent of debug.enabled, which used
+                    # to gate the duplicate pass and left canary #11 with no data at all.
+                    # Single sync, reused by both the logging gate and the skip decision.
+                    grad_norm_is_finite = bool(torch.isfinite(grad_norm))
+
+                    # Only FINITE norms go into train/grad_norm, and a non-finite one does
+                    # not consume the latch. Writing the non-finite value would put inf/nan
+                    # into the series (log_scalar does not sanitize) and canary #11's
+                    # documented epoch-max reduction would read inf precisely when #12
+                    # fires and #11 is most needed as corroboration - while the latch would
+                    # then suppress the retried window's healthy norm at the same step. The
+                    # event itself is not lost: nan_grad_skipped records it below.
+                    if (should_log and grad_norm_is_finite
+                            and anticipated_step != _last_gradnorm_log_step
+                            and config.debug.log_gradient_norm):
+                        _last_gradnorm_log_step = anticipated_step
+                        monitor.log_scalar('train/grad_norm', float(grad_norm), anticipated_step)
+
+                    if not grad_norm_is_finite:
+                        if is_wsd:
+                            raise FloatingPointError("Non-finite gradient norm: aborting V2")
                         logger.warning(
                             "Non-finite gradient norm at step %s - skipping optimizer update "
                             "to prevent weight corruption", global_step
                         )
-                        monitor.log_scalar('train/nan_grad_skipped', 1.0, global_step)
+                        # Stamped with anticipated_step, matching the diagnostics written
+                        # earlier in this iteration. global_step is still the PREVIOUS
+                        # update's number here, so a failure on the first update of an epoch
+                        # was being attributed to the previous epoch's step range - which
+                        # breaks canary #12's "count events in the epoch's step range".
+                        monitor.log_scalar('train/nan_grad_skipped', 1.0, anticipated_step)
                         optimizer.zero_grad(set_to_none=True)
+                        # The whole window's gradients are gone, not just this
+                        # microbatch's: accum_count microbatches had already accumulated
+                        # into it and were counted as processed. Record that so
+                        # train/discarded_batches reflects the real amount of thrown-away
+                        # work (train/skip_rate counts only never-measured microbatches).
+                        discarded_batches += accum_count
                         accum_count = 0
                         # This boundary microbatch had a finite loss and its forward/backward
                         # ran; only the optimizer update was discarded (tracked via the
@@ -2156,6 +2432,13 @@ def train_with_orientation_tracking(config: FullConfig):
                         processed_batches += 1
                         del loss_detached
                         continue
+
+                    # The LR that this update actually applied, captured BEFORE
+                    # scheduler.step() advances it. Reading param_groups at logging time
+                    # (after the step) labelled step G with step G+1's LR - visible as a
+                    # one-update offset in train/learning_rate, and misleading during the
+                    # warmup ramp where consecutive LRs differ most.
+                    lr_this_update = optimizer.param_groups[0]['lr']
 
                     if use_scaler:
                         scaler.step(optimizer)
@@ -2169,6 +2452,8 @@ def train_with_orientation_tracking(config: FullConfig):
                     try:
                         scheduler.step()
                     except Exception as sched_exc:
+                        if is_wsd:
+                            raise
                         # keep training even if a rare scheduler state issue occurs
                         logger.warning(f"Scheduler step failed at global_step={global_step}: {sched_exc}")
 
@@ -2292,6 +2577,11 @@ def train_with_orientation_tracking(config: FullConfig):
                                 soft_stop_wait_steps, accum, accum_count,
                             )
                             optimizer.zero_grad(set_to_none=True)
+                            # Counted for consistency with the other discard sites. This
+                            # epoch exits via early_exit before the epoch-end scalar
+                            # writes, so it is currently unobservable in TensorBoard -
+                            # kept correct so it stays correct if that shape changes.
+                            discarded_batches += accum_count
                             accum_count = 0
                         logger.info("Soft stop requested - saving checkpoint...")
 
@@ -2422,7 +2712,7 @@ def train_with_orientation_tracking(config: FullConfig):
                         global_step,
                         loss_item,
                         losses_items,
-                        optimizer.param_groups[0]['lr'],
+                        lr_this_update,
                         batch_size_current,
                     )
                 # Memory monitoring (check every 2000 updates to reduce psutil overhead)
@@ -2487,6 +2777,9 @@ def train_with_orientation_tracking(config: FullConfig):
                             logger.info(f"Logged {config.monitor.tb_image_logging.max_samples} training images to TensorBoard at step {global_step}")
                     except Exception as e:
                         logger.warning(f"Failed to log training images: {e}")
+
+                if is_wsd and scheduler.finished:
+                    break
 
             if stats_queue:
                 # Non-blocking drain of augmentation stats (accept both tuple and bare dict)
@@ -2575,15 +2868,28 @@ def train_with_orientation_tracking(config: FullConfig):
                         try:
                             scheduler.step()
                         except Exception as sched_exc:
+                            if is_wsd:
+                                raise
                             logger.warning("Scheduler step failed during epoch-boundary flush at global_step=%s: %s", global_step, sched_exc)
                         training_state.optimizer_updates += 1
                     else:
+                        if is_wsd:
+                            raise FloatingPointError("Non-finite gradient norm during V2 accumulation flush")
                         logger.warning("Non-finite gradient norm during epoch-boundary flush - discarding partial accumulation")
+                        # Canary #12 reads "absence of the scalar means zero events", so
+                        # this path has to write the flag too - it used to discard a
+                        # window on a non-finite norm with no scalar at all, leaving the
+                        # NaN canary blind to every epoch boundary.
+                        monitor.log_scalar('train/nan_grad_skipped', 1.0, global_step)
                         optimizer.zero_grad(set_to_none=True)
+                        discarded_batches += accum_count
                         accum_count = 0
                 except Exception as e:
+                    if is_wsd:
+                        raise
                     logger.warning("Epoch-boundary accumulation flush failed: %s", e)
                     optimizer.zero_grad(set_to_none=True)
+                    discarded_batches += accum_count
                     accum_count = 0
 
             # Clear GPU cache after epoch-boundary flush before validation
@@ -2659,7 +2965,7 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.info(f"Completed resumed epoch {epoch + 1} - cleared mid-epoch flag")
             is_mid_epoch = False
 
-        force_validate = False
+        force_validate = is_wsd and scheduler.finished
         if total_train_samples > 0:
             avg_train_loss = _loss_to_float(running_loss / total_train_samples)  # Per-sample average; sync OK at epoch end
         else:
@@ -2691,6 +2997,19 @@ def train_with_orientation_tracking(config: FullConfig):
             logger.info(f"Epoch {epoch+1}: Skipped {skipped_batches} batches ({skip_rate:.2%} of total)")
             monitor.log_scalar('train/skipped_batches', skipped_batches, global_step)
             monitor.log_scalar('train/skip_rate', skip_rate, global_step)
+        # Microbatches measured but whose gradients died with their window. Reported
+        # separately because skipped_batches counts only the never-measured ones: a
+        # single mid-window NaN destroys up to `accum` microbatches of work while
+        # incrementing skipped_batches by 1, so skip_rate alone understates the damage
+        # by up to accum-fold. Both are absent when zero (canary #9 convention).
+        if discarded_batches > 0:
+            discard_rate = discarded_batches / max(1, processed_batches + skipped_batches)
+            logger.info(
+                f"Epoch {epoch+1}: {discarded_batches} microbatches measured but their "
+                f"gradients were discarded ({discard_rate:.2%} of total)"
+            )
+            monitor.log_scalar('train/discarded_batches', discarded_batches, global_step)
+            monitor.log_scalar('train/discard_rate', discard_rate, global_step)
 
         # Check if we should run validation this epoch (based on eval_steps)
         # eval_steps=0 means validate every epoch; otherwise validate every N steps
@@ -2707,10 +3026,19 @@ def train_with_orientation_tracking(config: FullConfig):
         )
 
         if not should_validate:
-            # Skip validation, use cached values from training state
+            # Skip validation, use cached values from training state.
+            # NOTE: these cached scalars are used for logging and checkpoint
+            # metadata ONLY. They are deliberately never appended to
+            # eval_history, so no stop rule can ever see an epoch that produced
+            # no measurement -- the defect that let V1-P1 burn a patience unit on
+            # every validation-skipped epoch.
+            val_fingerprints = {}
+            val_clean_margin = None
             avg_val_loss = getattr(training_state, 'val_loss', 0.0) or 0.0
             val_f1_macro = getattr(training_state, 'val_f1_macro', 0.0) or 0.0
-            val_f1_micro = val_f1_macro  # Approximation when skipping
+            # Carried forward from the last real validation (TrainingState.val_f1_micro),
+            # not approximated as val_f1_macro - see that field's comment.
+            val_f1_micro = getattr(training_state, 'val_f1_micro', 0.0) or 0.0
             val_mAP = getattr(training_state, 'val_mAP', 0.0) or 0.0
             if not has_val_loader:
                 logger.info(
@@ -2743,15 +3071,26 @@ def train_with_orientation_tracking(config: FullConfig):
                 getattr(config, 'threshold_calibration', None)
                 and config.threshold_calibration.enabled
             )
-            accumulate_val_cpu = config.training.use_tensorboard or calibration_enabled
-            all_val_probs = []  # Accumulate for frequency-bucketed metrics / calibration
-            all_val_targs = []
+            accumulate_val_cpu = (is_wsd or config.training.use_tensorboard or calibration_enabled
+                                  or config.training.asl_telemetry.enabled)
+            val_buffer = (ValidationBuffer(len(val_loader.dataset), num_tags)
+                          if accumulate_val_cpu else None)
+            # Streaming fingerprint accumulators (scalars only -- deliberately not
+            # derived from the CPU-accumulated matrices, which are gated on
+            # TensorBoard/calibration and will not fit once max_val_samples grows
+            # to the full ~276K split).
+            fp_pred_pos = torch.zeros((), dtype=torch.float64, device=device)
+            fp_label_pos = torch.zeros((), dtype=torch.float64, device=device)
+            fp_topk_unlabeled_sum = torch.zeros((), dtype=torch.float64, device=device)
+            fp_rank_std_sum = torch.zeros((), dtype=torch.float64, device=device)
+            fp_rows = 0
             val_h2d_stream = torch.cuda.Stream() if device.type == 'cuda' else None
             with torch.no_grad():
                 for val_step, batch in enumerate(val_loader):
                     # Filter out error samples that failed to load
                     error_flags = batch.get('error')
                     if error_flags is not None and isinstance(error_flags, torch.Tensor) and error_flags.any():
+                        bad_image_reporter.record_batch(batch)
                         valid_mask = ~error_flags
                         if valid_mask.sum() == 0:
                             continue  # Skip entirely failed batches
@@ -2789,7 +3128,7 @@ def train_with_orientation_tracking(config: FullConfig):
                     val_loss = val_loss + loss.detach() * images.size(0)
 
                     # Update streaming metrics (keep on GPU to avoid per-batch sync/transfer)
-                    probs = torch.sigmoid(outputs['tag_logits']).float()
+                    probs = torch.sigmoid(outputs['tag_logits'].float())
                     # Targets must be int/long for torchmetrics (mAP uses precision-recall curves)
                     targs = tag_labels.long()
                     # Skip PAD/UNK columns (indices 0,1) for streaming metrics
@@ -2797,14 +3136,44 @@ def train_with_orientation_tracking(config: FullConfig):
                     metric_targs = targs[:, skip_metric_cols:]
                     val_metrics['f1_macro_per_class'].update(metric_probs, metric_targs)
                     val_metrics['f1_micro'].update(metric_probs, metric_targs)
-                    val_metrics['map_per_class'].update(metric_probs, metric_targs)
-                    val_pos_counts += metric_targs.sum(dim=0)
+                    update_binned_average_precision(
+                        val_metrics['map_per_class'], metric_probs, metric_targs, ap_update_chunk_size,
+                    )
+                    val_pos_counts += (metric_targs == 1).sum(dim=0)
+
+                    if fingerprints_enabled:
+                        # Missing-positive / memorization fingerprints, streamed.
+                        # All three are direction-only advisory signals; see
+                        # todos/v2-monitoring.md. Everything here is a reduction to
+                        # a scalar, so cost is O(batch x labels) with no retention.
+                        fp_pred_pos += ((metric_probs > threshold) & (metric_targs >= 0)).sum(dtype=torch.float64)
+                        fp_label_pos += (metric_targs == 1).sum(dtype=torch.float64)
+                        # mean_sigmoid_topK_unlabeled: mean sigmoid over the top-K
+                        # columns NOT in the GT label set. Falling = the model is
+                        # learning to suppress co-occurring/unlabeled-correct tags
+                        # (Liu et al., ELR, NeurIPS 2020). Masking with -1 is safe
+                        # because these are sigmoids in [0, 1], so a masked column
+                        # can never win a topk against a real one.
+                        unlabeled = metric_probs.masked_fill(metric_targs != 0, -1.0)
+                        k_top = min(fingerprint_topk, unlabeled.shape[1])
+                        top_unlabeled = unlabeled.topk(k_top, dim=1).values
+                        # A row whose GT covers everything in the top-K yields only
+                        # masked entries; clamp so it contributes 0 rather than -1.
+                        fp_topk_unlabeled_sum += top_unlabeled.clamp_min(0.0).mean(dim=1).sum(dtype=torch.float64)
+                        # logit_std_rank_11_50: spread of the second tier of
+                        # predictions. Compressing = second-tier predictions
+                        # collapsing onto the suppression mode (Kim et al., CVPR
+                        # 2022). Computed in logit space via the inverse sigmoid so
+                        # it is not squashed by saturation at either end.
+                        if fingerprint_rank_hi > fingerprint_rank_lo:
+                            ranked = metric_probs.topk(fingerprint_rank_hi, dim=1).values[:, fingerprint_rank_lo - 1:]
+                            ranked = ranked.clamp(1e-6, 1.0 - 1e-6)
+                            fp_rank_std_sum += torch.logit(ranked).std(dim=1).sum(dtype=torch.float64)
+                        fp_rows += int(metric_probs.shape[0])
+
                     if accumulate_val_cpu:
-                        # Compact dtypes for host accumulation: fp16 probs (cast back to
-                        # fp32 by the consumers) and bool targets (vs int64 = 8 bytes per
-                        # {0,1} value) cut host RAM and PCIe traffic ~5x.
-                        all_val_probs.append(probs.to(torch.float16).to('cpu', non_blocking=True))
-                        all_val_targs.append(targs.to(torch.bool).to('cpu', non_blocking=True))
+                        # Preserve fp32 scores and signed int8 targets (including -1).
+                        val_buffer.append(probs, targs)
 
                     if val_step == 0 and config.training.use_tensorboard:
                         tag_names = [vocab.index_to_tag.get(i, vocab.unk_token) for i in range(len(vocab.index_to_tag))]
@@ -2820,13 +3189,70 @@ def train_with_orientation_tracking(config: FullConfig):
                         )
 
             # Compute metrics (now on CPU to prevent VRAM accumulation)
-            val_loss_avg = (val_loss / max(1, total_val_samples)).cpu()
+            skipped_val_samples = len(val_loader.dataset) - total_val_samples
+            monitor.log_scalar('val/samples_evaluated', total_val_samples, global_step)
+            monitor.log_scalar('val/samples_skipped', skipped_val_samples, global_step)
+            if skipped_val_samples:
+                logger.info('Validation evaluated %s/%s images; failures recorded in %s',
+                            total_val_samples, len(val_loader.dataset), bad_image_reporter.path)
+            if total_val_samples == 0:
+                # No fabricated validation score or best selection when every
+                # image failed. Preserve progress and continue the epoch budget.
+                logger.warning('No readable validation images; saving progress without validation scores')
+                training_state.epoch = epoch + 1
+                training_state.global_step = global_step
+                training_state.train_loss = avg_train_loss
+                training_state.is_epoch_boundary = True
+                training_state.batch_in_epoch = training_state.sample_in_epoch = 0
+                training_state.completed_epochs = epoch + 1
+                checkpoint_manager.save_checkpoint(
+                    model=model, optimizer=optimizer, scheduler=scheduler,
+                    epoch=epoch + 1, step=global_step, metrics={'train_loss': avg_train_loss},
+                    training_state=training_state, is_best=False, config=config.to_dict(),
+                    train_loader=train_loader, scaler=scaler,
+                )
+                continue
+            val_loss_avg = (val_loss / total_val_samples).cpu()
 
             # Per-class compute, then mean over classes that actually had a positive
             # in this validation draw — see val_metrics initialization above.
             per_class_f1 = val_metrics['f1_macro_per_class'].compute()
             per_class_ap = val_metrics['map_per_class'].compute()
-            keep_classes = (val_pos_counts > 0)
+            supported_now = (val_pos_counts > 0)
+            if freeze_macro_tags:
+                if frozen_macro_mask is None:
+                    # First validated epoch of the phase: freeze the denominator.
+                    frozen_macro_mask = supported_now.clone()
+                    _frozen_macro_indices = frozen_macro_mask.nonzero(as_tuple=True)[0].tolist()
+                    training_state.frozen_macro_tag_indices = list(_frozen_macro_indices)
+                    logger.info(
+                        "Froze the macro-average tag list at epoch %d: %d of %d tags with "
+                        "positive support. Every subsequent macro metric this phase uses this "
+                        "exact denominator, so cross-epoch deltas (which the stop rules read at "
+                        "a %g scale) are comparable.",
+                        epoch + 1, len(_frozen_macro_indices), num_metric_labels,
+                        stop_policy.min_delta,
+                    )
+                else:
+                    # Report drift rather than silently absorbing it. Support should
+                    # be deterministic for a fixed val split; when it is not, the
+                    # per-batch error filter dropped different samples, and the size
+                    # of the difference is the size of the confound the frozen list
+                    # is protecting the stop rules from.
+                    gained = int((supported_now & ~frozen_macro_mask).sum().item())
+                    lost = int((~supported_now & frozen_macro_mask).sum().item())
+                    if gained or lost:
+                        logger.warning(
+                            "Validation support drifted at epoch %d: %d tag(s) gained support and "
+                            "%d lost it versus the frozen list. Metrics still use the FROZEN list "
+                            "(correct for comparison); the drift itself means the val pass is not "
+                            "seeing an identical sample set every epoch -- check the per-batch "
+                            "error filter.",
+                            epoch + 1, gained, lost,
+                        )
+                keep_classes = frozen_macro_mask
+            else:
+                keep_classes = supported_now
             num_supported = int(keep_classes.sum().item())
             if num_supported > 0:
                 val_f1_macro = per_class_f1[keep_classes].float().mean().item()
@@ -2834,12 +3260,44 @@ def train_with_orientation_tracking(config: FullConfig):
             else:
                 val_f1_macro = 0.0
                 val_mAP = 0.0
+            if is_wsd:
+                from utils.v2_diagnostics import binned_diagnostics
+                diagnostics = binned_diagnostics(
+                    val_metrics['map_per_class'].confmat, per_class_ap, keep_classes,
+                    [vocab.index_to_tag[i] for i in range(skip_metric_cols, num_tags)],
+                    vocab.tag_frequencies,
+                )
+                for name, value in diagnostics.items():
+                    monitor.log_scalar(name, value, global_step)
+                with (Path(config.log_dir) / 'validation_diagnostics.jsonl').open('a', encoding='utf-8') as stream:
+                    stream.write(json.dumps({'epoch': epoch + 1, 'step': global_step, **diagnostics}) + '\n')
             val_f1_micro = val_metrics['f1_micro'].compute().item()
             avg_val_loss = val_loss_avg.item()  # already CPU
+            if is_wsd and not all(math.isfinite(v) for v in (avg_val_loss, val_mAP, val_f1_macro, val_f1_micro)):
+                raise RuntimeError('V2 validation produced non-finite metrics')
+
             logger.debug(
                 f"Macro metrics averaged over {num_supported}/{num_metric_labels} "
-                f"classes with positive support this epoch."
+                f"classes ({'frozen list' if freeze_macro_tags else 'positive support this epoch'})."
             )
+
+            # Set below by the ASL val telemetry block, when it runs (it needs the
+            # CPU-accumulated matrices). None = no arbiter this epoch, which
+            # stop_conditions reports as `clean_margin: pending` rather than
+            # silently treating a peak_decline as corroborated.
+            val_clean_margin = None
+
+            # Reduce the streaming fingerprints. Advisory only.
+            val_fingerprints = {}
+            if fingerprints_enabled and fp_rows > 0:
+                _label_pos = float(fp_label_pos.item())
+                if _label_pos > 0:
+                    val_fingerprints['pred_pos_ratio'] = float(fp_pred_pos.item()) / _label_pos
+                val_fingerprints['mean_sigmoid_topK_unlabeled'] = float(fp_topk_unlabeled_sum.item()) / fp_rows
+                if fingerprint_rank_hi > fingerprint_rank_lo:
+                    val_fingerprints['logit_std_rank_11_50'] = float(fp_rank_std_sum.item()) / fp_rows
+                for _fp_name, _fp_value in sorted(val_fingerprints.items()):
+                    monitor.log_scalar(f'val_fingerprint/{_fp_name}', _fp_value, global_step)
 
             # Reset metrics for next epoch
             for metric in val_metrics.values():
@@ -2861,17 +3319,18 @@ def train_with_orientation_tracking(config: FullConfig):
             try:
                 cat_probs = None
                 cat_targs = None
-                if all_val_probs:
-                    cat_probs = torch.cat(all_val_probs, dim=0).float()
-                    del all_val_probs
-                    cat_targs = torch.cat(all_val_targs, dim=0)
-                    del all_val_targs
+                if val_buffer is not None and val_buffer.rows:
+                    cat_probs, cat_targs = val_buffer.tensors()
                     freq_bins = getattr(config.validation, 'frequency_bins', None) or [300, 500, 1000, 5000, 10000, float('inf')]
                     tag_names = [vocab.index_to_tag.get(i, vocab.unk_token) for i in range(len(vocab.index_to_tag))]
 
-                if cat_probs is not None and config.training.use_tensorboard:
+                if cat_probs is not None:
                     pred_thr = float(config.inference.prediction_threshold)
-                    mean_active = (cat_probs[:, skip_metric_cols:] > pred_thr).float().sum(dim=1).mean().item()
+                    active_count = sum(
+                        (cat_probs[i:i + 256, skip_metric_cols:] > pred_thr).sum().item()
+                        for i in range(0, len(cat_probs), 256)
+                    )
+                    mean_active = active_count / len(cat_probs)
                     monitor.log_scalar('val/mean_active', mean_active, global_step)
                     bucket_metrics = FrequencyBucketMetrics(
                         tag_frequencies=vocab.tag_frequencies,
@@ -2890,6 +3349,13 @@ def train_with_orientation_tracking(config: FullConfig):
                         for b, m in bucketed_results.items() if m['num_tags'] > 0
                     )
                     logger.info(f"Bucketed metrics: {bucket_summary}")
+                    supported_total = sum(m['num_supported_tags'] for m in bucketed_results.values())
+                    exact_map = (sum(m['mAP'] * m['num_supported_tags'] for m in bucketed_results.values())
+                                 / max(1, supported_total))
+                    monitor.log_scalar('val/exact_mAP_diagnostic', exact_map, global_step)
+                    monitor.log_scalar('val/binned_map_gap_diagnostic', exact_map - val_mAP, global_step)
+                    logger.info('Exact diagnostic mAP=%.6f; exact-minus-binned=%.6f', exact_map, exact_map - val_mAP)
+
 
                 # ASL val telemetry (todos/ASL_plan.md SS5): non-GT score
                 # histogram (clip watch band), sibling-gap per confusable group,
@@ -2897,7 +3363,12 @@ def train_with_orientation_tracking(config: FullConfig):
                 # already-accumulated CPU prob/target matrices.
                 if cat_probs is not None:
                     try:
-                        asl_drive.compute_val(cat_probs, cat_targs, global_step, epoch)
+                        _asl_val_scalars = asl_drive.compute_val(
+                            cat_probs, cat_targs, global_step, epoch
+                        ) or {}
+                        # Falling sibling margin can corroborate a stop trigger;
+                        # a holding/rising margin never grants permission to continue.
+                        val_clean_margin = _asl_val_scalars.get('asl_val/sibling_gap_macro')
                     except Exception as _asl_exc:
                         logger.warning(f"ASL val telemetry failed: {_asl_exc}")
 
@@ -2934,11 +3405,7 @@ def train_with_orientation_tracking(config: FullConfig):
             except Exception as e:
                 logger.warning(f"Failed to compute bucketed metrics: {e}")
             finally:
-                # Lists may already be deleted after torch.cat above
-                try:
-                    del all_val_probs, all_val_targs
-                except NameError:
-                    pass
+                del val_buffer
                 try:
                     del cat_probs, cat_targs
                 except NameError:
@@ -2960,6 +3427,7 @@ def train_with_orientation_tracking(config: FullConfig):
         training_state.train_loss = avg_train_loss
         training_state.val_loss = avg_val_loss
         training_state.val_f1_macro = val_f1_macro
+        training_state.val_f1_micro = val_f1_micro
         training_state.val_mAP = val_mAP
         training_state.learning_rates.append(current_lr)
 
@@ -3028,43 +3496,160 @@ def train_with_orientation_tracking(config: FullConfig):
                         baseline = float(np.median(_burn_in_vals))
                 except Exception:
                     baseline = float(np.median(_burn_in_vals))
-                # Keep the better of baseline or actual best achieved during burn-in
+                # The bar is the STRATEGY's summary, not the burn-in maximum. The old
+                # line was `max(baseline, max(_burn_in_vals))`, which is always the
+                # max -- so `median`/`mean`/`last` were dead options and the
+                # post-burn-in bar was always the burn-in high-water mark. On a
+                # noisy metric a lucky burn-in spike then set a bar the real curve
+                # needed many epochs to clear. Nothing is lost by using the
+                # summary: `is_best` is never saved during burn-in, so there is no
+                # burn-in checkpoint whose provenance this could orphan.
                 best_during_burnin = float(np.max(_burn_in_vals))
                 prev_best = prev_best_for_log  # Use value captured before any modifications this epoch
-                training_state.best_metric = max(baseline, best_during_burnin)
+                training_state.best_metric = baseline
                 training_state.patience_counter = 0
                 logger.info(
                     "Early-stopping burn-in complete (epochs=%d, strategy=%s). "
-                    "Baseline set to %.4f (best during burn-in %.4f, prev best %.4f).",
+                    "Baseline set to %.6f (best during burn-in %.6f, prev best %.6f). "
+                    "The baseline is the %s of the window by design; the burn-in max is "
+                    "reported for context only.",
                     burn_in_epochs, burn_in_strategy, baseline, best_during_burnin, prev_best,
+                    burn_in_strategy,
                 )
-            # During burn-in: patience not updated, but best is still tracked
+            # During burn-in: best is tracked but no stop rule may fire (the
+            # burn-in window is excluded from the stop history by StopPolicy).
         else:
-            # LR-aware early stopping: only count patience when LR has dropped
-            # significantly within a cycle (in the "fine-tuning" phase)
-            current_lr = scheduler.get_last_lr()[0]
-            cycle_max_lr = scheduler.max_lr  # Already accounts for gamma decay
-            lr_ratio = current_lr / cycle_max_lr if cycle_max_lr > 0 else 1.0
-
-            # Only update best/patience on epochs where validation actually ran.
-            # When validation is skipped (eval_steps cadence), the selection metric
-            # is a stale cached value: it never beats best, so without this guard the
-            # `elif lr_ratio < 0.5` branch would advance patience toward the early-
-            # stop limit on an epoch that produced no new metric.
+            # Best-checkpoint selection ONLY. The stop decision is made below, by
+            # stop_conditions.evaluate() over the persisted eval_history.
+            #
+            # Gone from this branch, deliberately:
+            #   * `patience_counter += 1` -- an accumulated counter cannot survive a
+            #     soft stop without either double-counting or silently resetting,
+            #     and it advanced on epochs that never validated. patience_counter
+            #     is now DERIVED below, for reporting only.
+            #   * the `lr_ratio < 0.5` gate -- on num_cycles=1 that is false until
+            #     the midpoint of the anneal, so it silently suppressed the whole
+            #     mechanism for the first half of every run (V1-P2: no stop was
+            #     possible before ~epoch 13 of 15). The floor is now the explicit
+            #     early_stopping_min_epochs.
             if should_validate and selection_value > training_state.best_metric + es_threshold:
                 training_state.best_metric = selection_value
-                training_state.patience_counter = 0
                 training_state.best_epoch = epoch + 1
                 is_best = True
-            elif should_validate and lr_ratio < 0.5:
-                # Only count patience when LR < 50% of cycle max (fine-tuning phase)
-                training_state.patience_counter += 1
-            # else: During warmup/early-cycle phase, don't increment patience
-            # This prevents false early stops during cosine-induced plateaus
 
-        # Respect "save_best_only": skip cadence saves unless this is a new best.
-        # Only handle best-at-epoch saves here; periodic saves happen in-loop
-        if is_best:
+        # ------------------------------------------------------------------
+        # Stop system. Record the epoch, then re-derive every verdict from the
+        # whole persisted history.
+        #
+        # The append happens on VALIDATED epochs only, and the record is keyed by
+        # epoch so a replayed epoch (mid-epoch soft stop -> resume -> re-validate)
+        # replaces its own entry instead of adding a duplicate. Combined with the
+        # rules being pure functions of that list, this is what makes a stop
+        # decision identical before and after a soft stop: nothing is carried in
+        # process-local state, so nothing can be lost or double-counted.
+        # ------------------------------------------------------------------
+        stop_verdict = None
+        if should_validate:
+            _eval_history = stop_conditions.append_record(
+                _eval_history,
+                stop_conditions.make_record(
+                    epoch=epoch + 1,
+                    global_step=global_step,
+                    selection_value=float(selection_value),
+                    val_mAP=float(val_mAP),
+                    val_loss=float(avg_val_loss),
+                    train_loss=float(avg_train_loss),
+                    val_f1_macro=float(val_f1_macro),
+                    val_f1_micro=float(val_f1_micro),
+                    lr=float(current_lr),
+                    # Identifies the loss FUNCTION this row was measured under.
+                    # An ASL gamma_neg step changes what val_loss means, so the
+                    # overfit rule must refuse to read monotonicity across one --
+                    # and because gamma steps are manual (stop, set override,
+                    # resume), a straddling window is exactly what the resumed run
+                    # would evaluate first.
+                    loss_id=(training_state.loss_state or {}).get(
+                        'gamma_neg', getattr(config.training.tag_loss, 'gamma_neg', None)
+                    ),
+                    clean_margin=val_clean_margin,
+                    fingerprints=val_fingerprints,
+                ),
+            )
+            # Mirror at the point of change so EVERY checkpoint written afterwards
+            # (best, periodic, one-shot, soft stop) carries the full history.
+            training_state.eval_history = [dict(r) for r in _eval_history]
+
+            stop_verdict = stop_conditions.evaluate(
+                _eval_history, stop_policy, completed_epochs=epoch + 1,
+            )
+            # patience_counter is now purely derived — reported, never read.
+            if stop_verdict.epochs_since_best is not None:
+                training_state.patience_counter = int(stop_verdict.epochs_since_best)
+            logger.info("%s", stop_verdict.summary_line())
+            for _t in stop_verdict.triggers:
+                if _t.name == 'plateau' and 'latest_gain' in _t.values:
+                    monitor.log_scalar('stop/plateau_gain', _t.values['latest_gain'], global_step)
+                elif _t.name == 'peak_decline' and 'gap' in _t.values:
+                    monitor.log_scalar('stop/gap_to_best', _t.values['gap'], global_step)
+            monitor.log_scalar('stop/epochs_since_best', float(stop_verdict.epochs_since_best or 0), global_step)
+            monitor.log_scalar(
+                'stop/action', {'continue': 0.0, 'advise': 1.0, 'halt': 2.0}[stop_verdict.action], global_step
+            )
+
+            # Append-only JSONL audit trail. Written before any action is taken so
+            # the record exists even if the process dies on the same epoch.
+            try:
+                with stop_log_path.open('a', encoding='utf-8') as _fh:
+                    _fh.write(json.dumps({
+                        'epoch': epoch + 1,
+                        'global_step': global_step,
+                        'selection_metric': selection_metric,
+                        **stop_verdict.to_dict(),
+                    }) + '\n')
+            except Exception as _stop_log_exc:
+                logger.debug("Could not append to %s: %s", stop_log_path, _stop_log_exc)
+
+            # Announce each tripped trigger once per epoch it newly appears on, so
+            # a resumed run does not re-shout an advisory the operator already saw
+            # and chose to override.
+            for _t in stop_verdict.stop_triggers + stop_verdict.advisories:
+                _key = f"{epoch + 1}:{_t.name}"
+                if _key in _advisories_seen:
+                    continue
+                _advisories_seen.add(_key)
+                if _t.advisory:
+                    logger.warning(
+                        "ADVISORY %s at epoch %d: %s", _t.name, epoch + 1, _t.detail,
+                    )
+                else:
+                    logger.warning(
+                        "STOP TRIGGER '%s' at epoch %d: %s", _t.name, epoch + 1, _t.detail,
+                    )
+            training_state.stop_advisories_seen = sorted(_advisories_seen)
+
+        # Always persist the final completed epoch and a policy halt, even if
+        # burn-in or a worse validation score prevented a best-model save.
+        if is_wsd:
+            # Only checkpoints measured after at least one cooldown update can
+            # become the final phase-selection checkpoint.
+            in_cooldown = scheduler.cooldown_start is not None and global_step > scheduler.cooldown_start
+            if in_cooldown and should_validate and math.isfinite(selection_value):
+                is_best = selection_value > scheduler.cooldown_best_metric
+                if is_best:
+                    scheduler.cooldown_best_metric = float(selection_value)
+                    training_state.best_metric = float(selection_value)
+                    training_state.best_epoch = epoch + 1
+            if (config.training.wsd_plateau_enabled and scheduler.phase == 'stable'
+                    and stop_verdict is not None
+                    and any(t.name == 'plateau' for t in stop_verdict.stop_triggers)):
+                scheduler.start_cooldown('plateau')
+                logger.info("WSD plateau cooldown: start=%s, length=%s", scheduler.cooldown_start, scheduler.cooldown_steps)
+            monitor.log_scalar('train/wsd_phase', {'warmup': 0, 'stable': 1, 'cooldown': 2, 'complete': 3}[scheduler.phase], global_step)
+        policy_halt = (scheduler.finished if is_wsd else
+                       stop_verdict is not None and stop_verdict.action == 'halt')
+        if policy_halt:
+            training_state.should_stop = True
+        if is_best or epoch + 1 == config.training.num_epochs or policy_halt:
             # Ensure GPU state is consistent and free memory before checkpoint save
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -3091,15 +3676,48 @@ def train_with_orientation_tracking(config: FullConfig):
                     'selection_metric': selection_metric,
                 },
                 training_state=training_state,
-                is_best=True,
+                is_best=is_best,
                 config=config.to_dict(),
                 train_loader=train_loader,
                 scaler=scaler,
             )
 
-        if patience and training_state.patience_counter >= patience:
-            logger.info("Early stopping triggered: no improvement in %s for %s epochs", selection_metric, patience)
+        if is_wsd and scheduler.finished:
+            logger.info('Phase 1 cooldown complete (%s); best_model.pt is selected within cooldown', scheduler.cooldown_reason)
             break
+        if is_wsd and epoch + 1 == config.training.num_epochs and not scheduler.finished:
+            checkpoint_manager.shutdown()
+            raise RuntimeError('Phase 1 epoch ceiling reached before cooldown completed (skipped updates); '
+                               'last.pt was saved, but this is not a completed phase')
+
+        # Act on the verdict. 'advise' logs and keeps going -- the epoch budget is
+        # the only thing that ends an advise-mode run. That default is a direct
+        # consequence of V1: the one mechanical red flag raised during V1-P2 was
+        # overridden by the operator, and the operator was right (val/mAP rose
+        # every remaining epoch). Set early_stopping_mode: halt once the bands
+        # have been re-derived on this run's own val curve.
+        if not is_wsd and stop_verdict is not None and stop_verdict.action != 'continue':
+            _names = ", ".join(t.name for t in stop_verdict.stop_triggers)
+            if stop_verdict.action == 'halt':
+                logger.warning(
+                    "Early stopping triggered on %s (selection metric %s, best %.6f at epoch %s). "
+                    "Reasons:\n%s",
+                    _names, selection_metric, stop_verdict.best_value or float('nan'),
+                    stop_verdict.best_epoch, stop_verdict.reasons(),
+                )
+                training_state.should_stop = True
+                break
+            logger.warning(
+                "Stop condition met on %s but early_stopping_mode=advise -- CONTINUING to the "
+                "epoch budget (%s). Best %s so far: %.6f at epoch %s. Reasons:\n%s\n"
+                "To act on this, soft-stop with the STOP_TRAINING sentinel; the decision record is "
+                "at %s and the full per-epoch history is in the checkpoint's eval_history.",
+                _names, stop_policy.max_epochs or 'unbounded', selection_metric,
+                stop_verdict.best_value or float('nan'), stop_verdict.best_epoch,
+                stop_verdict.reasons(), stop_log_path,
+            )
+
+    bad_image_reporter.close()
 
     # Clear the one-shot SAVE_CHECKPOINT sentinel on every exit path. It is normally
     # unlinked when consumed, but a soft stop / early stop that breaks out while the
@@ -3132,11 +3750,13 @@ def train_with_orientation_tracking(config: FullConfig):
     logger.debug("Cleaning up training resources...")
 
     # Shutdown async checkpoint writer first (waits for pending saves)
+    checkpoint_shutdown_error = None
     try:
         checkpoint_manager.shutdown(wait=True, timeout=300.0)
         logger.debug("Checkpoint manager shutdown successfully")
     except Exception as e:
         logger.warning(f"Error shutting down checkpoint manager: {e}")
+        checkpoint_shutdown_error = e
 
     # Synchronize CUDA and clear cache before final cleanup
     try:
@@ -3182,6 +3802,8 @@ def train_with_orientation_tracking(config: FullConfig):
         logger.warning(f"Error cleaning up stats queue: {e}")
 
     logger.debug("Training resource cleanup complete")
+    if checkpoint_shutdown_error is not None:
+        raise RuntimeError("Training ended without a verified checkpoint flush") from checkpoint_shutdown_error
 
 def main():
     """Main entry point for training script."""

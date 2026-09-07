@@ -711,6 +711,7 @@ class TrainingState:
     # is_best forever or makes the first epoch a guaranteed false "best".
     # Empty string = a checkpoint predating this field.
     selection_metric: str = ""
+    measurement_contract: str = ""
 
     # Epoch tracking for proper resume semantics
     completed_epochs: int = 0
@@ -726,6 +727,12 @@ class TrainingState:
     # Validation metric tracking (real fields so asdict()/checkpoints preserve
     # them; the trainer's validation-skip branch reads them back on resume)
     val_f1_macro: float = 0.0
+    # Persisted so the validation-skip branch can carry the real value forward.
+    # It used to be re-derived as `val_f1_micro = val_f1_macro` ("approximation
+    # when skipping"), which on this task is wrong by ~30%: the two differ because
+    # macro drops zero-support classes and micro does not. That fabricated value
+    # then fed the selection-metric dispatch and the checkpoint metrics dict.
+    val_f1_micro: float = 0.0
     val_mAP: float = 0.0
     
     # Metric tracking
@@ -733,8 +740,31 @@ class TrainingState:
     learning_rates: List[float] = field(default_factory=list)
     
     # Early stopping
+    # DERIVED, not accumulated: recomputed every validated epoch as "validated
+    # epochs since the best" from `eval_history`. Kept as a field only so the
+    # checkpoint and get_summary() still report it. Nothing reads it to make a
+    # decision, which is why a resume can no longer desynchronize it.
     patience_counter: int = 0
     should_stop: bool = False
+    # One record per VALIDATED epoch, phase-local, ordered by epoch. This is the
+    # sole input to every stop rule (stop_conditions.evaluate), so a stop
+    # decision survives a soft stop intact instead of being rebuilt from
+    # process-local counters. Records are keyed by epoch and replaced rather
+    # than appended (stop_conditions.append_record), so re-validating a replayed
+    # epoch after a mid-epoch resume cannot double-count.
+    eval_history: List[Dict[str, Any]] = field(default_factory=list)
+    # Stop-check verdicts already reported to the operator, as
+    # "<epoch>:<trigger>" keys. Persisted so a resumed run does not re-announce
+    # an advisory the operator already saw and chose to override.
+    stop_advisories_seen: List[str] = field(default_factory=list)
+    # Tag column indices (post PAD/UNK skip) over which the macro metrics are
+    # averaged, frozen at the first validated epoch of the phase. Without this
+    # the denominator is `val_pos_counts > 0`, which drifts between epochs
+    # whenever the per-batch error filter drops different samples -- and the
+    # stop rules compare metric values across epochs at a 3e-3 decision scale,
+    # so a drifting tag set silently corrupts the comparison. Empty = not yet
+    # frozen.
+    frozen_macro_tag_indices: List[int] = field(default_factory=list)
     # Burn-in samples collected so far. Persisted because the burn-in baseline is a
     # summary (median/mean/max) over the WHOLE window: a resume inside the window that
     # restarted this list empty would compute the baseline from the post-resume subset
@@ -761,10 +791,8 @@ class TrainingState:
     # Unified training phase (config.training.phase) recorded at save time so a
     # resume can detect a phase transition (0 = pre-phase-key checkpoint)
     phase: int = 0
-    # ASL loss-state persistence (todos/ASL_plan.md SS8 row 2): gamma_neg,
-    # gamma-step history/dwell bookkeeping, and telemetry EMAs. Owned (and
-    # mutated in place) by asl_telemetry.ASLDriveManager; without this, any
-    # gamma change silently reverts to the YAML value on restart.
+    # Fixed gamma plus checkpointed telemetry. The manager validates this state
+    # after resume; it cannot override the fixed training objective.
     loss_state: Dict[str, Any] = field(default_factory=dict)
 
     def update_metrics(self, metrics: Dict[str, float]):
@@ -826,7 +854,14 @@ class CosineAnnealingWarmupRestarts(_LRScheduler):
         # mirrors the restart guard in step() below.
         self.cur_cycle_steps = max(first_cycle_steps, warmup_steps + 1)
         self.cycle = 0
-        self.step_in_cycle = 0
+        # -1 so the _LRScheduler.__init__ probe step() lands on step_in_cycle=0.
+        # With 0 here, the constructor's inherited step() advances it to 1 before
+        # training starts: update k runs at get_lr(k) instead of get_lr(k-1), the
+        # first warmup rung (min_lr) is never used, and a num_cycles=1 run ends its
+        # anneal one update early -- the final update jumps onto the fresh warmup
+        # ramp instead of landing on min_lr. Resume is unaffected: state_dict
+        # restores the saved post-increment value over this.
+        self.step_in_cycle = -1
         
         self.base_max_lr = max_lr
 
@@ -1135,7 +1170,8 @@ class AsyncCheckpointWriter:
             timeout: Max seconds to wait
         """
         if wait:
-            self.wait_pending(timeout)
+            if not self.wait_pending(timeout):
+                raise TimeoutError("Checkpoint writer did not drain; pending saves were not discarded")
         self._shutdown_event.set()
         self._queue.put(None)  # Wake up worker
         self._thread.join(timeout=10.0)
@@ -1221,6 +1257,11 @@ class CheckpointManager:
 
     def _sync_save_checkpoint(self, checkpoint: Dict[str, Any], path: Path, lock_context) -> None:
         """Synchronously save checkpoint with atomic write and file locking."""
+        # Backpressure preserves submission order, including direct last.pt
+        # writes and repeated epoch/step filenames. Never overtake queued saves.
+        if self._async_writer is not None:
+            if not self._async_writer.wait_pending(timeout=300.0):
+                raise TimeoutError("Cannot save checkpoint while older saves are pending")
         temp_path = None
         try:
             with lock_context:
@@ -1251,13 +1292,9 @@ class CheckpointManager:
             # one save behind, and the operator must know the async best/numbered
             # copies may be absent.
             if self._async_writer.last_error is not None:
-                logger.error(
-                    "Async checkpoint writer reported an unresolved error during the run: "
-                    f"{self._async_writer.last_error!r}. Numbered/best async checkpoints may be "
-                    "missing or incomplete - verify the checkpoint directory. (last.pt is "
-                    "always a complete file but may be one save behind.)"
-                )
+                raise RuntimeError("Async checkpoint save failed") from self._async_writer.last_error
             self._async_writer = None
+        self._cleanup_old_checkpoints()
 
     def _deep_to_cpu(self, obj):
         """Recursively move tensors to CPU and clone them to ensure thread safety."""
@@ -1553,6 +1590,7 @@ class CheckpointManager:
                     logger.info(f"Saved best model to {best_path}")
             except Exception as e:
                 logger.warning(f"Failed to save best model to {best_path}: {e}")
+                raise
             finally:
                 if temp_best is not None:
                     try:
@@ -1597,6 +1635,7 @@ class CheckpointManager:
                     logger.debug(f"Updated {last_path} from {source_path}")
             except Exception as e:
                 logger.warning(f"Failed to update {last_path} from {source_path}: {e}")
+                raise
             finally:
                 if temp_last is not None:
                     try:
@@ -1611,6 +1650,7 @@ class CheckpointManager:
                 logger.info(f"Async checkpoint saved to {path}")
                 _save_best_from_checkpoint(path)
                 _update_last_from_file(path)
+                self._cleanup_old_checkpoints(from_writer=True)
             else:
                 logger.error(f"Async checkpoint save failed for {path}: {error}")
 
@@ -1692,6 +1732,7 @@ class CheckpointManager:
                     self._sync_save_checkpoint(checkpoint, last_path, lock_context)
                 except Exception as e2:
                     logger.error("Failed to update %s: %s", last_path, e2)
+                    raise
         
         # Manage checkpoint limit
         if wrote_numbered:
@@ -1710,12 +1751,17 @@ class CheckpointManager:
 
         return checkpoint_path if wrote_numbered else None
     
-    def _cleanup_old_checkpoints(self):
+    def _cleanup_old_checkpoints(self, from_writer: bool = False):
         """Remove old checkpoints if exceeding limit"""
         if not self._is_primary_process():
             return
 
         if self.max_checkpoints is None or self.max_checkpoints <= 0:
+            return
+
+        # A file can be visible before its pointer callback has finished.
+        # Retention must not unlink a callback's source (or a queued replacement).
+        if not from_writer and self._async_writer is not None and self._async_writer.pending_count:
             return
 
         # Refresh and sort checkpoints
@@ -2688,13 +2734,19 @@ class TrainingUtils:
                     "bitsandbytes is required for AdamW8bit optimizer. "
                     "Install it with: pip install bitsandbytes"
                 )
+            if kwargs.get('fp32_head_optimizer', False):
+                manager = bnb.optim.GlobalOptimManager.get_instance()
+                manager.register_module_override(model.tag_head, 'weight', {'optim_bits': 32})
+                manager.register_module_override(model.tag_head, 'bias', {'optim_bits': 32})
+                manager.register_module_override(model, 'pos_embed', {'optim_bits': 32})
+            # bitsandbytes 0.50 always uses block-wise 8-bit states; the old
+            # block_wise keyword was removed. Keep the fp32 module overrides above.
             return bnb.optim.AdamW8bit(
                 params,
                 lr=learning_rate,
                 betas=kwargs.get('betas', (0.9, 0.999)),
                 eps=kwargs.get('eps', 1e-8),
                 weight_decay=weight_decay,
-                block_wise=True,
             )
         
         elif optimizer_type.lower() == 'sgd':
@@ -2755,7 +2807,7 @@ class TrainingUtils:
         # ViT convention (DeiT/MAE/timm): exclude position embeddings, special tokens,
         # and the patch projection in addition to bias/norm. Decaying pos_embed or
         # cls_token degrades the only token the head reads from.
-        no_decay = ['bias', 'norm', 'pos_embed', 'cls_token', '_token', 'patch_embed']
+        no_decay = ['bias', 'norm', 'pos_embed', 'cls_token', '_token', 'patch_embed', '.ls1', '.ls2']
         
         if layer_decay is None or layer_decay == 1.0:
             # Standard parameter groups

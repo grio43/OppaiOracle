@@ -4,14 +4,17 @@ Guide for AI coding agents working in this repo. Keep it accurate; if you change
 
 ## Project overview
 
-OppaiOracle is a **PyTorch multi-label anime image tagger** (Vision Transformer, trained from scratch — not ImageNet-pretrained). It predicts ~19K tags (target 18–24K) plus rating tags (rating tags now live inside the tag vocabulary, there is no separate rating head).
+OppaiOracle is a **PyTorch multi-label anime image tagger**, trained from scratch.
+The active setup is **V2 Phase 1**: patch16, width 896, 18 layers, 14 heads,
+MLP 2320, QK normalization and LayerScale 0.1 (~151M parameters at the old 19K
+vocabulary size). The final vocabulary size will be measured after all new data arrives.
 
-The model is trained with a **two-stage progressive-resolution plan**:
-
-- **Phase 1** — 320×320, ~40-epoch from-scratch run.
-- **Phase 2 (active)** — 448×448 fine-tune, target 15 epochs. Position embeddings are bicubically interpolated at the resolution switch; optimizer/scheduler state is reset.
-
-Architecture: ViT-L/16, 18 transformer layers, hidden_size 1024, 16 heads, mlp_dim 4096 (~228M backbone, ~250M total). Training is procedural (no Trainer/Lightning class) via [train_direct.py](train_direct.py).
+- **Phase 1 (configured, not launched):** 320×320, WSD, at most 60 epochs including cooldown.
+- **Phase 2/3 (future):** 448 then 512; only Phase 1 is implemented by this setup.
+- Training remains procedural through [train_direct.py](train_direct.py).
+- Dataset: `E:\Dataset`, including `Danbooru` and another top-level subset the user will add.
+  **Do not build the production vocabulary until that subset is present.**
+- Operational instructions and old/new rating rules: [todos/v2-phase1-setup.md](todos/v2-phase1-setup.md).
 
 Design rationale and live status live in [todos/v2-plan.md](todos/v2-plan.md) (the authoritative V2 plan; see the Docs section below for the full doc set) and [TRAINING_HEALTH_TRACKER.md](TRAINING_HEALTH_TRACKER.md) (V1 Phase-2 run archive).
 
@@ -27,9 +30,9 @@ Design rationale and live status live in [todos/v2-plan.md](todos/v2-plan.md) (t
 ### Training
 
 - [train_direct.py](train_direct.py) — **main training entrypoint** (procedural, ~2.5K LOC). `main()` parses args, loads `FullConfig`, dispatches validation-only or training. Core loop is `train_with_orientation_tracking(config)` (name retained for continuity; flip logic is inlined in the dataset). Handles vocab auto-build, dataloaders, ViT setup, AMP (bfloat16), gradient accumulation, checkpointing, metrics (F1-macro, mAP), early stopping, soft-stop, `torch.compile`, NaN/Inf detection.
-- [Start_AI_Training.ps1](Start_AI_Training.ps1) — Windows launcher. Sources `payton_env.ps1`, sets VS Build Tools + Windows SDK paths for `torch.compile`, then runs `train_direct.py`. Args: `-ConfigPath`, `-TrainingArgs`, `-KeepOpenOnError`, `-KeepOpen`.
+- [Start_AI_Training.ps1](Start_AI_Training.ps1) — Windows launcher. Sources `payton_env.ps1`, sets VS Build Tools + Windows SDK paths for `torch.compile`, then runs `train_direct.py`. Args: `-ConfigPath`, `-TrainingArgs`, `-KeepOpenOnError`, `-KeepOpen`. `-CheckTrainingStack` runs the bounded synthetic CUDA probe instead of production training.
 - [training_utils.py](training_utils.py) — training core: `TrainingState`, `CosineAnnealingWarmupRestarts`, `AsyncCheckpointWriter`, `CheckpointManager` (canonical checkpoint lifecycle), `TrainingUtils` (seed/optimizer/param-group/scheduler helpers), `validate_config_compatibility`, `detect_architecture_from_state_dict`.
-- [schedulers.py](schedulers.py) — `LinearWarmupCosineLR` (warmup then cosine anneal).
+- [schedulers.py](schedulers.py) — `WarmupStableDecayLR` (V2 update-based warmup → stable → 1-sqrt cooldown with persisted state) and legacy `LinearWarmupCosineLR`.
 - [adan_optimizer.py](adan_optimizer.py) — Adan optimizer (arXiv:2208.06677); single-/multi-tensor/CUDA-fused variants.
 - [custom_drop_path.py](custom_drop_path.py) — `SafeDropPath` stochastic-depth layer used in the ViT.
 
@@ -42,13 +45,13 @@ Design rationale and live status live in [todos/v2-plan.md](todos/v2-plan.md) (t
 - [vocabulary_utils/vocab_utils.py](vocabulary_utils/vocab_utils.py) — `load_vocab`/`save_vocab`/`compute_vocab_hash`/`diff_vocab` (accept list or dict).
 - [vocabulary_utils/vocab_append.py](vocabulary_utils/vocab_append.py) — append-only vocab updater; preserves existing indices, appends new tags, keeps `<PAD>=0`/`<UNK>=1`.
 - [vocabulary.json](vocabulary.json) — generated vocabulary. A JSON object with three sections: `tag_to_index`, `index_to_tag`, and `tag_frequencies` (the `tag_to_index` sub-map has ~19K entries, `<PAD>=0`, `<UNK>=1`). It is **not** a flat dict. **Do not hand-edit.**
-- [Tags_ignore.txt](Tags_ignore.txt) — exclusion list for vocab generation (one tag per line; 78 entries).
+- [Tags_ignore.txt](Tags_ignore.txt) — exclusion list for vocab generation (77 unique category-prefixed exclusions; legacy bare spellings are also recognized).
 - [selected_tags.csv](selected_tags.csv) — `(tag_id, name, category)` export for tagger-UI compatibility; vocabulary.json is canonical.
 
 ### Model / loss / metrics
 
 - [model_architecture.py](model_architecture.py) — `BaseTagger` (abstract), `SimplifiedTagger` (**ViT**, PyTorch 2.5+ Flex Attention with `scaled_dot_product_attention` ONNX fallback), `VisionTransformerConfig` (its config dataclass), `create_model(config, architecture_type='vit')`. Returns `{'tag_logits': ..., 'logits': ...}`.
-- [loss_functions.py](loss_functions.py) — `AsymmetricFocalLoss` (multi-label ASL; `gamma_pos`, `gamma_neg`, `alpha`, `clip`, `label_smoothing`, `ignore_indices=[0]`, per-class weights; log-space math for stability) and `MultiTaskLoss` wrapper (tag loss only).
+- [loss_functions.py](loss_functions.py) — `AsymmetricFocalLoss` (multi-label ASL; `gamma_pos`, `gamma_neg`, `alpha`, `clip`, `label_smoothing`, `ignore_indices=[0]`, per-class weights; fp32 probability/log/focal math under bf16 autocast, detached focal weights by default) and `MultiTaskLoss` wrapper (tag loss only).
 - [evaluation_metrics.py](evaluation_metrics.py) — `MetricComputer` (F1 macro/micro, mAP; default threshold **0.7927**, the measured micro-F1-optimal point that replaced 0.2653; `skip_indices=[0]`), `FrequencyBucketMetrics` (LVIS-style per-frequency buckets), `ThresholdCalibrator` (per-tag/per-bucket threshold search).
 
 ### Inference & export
@@ -68,6 +71,7 @@ Design rationale and live status live in [todos/v2-plan.md](todos/v2-plan.md) (t
 - [tools/run_validation_for_epoch.py](tools/run_validation_for_epoch.py) — replicate exact train-loop validation for a checkpoint; emits a `TRAINING_HEALTH_TRACKER` row.
 - [tools/diagnose_f1.py](tools/diagnose_f1.py) — F1 pipeline diagnosis (logit/sigmoid/threshold, sklearn cross-check, optimal threshold).
 - [tools/bench_precision.py](tools/bench_precision.py) — FP32/FP16/FP8 ONNX latency + throughput benchmark on CUDA.
+- [tools/check_training_stack.py](tools/check_training_stack.py) — two-layer synthetic CUDA probe using configured V2 width/grid and compile mode; compares bf16 Flex Attention outputs/loss/gradients with SDPA, checks AdamW8bit/fp32-head states and partial-batch validation. Run via `Start_AI_Training.ps1 -CheckTrainingStack` for MSVC/SDK setup. Timing is not a full-model benchmark.
 - [tools/export_fp8.py](tools/export_fp8.py) / [tools/export_fp8_weightonly.py](tools/export_fp8_weightonly.py) — FP8 (E4M3) static / weight-only quantization; re-attach vocab+metadata afterward.
 - [tools/validate_fp8.py](tools/validate_fp8.py) / [tools/eval_fp8_map.py](tools/eval_fp8_map.py) — FP8 structure validation / FP8-vs-FP32 mAP drift.
 - [tools/release_v1_1.py](tools/release_v1_1.py) — build V1.1 safetensors (bfloat16) + `selected_tags.csv` into `huggingface_release/`; strips `_orig_mod`/DDP/compile prefixes.
@@ -78,11 +82,16 @@ Design rationale and live status live in [todos/v2-plan.md](todos/v2-plan.md) (t
 
 ### Docs & state
 
-- [todos/v2-plan.md](todos/v2-plan.md) — the authoritative V2 plan (decisions + config); evidence base in [todos/v2-plan-review-2026-07-28.md](todos/v2-plan-review-2026-07-28.md).
-- [todos/janitor-cleaning-model-plan.md](todos/janitor-cleaning-model-plan.md) — throwaway cleaning-model campaign (one pass over 6.3M, then discard).
-- [todos/v2.1.1-suggestion-engine-buildout.md](todos/v2.1.1-suggestion-engine-buildout.md) — gold-training pipeline buildout; evidence base in [.research/_wf5_v2.1.1_verification.md](.research/_wf5_v2.1.1_verification.md).
-- [.research/golden_set_plan.md](.research/golden_set_plan.md) + [.research/golden_set_collection_targets.md](.research/golden_set_collection_targets.md) — golden-set rubrics, sizing, and Anima provenance (§8).
-- [TRAINING_HEALTH_TRACKER.md](TRAINING_HEALTH_TRACKER.md) — **V1 Phase-2 run archive** (soft-stopped at E5; per-epoch metrics + canary methodology; row format still emitted by `tools/run_validation_for_epoch.py`).
+- [todos/README.md](todos/README.md) — entry point for the V2 roadmap, document ownership, dependency order, and evidence index. Active plans stay at `todos/`; supporting reviews live in `todos/reviews/`; superseded snapshots live in `todos/archive/`. Detailed work queues stay in their owning plans rather than being duplicated in the index.
+- [todos/v2-augmentation.md](todos/v2-augmentation.md) — consolidated status of both augmentation reviews, pending D1–D4 decisions, and downstream routing. Adopted settings stay in `v2-plan.md` §7; review recommendations are not approvals.
+- [todos/reviews/vit-major-issues-audit-2026-09-05.md](todos/reviews/vit-major-issues-audit-2026-09-05.md) — implementation audit and bounded reproductions; closure checks are integrated into `v2-plan.md` §12.
+- [todos/v2-plan.md](todos/v2-plan.md) — the authoritative V2 plan (decisions + config). Amend it in place; never add a dated correction layer. September verification retains detached ASL 7/0/.05, distinguishes the paper’s 4/0/.05 baseline, and corrects SoViT shape, missingness, calibration, and gate assumptions. Freeze the gold sampling protocol before P1; the realized V2-dependent pool follows fixed-model inference. Frozen evidence appendix: [todos/reviews/v2-plan-review-2026-07-28.md](todos/reviews/v2-plan-review-2026-07-28.md) (the plan wins on any disagreement).
+- [todos/v2-monitoring.md](todos/v2-monitoring.md) — canary checks, decision rules, and the scalar-reduction procedure for a live run. Bands are V1-calibrated and need re-deriving against V2's val set and threshold.
+- [todos/janitor-cleaning-model-plan.md](todos/janitor-cleaning-model-plan.md) — throwaway cleaning-model campaign (one pass over the ~5.92M corpus, then discard).
+- ordinal-fusion track — spec split out in `2c1cfa1` (2026-07-29), retired from the tree 2026-07-30; recover via `git show 2c1cfa1:todos/ordinal-fusion-track.md`. Living summary in janitor plan §7.1. Deferred DINOv2 external-anchor fusion (ordinal / M2 cleaning); a separate program from the janitor, which is structurally blind to the diagonal.
+- [todos/v2.1.1-gold-training-pipeline.md](todos/v2.1.1-gold-training-pipeline.md) — gold-training pipeline (renamed 2026-07-30 from `v2.1.1-suggestion-engine-buildout.md`; the old name described a scope its own IS-NOT list disavows); frozen evidence base in [.research/_wf5_v2.1.1_verification.md](.research/_wf5_v2.1.1_verification.md).
+- [.research/golden_set_plan.md](.research/golden_set_plan.md) (taxonomy, rubrics, method) + [.research/golden_set_collection_targets.md](.research/golden_set_collection_targets.md) (all per-bucket numbers + Anima provenance, §8). The seam is strict: no target tables in the plan.
+- [TRAINING_HEALTH_TRACKER.md](TRAINING_HEALTH_TRACKER.md) — **V1 Phase-2 run archive** (soft-stopped at E5; per-epoch metrics only — methodology moved to `todos/v2-monitoring.md`). Row format still emitted by `tools/run_validation_for_epoch.py`, but a freshly emitted row is *not* numerically comparable to E0–E5 (different threshold).
 
 ## Common commands
 
@@ -142,31 +151,40 @@ $env:ANIME_TAGGER_DATA__IMAGE_SIZE = "448"; python train_direct.py --config conf
 ## Config rules & invariants
 
 - **Canonical source:** [configs/unified_config.yaml](configs/unified_config.yaml). Keep the [Configuration_System.py](Configuration_System.py) dataclass hierarchy in sync with it. `--config` has **no default and is not required**; if omitted, the config is built from env overrides + dataclass defaults (no error). The PowerShell wrappers always pass it.
-- **Resolution:** `data.image_size` is the single source of truth and is synced to `model.image_size` and `validation.preprocessing.image_size` at startup (`FullConfig.validate`). **Phase 2 target = 448** (Phase 1 was 320).
+- **Resolution:** `data.image_size` is the single source of truth and is synced to `model.image_size` and `validation.preprocessing.image_size` at startup (`FullConfig.validate`). **Active Phase 1 = 320**; later targets are 448/512.
 - **Patch divisibility:** `image_size % patch_size == 0` (enforced in `ModelConfig`). ViT `patch_size=16` → 28×28 = 784 tokens at 448px.
 - **Normalization:** mean = std = `[0.5, 0.5, 0.5]` for anime-optimized from-scratch training. Train and inference normalization, pad color, and `color_order` **must stay aligned** across all code paths.
 - **Color order:** `data.color_order` is `RGB` (default) or `BGR`. All per-channel values (`normalize_mean`, `normalize_std`, `pad_color`) are interpreted in this order; a single channel flip is applied after PIL→numpy materialization for BGR.
-- **Effective batch size:** `batch_size (48) * gradient_accumulation_steps (9) [* world_size]` = **432** samples/optimizer step on a single GPU. Note: `FullConfig.compute_effective_batch_size()` multiplies by `self.training.world_size`, which is **not currently a field on `TrainingConfig`** — that method will raise on a single-GPU run; compute 432 directly, or add a `world_size` field (default 1) before calling it.
-- **LR scaling:** base `learning_rate=1.0e-5`, `lr_scaling_mode='sqrt'` → `sqrt(effective_batch/256)` ≈ 1.3× → ~1.4e-5 peak (Phase 2). Modes: `sqrt`/`linear`/`none`.
+- **Effective batch size:** provisional `64 × 16 × world_size(1) = 1024`. Profile the final vocabulary on the target GPU before the long run. `TrainingConfig.world_size` now exists (default 1).
+- **LR scaling:** base `2.7e-4`, sqrt scaling against 256 → `5.4e-4` stable LR at batch 1024.
+- **V2 schedule:** `training.scheduler=wsd`, 10,000-update warmup, 15% elapsed-update cooldown, terminal LR zero, maximum 60 epochs including cooldown. Plateau dispatch starts disabled until stable-phase jitter review; budget cooldown is automatic. WSD rejects changed resume geometry. Soft stop pauses; it does not certify phase completion. NaN/Inf loss/gradients abort. Attention-logit checks use a two-image diagnostic sample, not an exhaustive maximum.
+- **Prepared-data guard:** `tools/prepare_v2_dataset.py --config configs/unified_config.yaml` builds the new vocabulary and exact 30K split after all subsets arrive. Startup verifies manifest/hash/count/recipe conformance. Existing V2 checkpoints block preparation/reindexing. No production vocabulary has been built during setup.
 - **Weight decay:** fixed at `0.05` (`training.weight_decay`) — no dataset-size scaling, by design.
-- **Loss (Phase 2):** `AsymmetricFocalLoss` with `gamma_pos=0.0`, `gamma_neg=7.0` (hard-negative focus), `clip=0.2`, `label_smoothing=0.0`, `ignore_indices=[0]`. Phase 1 used `gamma_neg=4.0`, `clip=0.05`. Static class weights are removed as redundant with ASL asymmetry. `MetricComputer` default threshold is `0.7927` (measured micro-F1 optimum; replaced 0.2653).
+- **Loss (fixed training contract):** `AsymmetricFocalLoss` with `gamma_pos=0.0`, `gamma_neg=7.0`, `clip=0.05`, `alpha=1.0`, `label_smoothing=0.0`, `detach_focal_weight=true`, `ignore_indices=[0, 1]`. `ASLDriveManager` verifies config and live criterion after resume; conflicting checkpoint gamma aborts, gamma overrides and schedules are refused. Telemetry has no loss-mutation authority. Phase 1 used `gamma_neg=4.0`, `clip=0.05`. Static class weights are removed as redundant with ASL asymmetry. `MetricComputer` default threshold is `0.7927` (measured micro-F1 optimum; replaced 0.2653).
 - **AMP:** `amp_dtype = bfloat16` (required on CUDA; float16 not supported). `GradScaler` is disabled for bfloat16.
-- **Optimizers:** `adam`, `adamw`, `adamw8bit`, `sgd`, `rmsprop`, `adan`.
+- **Optimizers:** `adam`, `adamw`, `adamw8bit`, `sgd`, `rmsprop`, `adan`. bitsandbytes 0.50 uses block-wise 8-bit states unconditionally; do not pass the removed `block_wise` constructor argument. The V2 fp32 tag-head/pos-embed overrides remain enabled.
 - **Gradient clipping:** enabled, `max_norm=1.0`. **NaN/Inf checks** run periodically (`NAN_CHECK_INTERVAL_STEPS`, default 50).
 - **Resume:** `training.resume_from` ∈ `none`/`false`/`off` / `latest` / `best` / `<path>`; defaults to `latest` if checkpoints exist. Mid-epoch resume tracks batch/sample-in-epoch. Architecture is `vit` (the only supported architecture), taken from `model.architecture_type` or inferred from state-dict keys (`patch_embed`, `blocks`).
 - **Checkpoints** embed config + preprocessing params (normalize mean/std, image_size, patch_size, color_order) and vocab for reproducible inference. `torch.compile` is deferred until after checkpoint load (preserves tensor strides; requires Triton).
-- **Early stopping** watches the configured `selection_metric` — currently **`val_mAP`** (`configs/unified_config.yaml:467`; dispatched in `train_direct.py`), patience 4, burn-in 2. The old f1_macro-based auto-stop was replaced per the v2 plan; a cross-metric `best_metric` reset guard handles resuming across the metric change.
+- **Stop system** lives in [stop_conditions.py](stop_conditions.py) and watches the configured `selection_metric` — currently **`val_mAP`** (dispatched via `_SELECTION_METRICS` in `train_direct.py`). Every rule is a **pure function of `TrainingState.eval_history`** (one record per *validated* epoch, keyed by epoch), so a verdict is identical before and after a soft stop and a replayed epoch cannot double-count. Rules: `plateau` (best of last *k* vs best of previous *k* < `min_delta`, confirmed), `peak_decline`, `overfit_loss` (canary #6), plus informational `budget` and `clean_margin`. Geometry is per-phase via `training.early_stopping_phases`. `clean_margin` carries `asl_val/sibling_gap_macro` — **veto-only, never a green light** (v2-plan.md §9.2): a *falling* margin corroborates a tripped `peak_decline`; a holding/rising margin is uninformative — a model that has memorized a wrong positive *maximizes* the gap — and must never demote a stop signal. Holding/rising margin leaves the decline trigger intact; falling margin may corroborate it. Default `early_stopping_mode: advise` — a trip is logged and written to `logs/stop_decisions.jsonl`, and only the epoch budget ends the run; set `halt` to let it stop training. `early_stopping_patience`/`_threshold` now govern **best-checkpoint selection only**. A cross-metric `best_metric` reset guard handles resuming across a `selection_metric` change. Tests: [test_stop_conditions.py](test_stop_conditions.py).
+- **Checkpoint integrity:** a found incompatible resume or missing explicit checkpoint path aborts. Final completion and policy halt save `last.pt` even when not best. A full async queue applies backpressure before synchronous fallback; retention runs after pointer updates and shutdown surfaces write failures. Corrected validation uses fp32 logits before sigmoid; `TrainingState.measurement_contract` resets incompatible best/burn-in/stop history, frozen macro support, cooldown comparisons and telemetry before resume; optimizer/scheduler progress is preserved.
+- **Validation memory:** a single fp32/int8 host buffer (preserving unknown targets as -1) replaces concatenation. Frequency buckets use 32-column scratch chunks and exact per-label AP; headline mAP remains binned. `validation.ap_update_chunk_size: 8` bounds GPU AP updates independently of inference batch size, preserving the 200-bin confusion counts. ASL validation telemetry runs independently of TensorBoard.
+- **Bad images (prepared V2):** failed images are skipped and reported once per full path in `<log_dir>/bad_images.txt` (path, image ID, error; tab-separated). `utils/bad_image_report.py` owns one low-priority background writer, batches appends every 30 seconds, and flushes on clean exit. No image hashes, preparation decode scan, per-worker file writes, or blacklist are added. Existing `cache_exclusions.txt` does not remove or blacklist prepared rows; sample positions stay fixed for resume and repaired files are retried normally. Validation uses readable images and logs `val/samples_evaluated` / `val/samples_skipped`; an entirely failed validation pass saves progress without inventing a score or selecting a best checkpoint. Tests: [test_training_readiness.py](test_training_readiness.py).
 - **Soft-stop:** SIGINT/SIGTERM are queued to the next optimizer-step boundary; a `STOP_TRAINING` sentinel file also triggers a clean stop.
 
 ## Data & vocabulary
 
-**Sidecar JSON layout (primary).** Each image has a sibling JSON (e.g. `12345.json` next to `12345.jpg`):
+**Sidecar JSON layout (primary).** New data lives below `E:\Dataset`; each top-level subset may contain nested shard directories:
 
 ```json
-{"filename": "12345.jpg", "tags": "tag1 tag2", "rating": "general"}
+{"filename": "12345.jpg", "tags": "gen:1girl char:alice meta:highres", "rating": "s"}
 ```
 
-`tags` accepts a space-separated string or a list; `rating` ∈ general/sensitive/questionable/explicit and is mapped into the multi-hot vector (rating tags are part of the vocabulary). `SidecarJsonDataset` scans the dataset root, auto-splits 95/5 train/val, and caches metadata as **Arrow IPC** under `logs/metadata_cache/` (memory-mapped, shared across workers, version/hash/count-validated). Split caches live in `logs/splits/`. A file-based exclusion manager (`cache_exclusions.txt`) tracks corrupted images.
+`utils/metadata_ingestion.py` preserves category prefixes, punctuation and case, parses V2 whitespace-delimited strings plus legacy comma-delimited strings/lists, and centralizes rating mapping. `g/s/q/e` → `rating:general/sensitive/questionable/explicit`; `s` means **sensitive**, while spelled-out `safe` still means general. Missing/unknown ratings retain the image for content-tag training: all four rating targets are -1 (unobserved), excluded from ASL, validation metrics and calibration. Known ratings supervise one positive and three negatives; the separate field overrides inline rating tokens. ASL mean reduction averages observed labels per image, then images. Ratings remain mandatory vocabulary entries and share ASL with other tags; no separate rating head. Rating-field frequencies are counted once per rated image; V2 preparation records rated/unrated counts, and rating bias priors use only rated images. Blank/null/malformed/unrecognized rating fields are unobserved. Optional ASL rating diagnostics also mask unknown targets. Sparse or entirely unrated validation is supported; buckets with no positive calibration evidence retain the default threshold.
+
+`utils/sidecar_discovery.py` discovers image/JSON pairs and skips environments/updater JSONs. V2 image IDs include a directory hash so numeric IDs from different subsets do not collide. Split and Arrow caches are version 3.0; Arrow selections remain mmap-backed across worker spawn. Top-level subset changes invalidate preparation and vocabulary file-list caches; the bare loader preserves cached validation membership when appending new subsets to training. After preparation, the dataset is frozen: rerun preparation before training if files or labels change inside an existing subset.
+
+User decision for V2: **fresh deterministic 30K validation set**, drawn only after both subsets are ready; all other images train. No extra CALIB/TEST reservation. Preparation records TRAIN/EVAL membership and label hashes plus source-sidecar SHA256 snapshots under `logs/v2_phase1`; startup verifies artifacts, not every raw sidecar. Old V1 split-cache lists were removed; source images were retained. Full-corpus counts await preparation.
 
 Manifest mode (`DatasetLoader`, requires `train.json`/`val.json`/`images/`) is **legacy** and does not support flip augmentation; use sidecar mode for new work.
 
@@ -177,9 +195,9 @@ python vocabulary.py <dataset_root>+           # full rebuild via create_vocabul
 python vocabulary_utils/vocab_append.py         # append new tags, preserve existing indices
 ```
 
-Tags listed in [Tags_ignore.txt](Tags_ignore.txt) are excluded during generation. Vocabulary size sets the output shape: labels are `(num_classes,)` multi-hot vectors. `OO_AUTO_REBUILD_VOCAB=1` forces an auto-rebuild; `train_direct.py` prompts to rebuild if the vocab is missing (falls back to non-interactive when not a TTY).
+Tags listed in [Tags_ignore.txt](Tags_ignore.txt) are excluded during generation. V2 writes `vocabulary/v2/vocabulary.json`; the root `vocabulary.json` remains a legacy artifact. Preparation is required before V2 startup and bypasses the old interactive rebuild prompt. Vocabulary size sets the output shape: labels are `(num_classes,)` multi-hot vectors. `OO_AUTO_REBUILD_VOCAB=1` forces an auto-rebuild; `train_direct.py` prompts to rebuild if the vocab is missing (falls back to non-interactive when not a TTY).
 
-**Horizontal flip / directional tags (current mechanism).** `orientation_handler.py` no longer exists; there is **no directional-tag swapping** because the vocabulary contains no orientation-sensitive tags. Flip logic is **inlined in `SidecarJsonDataset`**:
+**Horizontal flip / directional tags (current mechanism).** `orientation_handler.py` no longer exists; there is **no directional-tag swapping**. The augmentation review identified four chirality exceptions (`left-handed`, `left-to-right_manga`, `right-over-left_kimono`, `right-to-left_comic`); their proposed name-based exclusion is pending D1 in [todos/v2-augmentation.md](todos/v2-augmentation.md). Flip logic is **inlined in `SidecarJsonDataset`**:
 
 - Per-image deterministic-but-epoch-varying decision via `_deterministic_coin()` (CRC32 of `image_id + epoch`), gated by `random_flip_prob`.
 - `_decide_flip_mode()` honors an optional `flip_overrides_path` JSON: `{"force_flip": [...], "never_flip": [...]}`, `{"flip": [...]}`, or a bare list.
@@ -188,13 +206,13 @@ Tags listed in [Tags_ignore.txt](Tags_ignore.txt) are excluded during generation
 
 `configs/orientation_map.json` and its README still exist on disk but are **vestigial** — leftovers of the removed orientation system. `Inference_Engine.py` declares an `ORIENTATION_MAP_PATH` constant but never actually loads the file (flip TTA averages predictions elementwise, with no index remapping); training ignores it entirely. Treat it as a deletion candidate, not a live input.
 
-**Padding masks.** `True = PAD` (letterbox fill). Pixel masks are produced during letterboxing and pooled to token-level ignore masks for attention (see [mask_utils.py](mask_utils.py)).
+**Padding masks.** `True = PAD` (letterbox fill). Pixel masks are produced during letterboxing and pooled to token-level ignore masks for attention (see [mask_utils.py](mask_utils.py)). Block-mask creation reuses `torch.compile(create_block_mask)` when Triton is available; do not use PyTorch's deprecated private `_compile` argument. Compilation remains lazy. `_create_block_mask` uses `torch.compiler.disable(recursive=False)` to keep host dispatch outside the dynamic model graph (avoiding PyTorch 2.14's reproduced Inductor `CantSplit` failure); the inner mask kernels remain compiled. Retain `compile_fullgraph: false`.
 
 ## Environment & secrets
 
-- **Python:** [pyproject.toml](pyproject.toml) requires `>=3.12`. [payton_env.ps1](payton_env.ps1) creates/activates the venv at `L:\Dab\payton_env` (its `-PythonVersion` default is `3.11`; pass `-PythonVersion 3.12` to match pyproject when creating a fresh venv). It sets `OPPAI_ORACLE_ROOT`, `PYTHONPATH`, `VIRTUAL_ENV`, `PATH`.
-- **Dependencies:** [requirements.txt](requirements.txt) (torch ≥ 2.9.1, torchvision ≥ 0.24.1, onnx, onnxruntime-gpu ≥ 1.22, tensorboard, scikit-learn, fastapi, safetensors, …). The pinned floor is **torch ≥ 2.9.1** (Flex Attention itself needs ≥ 2.5); `torch.compile` additionally requires Triton.
-- **Setup:** `.\payton_env.ps1 -VenvPath L:\Dab\payton_env -PythonVersion 3.12 -InstallDeps`.
+- **Python:** [pyproject.toml](pyproject.toml) requires `>=3.12`. [payton_env.ps1](payton_env.ps1) creates new environments with Python 3.12 by default and preserves the interpreter of existing environments, including the tested legacy Python 3.11.9 venv at `L:\Dab\payton_env`. An explicit `-PythonVersion` enforces that version. It sets `OPPAI_ORACLE_ROOT`, `PYTHONPATH`, `VIRTUAL_ENV`, `PATH`; `-PythonExe` selects the interpreter for creation.
+- **Dependencies:** [requirements.txt](requirements.txt) pins the matched training stack: **torch 2.14.0, torchvision 0.29.0, triton-windows 3.8.0.post28, bitsandbytes 0.50.2**. Windows Triton is platform-gated; Linux PyTorch supplies upstream Triton. [requirements-training-cu130.txt](requirements-training-cu130.txt) selects explicit CUDA 13.0 wheels before the rest of the requirements. Update both manifests together. Details and upstream sources: [docs/training-dependencies.md](docs/training-dependencies.md).
+- **Setup:** `.\payton_env.ps1 -VenvPath L:\Dab\payton_env -InstallDeps` updates the existing venv, stops on pip failures, and runs `pip check`. New environments default to Python 3.12. Legacy torchaudio 2.11 is unused and must be removed before upgrading torch. Verify kernels with `.\Start_AI_Training.ps1 -CheckTrainingStack`.
 - **Secrets:** copy `sensitive_config.py.example` → `sensitive_config.py` (git-ignored). Used by [Monitor_log.py](Monitor_log.py) for optional webhook URLs; absence is handled gracefully.
 - **torch.compile on Windows:** needs Visual Studio Build Tools + Windows SDK; `Start_AI_Training.ps1` configures these paths.
 
@@ -226,6 +244,10 @@ These are runtime/generated and excluded by [.gitignore](.gitignore) (no Git LFS
 
 There is no full pytest suite. To sanity-check changes:
 
+- **Rating edge cases:** `python -B test_rating_system.py` (43 field variants through uncached/cold/warm Arrow workers, complete unrated preparation, CPU/CUDA bf16 gradient isolation, sparse metrics, telemetry and resume reset).
+- **V2 regressions:** `python -B test_v2_pipeline.py` (new tag/rating formats, unrated-image retention and masked loss/metrics, exact holdout preparation, subset IDs, Arrow workers, QK/LayerScale, WSD completion/resume, CUDA fp32-head/8-bit-backbone states).
+- **Training audit:** `python -B test_training_audit.py` (CUDA loss gradients, metric precision, holdout isolation, worker allocations, queue saturation, completion/halt checkpoints, fixed-loss enforcement). Uses temporary data and checkpoints.
+- **Training readiness fixes:** `python -B test_training_readiness.py` (report deduplication across restarts, background-only file I/O, Arrow/fallback workers, repaired-image retry, real WSD resume with bad TRAIN/EVAL images, all-failed EVAL, identical chunked AP counts on CPU/CUDA).
 - **Config:** `python Configuration_System.py validate configs/unified_config.yaml` after any schema/YAML change.
 - **Flip pipeline:** `python test_flip_pipeline.py` (determinism, epoch variation, worker serialization, pixel correctness) after touching dataset/flip code.
 - **Quick model/loss/metric smoke checks:**

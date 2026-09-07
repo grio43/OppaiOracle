@@ -27,7 +27,7 @@ except ImportError:
 
 # Import required functions from utils
 from utils.path_utils import sanitize_identifier
-from utils.metadata_ingestion import parse_tags_field
+from utils.metadata_ingestion import parse_tags_field, rating_to_tag, sidecar_image_id
 
 # PyArrow for zero-copy metadata cache (memory-mapped, shared across workers)
 try:
@@ -54,7 +54,7 @@ except ImportError:
 
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent
-_ARROW_CACHE_VERSION = "2.0"  # Arrow IPC format (added json_stem column)
+_ARROW_CACHE_VERSION = "3.0"  # V2 token parsing, canonical ratings, namespaced image IDs
 # Fraction of sidecar JSON files that may fail to parse before _build_arrow_cache
 # refuses to persist the result. Per-file failures are logged and skipped, but the
 # cache is built once and reused for the whole run, so a systematic parse problem
@@ -230,7 +230,8 @@ def _parse_json_batch(
             image_id = sanitize_identifier(Path(fname).stem)
             tags_raw = data.get("tags")
             tags_list = parse_tags_field(tags_raw)
-            rating = data.get("rating", "unknown")
+            image_id = sidecar_image_id(jp, fname, tags_list)
+            rating = rating_to_tag(data.get("rating")) or "unknown"
 
             items.append({
                 "image_id": image_id,
