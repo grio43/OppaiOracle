@@ -48,3 +48,6 @@ tunnel_log*.txt
 /layer_sweep.csv
 =3.9.0
 Untitled-*.json
+
+# Local vocabulary blacklist; never publish its contents.
+/Tags_ignore.txt
